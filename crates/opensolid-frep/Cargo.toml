@@ -1,0 +1,11 @@
+[package]
+name = "opensolid-frep"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "F-Rep / implicit geometry: SDF primitives, CSG via min/max, blending, meshing"
+
+[dependencies]
+opensolid-core = { path = "../opensolid-core" }
+nalgebra = { workspace = true }
+thiserror = { workspace = true }

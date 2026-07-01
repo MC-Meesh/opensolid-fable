@@ -1,0 +1,13 @@
+[package]
+name = "opensolid-kernel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Unified kernel: hybrid F-Rep + B-Rep, meshing, session management"
+
+[dependencies]
+opensolid-core = { path = "../opensolid-core" }
+opensolid-frep = { path = "../opensolid-frep" }
+opensolid-brep = { path = "../opensolid-brep" }
+nalgebra = { workspace = true }
+thiserror = { workspace = true }

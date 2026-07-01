@@ -1,0 +1,11 @@
+[package]
+name = "opensolid-brep"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "B-Rep topology and parametric geometry: NURBS curves/surfaces, face/edge/vertex graph"
+
+[dependencies]
+opensolid-core = { path = "../opensolid-core" }
+nalgebra = { workspace = true }
+thiserror = { workspace = true }

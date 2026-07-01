@@ -1,0 +1,10 @@
+[package]
+name = "opensolid-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Core types: points, vectors, transforms, arena allocator, entity IDs"
+
+[dependencies]
+nalgebra = { workspace = true }
+thiserror = { workspace = true }

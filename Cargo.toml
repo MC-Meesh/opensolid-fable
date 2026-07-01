@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/opensolid-core",
+    "crates/opensolid-frep",
+    "crates/opensolid-brep",
+    "crates/opensolid-kernel",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MPL-2.0"
+repository = "https://github.com/MC-Meesh/opensolid-fable"
+
+[workspace.dependencies]
+nalgebra = "0.33"
+thiserror = "2"
