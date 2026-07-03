@@ -5,6 +5,11 @@
 //! [`SurfaceEval`]), NURBS curves ([`NurbsCurve`]), and the topology graph
 //! ([`TopologyStore`]: Body > Shell > Face > Loop > Fin > Edge > Vertex).
 //! NURBS surfaces and tolerant modeling land here next.
+//!
+//! This crate follows the OpenSolid error handling policy documented at the
+//! [`opensolid_core`] crate level: fallible public APIs (e.g. the [`Curve3`]
+//! constructors) return [`opensolid_core::CoreResult`] instead of panicking
+//! on invalid input.
 
 pub mod curve;
 pub mod nurbs;

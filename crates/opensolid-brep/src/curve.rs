@@ -7,6 +7,7 @@
 //!   counterclockwise when viewed from the tip of `axis` (right-hand rule).
 //!   `t = 0` lies along the reference x-direction of the curve's frame.
 
+use opensolid_core::error::{CoreError, CoreResult};
 use opensolid_core::types::{Point3, Vector3};
 
 /// Full angular period of a closed conic parameterization.
@@ -83,31 +84,47 @@ pub fn plane_basis(axis: &Vector3) -> (Vector3, Vector3) {
 impl Curve3 {
     /// Line through `origin` in the direction of `dir` (normalized here).
     ///
-    /// # Panics
-    /// Panics if `dir` has zero length.
-    pub fn line(origin: Point3, dir: Vector3) -> Self {
+    /// # Errors
+    /// [`CoreError::Degenerate`] if `dir` has zero or non-finite length.
+    pub fn line(origin: Point3, dir: Vector3) -> CoreResult<Self> {
         let norm = dir.norm();
-        assert!(norm > 0.0, "line direction must be non-zero");
-        Curve3::Line {
+        if norm == 0.0 || !norm.is_finite() {
+            return Err(CoreError::Degenerate {
+                context: "Curve3::line",
+                reason: format!("direction must have non-zero finite length, got {dir}"),
+            });
+        }
+        Ok(Curve3::Line {
             origin,
             dir: dir / norm,
-        }
+        })
     }
 
     /// Circle of `radius` about `center` in the plane normal to `axis`
     /// (normalized here).
     ///
-    /// # Panics
-    /// Panics if `axis` has zero length or `radius` is not positive.
-    pub fn circle(center: Point3, axis: Vector3, radius: f64) -> Self {
+    /// # Errors
+    /// [`CoreError::Degenerate`] if `axis` has zero or non-finite length;
+    /// [`CoreError::InvalidArgument`] if `radius` is not positive and finite.
+    pub fn circle(center: Point3, axis: Vector3, radius: f64) -> CoreResult<Self> {
         let norm = axis.norm();
-        assert!(norm > 0.0, "circle axis must be non-zero");
-        assert!(radius > 0.0, "circle radius must be positive");
-        Curve3::Circle {
+        if norm == 0.0 || !norm.is_finite() {
+            return Err(CoreError::Degenerate {
+                context: "Curve3::circle",
+                reason: format!("axis must have non-zero finite length, got {axis}"),
+            });
+        }
+        if radius <= 0.0 || !radius.is_finite() {
+            return Err(CoreError::InvalidArgument {
+                argument: "radius",
+                reason: format!("must be positive and finite, got {radius}"),
+            });
+        }
+        Ok(Curve3::Circle {
             center,
             axis: axis / norm,
             radius,
-        }
+        })
     }
 
     /// Ellipse about `center` in the plane normal to `axis`, with the major
@@ -115,41 +132,63 @@ impl Curve3 {
     /// re-orthogonalized against it (Gram-Schmidt), so `major_dir` only needs
     /// to be non-parallel to `axis`.
     ///
-    /// # Panics
-    /// Panics if `axis` or `major_dir` is degenerate (zero length or
-    /// parallel to each other), if either radius is not positive, or if
-    /// `minor_radius > major_radius`.
+    /// # Errors
+    /// [`CoreError::Degenerate`] if `axis` has zero or non-finite length, or
+    /// if `major_dir` is (nearly) parallel to `axis`;
+    /// [`CoreError::InvalidArgument`] if either radius is not positive and
+    /// finite, or if `minor_radius > major_radius`.
     pub fn ellipse(
         center: Point3,
         axis: Vector3,
         major_dir: Vector3,
         major_radius: f64,
         minor_radius: f64,
-    ) -> Self {
+    ) -> CoreResult<Self> {
         let axis_norm = axis.norm();
-        assert!(axis_norm > 0.0, "ellipse axis must be non-zero");
+        if axis_norm == 0.0 || !axis_norm.is_finite() {
+            return Err(CoreError::Degenerate {
+                context: "Curve3::ellipse",
+                reason: format!("axis must have non-zero finite length, got {axis}"),
+            });
+        }
         let axis = axis / axis_norm;
         let in_plane = major_dir - axis * major_dir.dot(&axis);
         let major_norm = in_plane.norm();
-        assert!(
-            major_norm > 1e-12,
-            "ellipse major_dir must not be parallel to axis"
-        );
-        assert!(
-            major_radius > 0.0 && minor_radius > 0.0,
-            "ellipse radii must be positive"
-        );
-        assert!(
-            minor_radius <= major_radius,
-            "ellipse minor_radius must not exceed major_radius"
-        );
-        Curve3::Ellipse {
+        if major_norm <= 1e-12 || !major_norm.is_finite() {
+            return Err(CoreError::Degenerate {
+                context: "Curve3::ellipse",
+                reason: format!(
+                    "major_dir {major_dir} must not be parallel to axis (or zero/non-finite)"
+                ),
+            });
+        }
+        for (name, r) in [
+            ("major_radius", major_radius),
+            ("minor_radius", minor_radius),
+        ] {
+            if r <= 0.0 || !r.is_finite() {
+                return Err(CoreError::InvalidArgument {
+                    argument: name,
+                    reason: format!("must be positive and finite, got {r}"),
+                });
+            }
+        }
+        if minor_radius > major_radius {
+            return Err(CoreError::InvalidArgument {
+                argument: "minor_radius",
+                reason: format!(
+                    "must not exceed major_radius ({minor_radius} > {major_radius}); \
+                     swap the radii and rotate major_dir if the minor axis is longer"
+                ),
+            });
+        }
+        Ok(Curve3::Ellipse {
             center,
             axis,
             major_dir: in_plane / major_norm,
             major_radius,
             minor_radius,
-        }
+        })
     }
 
     /// In-plane frame `(u, v)` for conic evaluation: `u` at t = 0, `v` at
@@ -287,7 +326,8 @@ mod tests {
 
     #[test]
     fn line_points_by_arc_length() {
-        let l = Curve3::line(Point3::new(1.0, 2.0, 3.0), Vector3::new(0.0, 0.0, 5.0));
+        let l = Curve3::line(Point3::new(1.0, 2.0, 3.0), Vector3::new(0.0, 0.0, 5.0))
+            .expect("valid curve");
         assert_point_eq(&l.point(0.0), &Point3::new(1.0, 2.0, 3.0));
         // dir was length 5 but is normalized: t is arc length.
         assert_point_eq(&l.point(2.0), &Point3::new(1.0, 2.0, 5.0));
@@ -296,7 +336,7 @@ mod tests {
 
     #[test]
     fn line_derivatives() {
-        let l = Curve3::line(Point3::origin(), Vector3::new(3.0, 0.0, 4.0));
+        let l = Curve3::line(Point3::origin(), Vector3::new(3.0, 0.0, 4.0)).expect("valid curve");
         let d = l.derivative(7.0);
         assert!((d.norm() - 1.0).abs() < EPS, "unit tangent expected");
         assert_vec_eq(&d, &Vector3::new(0.6, 0.0, 0.8));
@@ -306,7 +346,7 @@ mod tests {
 
     #[test]
     fn line_domain_and_topology() {
-        let l = Curve3::line(Point3::origin(), Vector3::x());
+        let l = Curve3::line(Point3::origin(), Vector3::x()).expect("valid curve");
         let (t0, t1) = l.domain();
         assert!(t0.is_infinite() && t0 < 0.0);
         assert!(t1.is_infinite() && t1 > 0.0);
@@ -316,15 +356,18 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "non-zero")]
     fn line_rejects_zero_direction() {
-        Curve3::line(Point3::origin(), Vector3::zeros());
+        let err = Curve3::line(Point3::origin(), Vector3::zeros()).unwrap_err();
+        assert!(matches!(err, CoreError::Degenerate { .. }), "got {err}");
+        let msg = err.to_string();
+        assert!(msg.contains("Curve3::line"), "missing context: {msg}");
+        assert!(msg.contains("non-zero"), "missing constraint: {msg}");
     }
 
     #[test]
     fn circle_analytic_points() {
         // Axis = +Z: plane_basis seeds from world X, so u = X, v = Y.
-        let c = Curve3::circle(Point3::new(1.0, 1.0, 0.0), Vector3::z(), 2.0);
+        let c = Curve3::circle(Point3::new(1.0, 1.0, 0.0), Vector3::z(), 2.0).expect("valid curve");
         assert_point_eq(&c.point(0.0), &Point3::new(3.0, 1.0, 0.0));
         assert_point_eq(&c.point(FRAC_PI_2), &Point3::new(1.0, 3.0, 0.0));
         assert_point_eq(&c.point(PI), &Point3::new(-1.0, 1.0, 0.0));
@@ -335,7 +378,7 @@ mod tests {
     fn circle_arbitrary_axis_stays_on_circle() {
         let center = Point3::new(-2.0, 5.0, 1.0);
         let axis = Vector3::new(1.0, 2.0, -3.0);
-        let c = Curve3::circle(center, axis, 1.5);
+        let c = Curve3::circle(center, axis, 1.5).expect("valid curve");
         let n = axis.normalize();
         for i in 0..12 {
             let t = TWO_PI * f64::from(i) / 12.0;
@@ -348,7 +391,7 @@ mod tests {
 
     #[test]
     fn circle_derivatives() {
-        let c = Curve3::circle(Point3::origin(), Vector3::z(), 3.0);
+        let c = Curve3::circle(Point3::origin(), Vector3::z(), 3.0).expect("valid curve");
         // Tangent has magnitude r, is perpendicular to the radius vector.
         for t in [0.0, 0.4, FRAC_PI_2, 2.0, PI, 5.0] {
             let d = c.derivative(t);
@@ -363,7 +406,7 @@ mod tests {
 
     #[test]
     fn circle_counterclockwise_about_axis() {
-        let c = Curve3::circle(Point3::origin(), Vector3::z(), 1.0);
+        let c = Curve3::circle(Point3::origin(), Vector3::z(), 1.0).expect("valid curve");
         // r × dr/dt must point along +axis (right-hand rule).
         let cross = (c.point(0.3) - Point3::origin()).cross(&c.derivative(0.3));
         assert!(cross.z > 0.0);
@@ -372,7 +415,8 @@ mod tests {
 
     #[test]
     fn circle_periodicity_and_domain() {
-        let c = Curve3::circle(Point3::new(0.0, 1.0, 2.0), Vector3::new(0.0, 1.0, 1.0), 4.0);
+        let c = Curve3::circle(Point3::new(0.0, 1.0, 2.0), Vector3::new(0.0, 1.0, 1.0), 4.0)
+            .expect("valid curve");
         assert!(c.is_closed());
         assert!(c.is_periodic());
         assert_eq!(c.period(), Some(TWO_PI));
@@ -385,14 +429,33 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "radius must be positive")]
     fn circle_rejects_nonpositive_radius() {
-        Curve3::circle(Point3::origin(), Vector3::z(), 0.0);
+        for bad in [0.0, -2.0, f64::NAN, f64::INFINITY] {
+            let err = Curve3::circle(Point3::origin(), Vector3::z(), bad).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    CoreError::InvalidArgument {
+                        argument: "radius",
+                        ..
+                    }
+                ),
+                "radius {bad}: got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn circle_rejects_zero_axis() {
+        let err = Curve3::circle(Point3::origin(), Vector3::zeros(), 1.0).unwrap_err();
+        assert!(matches!(err, CoreError::Degenerate { .. }), "got {err}");
+        assert!(err.to_string().contains("axis"), "unhelpful message: {err}");
     }
 
     #[test]
     fn ellipse_analytic_points() {
-        let c = Curve3::ellipse(Point3::origin(), Vector3::z(), Vector3::x(), 3.0, 1.0);
+        let c = Curve3::ellipse(Point3::origin(), Vector3::z(), Vector3::x(), 3.0, 1.0)
+            .expect("valid curve");
         assert_point_eq(&c.point(0.0), &Point3::new(3.0, 0.0, 0.0));
         assert_point_eq(&c.point(FRAC_PI_2), &Point3::new(0.0, 1.0, 0.0));
         assert_point_eq(&c.point(PI), &Point3::new(-3.0, 0.0, 0.0));
@@ -404,7 +467,7 @@ mod tests {
         let center = Point3::new(1.0, -2.0, 0.5);
         let axis = Vector3::new(0.0, 1.0, 2.0);
         let major_dir = Vector3::x();
-        let c = Curve3::ellipse(center, axis, major_dir, 2.5, 1.5);
+        let c = Curve3::ellipse(center, axis, major_dir, 2.5, 1.5).expect("valid curve");
         let (u, v) = match &c {
             Curve3::Ellipse {
                 axis, major_dir, ..
@@ -423,7 +486,8 @@ mod tests {
 
     #[test]
     fn ellipse_derivatives() {
-        let c = Curve3::ellipse(Point3::origin(), Vector3::z(), Vector3::x(), 3.0, 1.0);
+        let c = Curve3::ellipse(Point3::origin(), Vector3::z(), Vector3::x(), 3.0, 1.0)
+            .expect("valid curve");
         assert_vec_eq(&c.derivative(0.0), &Vector3::new(0.0, 1.0, 0.0));
         assert_vec_eq(&c.derivative(FRAC_PI_2), &Vector3::new(-3.0, 0.0, 0.0));
         assert_vec_eq(&c.second_derivative(0.0), &Vector3::new(-3.0, 0.0, 0.0));
@@ -439,9 +503,9 @@ mod tests {
     #[test]
     fn ellipse_with_equal_radii_matches_circle() {
         let center = Point3::new(2.0, 0.0, -1.0);
-        let e = Curve3::ellipse(center, Vector3::z(), Vector3::x(), 2.0, 2.0);
+        let e = Curve3::ellipse(center, Vector3::z(), Vector3::x(), 2.0, 2.0).expect("valid curve");
         // plane_basis(z) also yields u = X, v = Y, so evaluations agree.
-        let c = Curve3::circle(center, Vector3::z(), 2.0);
+        let c = Curve3::circle(center, Vector3::z(), 2.0).expect("valid curve");
         for t in [0.0, 1.0, 2.5, 4.0, 6.0] {
             assert_point_eq(&e.point(t), &c.point(t));
             assert_vec_eq(&e.derivative(t), &c.derivative(t));
@@ -459,7 +523,8 @@ mod tests {
             Vector3::new(1.0, 0.0, 0.7),
             2.0,
             1.0,
-        );
+        )
+        .expect("valid curve");
         match &c {
             Curve3::Ellipse {
                 axis, major_dir, ..
@@ -474,7 +539,8 @@ mod tests {
 
     #[test]
     fn ellipse_periodicity() {
-        let c = Curve3::ellipse(Point3::origin(), Vector3::z(), Vector3::x(), 3.0, 1.0);
+        let c = Curve3::ellipse(Point3::origin(), Vector3::z(), Vector3::x(), 3.0, 1.0)
+            .expect("valid curve");
         assert!(c.is_closed());
         assert!(c.is_periodic());
         assert_eq!(c.period(), Some(TWO_PI));
@@ -482,15 +548,62 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "parallel to axis")]
     fn ellipse_rejects_major_dir_parallel_to_axis() {
-        Curve3::ellipse(Point3::origin(), Vector3::z(), Vector3::z(), 2.0, 1.0);
+        let err =
+            Curve3::ellipse(Point3::origin(), Vector3::z(), Vector3::z(), 2.0, 1.0).unwrap_err();
+        assert!(matches!(err, CoreError::Degenerate { .. }), "got {err}");
+        assert!(
+            err.to_string().contains("parallel to axis"),
+            "unhelpful message: {err}"
+        );
     }
 
     #[test]
-    #[should_panic(expected = "must not exceed")]
     fn ellipse_rejects_minor_greater_than_major() {
-        Curve3::ellipse(Point3::origin(), Vector3::z(), Vector3::x(), 1.0, 2.0);
+        let err =
+            Curve3::ellipse(Point3::origin(), Vector3::z(), Vector3::x(), 1.0, 2.0).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CoreError::InvalidArgument {
+                    argument: "minor_radius",
+                    ..
+                }
+            ),
+            "got {err}"
+        );
+        assert!(
+            err.to_string().contains("must not exceed major_radius"),
+            "unhelpful message: {err}"
+        );
+    }
+
+    #[test]
+    fn ellipse_rejects_nonpositive_radii() {
+        let err =
+            Curve3::ellipse(Point3::origin(), Vector3::z(), Vector3::x(), -1.0, 1.0).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CoreError::InvalidArgument {
+                    argument: "major_radius",
+                    ..
+                }
+            ),
+            "got {err}"
+        );
+        let err =
+            Curve3::ellipse(Point3::origin(), Vector3::z(), Vector3::x(), 2.0, 0.0).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CoreError::InvalidArgument {
+                    argument: "minor_radius",
+                    ..
+                }
+            ),
+            "got {err}"
+        );
     }
 
     #[test]

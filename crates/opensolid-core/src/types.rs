@@ -30,6 +30,10 @@ impl Ray3 {
 /// A box is *empty* when `min > max` on any axis; [`BoundingBox3::EMPTY`]
 /// (min = +∞, max = −∞) is the canonical empty box and the identity for
 /// [`union`](BoundingBox3::union). Queries treat boundaries as inclusive.
+///
+/// Every `(min, max)` pair is a meaningful box under this model (inverted
+/// corners are simply empty), so [`BoundingBox3::new`] is total and
+/// infallible — no `Result` needed per the crate error-handling policy.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BoundingBox3 {
     pub min: Point3,
