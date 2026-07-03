@@ -9,3 +9,4 @@ description = "F-Rep / implicit geometry: SDF primitives, CSG via min/max, blend
 opensolid-core = { path = "../opensolid-core" }
 nalgebra = { workspace = true }
 thiserror = { workspace = true }
+rayon = { workspace = true }

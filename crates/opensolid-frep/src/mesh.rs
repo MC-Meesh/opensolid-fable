@@ -12,6 +12,7 @@
 use crate::eval::gradient;
 use crate::primitives::Sdf;
 use opensolid_core::types::{BoundingBox3, Point3, Vector3};
+use rayon::prelude::*;
 
 pub use opensolid_core::mesh::{Triangle, TriangleMesh};
 
@@ -58,115 +59,242 @@ const CELL_EDGES: [(usize, usize); 12] = [
     (3, 7), // z-aligned
 ];
 
+/// Geometry shared by the meshing passes.
+struct Grid {
+    n: usize,
+    np: usize,
+    min: Point3,
+    step: Vector3,
+}
+
+impl Grid {
+    fn new(opts: &MeshOptions) -> Self {
+        let n = opts.resolution;
+        let size = opts.bounds.max - opts.bounds.min;
+        let nf = n as f64;
+        Self {
+            n,
+            np: n + 1,
+            min: opts.bounds.min,
+            step: Vector3::new(size.x / nf, size.y / nf, size.z / nf),
+        }
+    }
+
+    fn point_at(&self, i: usize, j: usize, k: usize) -> Point3 {
+        Point3::new(
+            self.min.x + self.step.x * i as f64,
+            self.min.y + self.step.y * j as f64,
+            self.min.z + self.step.z * k as f64,
+        )
+    }
+
+    fn vidx(&self, i: usize, j: usize, k: usize) -> usize {
+        (i * self.np + j) * self.np + k
+    }
+
+    fn cidx(&self, i: usize, j: usize, k: usize) -> usize {
+        (i * self.n + j) * self.n + k
+    }
+}
+
+fn corner(c: usize) -> (usize, usize, usize) {
+    (c & 1, (c >> 1) & 1, (c >> 2) & 1)
+}
+
+/// Hermite vertex for one cell: centroid of the sign-change crossings on its
+/// edges (linear interpolation of the SDF along each crossed edge), or `None`
+/// if no edge crosses the surface.
+fn cell_candidate(g: &Grid, values: &[f64], i: usize, j: usize, k: usize) -> Option<Point3> {
+    let mut sum = Vector3::zeros();
+    let mut count = 0usize;
+    for &(a, b) in &CELL_EDGES {
+        let (ax, ay, az) = corner(a);
+        let (bx, by, bz) = corner(b);
+        let va = values[g.vidx(i + ax, j + ay, k + az)];
+        let vb = values[g.vidx(i + bx, j + by, k + bz)];
+        if (va < 0.0) == (vb < 0.0) {
+            continue;
+        }
+        let t = va / (va - vb);
+        let pa = g.point_at(i + ax, j + ay, k + az);
+        let pb = g.point_at(i + bx, j + by, k + bz);
+        sum += pa.coords + (pb.coords - pa.coords) * t;
+        count += 1;
+    }
+    (count > 0).then(|| Point3::from(sum / count as f64))
+}
+
+/// Triangles for one `(d, gd)` slab of the quad-emission pass: for each
+/// interior grid edge along axis `d` at depth `gd` with a sign change,
+/// connect the vertices of the four cells sharing that edge. Winding: with
+/// perpendicular axes u = (d+1)%3 and v = (d+2)%3, the quad order
+/// (0,0),(1,0),(1,1),(0,1) faces +d; reversed when the surface faces -d.
+fn slab_triangles(
+    g: &Grid,
+    values: &[f64],
+    cell_vertex: &[Option<usize>],
+    d: usize,
+    gd: usize,
+) -> Vec<[usize; 3]> {
+    let n = g.n;
+    let u = (d + 1) % 3;
+    let v = (d + 2) % 3;
+    let mut tris = Vec::new();
+    for gu in 1..n {
+        for gv in 1..n {
+            let mut g0 = [0usize; 3];
+            g0[d] = gd;
+            g0[u] = gu;
+            g0[v] = gv;
+            let mut g1 = g0;
+            g1[d] += 1;
+            let v0 = values[g.vidx(g0[0], g0[1], g0[2])];
+            let v1 = values[g.vidx(g1[0], g1[1], g1[2])];
+            let inside0 = v0 < 0.0;
+            if inside0 == (v1 < 0.0) {
+                continue;
+            }
+            let cell = |a: usize, b: usize| {
+                let mut c = g0;
+                c[u] = c[u] - 1 + a;
+                c[v] = c[v] - 1 + b;
+                cell_vertex[g.cidx(c[0], c[1], c[2])]
+                    .expect("cell adjacent to a sign-change edge must have a vertex")
+            };
+            let mut quad = [cell(0, 0), cell(1, 0), cell(1, 1), cell(0, 1)];
+            if !inside0 {
+                quad.reverse();
+            }
+            tris.push([quad[0], quad[1], quad[2]]);
+            tris.push([quad[0], quad[2], quad[3]]);
+        }
+    }
+    tris
+}
+
+/// Parallel mesher. Every pass fans out over independent x-slabs (or
+/// vertices) and preserves the serial iteration order, so the output is
+/// identical to [`build_mesh_serial`] triangle-for-triangle.
 fn build_mesh(sdf: &dyn Sdf, opts: &MeshOptions) -> TriangleMesh {
     let n = opts.resolution;
     let mut mesh = TriangleMesh::new();
     if n == 0 {
         return mesh;
     }
+    let g = &Grid::new(opts);
+    let np = g.np;
 
-    let np = n + 1;
-    let min = opts.bounds.min;
-    let size = opts.bounds.max - opts.bounds.min;
-    let nf = n as f64;
-    let step = Vector3::new(size.x / nf, size.y / nf, size.z / nf);
+    // Sample the SDF at every grid point, one parallel task per x-slab
+    // (each slab is a contiguous run of the i-major value array).
+    let mut values = vec![0.0f64; np * np * np];
+    values
+        .par_chunks_mut(np * np)
+        .enumerate()
+        .for_each(|(i, slab)| {
+            for j in 0..np {
+                for k in 0..np {
+                    slab[j * np + k] = sdf.eval(&g.point_at(i, j, k));
+                }
+            }
+        });
 
-    let point_at = |i: usize, j: usize, k: usize| {
-        Point3::new(
-            min.x + step.x * i as f64,
-            min.y + step.y * j as f64,
-            min.z + step.z * k as f64,
-        )
-    };
-    let vidx = |i: usize, j: usize, k: usize| (i * np + j) * np + k;
-    let cidx = |i: usize, j: usize, k: usize| (i * n + j) * n + k;
-    let corner = |c: usize| (c & 1, (c >> 1) & 1, (c >> 2) & 1);
+    // Compute cell vertices in parallel, then number them in serial scan
+    // order so vertex indices match the serial mesher exactly.
+    let mut candidates: Vec<Option<Point3>> = vec![None; n * n * n];
+    candidates
+        .par_chunks_mut(n * n)
+        .enumerate()
+        .for_each(|(i, slab)| {
+            for j in 0..n {
+                for k in 0..n {
+                    slab[j * n + k] = cell_candidate(g, &values, i, j, k);
+                }
+            }
+        });
+    let mut cell_vertex: Vec<Option<usize>> = vec![None; n * n * n];
+    for (c, candidate) in candidates.into_iter().enumerate() {
+        if let Some(p) = candidate {
+            cell_vertex[c] = Some(mesh.positions.len());
+            mesh.positions.push(p);
+        }
+    }
 
-    // Sample the SDF at every grid point.
+    // Normals per vertex; parallel collect preserves order.
+    mesh.normals = mesh
+        .positions
+        .par_iter()
+        .map(|p| {
+            let grad = gradient(sdf, p);
+            let norm = grad.norm();
+            if norm > 1e-12 {
+                grad / norm
+            } else {
+                Vector3::z()
+            }
+        })
+        .collect();
+
+    // Emit quads per (axis, depth) slab in parallel, concatenated in the
+    // serial loop order.
+    let slabs: Vec<(usize, usize)> = (0..3).flat_map(|d| (0..n).map(move |gd| (d, gd))).collect();
+    let per_slab: Vec<Vec<[usize; 3]>> = slabs
+        .par_iter()
+        .map(|&(d, gd)| slab_triangles(g, &values, &cell_vertex, d, gd))
+        .collect();
+    for tris in per_slab {
+        mesh.indices.extend(tris);
+    }
+
+    mesh
+}
+
+/// Single-threaded reference implementation. Kept (test-only) as the ground
+/// truth the parallel mesher must reproduce exactly.
+#[cfg(test)]
+fn build_mesh_serial(sdf: &dyn Sdf, opts: &MeshOptions) -> TriangleMesh {
+    let n = opts.resolution;
+    let mut mesh = TriangleMesh::new();
+    if n == 0 {
+        return mesh;
+    }
+    let g = &Grid::new(opts);
+    let np = g.np;
+
     let mut values = vec![0.0f64; np * np * np];
     for i in 0..np {
         for j in 0..np {
             for k in 0..np {
-                values[vidx(i, j, k)] = sdf.eval(&point_at(i, j, k));
+                values[g.vidx(i, j, k)] = sdf.eval(&g.point_at(i, j, k));
             }
         }
     }
 
-    // Place one vertex per cell that has a sign change: the centroid of the
-    // Hermite edge crossings (linear interpolation of the SDF along each
-    // crossed cell edge).
     let mut cell_vertex: Vec<Option<usize>> = vec![None; n * n * n];
     for i in 0..n {
         for j in 0..n {
             for k in 0..n {
-                let mut sum = Vector3::zeros();
-                let mut count = 0usize;
-                for &(a, b) in &CELL_EDGES {
-                    let (ax, ay, az) = corner(a);
-                    let (bx, by, bz) = corner(b);
-                    let va = values[vidx(i + ax, j + ay, k + az)];
-                    let vb = values[vidx(i + bx, j + by, k + bz)];
-                    if (va < 0.0) == (vb < 0.0) {
-                        continue;
-                    }
-                    let t = va / (va - vb);
-                    let pa = point_at(i + ax, j + ay, k + az);
-                    let pb = point_at(i + bx, j + by, k + bz);
-                    sum += pa.coords + (pb.coords - pa.coords) * t;
-                    count += 1;
-                }
-                if count > 0 {
-                    cell_vertex[cidx(i, j, k)] = Some(mesh.positions.len());
-                    mesh.positions.push(Point3::from(sum / count as f64));
+                if let Some(p) = cell_candidate(g, &values, i, j, k) {
+                    cell_vertex[g.cidx(i, j, k)] = Some(mesh.positions.len());
+                    mesh.positions.push(p);
                 }
             }
         }
     }
 
     for p in &mesh.positions {
-        let g = gradient(sdf, p);
-        let norm = g.norm();
-        mesh.normals
-            .push(if norm > 1e-12 { g / norm } else { Vector3::z() });
+        let grad = gradient(sdf, p);
+        let norm = grad.norm();
+        mesh.normals.push(if norm > 1e-12 {
+            grad / norm
+        } else {
+            Vector3::z()
+        });
     }
 
-    // For each interior grid edge with a sign change, connect the vertices of
-    // the four cells sharing that edge into a quad (two triangles). Winding:
-    // with perpendicular axes u = (d+1)%3 and v = (d+2)%3, the quad order
-    // (0,0),(1,0),(1,1),(0,1) faces +d; reversed when the surface faces -d.
     for d in 0..3 {
-        let u = (d + 1) % 3;
-        let v = (d + 2) % 3;
         for gd in 0..n {
-            for gu in 1..n {
-                for gv in 1..n {
-                    let mut g0 = [0usize; 3];
-                    g0[d] = gd;
-                    g0[u] = gu;
-                    g0[v] = gv;
-                    let mut g1 = g0;
-                    g1[d] += 1;
-                    let v0 = values[vidx(g0[0], g0[1], g0[2])];
-                    let v1 = values[vidx(g1[0], g1[1], g1[2])];
-                    let inside0 = v0 < 0.0;
-                    if inside0 == (v1 < 0.0) {
-                        continue;
-                    }
-                    let cell = |a: usize, b: usize| {
-                        let mut c = g0;
-                        c[u] = c[u] - 1 + a;
-                        c[v] = c[v] - 1 + b;
-                        cell_vertex[cidx(c[0], c[1], c[2])]
-                            .expect("cell adjacent to a sign-change edge must have a vertex")
-                    };
-                    let mut quad = [cell(0, 0), cell(1, 0), cell(1, 1), cell(0, 1)];
-                    if !inside0 {
-                        quad.reverse();
-                    }
-                    mesh.indices.push([quad[0], quad[1], quad[2]]);
-                    mesh.indices.push([quad[0], quad[2], quad[3]]);
-                }
-            }
+            mesh.indices
+                .extend(slab_triangles(g, &values, &cell_vertex, d, gd));
         }
     }
 
@@ -336,6 +464,49 @@ mod tests {
         for p in &mesh.positions {
             assert!(union.eval(p).abs() < cell, "vertex {p:?} off the surface");
         }
+    }
+
+    /// The parallel mesher must reproduce the serial reference bit-for-bit:
+    /// same vertices in the same order, same normals, same triangles.
+    fn assert_parallel_matches_serial(sdf: &dyn Sdf, opts: &MeshOptions) {
+        let parallel = mesh_sdf_indexed(sdf, opts);
+        let serial = build_mesh_serial(sdf, opts);
+        assert!(!serial.is_empty());
+        assert_eq!(parallel.positions, serial.positions);
+        assert_eq!(parallel.normals, serial.normals);
+        assert_eq!(parallel.indices, serial.indices);
+    }
+
+    #[test]
+    fn parallel_matches_serial_sphere() {
+        let s = Sphere {
+            center: Point3::origin(),
+            radius: 1.0,
+        };
+        let opts = MeshOptions {
+            bounds: bounds(1.6),
+            resolution: 20,
+        };
+        assert_parallel_matches_serial(&s, &opts);
+    }
+
+    #[test]
+    fn parallel_matches_serial_csg_union() {
+        let union = Union {
+            a: Sphere {
+                center: Point3::new(-0.5, 0.0, 0.0),
+                radius: 1.0,
+            },
+            b: Sphere {
+                center: Point3::new(0.5, 0.0, 0.0),
+                radius: 1.0,
+            },
+        };
+        let opts = MeshOptions {
+            bounds: bounds(1.8),
+            resolution: 24,
+        };
+        assert_parallel_matches_serial(&union, &opts);
     }
 
     #[test]
