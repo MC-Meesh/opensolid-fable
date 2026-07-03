@@ -1,3 +1,15 @@
+//! Smooth CSG via the polynomial smooth min/max.
+//!
+//! # Metric properties
+//!
+//! Both blends preserve the 1-Lipschitz bound when their children satisfy
+//! it: the gradient is `h * grad_a ± (1 - h) * grad_b` with `h ∈ [0, 1]`, a
+//! convex combination of vectors of norm <= 1, so its norm is <= 1. Inside
+//! the blend region the field is *not* an exact distance (the surface is
+//! pulled off both operands), and `|grad|` dips below 1 where the child
+//! gradients disagree — so gradient-norm ~ 1 holds only for exact
+//! primitives, not for blended fields.
+
 use crate::primitives::Sdf;
 use opensolid_core::types::{Point3, Vector3};
 

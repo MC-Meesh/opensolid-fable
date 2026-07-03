@@ -1,6 +1,20 @@
+//! Sharp CSG via min/max.
+//!
+//! # Metric properties
+//!
+//! `min` and `max` of 1-Lipschitz functions are 1-Lipschitz, so every
+//! combinator here preserves the 1-Lipschitz bound `|f(p) - f(q)| <= |p - q|`
+//! when its children satisfy it. The result is *not* an exact distance in
+//! general: e.g. inside an overlapping union, `min` reports the distance to a
+//! surface that may lie inside the other operand, underestimating the true
+//! distance to the combined boundary. The field is always a conservative
+//! (lower-magnitude) bound, which is what sphere tracing and the mesher need.
+
 use crate::primitives::Sdf;
 use opensolid_core::types::{Point3, Vector3};
 
+/// `min(a, b)`. Preserves 1-Lipschitz; exact only where the nearest surface
+/// point of the winning operand lies on the union boundary.
 pub struct Union<A, B> {
     pub a: A,
     pub b: B,
@@ -20,6 +34,8 @@ impl<A: Sdf, B: Sdf> Sdf for Union<A, B> {
     }
 }
 
+/// `max(a, b)`. Preserves 1-Lipschitz; underestimates distance near corners
+/// where the true nearest boundary point is on the intersection curve.
 pub struct Intersection<A, B> {
     pub a: A,
     pub b: B,
@@ -39,6 +55,9 @@ impl<A: Sdf, B: Sdf> Sdf for Intersection<A, B> {
     }
 }
 
+/// `max(a, -b)`. Negation and `max` both preserve 1-Lipschitz, so the result
+/// does too; like the other sharp combinators it is a bound, not an exact
+/// distance.
 pub struct Subtraction<A, B> {
     pub a: A,
     pub b: B,

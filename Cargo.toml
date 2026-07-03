@@ -22,3 +22,4 @@ rayon = "1"
 # Dev-dependencies only (PM-approved exceptions to the minimal-deps rule;
 # see ROADMAP.md). Never promote these to runtime [dependencies].
 criterion = "0.5"
+proptest = "1"
