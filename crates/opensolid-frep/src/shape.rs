@@ -35,6 +35,13 @@ impl Shape {
             radius,
         })
     }
+
+    /// True if both handles refer to the same underlying SDF instance.
+    /// Structural equality of SDF trees is undecidable in general; identity
+    /// is what sessions need to verify state restoration.
+    pub fn ptr_eq(&self, other: &Shape) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
 }
 
 impl Sdf for Shape {
