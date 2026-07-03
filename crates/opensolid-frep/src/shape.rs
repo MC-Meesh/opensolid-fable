@@ -1,7 +1,7 @@
 use crate::blend::SmoothUnion;
 use crate::csg::{Intersection, Subtraction, Union};
 use crate::primitives::Sdf;
-use opensolid_core::types::Point3;
+use opensolid_core::types::{Point3, Vector3};
 use std::sync::Arc;
 
 /// Runtime-composable handle to an SDF tree. Cloning is cheap (shared
@@ -40,6 +40,10 @@ impl Shape {
 impl Sdf for Shape {
     fn eval(&self, p: &Point3) -> f64 {
         self.0.eval(p)
+    }
+
+    fn grad(&self, p: &Point3) -> Vector3 {
+        self.0.grad(p)
     }
 }
 

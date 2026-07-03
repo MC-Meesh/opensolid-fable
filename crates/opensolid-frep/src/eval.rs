@@ -2,16 +2,9 @@ use crate::primitives::Sdf;
 use nalgebra::Vector3;
 use opensolid_core::types::Point3;
 
-const GRADIENT_EPS: f64 = 1e-6;
-
+/// Thin wrapper over [`Sdf::grad`] for dyn contexts.
 pub fn gradient(sdf: &dyn Sdf, p: &Point3) -> Vector3<f64> {
-    let dx = sdf.eval(&Point3::new(p.x + GRADIENT_EPS, p.y, p.z))
-        - sdf.eval(&Point3::new(p.x - GRADIENT_EPS, p.y, p.z));
-    let dy = sdf.eval(&Point3::new(p.x, p.y + GRADIENT_EPS, p.z))
-        - sdf.eval(&Point3::new(p.x, p.y - GRADIENT_EPS, p.z));
-    let dz = sdf.eval(&Point3::new(p.x, p.y, p.z + GRADIENT_EPS))
-        - sdf.eval(&Point3::new(p.x, p.y, p.z - GRADIENT_EPS));
-    Vector3::new(dx, dy, dz) / (2.0 * GRADIENT_EPS)
+    sdf.grad(p)
 }
 
 pub fn normal(sdf: &dyn Sdf, p: &Point3) -> Vector3<f64> {

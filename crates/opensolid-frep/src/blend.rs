@@ -1,5 +1,5 @@
 use crate::primitives::Sdf;
-use opensolid_core::types::Point3;
+use opensolid_core::types::{Point3, Vector3};
 
 pub struct SmoothUnion<A, B> {
     pub a: A,
@@ -13,6 +13,15 @@ impl<A: Sdf, B: Sdf> Sdf for SmoothUnion<A, B> {
         let db = self.b.eval(p);
         let h = (0.5 + 0.5 * (db - da) / self.radius).clamp(0.0, 1.0);
         db * (1.0 - h) + da * h - self.radius * h * (1.0 - h)
+    }
+
+    // The h-dependence cancels exactly for the polynomial smooth min,
+    // leaving the plain mix of child gradients.
+    fn grad(&self, p: &Point3) -> Vector3 {
+        let da = self.a.eval(p);
+        let db = self.b.eval(p);
+        let h = (0.5 + 0.5 * (db - da) / self.radius).clamp(0.0, 1.0);
+        self.a.grad(p) * h + self.b.grad(p) * (1.0 - h)
     }
 }
 
@@ -30,6 +39,16 @@ impl<A: Sdf, B: Sdf> Sdf for SmoothSubtraction<A, B> {
         // cutter (returning da), not the negated one.
         let h = (0.5 - 0.5 * (da + db) / self.radius).clamp(0.0, 1.0);
         da * (1.0 - h) - db * h + self.radius * h * (1.0 - h)
+    }
+
+    // With h on the raw cutter distance (of-9ht) the dd/dh term cancels
+    // exactly, as in SmoothUnion, leaving the plain mix of child gradients;
+    // the cutter contributes negated. If eval changes, re-derive this.
+    fn grad(&self, p: &Point3) -> Vector3 {
+        let da = self.a.eval(p);
+        let db = self.b.eval(p);
+        let h = (0.5 - 0.5 * (da + db) / self.radius).clamp(0.0, 1.0);
+        self.a.grad(p) * (1.0 - h) - self.b.grad(p) * h
     }
 }
 

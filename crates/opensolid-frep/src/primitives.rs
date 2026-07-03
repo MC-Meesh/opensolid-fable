@@ -1,12 +1,32 @@
 use opensolid_core::types::{Point3, Vector3};
 
+const GRADIENT_EPS: f64 = 1e-6;
+
 pub trait Sdf: Send + Sync {
     fn eval(&self, p: &Point3) -> f64;
+
+    /// Gradient of the distance field. The default uses central finite
+    /// differences; implementations with a cheap closed form override it.
+    /// On non-smooth loci (edges, branch switches) any subgradient may be
+    /// returned.
+    fn grad(&self, p: &Point3) -> Vector3 {
+        let dx = self.eval(&Point3::new(p.x + GRADIENT_EPS, p.y, p.z))
+            - self.eval(&Point3::new(p.x - GRADIENT_EPS, p.y, p.z));
+        let dy = self.eval(&Point3::new(p.x, p.y + GRADIENT_EPS, p.z))
+            - self.eval(&Point3::new(p.x, p.y - GRADIENT_EPS, p.z));
+        let dz = self.eval(&Point3::new(p.x, p.y, p.z + GRADIENT_EPS))
+            - self.eval(&Point3::new(p.x, p.y, p.z - GRADIENT_EPS));
+        Vector3::new(dx, dy, dz) / (2.0 * GRADIENT_EPS)
+    }
 }
 
 impl<T: Sdf + ?Sized> Sdf for &T {
     fn eval(&self, p: &Point3) -> f64 {
         (**self).eval(p)
+    }
+
+    fn grad(&self, p: &Point3) -> Vector3 {
+        (**self).grad(p)
     }
 }
 
@@ -14,11 +34,19 @@ impl<T: Sdf + ?Sized> Sdf for Box<T> {
     fn eval(&self, p: &Point3) -> f64 {
         (**self).eval(p)
     }
+
+    fn grad(&self, p: &Point3) -> Vector3 {
+        (**self).grad(p)
+    }
 }
 
 impl<T: Sdf + ?Sized> Sdf for std::sync::Arc<T> {
     fn eval(&self, p: &Point3) -> f64 {
         (**self).eval(p)
+    }
+
+    fn grad(&self, p: &Point3) -> Vector3 {
+        (**self).grad(p)
     }
 }
 
@@ -30,6 +58,12 @@ pub struct Sphere {
 impl Sdf for Sphere {
     fn eval(&self, p: &Point3) -> f64 {
         (p - self.center).norm() - self.radius
+    }
+
+    fn grad(&self, p: &Point3) -> Vector3 {
+        let v = p - self.center;
+        let n = v.norm();
+        if n == 0.0 { Vector3::zeros() } else { v / n }
     }
 }
 
@@ -50,6 +84,35 @@ impl Sdf for Box3 {
         let inside = d[0].max(d[1]).max(d[2]).min(0.0);
         outside + inside
     }
+
+    fn grad(&self, p: &Point3) -> Vector3 {
+        let q = p - self.center;
+        let d = [
+            q.x.abs() - self.half_extents[0],
+            q.y.abs() - self.half_extents[1],
+            q.z.abs() - self.half_extents[2],
+        ];
+        let s = [q.x.signum(), q.y.signum(), q.z.signum()];
+        let outward = Vector3::new(
+            d[0].max(0.0) * s[0],
+            d[1].max(0.0) * s[1],
+            d[2].max(0.0) * s[2],
+        );
+        let n = outward.norm();
+        if n > 0.0 {
+            return outward / n;
+        }
+        // Inside: distance changes along the least-deep axis only.
+        let mut axis = 0;
+        for i in 1..3 {
+            if d[i] > d[axis] {
+                axis = i;
+            }
+        }
+        let mut g = Vector3::zeros();
+        g[axis] = s[axis];
+        g
+    }
 }
 
 pub struct Cylinder {
@@ -67,6 +130,30 @@ impl Sdf for Cylinder {
         let outside = radial.max(0.0).hypot(axial.max(0.0));
         let inside = radial.max(axial).min(0.0);
         outside + inside
+    }
+
+    fn grad(&self, p: &Point3) -> Vector3 {
+        let dx = p.x - self.center.x;
+        let dy = p.y - self.center.y;
+        let dz = p.z - self.center.z;
+        let rho = dx.hypot(dz);
+        let radial = rho - self.radius;
+        let axial = dy.abs() - self.half_height;
+        let radial_dir = if rho > 0.0 {
+            Vector3::new(dx / rho, 0.0, dz / rho)
+        } else {
+            Vector3::zeros()
+        };
+        let ro = radial.max(0.0);
+        let ao = axial.max(0.0);
+        let outside = ro.hypot(ao);
+        if outside > 0.0 {
+            (radial_dir * ro + Vector3::new(0.0, dy.signum() * ao, 0.0)) / outside
+        } else if radial > axial {
+            radial_dir
+        } else {
+            Vector3::new(0.0, dy.signum(), 0.0)
+        }
     }
 }
 
@@ -126,6 +213,15 @@ impl Sdf for Capsule {
         let t = (pa.dot(&ba) / ba.dot(&ba)).clamp(0.0, 1.0);
         (pa - ba * t).norm() - self.radius
     }
+
+    fn grad(&self, p: &Point3) -> Vector3 {
+        let pa = p - self.start;
+        let ba = self.end - self.start;
+        let t = (pa.dot(&ba) / ba.dot(&ba)).clamp(0.0, 1.0);
+        let v = pa - ba * t;
+        let n = v.norm();
+        if n == 0.0 { Vector3::zeros() } else { v / n }
+    }
 }
 
 pub struct HalfSpace {
@@ -136,6 +232,10 @@ pub struct HalfSpace {
 impl Sdf for HalfSpace {
     fn eval(&self, p: &Point3) -> f64 {
         (self.normal.dot(&p.coords) - self.offset) / self.normal.norm()
+    }
+
+    fn grad(&self, _p: &Point3) -> Vector3 {
+        self.normal / self.normal.norm()
     }
 }
 

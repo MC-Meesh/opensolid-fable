@@ -1,5 +1,5 @@
 use crate::primitives::Sdf;
-use opensolid_core::types::Point3;
+use opensolid_core::types::{Point3, Vector3};
 
 pub struct Union<A, B> {
     pub a: A,
@@ -9,6 +9,14 @@ pub struct Union<A, B> {
 impl<A: Sdf, B: Sdf> Sdf for Union<A, B> {
     fn eval(&self, p: &Point3) -> f64 {
         self.a.eval(p).min(self.b.eval(p))
+    }
+
+    fn grad(&self, p: &Point3) -> Vector3 {
+        if self.a.eval(p) <= self.b.eval(p) {
+            self.a.grad(p)
+        } else {
+            self.b.grad(p)
+        }
     }
 }
 
@@ -21,6 +29,14 @@ impl<A: Sdf, B: Sdf> Sdf for Intersection<A, B> {
     fn eval(&self, p: &Point3) -> f64 {
         self.a.eval(p).max(self.b.eval(p))
     }
+
+    fn grad(&self, p: &Point3) -> Vector3 {
+        if self.a.eval(p) >= self.b.eval(p) {
+            self.a.grad(p)
+        } else {
+            self.b.grad(p)
+        }
+    }
 }
 
 pub struct Subtraction<A, B> {
@@ -31,6 +47,14 @@ pub struct Subtraction<A, B> {
 impl<A: Sdf, B: Sdf> Sdf for Subtraction<A, B> {
     fn eval(&self, p: &Point3) -> f64 {
         self.a.eval(p).max(-self.b.eval(p))
+    }
+
+    fn grad(&self, p: &Point3) -> Vector3 {
+        if self.a.eval(p) >= -self.b.eval(p) {
+            self.a.grad(p)
+        } else {
+            -self.b.grad(p)
+        }
     }
 }
 
