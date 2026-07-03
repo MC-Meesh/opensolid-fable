@@ -8,7 +8,7 @@
 use opensolid_core::mesh::TriangleMesh;
 use opensolid_core::types::{BoundingBox3, Point3, Vector3};
 use opensolid_frep::mesh::{MeshOptions, mesh_sdf_indexed};
-use opensolid_frep::primitives::{Box3, Capsule, Cylinder, Sphere, Torus};
+use opensolid_frep::primitives::{Box3, Capsule, Cylinder, RoundedBox, Sphere, Torus};
 use opensolid_frep::{SdfTransformExt, Shape};
 
 /// A runtime-composable shape that carries a conservative axis-aligned
@@ -61,6 +61,21 @@ impl BoundedShape {
             shape: Shape::new(Box3 {
                 center: Point3::origin(),
                 half_extents: [hx, hy, hz],
+            }),
+            bounds: symmetric_bounds(hx, hy, hz),
+        }
+    }
+
+    /// Box with rounded edges. `hx`/`hy`/`hz` are the outer half-extents
+    /// including the rounding, so the box occupies the same volume as
+    /// [`Self::box3`] with the same half-extents; `radius` must not exceed
+    /// the smallest half-extent (matches [`RoundedBox`]).
+    pub fn rounded_box(hx: f64, hy: f64, hz: f64, radius: f64) -> Self {
+        Self {
+            shape: Shape::new(RoundedBox {
+                center: Point3::origin(),
+                half_extents: [hx, hy, hz],
+                radius,
             }),
             bounds: symmetric_bounds(hx, hy, hz),
         }
@@ -249,6 +264,7 @@ mod tests {
     fn primitives_mesh_within_auto_bounds() {
         assert_meshes_cleanly(&BoundedShape::sphere(1.0));
         assert_meshes_cleanly(&BoundedShape::box3(1.0, 0.5, 0.75));
+        assert_meshes_cleanly(&BoundedShape::rounded_box(1.0, 0.5, 0.75, 0.2));
         assert_meshes_cleanly(&BoundedShape::cylinder(0.5, 1.0));
         assert_meshes_cleanly(&BoundedShape::torus(1.0, 0.3));
         assert_meshes_cleanly(&BoundedShape::capsule(
@@ -272,6 +288,12 @@ mod tests {
         assert!(t.shape.eval(&t.bounds.max) > 0.0);
         assert!(t.shape.eval(&Point3::new(1.3, 0.0, 0.0)).abs() < 1e-12);
         assert!(t.shape.eval(&Point3::new(0.0, 0.3, 1.0)).abs() < 1e-12);
+
+        // Rounded box surface reaches the face centers of its tracked box.
+        let r = BoundedShape::rounded_box(1.0, 0.5, 0.75, 0.2);
+        assert!(r.shape.eval(&r.bounds.max) > 0.0);
+        assert!(r.shape.eval(&Point3::new(1.0, 0.0, 0.0)).abs() < 1e-12);
+        assert!(r.shape.eval(&Point3::new(0.0, 0.5, 0.0)).abs() < 1e-12);
     }
 
     #[test]

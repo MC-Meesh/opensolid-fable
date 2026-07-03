@@ -44,6 +44,14 @@ impl WasmShape {
         WasmShape(BoundedShape::box3(hx, hy, hz))
     }
 
+    /// Box with rounded edges: outer half-extents `(hx, hy, hz)` including
+    /// the rounding, edge radius `radius` (≤ the smallest half-extent),
+    /// centered at the origin.
+    #[wasm_bindgen(js_name = roundedBox)]
+    pub fn rounded_box(hx: f64, hy: f64, hz: f64, radius: f64) -> WasmShape {
+        WasmShape(BoundedShape::rounded_box(hx, hy, hz, radius))
+    }
+
     /// Cylinder along the y axis: radius in the xz plane, y ∈ ±half_height.
     pub fn cylinder(radius: f64, half_height: f64) -> WasmShape {
         WasmShape(BoundedShape::cylinder(radius, half_height))
@@ -131,6 +139,17 @@ mod tests {
     fn sphere_meshes_via_wasm_api() {
         let data = WasmShape::sphere(1.0).mesh(24, None);
         assert_valid(&data);
+    }
+
+    #[test]
+    fn playground_default_demo_meshes() {
+        // The playground's default snippet: rounded box smooth-united with a
+        // sphere, with a cylinder hole subtracted.
+        let body = WasmShape::rounded_box(1.0, 0.6, 0.8, 0.15);
+        let bump = WasmShape::sphere(0.55).translate(0.0, 0.7, 0.0);
+        let hole = WasmShape::cylinder(0.3, 2.0);
+        let part = body.smooth_union(&bump, Some(0.25)).subtract(&hole);
+        assert_valid(&part.mesh(48, None));
     }
 
     #[test]
