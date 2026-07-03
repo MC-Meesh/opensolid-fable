@@ -10,3 +10,10 @@ opensolid-core = { path = "../opensolid-core" }
 nalgebra = { workspace = true }
 thiserror = { workspace = true }
 rayon = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "frep_bench"
+harness = false
