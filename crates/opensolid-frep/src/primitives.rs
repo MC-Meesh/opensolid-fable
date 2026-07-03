@@ -4,6 +4,24 @@ pub trait Sdf: Send + Sync {
     fn eval(&self, p: &Point3) -> f64;
 }
 
+impl<T: Sdf + ?Sized> Sdf for &T {
+    fn eval(&self, p: &Point3) -> f64 {
+        (**self).eval(p)
+    }
+}
+
+impl<T: Sdf + ?Sized> Sdf for Box<T> {
+    fn eval(&self, p: &Point3) -> f64 {
+        (**self).eval(p)
+    }
+}
+
+impl<T: Sdf + ?Sized> Sdf for std::sync::Arc<T> {
+    fn eval(&self, p: &Point3) -> f64 {
+        (**self).eval(p)
+    }
+}
+
 pub struct Sphere {
     pub center: Point3,
     pub radius: f64,
