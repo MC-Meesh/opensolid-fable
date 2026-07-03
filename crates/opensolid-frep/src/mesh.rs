@@ -13,12 +13,7 @@ use crate::eval::gradient;
 use crate::primitives::Sdf;
 use opensolid_core::types::{BoundingBox3, Point3, Vector3};
 
-/// A triangle with per-vertex positions and outward unit normals.
-#[derive(Debug, Clone)]
-pub struct Triangle {
-    pub positions: [Point3; 3],
-    pub normals: [Vector3; 3],
-}
+pub use opensolid_core::mesh::{Triangle, TriangleMesh};
 
 /// Options controlling SDF meshing.
 #[derive(Debug, Clone, Copy)]
@@ -34,29 +29,16 @@ pub struct MeshOptions {
 /// Returns an empty vec if the surface does not cross the sampled region
 /// or if `resolution` is zero.
 pub fn mesh_sdf(sdf: &dyn Sdf, opts: &MeshOptions) -> Vec<Triangle> {
-    let mesh = build_mesh(sdf, opts);
-    mesh.indices
-        .iter()
-        .map(|tri| Triangle {
-            positions: [
-                mesh.positions[tri[0]],
-                mesh.positions[tri[1]],
-                mesh.positions[tri[2]],
-            ],
-            normals: [
-                mesh.normals[tri[0]],
-                mesh.normals[tri[1]],
-                mesh.normals[tri[2]],
-            ],
-        })
-        .collect()
+    mesh_sdf_indexed(sdf, opts).to_triangles()
 }
 
-/// Indexed mesh: shared vertices referenced by triangle index triples.
-struct IndexedMesh {
-    positions: Vec<Point3>,
-    normals: Vec<Vector3>,
-    indices: Vec<[usize; 3]>,
+/// Mesh an SDF into an indexed [`TriangleMesh`] using dual contouring on a
+/// uniform grid. Vertices are shared between adjacent triangles.
+///
+/// Returns an empty mesh if the surface does not cross the sampled region
+/// or if `resolution` is zero.
+pub fn mesh_sdf_indexed(sdf: &dyn Sdf, opts: &MeshOptions) -> TriangleMesh {
+    build_mesh(sdf, opts)
 }
 
 /// Cell edges as pairs of corner indices. Corner bit layout: bit0 = x,
@@ -76,13 +58,9 @@ const CELL_EDGES: [(usize, usize); 12] = [
     (3, 7), // z-aligned
 ];
 
-fn build_mesh(sdf: &dyn Sdf, opts: &MeshOptions) -> IndexedMesh {
+fn build_mesh(sdf: &dyn Sdf, opts: &MeshOptions) -> TriangleMesh {
     let n = opts.resolution;
-    let mut mesh = IndexedMesh {
-        positions: Vec::new(),
-        normals: Vec::new(),
-        indices: Vec::new(),
-    };
+    let mut mesh = TriangleMesh::new();
     if n == 0 {
         return mesh;
     }
@@ -200,35 +178,12 @@ mod tests {
     use super::*;
     use crate::csg::Union;
     use crate::primitives::{Box3, Sphere};
-    use std::collections::HashMap;
 
     fn bounds(half: f64) -> BoundingBox3 {
         BoundingBox3::new(
             Point3::new(-half, -half, -half),
             Point3::new(half, half, half),
         )
-    }
-
-    /// Every undirected edge must be shared by exactly two triangles with
-    /// opposite orientations — i.e. the mesh is closed and consistently wound.
-    fn assert_closed_manifold(indices: &[[usize; 3]]) {
-        let mut edges: HashMap<(usize, usize), (usize, i64)> = HashMap::new();
-        for tri in indices {
-            for e in 0..3 {
-                let a = tri[e];
-                let b = tri[(e + 1) % 3];
-                assert_ne!(a, b, "degenerate triangle edge");
-                let key = (a.min(b), a.max(b));
-                let dir = if a < b { 1 } else { -1 };
-                let entry = edges.entry(key).or_insert((0, 0));
-                entry.0 += 1;
-                entry.1 += dir;
-            }
-        }
-        for (edge, (count, dir_sum)) in &edges {
-            assert_eq!(*count, 2, "edge {edge:?} used {count} times, want 2");
-            assert_eq!(*dir_sum, 0, "edge {edge:?} not consistently oriented");
-        }
     }
 
     fn total_area(tris: &[Triangle]) -> f64 {
@@ -251,13 +206,40 @@ mod tests {
             bounds: bounds(1.6),
             resolution: 20,
         };
-        let mesh = build_mesh(&s, &opts);
-        assert!(!mesh.indices.is_empty());
-        assert_closed_manifold(&mesh.indices);
+        let mesh = mesh_sdf_indexed(&s, &opts);
+        assert!(!mesh.is_empty());
+        assert!(mesh.is_closed_manifold());
         let cell = 3.2 / 20.0;
         for p in &mesh.positions {
             assert!(s.eval(p).abs() < cell, "vertex {p:?} too far from surface");
         }
+    }
+
+    /// Welding the triangle soup from `mesh_sdf` must reconstruct a closed
+    /// manifold that agrees with the indexed mesh from `mesh_sdf_indexed`.
+    #[test]
+    fn welded_soup_agrees_with_indexed_sphere_mesh() {
+        let s = Sphere {
+            center: Point3::origin(),
+            radius: 1.0,
+        };
+        let opts = MeshOptions {
+            bounds: bounds(1.6),
+            resolution: 20,
+        };
+        let indexed = mesh_sdf_indexed(&s, &opts);
+        let soup = mesh_sdf(&s, &opts);
+        assert_eq!(soup.len(), indexed.triangle_count());
+
+        let welded = TriangleMesh::from_triangles(&soup).weld(1e-12);
+        assert!(welded.is_closed_manifold());
+        assert_eq!(welded.triangle_count(), indexed.triangle_count());
+        // Every vertex the indexed mesh actually references must survive
+        // the soup round-trip as exactly one welded vertex.
+        let referenced: std::collections::HashSet<usize> =
+            indexed.indices.iter().flatten().copied().collect();
+        assert_eq!(welded.vertex_count(), referenced.len());
+        assert!((welded.total_area() - indexed.total_area()).abs() < 1e-9);
     }
 
     #[test]
@@ -304,9 +286,9 @@ mod tests {
             bounds: bounds(1.55),
             resolution: 24,
         };
-        let mesh = build_mesh(&b, &opts);
-        assert!(!mesh.indices.is_empty());
-        assert_closed_manifold(&mesh.indices);
+        let mesh = mesh_sdf_indexed(&b, &opts);
+        assert!(!mesh.is_empty());
+        assert!(mesh.is_closed_manifold());
 
         let cell = 3.1 / 24.0;
         let mut lo = Point3::new(f64::MAX, f64::MAX, f64::MAX);
@@ -347,9 +329,9 @@ mod tests {
             bounds: bounds(1.8),
             resolution: 24,
         };
-        let mesh = build_mesh(&union, &opts);
-        assert!(!mesh.indices.is_empty());
-        assert_closed_manifold(&mesh.indices);
+        let mesh = mesh_sdf_indexed(&union, &opts);
+        assert!(!mesh.is_empty());
+        assert!(mesh.is_closed_manifold());
         let cell = 3.6 / 24.0;
         for p in &mesh.positions {
             assert!(union.eval(p).abs() < cell, "vertex {p:?} off the surface");
