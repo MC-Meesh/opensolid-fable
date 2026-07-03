@@ -41,8 +41,14 @@ mod tests {
 
     #[test]
     fn union_of_spheres() {
-        let a = Sphere { center: Point3::new(-0.5, 0.0, 0.0), radius: 1.0 };
-        let b = Sphere { center: Point3::new(0.5, 0.0, 0.0), radius: 1.0 };
+        let a = Sphere {
+            center: Point3::new(-0.5, 0.0, 0.0),
+            radius: 1.0,
+        };
+        let b = Sphere {
+            center: Point3::new(0.5, 0.0, 0.0),
+            radius: 1.0,
+        };
         let u = Union { a, b };
         assert!(u.eval(&Point3::origin()) < 0.0);
         assert!(u.eval(&Point3::new(5.0, 0.0, 0.0)) > 0.0);
@@ -50,8 +56,14 @@ mod tests {
 
     #[test]
     fn subtraction_cuts_hole() {
-        let a = Sphere { center: Point3::origin(), radius: 2.0 };
-        let b = Sphere { center: Point3::origin(), radius: 1.0 };
+        let a = Sphere {
+            center: Point3::origin(),
+            radius: 2.0,
+        };
+        let b = Sphere {
+            center: Point3::origin(),
+            radius: 1.0,
+        };
         let s = Subtraction { a, b };
         // Center is inside B, so subtraction makes it outside
         assert!(s.eval(&Point3::origin()) > 0.0);

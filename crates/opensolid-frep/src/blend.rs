@@ -38,13 +38,27 @@ mod tests {
 
     #[test]
     fn smooth_union_blends() {
-        let a = Sphere { center: Point3::new(-0.5, 0.0, 0.0), radius: 1.0 };
-        let b = Sphere { center: Point3::new(0.5, 0.0, 0.0), radius: 1.0 };
+        let a = Sphere {
+            center: Point3::new(-0.5, 0.0, 0.0),
+            radius: 1.0,
+        };
+        let b = Sphere {
+            center: Point3::new(0.5, 0.0, 0.0),
+            radius: 1.0,
+        };
         let su = SmoothUnion { a, b, radius: 0.3 };
         // Smooth union should be more negative at origin than sharp union
-        let sharp_a = Sphere { center: Point3::new(-0.5, 0.0, 0.0), radius: 1.0 };
-        let sharp_b = Sphere { center: Point3::new(0.5, 0.0, 0.0), radius: 1.0 };
-        let sharp = sharp_a.eval(&Point3::origin()).min(sharp_b.eval(&Point3::origin()));
+        let sharp_a = Sphere {
+            center: Point3::new(-0.5, 0.0, 0.0),
+            radius: 1.0,
+        };
+        let sharp_b = Sphere {
+            center: Point3::new(0.5, 0.0, 0.0),
+            radius: 1.0,
+        };
+        let sharp = sharp_a
+            .eval(&Point3::origin())
+            .min(sharp_b.eval(&Point3::origin()));
         assert!(su.eval(&Point3::origin()) < sharp);
     }
 }

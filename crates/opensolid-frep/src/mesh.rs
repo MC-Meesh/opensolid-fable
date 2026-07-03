@@ -43,7 +43,11 @@ pub fn mesh_sdf(sdf: &dyn Sdf, opts: &MeshOptions) -> Vec<Triangle> {
                 mesh.positions[tri[1]],
                 mesh.positions[tri[2]],
             ],
-            normals: [mesh.normals[tri[0]], mesh.normals[tri[1]], mesh.normals[tri[2]]],
+            normals: [
+                mesh.normals[tri[0]],
+                mesh.normals[tri[1]],
+                mesh.normals[tri[2]],
+            ],
         })
         .collect()
 }
@@ -144,7 +148,8 @@ fn build_mesh(sdf: &dyn Sdf, opts: &MeshOptions) -> IndexedMesh {
     for p in &mesh.positions {
         let g = gradient(sdf, p);
         let norm = g.norm();
-        mesh.normals.push(if norm > 1e-12 { g / norm } else { Vector3::z() });
+        mesh.normals
+            .push(if norm > 1e-12 { g / norm } else { Vector3::z() });
     }
 
     // For each interior grid edge with a sign change, connect the vertices of
@@ -251,10 +256,7 @@ mod tests {
         assert_closed_manifold(&mesh.indices);
         let cell = 3.2 / 20.0;
         for p in &mesh.positions {
-            assert!(
-                s.eval(p).abs() < cell,
-                "vertex {p:?} too far from surface"
-            );
+            assert!(s.eval(p).abs() < cell, "vertex {p:?} too far from surface");
         }
     }
 
@@ -280,10 +282,8 @@ mod tests {
             let e1 = t.positions[1] - t.positions[0];
             let e2 = t.positions[2] - t.positions[0];
             let geo = e1.cross(&e2);
-            let centroid = (t.positions[0].coords
-                + t.positions[1].coords
-                + t.positions[2].coords)
-                / 3.0;
+            let centroid =
+                (t.positions[0].coords + t.positions[1].coords + t.positions[2].coords) / 3.0;
             assert!(geo.dot(&centroid) > 0.0, "triangle wound inward");
         }
         let area = total_area(&tris);

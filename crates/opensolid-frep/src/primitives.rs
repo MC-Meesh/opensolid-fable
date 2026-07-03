@@ -27,8 +27,8 @@ impl Sdf for Box3 {
             (p.y - self.center.y).abs() - self.half_extents[1],
             (p.z - self.center.z).abs() - self.half_extents[2],
         ];
-        let outside = (d[0].max(0.0).powi(2) + d[1].max(0.0).powi(2) + d[2].max(0.0).powi(2))
-            .sqrt();
+        let outside =
+            (d[0].max(0.0).powi(2) + d[1].max(0.0).powi(2) + d[2].max(0.0).powi(2)).sqrt();
         let inside = d[0].max(d[1]).max(d[2]).min(0.0);
         outside + inside
     }
