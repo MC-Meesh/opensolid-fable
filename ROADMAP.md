@@ -15,6 +15,9 @@ to the hybrid F-Rep + B-Rep architecture and the actual 4-crate layout
   (`mesh_sdf` — watertight, manifold-tested)
 - ⬜ `opensolid-brep`: stub — geometry and topology are the current frontier
 - ⬜ `opensolid-kernel`: re-exports only — conversion layer not started
+- ✅ End-to-end demo: `cargo run -p opensolid-kernel --example demo` builds a
+  CSG part (box ⊔ sphere, drilled hole), meshes it watertight, writes
+  STL + OBJ — doubles as living API documentation
 
 ## Epic index (bead IDs)
 
