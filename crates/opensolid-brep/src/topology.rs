@@ -347,7 +347,12 @@ impl TopologyStore {
     /// The store does not verify that consecutive edges share vertices;
     /// invariant checking arrives with the Euler-operator layer.
     ///
-    /// Panics if `face` or any edge id is stale.
+    /// # Panics
+    /// Panics if `face` or any edge id is stale, or if the face already has
+    /// an outer loop and `loop_type` is [`LoopType::Outer`]. Stale ids are
+    /// internal-invariant violations (like out-of-bounds indexing), not
+    /// recoverable input errors, per the error-handling policy documented in
+    /// [`opensolid_core`].
     pub fn create_loop(
         &mut self,
         face: EntityId<Face>,

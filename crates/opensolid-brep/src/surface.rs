@@ -30,6 +30,7 @@
 
 use crate::curve::{TWO_PI, plane_basis};
 use crate::topology::SYSTEM_RESOLUTION;
+use opensolid_core::error::{CoreError, CoreResult};
 use opensolid_core::types::{Point3, Vector3};
 
 /// Evaluation interface for parametric surfaces.
@@ -120,91 +121,129 @@ pub enum Surface3 {
     },
 }
 
-/// Normalize `axis`, panicking with `what` context if it is zero.
-fn unit_axis(axis: Vector3, what: &str) -> Vector3 {
+/// Normalize `axis`, rejecting zero or non-finite length with `context`.
+fn unit_axis(axis: Vector3, context: &'static str) -> CoreResult<Vector3> {
     let norm = axis.norm();
-    assert!(norm > 0.0, "{what} axis must be non-zero");
-    axis / norm
+    if norm == 0.0 || !norm.is_finite() {
+        return Err(CoreError::Degenerate {
+            context,
+            reason: format!("axis must have non-zero finite length, got {axis}"),
+        });
+    }
+    Ok(axis / norm)
+}
+
+/// Reject a radius-like argument that is not positive and finite.
+fn positive_radius(name: &'static str, value: f64) -> CoreResult<f64> {
+    if value <= 0.0 || !value.is_finite() {
+        return Err(CoreError::InvalidArgument {
+            argument: name,
+            reason: format!("must be positive and finite, got {value}"),
+        });
+    }
+    Ok(value)
 }
 
 impl Surface3 {
     /// Plane through `origin` normal to `normal` (normalized here).
     ///
-    /// # Panics
-    /// Panics if `normal` has zero length.
-    pub fn plane(origin: Point3, normal: Vector3) -> Self {
-        Surface3::Plane {
+    /// # Errors
+    /// [`CoreError::Degenerate`] if `normal` has zero or non-finite length.
+    pub fn plane(origin: Point3, normal: Vector3) -> CoreResult<Self> {
+        Ok(Surface3::Plane {
             origin,
-            normal: unit_axis(normal, "plane"),
-        }
+            normal: unit_axis(normal, "Surface3::plane")?,
+        })
     }
 
     /// Cylinder of `radius` about the axis through `origin` along `axis`
     /// (normalized here).
     ///
-    /// # Panics
-    /// Panics if `axis` has zero length or `radius` is not positive.
-    pub fn cylinder(origin: Point3, axis: Vector3, radius: f64) -> Self {
-        assert!(radius > 0.0, "cylinder radius must be positive");
-        Surface3::Cylinder {
+    /// # Errors
+    /// [`CoreError::Degenerate`] if `axis` has zero or non-finite length;
+    /// [`CoreError::InvalidArgument`] if `radius` is not positive and finite.
+    pub fn cylinder(origin: Point3, axis: Vector3, radius: f64) -> CoreResult<Self> {
+        Ok(Surface3::Cylinder {
             origin,
-            axis: unit_axis(axis, "cylinder"),
-            radius,
-        }
+            axis: unit_axis(axis, "Surface3::cylinder")?,
+            radius: positive_radius("radius", radius)?,
+        })
     }
 
     /// Cone with `radius` at `origin`, widening along `axis` (normalized
     /// here) with `half_angle`.
     ///
-    /// # Panics
-    /// Panics if `axis` has zero length, `half_angle` is outside `(0, π/2)`,
-    /// or `radius` is negative (zero places the apex at `v = 0`).
-    pub fn cone(origin: Point3, axis: Vector3, half_angle: f64, radius: f64) -> Self {
-        assert!(
-            half_angle > 0.0 && half_angle < std::f64::consts::FRAC_PI_2,
-            "cone half_angle must be in (0, PI/2)"
-        );
-        assert!(radius >= 0.0, "cone radius must be non-negative");
-        Surface3::Cone {
+    /// # Errors
+    /// [`CoreError::Degenerate`] if `axis` has zero or non-finite length;
+    /// [`CoreError::InvalidArgument`] if `half_angle` is outside `(0, π/2)`
+    /// or `radius` is negative or non-finite (zero places the apex at
+    /// `v = 0`).
+    pub fn cone(origin: Point3, axis: Vector3, half_angle: f64, radius: f64) -> CoreResult<Self> {
+        if !(half_angle > 0.0 && half_angle < std::f64::consts::FRAC_PI_2) {
+            return Err(CoreError::InvalidArgument {
+                argument: "half_angle",
+                reason: format!("must be in (0, PI/2), got {half_angle}"),
+            });
+        }
+        if radius < 0.0 || !radius.is_finite() {
+            return Err(CoreError::InvalidArgument {
+                argument: "radius",
+                reason: format!("must be non-negative and finite, got {radius}"),
+            });
+        }
+        Ok(Surface3::Cone {
             origin,
-            axis: unit_axis(axis, "cone"),
+            axis: unit_axis(axis, "Surface3::cone")?,
             half_angle,
             radius,
-        }
+        })
     }
 
     /// Sphere of `radius` about `center` with pole direction `axis`
     /// (normalized here).
     ///
-    /// # Panics
-    /// Panics if `axis` has zero length or `radius` is not positive.
-    pub fn sphere(center: Point3, axis: Vector3, radius: f64) -> Self {
-        assert!(radius > 0.0, "sphere radius must be positive");
-        Surface3::Sphere {
+    /// # Errors
+    /// [`CoreError::Degenerate`] if `axis` has zero or non-finite length;
+    /// [`CoreError::InvalidArgument`] if `radius` is not positive and finite.
+    pub fn sphere(center: Point3, axis: Vector3, radius: f64) -> CoreResult<Self> {
+        Ok(Surface3::Sphere {
             center,
-            axis: unit_axis(axis, "sphere"),
-            radius,
-        }
+            axis: unit_axis(axis, "Surface3::sphere")?,
+            radius: positive_radius("radius", radius)?,
+        })
     }
 
     /// Torus about `center` with `axis` (normalized here),
     /// `major_radius > minor_radius > 0`.
     ///
-    /// # Panics
-    /// Panics if `axis` has zero length, either radius is not positive, or
-    /// `major_radius <= minor_radius` (spindle/horn tori are not supported).
-    pub fn torus(center: Point3, axis: Vector3, major_radius: f64, minor_radius: f64) -> Self {
-        assert!(minor_radius > 0.0, "torus minor_radius must be positive");
-        assert!(
-            major_radius > minor_radius,
-            "torus major_radius must exceed minor_radius"
-        );
-        Surface3::Torus {
+    /// # Errors
+    /// [`CoreError::Degenerate`] if `axis` has zero or non-finite length;
+    /// [`CoreError::InvalidArgument`] if either radius is not positive and
+    /// finite, or `major_radius <= minor_radius` (spindle/horn tori are not
+    /// supported).
+    pub fn torus(
+        center: Point3,
+        axis: Vector3,
+        major_radius: f64,
+        minor_radius: f64,
+    ) -> CoreResult<Self> {
+        positive_radius("major_radius", major_radius)?;
+        positive_radius("minor_radius", minor_radius)?;
+        if major_radius <= minor_radius {
+            return Err(CoreError::InvalidArgument {
+                argument: "major_radius",
+                reason: format!(
+                    "must exceed minor_radius ({major_radius} <= {minor_radius}); \
+                     spindle/horn tori are not supported"
+                ),
+            });
+        }
+        Ok(Surface3::Torus {
             center,
-            axis: unit_axis(axis, "torus"),
+            axis: unit_axis(axis, "Surface3::torus")?,
             major_radius,
             minor_radius,
-        }
+        })
     }
 
     /// The unit axis defining this surface's frame.
@@ -473,7 +512,8 @@ mod tests {
     #[test]
     fn plane_points_and_normal() {
         // normal = +Z: plane_basis gives e_u = X, e_v = Y.
-        let p = Surface3::plane(Point3::new(1.0, 2.0, 3.0), Vector3::new(0.0, 0.0, 4.0));
+        let p = Surface3::plane(Point3::new(1.0, 2.0, 3.0), Vector3::new(0.0, 0.0, 4.0))
+            .expect("valid surface");
         assert_point_eq(&p.point(0.0, 0.0), &Point3::new(1.0, 2.0, 3.0));
         assert_point_eq(&p.point(2.0, -1.0), &Point3::new(3.0, 1.0, 3.0));
         assert_vec_eq(&p.normal(7.0, -3.0).unwrap(), &Vector3::z());
@@ -487,7 +527,7 @@ mod tests {
 
     #[test]
     fn plane_domain_and_periodicity() {
-        let p = Surface3::plane(Point3::origin(), Vector3::z());
+        let p = Surface3::plane(Point3::origin(), Vector3::z()).expect("valid surface");
         assert!(p.domain_u().0.is_infinite() && p.domain_u().1.is_infinite());
         assert!(p.domain_v().0.is_infinite() && p.domain_v().1.is_infinite());
         assert!(!p.is_periodic_u() && !p.is_periodic_v());
@@ -498,7 +538,7 @@ mod tests {
     #[test]
     fn cylinder_analytic_points_and_normals() {
         // axis = +Z: radial(0) = X, radial(π/2) = Y.
-        let c = Surface3::cylinder(Point3::origin(), Vector3::z(), 2.0);
+        let c = Surface3::cylinder(Point3::origin(), Vector3::z(), 2.0).expect("valid surface");
         assert_point_eq(&c.point(0.0, 0.0), &Point3::new(2.0, 0.0, 0.0));
         assert_point_eq(&c.point(FRAC_PI_2, 3.0), &Point3::new(0.0, 2.0, 3.0));
         assert_point_eq(&c.point(PI, -1.0), &Point3::new(-2.0, 0.0, -1.0));
@@ -516,7 +556,8 @@ mod tests {
             Point3::new(1.0, -1.0, 0.5),
             Vector3::new(1.0, 1.0, 0.0),
             1.5,
-        );
+        )
+        .expect("valid surface");
         assert!(c.is_periodic_u());
         assert!(!c.is_periodic_v());
         assert_eq!(c.period_u(), Some(TWO_PI));
@@ -528,7 +569,8 @@ mod tests {
     #[test]
     fn cone_points_normals_and_apex() {
         // half_angle = π/4 (tan = 1), radius 1 at v = 0: apex at v = -1.
-        let k = Surface3::cone(Point3::origin(), Vector3::z(), FRAC_PI_4, 1.0);
+        let k =
+            Surface3::cone(Point3::origin(), Vector3::z(), FRAC_PI_4, 1.0).expect("valid surface");
         assert_point_eq(&k.point(0.0, 0.0), &Point3::new(1.0, 0.0, 0.0));
         assert_point_eq(&k.point(0.0, 1.0), &Point3::new(2.0, 0.0, 1.0));
         // Apex reached exactly.
@@ -549,7 +591,8 @@ mod tests {
 
     #[test]
     fn cone_second_nappe_evaluates_with_flipped_normal() {
-        let k = Surface3::cone(Point3::origin(), Vector3::z(), FRAC_PI_4, 1.0);
+        let k =
+            Surface3::cone(Point3::origin(), Vector3::z(), FRAC_PI_4, 1.0).expect("valid surface");
         // v = -2 is past the apex: rho = -1, the mirror cone.
         let p = k.point(0.0, -2.0);
         assert_point_eq(&p, &Point3::new(-1.0, 0.0, -2.0));
@@ -559,7 +602,8 @@ mod tests {
 
     #[test]
     fn sphere_points_poles_and_normals() {
-        let s = Surface3::sphere(Point3::new(0.0, 0.0, 1.0), Vector3::z(), 2.0);
+        let s =
+            Surface3::sphere(Point3::new(0.0, 0.0, 1.0), Vector3::z(), 2.0).expect("valid surface");
         assert_point_eq(&s.point(0.0, 0.0), &Point3::new(2.0, 0.0, 1.0));
         // Poles: point = center ± r*axis, singular, but normal = ±axis.
         assert_point_eq(&s.point(1.234, FRAC_PI_2), &Point3::new(0.0, 0.0, 3.0));
@@ -578,7 +622,8 @@ mod tests {
 
     #[test]
     fn sphere_periodicity_and_domain() {
-        let s = Surface3::sphere(Point3::origin(), Vector3::new(0.0, 1.0, 1.0), 1.0);
+        let s = Surface3::sphere(Point3::origin(), Vector3::new(0.0, 1.0, 1.0), 1.0)
+            .expect("valid surface");
         assert!(s.is_periodic_u());
         assert!(!s.is_periodic_v());
         assert_eq!(s.period_u(), Some(TWO_PI));
@@ -594,7 +639,7 @@ mod tests {
     #[test]
     fn torus_analytic_points_and_implicit_equation() {
         // axis = +Z, R = 3, r = 1: implicit (√(x²+y²) − R)² + z² = r².
-        let t = Surface3::torus(Point3::origin(), Vector3::z(), 3.0, 1.0);
+        let t = Surface3::torus(Point3::origin(), Vector3::z(), 3.0, 1.0).expect("valid surface");
         assert_point_eq(&t.point(0.0, 0.0), &Point3::new(4.0, 0.0, 0.0));
         assert_point_eq(&t.point(0.0, PI), &Point3::new(2.0, 0.0, 0.0));
         assert_point_eq(&t.point(0.0, FRAC_PI_2), &Point3::new(3.0, 0.0, 1.0));
@@ -613,7 +658,7 @@ mod tests {
 
     #[test]
     fn torus_normals_point_outward_from_tube() {
-        let t = Surface3::torus(Point3::origin(), Vector3::z(), 3.0, 1.0);
+        let t = Surface3::torus(Point3::origin(), Vector3::z(), 3.0, 1.0).expect("valid surface");
         // Outer equator: normal = +radial; inner equator: −radial; top: +axis.
         assert_vec_eq(&t.normal(0.0, 0.0).unwrap(), &Vector3::x());
         assert_vec_eq(&t.normal(0.0, PI).unwrap(), &-Vector3::x());
@@ -627,7 +672,8 @@ mod tests {
             Vector3::new(1.0, 2.0, 2.0),
             5.0,
             0.5,
-        );
+        )
+        .expect("valid surface");
         assert!(t.is_periodic_u() && t.is_periodic_v());
         assert_eq!(t.period_u(), Some(TWO_PI));
         assert_eq!(t.period_v(), Some(TWO_PI));
@@ -639,7 +685,8 @@ mod tests {
 
     #[test]
     fn constructors_normalize_axes() {
-        let c = Surface3::cylinder(Point3::origin(), Vector3::new(0.0, 0.0, 9.0), 1.0);
+        let c = Surface3::cylinder(Point3::origin(), Vector3::new(0.0, 0.0, 9.0), 1.0)
+            .expect("valid surface");
         match &c {
             Surface3::Cylinder { axis, .. } => assert_vec_eq(axis, &Vector3::z()),
             _ => unreachable!(),
@@ -649,26 +696,136 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "axis must be non-zero")]
     fn plane_rejects_zero_normal() {
-        Surface3::plane(Point3::origin(), Vector3::zeros());
+        let err = Surface3::plane(Point3::origin(), Vector3::zeros()).unwrap_err();
+        assert!(matches!(err, CoreError::Degenerate { .. }), "got {err}");
+        let msg = err.to_string();
+        assert!(msg.contains("Surface3::plane"), "missing context: {msg}");
+        assert!(msg.contains("non-zero"), "missing constraint: {msg}");
     }
 
     #[test]
-    #[should_panic(expected = "radius must be positive")]
+    fn constructors_reject_zero_axis() {
+        for (name, err) in [
+            (
+                "cylinder",
+                Surface3::cylinder(Point3::origin(), Vector3::zeros(), 1.0).unwrap_err(),
+            ),
+            (
+                "cone",
+                Surface3::cone(Point3::origin(), Vector3::zeros(), FRAC_PI_4, 1.0).unwrap_err(),
+            ),
+            (
+                "sphere",
+                Surface3::sphere(Point3::origin(), Vector3::zeros(), 1.0).unwrap_err(),
+            ),
+            (
+                "torus",
+                Surface3::torus(Point3::origin(), Vector3::zeros(), 3.0, 1.0).unwrap_err(),
+            ),
+        ] {
+            assert!(
+                matches!(err, CoreError::Degenerate { .. }),
+                "{name}: got {err}"
+            );
+            assert!(err.to_string().contains(name), "{name}: unhelpful: {err}");
+        }
+    }
+
+    #[test]
     fn cylinder_rejects_nonpositive_radius() {
-        Surface3::cylinder(Point3::origin(), Vector3::z(), 0.0);
+        for bad in [0.0, -2.0, f64::NAN, f64::INFINITY] {
+            let err = Surface3::cylinder(Point3::origin(), Vector3::z(), bad).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    CoreError::InvalidArgument {
+                        argument: "radius",
+                        ..
+                    }
+                ),
+                "radius {bad}: got {err}"
+            );
+        }
     }
 
     #[test]
-    #[should_panic(expected = "half_angle must be in")]
+    fn sphere_rejects_nonpositive_radius() {
+        let err = Surface3::sphere(Point3::origin(), Vector3::z(), -1.0).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CoreError::InvalidArgument {
+                    argument: "radius",
+                    ..
+                }
+            ),
+            "got {err}"
+        );
+    }
+
+    #[test]
     fn cone_rejects_bad_half_angle() {
-        Surface3::cone(Point3::origin(), Vector3::z(), FRAC_PI_2, 1.0);
+        for bad in [0.0, -0.1, FRAC_PI_2, f64::NAN] {
+            let err = Surface3::cone(Point3::origin(), Vector3::z(), bad, 1.0).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    CoreError::InvalidArgument {
+                        argument: "half_angle",
+                        ..
+                    }
+                ),
+                "half_angle {bad}: got {err}"
+            );
+            assert!(err.to_string().contains("PI/2"), "unhelpful: {err}");
+        }
     }
 
     #[test]
-    #[should_panic(expected = "major_radius must exceed")]
-    fn torus_rejects_spindle() {
-        Surface3::torus(Point3::origin(), Vector3::z(), 1.0, 1.0);
+    fn cone_rejects_negative_radius() {
+        let err = Surface3::cone(Point3::origin(), Vector3::z(), FRAC_PI_4, -1.0).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CoreError::InvalidArgument {
+                    argument: "radius",
+                    ..
+                }
+            ),
+            "got {err}"
+        );
+        // Zero radius is allowed: apex at v = 0.
+        Surface3::cone(Point3::origin(), Vector3::z(), FRAC_PI_4, 0.0).expect("apex cone valid");
+    }
+
+    #[test]
+    fn torus_rejects_spindle_and_bad_radii() {
+        let err = Surface3::torus(Point3::origin(), Vector3::z(), 1.0, 1.0).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CoreError::InvalidArgument {
+                    argument: "major_radius",
+                    ..
+                }
+            ),
+            "got {err}"
+        );
+        assert!(
+            err.to_string().contains("minor_radius"),
+            "missing constraint: {err}"
+        );
+        for (major, minor, argument) in [
+            (0.0, 1.0, "major_radius"),
+            (3.0, -1.0, "minor_radius"),
+            (f64::NAN, 1.0, "major_radius"),
+        ] {
+            let err = Surface3::torus(Point3::origin(), Vector3::z(), major, minor).unwrap_err();
+            assert!(
+                matches!(&err, CoreError::InvalidArgument { argument: a, .. } if *a == argument),
+                "R={major} r={minor}: got {err}"
+            );
+        }
     }
 }

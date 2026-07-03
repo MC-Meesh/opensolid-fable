@@ -1,4 +1,5 @@
 use crate::primitives::Sdf;
+use opensolid_core::error::{CoreError, CoreResult};
 use opensolid_core::types::{Point3, Transform3, Vector3};
 
 /// An SDF placed by a rigid transform (rotation + translation).
@@ -45,10 +46,16 @@ pub struct UniformScale<S> {
 }
 
 impl<S> UniformScale<S> {
-    /// Panics if `factor` is not strictly positive.
-    pub fn new(sdf: S, factor: f64) -> Self {
-        assert!(factor > 0.0, "scale factor must be positive, got {factor}");
-        Self { sdf, factor }
+    /// # Errors
+    /// [`CoreError::InvalidArgument`] if `factor` is not positive and finite.
+    pub fn new(sdf: S, factor: f64) -> CoreResult<Self> {
+        if factor <= 0.0 || !factor.is_finite() {
+            return Err(CoreError::InvalidArgument {
+                argument: "factor",
+                reason: format!("must be positive and finite, got {factor}"),
+            });
+        }
+        Ok(Self { sdf, factor })
     }
 }
 
@@ -79,7 +86,10 @@ pub trait SdfTransformExt: Sdf + Sized {
     }
 
     /// Scale uniformly about the origin (`factor > 0`).
-    fn scaled(self, factor: f64) -> UniformScale<Self> {
+    ///
+    /// # Errors
+    /// [`CoreError::InvalidArgument`] if `factor` is not positive and finite.
+    fn scaled(self, factor: f64) -> CoreResult<UniformScale<Self>> {
         UniformScale::new(self, factor)
     }
 }
@@ -164,7 +174,7 @@ mod tests {
     fn scaled_sphere_distance_is_exact_everywhere() {
         // Unit sphere scaled by 2 is a radius-2 sphere; the field must be
         // the exact distance |p| - 2, inside and out.
-        let s = unit_sphere().scaled(2.0);
+        let s = unit_sphere().scaled(2.0).expect("valid scale");
         for p in [
             Point3::origin(),
             Point3::new(1.0, 0.0, 0.0),
@@ -182,7 +192,8 @@ mod tests {
         // with radius 2.
         let s = unit_sphere()
             .translated(Vector3::new(1.0, 0.0, 0.0))
-            .scaled(2.0);
+            .scaled(2.0)
+            .expect("valid scale");
         assert!(s.eval(&Point3::new(4.0, 0.0, 0.0)).abs() < 1e-12);
         assert!(s.eval(&Point3::origin()).abs() < 1e-12);
         assert!((s.eval(&Point3::new(2.0, 0.0, 0.0)) + 2.0).abs() < 1e-12);
@@ -194,27 +205,40 @@ mod tests {
             center: Point3::origin(),
             half_extents: [1.0, 0.5, 0.25],
         }
-        .scaled(3.0);
+        .scaled(3.0)
+        .expect("valid scale");
         assert_unit_gradient(&b, &Point3::new(3.2, 0.4, 0.1));
         assert_unit_gradient(&b, &Point3::new(0.5, 0.3, 0.2));
     }
 
     #[test]
     fn shrinking_scale_works() {
-        let s = unit_sphere().scaled(0.25);
+        let s = unit_sphere().scaled(0.25).expect("valid scale");
         assert!(s.eval(&Point3::new(0.25, 0.0, 0.0)).abs() < 1e-12);
         assert!((s.eval(&Point3::new(1.25, 0.0, 0.0)) - 1.0).abs() < 1e-12);
     }
 
     #[test]
-    #[should_panic(expected = "scale factor must be positive")]
-    fn zero_scale_panics() {
-        UniformScale::new(unit_sphere(), 0.0);
-    }
-
-    #[test]
-    #[should_panic(expected = "scale factor must be positive")]
-    fn negative_scale_panics() {
-        UniformScale::new(unit_sphere(), -1.0);
+    fn scale_rejects_nonpositive_factor() {
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let err = match UniformScale::new(unit_sphere(), bad) {
+                Ok(_) => panic!("factor {bad}: expected rejection"),
+                Err(e) => e,
+            };
+            assert!(
+                matches!(
+                    err,
+                    CoreError::InvalidArgument {
+                        argument: "factor",
+                        ..
+                    }
+                ),
+                "factor {bad}: got {err}"
+            );
+            assert!(
+                err.to_string().contains("positive"),
+                "missing constraint: {err}"
+            );
+        }
     }
 }

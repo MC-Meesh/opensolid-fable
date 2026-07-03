@@ -597,7 +597,8 @@ mod tests {
     #[test]
     fn nurbs_circle_matches_analytic_circle() {
         let nurbs = unit_circle();
-        let analytic = Curve3::circle(Point3::origin(), Vector3::z(), 1.0);
+        let analytic = Curve3::circle(Point3::origin(), Vector3::z(), 1.0)
+            .expect("unit circle construction is valid");
         for t in sample_params(100) {
             let p = nurbs.point(t);
             // Recover the angle and compare against the analytic evaluation.
