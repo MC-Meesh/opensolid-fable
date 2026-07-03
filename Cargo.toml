@@ -5,6 +5,7 @@ members = [
     "crates/opensolid-frep",
     "crates/opensolid-brep",
     "crates/opensolid-kernel",
+    "crates/opensolid-wasm",
 ]
 
 [workspace.package]
