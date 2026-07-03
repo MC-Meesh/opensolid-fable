@@ -304,8 +304,9 @@ fn build_mesh_serial(sdf: &dyn Sdf, opts: &MeshOptions) -> TriangleMesh {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::blend::SmoothSubtraction;
     use crate::csg::Union;
-    use crate::primitives::{Box3, Sphere};
+    use crate::primitives::{Box3, Cylinder, Sphere};
 
     fn bounds(half: f64) -> BoundingBox3 {
         BoundingBox3::new(
@@ -507,6 +508,47 @@ mod tests {
             resolution: 24,
         };
         assert_parallel_matches_serial(&union, &opts);
+    }
+
+    /// Regression for of-d62/of-9ht: the blend-factor sign bug made the
+    /// SmoothSubtraction field negative at infinity, so the mesher saw sign
+    /// crossings on the bounds boundary layer and produced unstitched
+    /// boundary edges (not a closed manifold, bad-edge count scaling with
+    /// resolution).
+    #[test]
+    fn smooth_subtraction_mesh_manifold() {
+        let shape = SmoothSubtraction {
+            a: Box3 {
+                center: Point3::origin(),
+                half_extents: [1.0, 1.0, 1.0],
+            },
+            b: Cylinder {
+                center: Point3::origin(),
+                radius: 0.4,
+                half_height: 1.5,
+            },
+            radius: 0.2,
+        };
+        let opts = MeshOptions {
+            bounds: bounds(1.8),
+            resolution: 24,
+        };
+        // The field must be positive at the sampling-region corners; with
+        // the sign bug the whole far field was "inside".
+        for sx in [-1.8, 1.8] {
+            for sy in [-1.8, 1.8] {
+                for sz in [-1.8, 1.8] {
+                    assert!(shape.eval(&Point3::new(sx, sy, sz)) > 0.0);
+                }
+            }
+        }
+        let mesh = mesh_sdf_indexed(&shape, &opts);
+        assert!(!mesh.is_empty());
+        assert!(mesh.is_closed_manifold());
+        let cell = 3.6 / 24.0;
+        for p in &mesh.positions {
+            assert!(shape.eval(p).abs() < cell, "vertex {p:?} off the surface");
+        }
     }
 
     #[test]
