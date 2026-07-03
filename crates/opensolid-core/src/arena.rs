@@ -1,10 +1,49 @@
 use std::marker::PhantomData;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct EntityId<T> {
     pub(crate) index: u32,
     pub(crate) generation: u32,
     _phantom: PhantomData<T>,
+}
+
+// Manual impls: deriving would bound them on `T: Copy` etc. via PhantomData,
+// but an id is copyable/comparable regardless of the entity type it names.
+impl<T> Clone for EntityId<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T> Copy for EntityId<T> {}
+
+impl<T> PartialEq for EntityId<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.index == other.index && self.generation == other.generation
+    }
+}
+
+impl<T> Eq for EntityId<T> {}
+
+impl<T> std::hash::Hash for EntityId<T> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.index.hash(state);
+        self.generation.hash(state);
+    }
+}
+
+impl<T> std::fmt::Debug for EntityId<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "EntityId<{}>({}, gen {})",
+            std::any::type_name::<T>()
+                .rsplit("::")
+                .next()
+                .unwrap_or("?"),
+            self.index,
+            self.generation
+        )
+    }
 }
 
 impl<T> EntityId<T> {
