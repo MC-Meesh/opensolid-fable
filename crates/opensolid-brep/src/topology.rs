@@ -48,11 +48,11 @@ const TOLERANT_THRESHOLD: f64 = SYSTEM_RESOLUTION * 10.0;
 /// parameter of `EntityId<Curve>` slots (`Edge::curve`, `Fin::pcurve`) so the
 /// topology carries geometry references from day one. A later issue replaces
 /// it with the real curve representation.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Curve;
 
 /// Placeholder for the parametric surface geometry type. See [`Curve`].
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Surface;
 
 /// The kind of a [`Body`], constraining its topology.
@@ -121,14 +121,14 @@ impl FinSense {
 }
 
 /// Top-level container: a connected model occupying space.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Body {
     pub body_type: BodyType,
     pub shells: Vec<EntityId<Shell>>,
 }
 
 /// A connected set of faces forming a boundary.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Shell {
     pub body: EntityId<Body>,
     pub faces: Vec<EntityId<Face>>,
@@ -138,7 +138,7 @@ pub struct Shell {
 }
 
 /// A bounded region on a surface: one outer loop plus zero or more holes.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Face {
     pub shell: EntityId<Shell>,
     /// Underlying surface (geometry layer pending, hence `Option`).
@@ -150,7 +150,7 @@ pub struct Face {
 }
 
 /// An ordered, closed cycle of fins bounding a face region.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Loop {
     pub face: EntityId<Face>,
     /// Fins in traversal order (each fin's end vertex is the next fin's start).
@@ -159,7 +159,7 @@ pub struct Loop {
 }
 
 /// Half-edge: one face's directed use of an edge.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Fin {
     pub edge: EntityId<Edge>,
     pub loop_ref: EntityId<Loop>,
@@ -179,7 +179,7 @@ pub struct Fin {
 }
 
 /// A bounded curve segment between two vertices.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Edge {
     /// Underlying 3D curve (geometry layer pending, hence `Option`).
     pub curve: Option<EntityId<Curve>>,
@@ -205,7 +205,7 @@ impl Edge {
 }
 
 /// A point in 3D space, shared between edges.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Vertex {
     pub point: Point3,
     /// Tolerant modeling: max distance between this vertex's point and the
