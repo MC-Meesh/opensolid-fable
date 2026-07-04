@@ -43,8 +43,8 @@ pub fn mesh_sdf_indexed(sdf: &dyn Sdf, opts: &MeshOptions) -> TriangleMesh {
 }
 
 /// Cell edges as pairs of corner indices. Corner bit layout: bit0 = x,
-/// bit1 = y, bit2 = z.
-const CELL_EDGES: [(usize, usize); 12] = [
+/// bit1 = y, bit2 = z. Shared with the adaptive mesher.
+pub(crate) const CELL_EDGES: [(usize, usize); 12] = [
     (0, 1),
     (2, 3),
     (4, 5),
@@ -97,7 +97,7 @@ impl Grid {
     }
 }
 
-fn corner(c: usize) -> (usize, usize, usize) {
+pub(crate) fn corner(c: usize) -> (usize, usize, usize) {
     (c & 1, (c >> 1) & 1, (c >> 2) & 1)
 }
 
