@@ -33,6 +33,8 @@
 //! means the topology is corrupt. Direct lookups (`body()`, `edge()`, ...)
 //! return `Option` so callers can test id validity.
 
+use crate::curve::Curve3;
+use crate::surface::Surface3;
 use opensolid_core::{Arena, EntityId, Point3};
 
 /// System resolution: distances smaller than this are considered zero.
@@ -43,18 +45,17 @@ pub const SYSTEM_RESOLUTION: f64 = 1e-10;
 /// considered "tolerant" (carrying a real precision gap).
 const TOLERANT_THRESHOLD: f64 = SYSTEM_RESOLUTION * 10.0;
 
-/// Placeholder for the parametric curve geometry type.
+/// Placeholder for the 2D parameter-space curve geometry type.
 ///
-/// The geometry layer does not exist yet; this marker only serves as the type
-/// parameter of `EntityId<Curve>` slots (`Edge::curve`, `Fin::pcurve`) so the
-/// topology carries geometry references from day one. A later issue replaces
-/// it with the real curve representation.
+/// 3D geometry slots reference the real types ([`Edge::curve`] →
+/// [`Curve3`], [`Face::surface`] → [`Surface3`], both living in a
+/// [`GeometryStore`](crate::geometry::GeometryStore)), but no 2D curve
+/// representation exists yet; this marker only serves as the type parameter
+/// of the `EntityId<Curve>` slot in [`Fin::pcurve`] so the topology carries
+/// the reference from day one. A later issue replaces it with the real
+/// SP-curve representation.
 #[derive(Debug, Clone)]
 pub struct Curve;
-
-/// Placeholder for the parametric surface geometry type. See [`Curve`].
-#[derive(Debug, Clone)]
-pub struct Surface;
 
 /// The kind of a [`Body`], constraining its topology.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,8 +147,9 @@ pub struct Shell {
 #[derive(Debug, Clone)]
 pub struct Face {
     pub shell: EntityId<Shell>,
-    /// Underlying surface (geometry layer pending, hence `Option`).
-    pub surface: Option<EntityId<Surface>>,
+    /// Underlying surface, in a [`GeometryStore`](crate::geometry::GeometryStore).
+    /// `None` for faces whose geometry has not been attached yet.
+    pub surface: Option<EntityId<Surface3>>,
     pub sense: FaceSense,
     /// Set when the outer loop is created via [`TopologyStore::create_loop`].
     pub outer_loop: Option<EntityId<Loop>>,
@@ -190,8 +192,9 @@ pub struct Fin {
 /// A bounded curve segment between two vertices.
 #[derive(Debug, Clone)]
 pub struct Edge {
-    /// Underlying 3D curve (geometry layer pending, hence `Option`).
-    pub curve: Option<EntityId<Curve>>,
+    /// Underlying 3D curve, in a [`GeometryStore`](crate::geometry::GeometryStore).
+    /// `None` for edges whose geometry has not been attached yet.
+    pub curve: Option<EntityId<Curve3>>,
     pub start_vertex: EntityId<Vertex>,
     pub end_vertex: EntityId<Vertex>,
     /// Curve parameter at the start vertex.
@@ -867,10 +870,14 @@ mod tests {
     fn pcurve_and_curve_slots_accept_geometry_ids() {
         let mut tet = build_tetrahedron();
 
-        // Stand-in geometry arena; the real geometry layer replaces this.
-        let mut curves: Arena<Curve> = Arena::new();
-        let pcurve_id = curves.insert(Curve);
-        let curve_id = curves.insert(Curve);
+        // 2D pcurves are still a placeholder marker; 3D curves are real.
+        let mut pcurves: Arena<Curve> = Arena::new();
+        let pcurve_id = pcurves.insert(Curve);
+        let mut curves: Arena<Curve3> = Arena::new();
+        let curve_id = curves.insert(
+            Curve3::line(Point3::new(0.0, 0.0, 0.0), opensolid_core::Vector3::x())
+                .expect("valid line"),
+        );
 
         let loop_id = tet.store.loops_of_face(tet.faces[0])[0];
         let fin_id = tet.store.fins_of_loop(loop_id)[0];

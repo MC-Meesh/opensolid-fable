@@ -10,9 +10,11 @@
 //! the Euler operators ([`euler`]: MVFS/MEV/MEF/KEMR/KFMRH with
 //! Euler-Poincaré invariant checking), body validation
 //! ([`check`]: [`TopologyStore::check`] returning structured
-//! [`CheckFailure`]s), and the sweep constructors ([`sweep`]: [`extrude`]
-//! and [`revolve`] planar profiles into solids). Tolerant modeling lands
-//! here next.
+//! [`CheckFailure`]s), the sweep constructors ([`sweep`]: [`extrude`]
+//! and [`revolve`] planar profiles into solids), the geometry store
+//! ([`GeometryStore`] backing [`Edge::curve`]/[`Face::surface`]), and
+//! primitive solids ([`primitives`]: block, cylinder, sphere, torus with
+//! full topology + geometry). Tolerant modeling lands here next.
 //!
 //! This crate follows the OpenSolid error handling policy documented at the
 //! [`opensolid_core`] crate level: fallible public APIs (e.g. the [`Curve3`]
@@ -22,7 +24,9 @@
 pub mod check;
 pub mod curve;
 pub mod euler;
+pub mod geometry;
 pub mod nurbs;
+pub mod primitives;
 pub mod project;
 pub mod ssi;
 pub mod surface;
@@ -32,6 +36,7 @@ pub mod topology;
 pub use check::{CheckFailure, EntityRef, MAX_ALLOWED_TOLERANCE};
 pub use curve::{Curve3, CurveEval};
 pub use euler::{EulerCounts, EulerError};
+pub use geometry::GeometryStore;
 pub use nurbs::{KnotVector, NurbsCurve, NurbsError, NurbsSurface};
 pub use project::{CurveProject, CurveProjection, SurfaceProject, SurfaceProjection};
 pub use ssi::{
@@ -42,5 +47,5 @@ pub use surface::{Surface3, SurfaceEval};
 pub use sweep::{Profile, ProfileSegment, SweptBody, extrude, revolve};
 pub use topology::{
     Body, BodyType, Curve, Edge, Face, FaceSense, Fin, FinSense, Loop, LoopType, SYSTEM_RESOLUTION,
-    Shell, ShellOrientation, Surface, TopologyStore, Vertex,
+    Shell, ShellOrientation, TopologyStore, Vertex,
 };
