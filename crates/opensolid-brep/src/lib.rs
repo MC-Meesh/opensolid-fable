@@ -2,7 +2,8 @@
 //!
 //! Current contents: analytic parametric curves ([`Curve3`]) and surfaces
 //! ([`Surface3`]) with their evaluation traits ([`CurveEval`],
-//! [`SurfaceEval`]), NURBS curves ([`NurbsCurve`]) and tensor-product
+//! [`SurfaceEval`]), analytic surface-surface intersection ([`ssi`]),
+//! NURBS curves ([`NurbsCurve`]) and tensor-product
 //! surfaces ([`NurbsSurface`]), the topology graph
 //! ([`TopologyStore`]: Body > Shell > Face > Loop > Fin > Edge > Vertex),
 //! and the Euler operators ([`euler`]: MVFS/MEV/MEF/KEMR/KFMRH with
@@ -16,12 +17,14 @@
 pub mod curve;
 pub mod euler;
 pub mod nurbs;
+pub mod ssi;
 pub mod surface;
 pub mod topology;
 
 pub use curve::{Curve3, CurveEval};
 pub use euler::{EulerCounts, EulerError};
 pub use nurbs::{KnotVector, NurbsCurve, NurbsError, NurbsSurface};
+pub use ssi::{IntersectionCurve, IntersectionKind, SurfaceIntersection, intersect};
 pub use surface::{Surface3, SurfaceEval};
 pub use topology::{
     Body, BodyType, Curve, Edge, Face, FaceSense, Fin, FinSense, Loop, LoopType, SYSTEM_RESOLUTION,
