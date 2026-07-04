@@ -14,7 +14,9 @@
 //! and [`revolve`] planar profiles into solids), the geometry store
 //! ([`GeometryStore`] backing [`Edge::curve`]/[`Face::surface`]), and
 //! primitive solids ([`primitives`]: block, cylinder, sphere, torus with
-//! full topology + geometry). Tolerant modeling lands here next.
+//! full topology + geometry), and tessellation ([`tessellate`]: analytic
+//! faces to [`opensolid_core::TriangleMesh`]). Tolerant modeling lands
+//! here next.
 //!
 //! This crate follows the OpenSolid error handling policy documented at the
 //! [`opensolid_core`] crate level: fallible public APIs (e.g. the [`Curve3`]
@@ -31,6 +33,7 @@ pub mod project;
 pub mod ssi;
 pub mod surface;
 pub mod sweep;
+pub mod tessellate;
 pub mod topology;
 
 pub use check::{CheckFailure, EntityRef, MAX_ALLOWED_TOLERANCE};
@@ -45,6 +48,7 @@ pub use ssi::{
 };
 pub use surface::{Surface3, SurfaceEval};
 pub use sweep::{Profile, ProfileSegment, SweptBody, extrude, revolve};
+pub use tessellate::{TessellationOptions, tessellate_body, tessellate_face};
 pub use topology::{
     Body, BodyType, Curve, Edge, Face, FaceSense, Fin, FinSense, Loop, LoopType, SYSTEM_RESOLUTION,
     Shell, ShellOrientation, TopologyStore, Vertex,
