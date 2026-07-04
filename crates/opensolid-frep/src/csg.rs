@@ -11,7 +11,8 @@
 //! (lower-magnitude) bound, which is what sphere tracing and the mesher need.
 
 use crate::primitives::Sdf;
-use opensolid_core::types::{Point3, Vector3};
+use opensolid_core::interval::Interval;
+use opensolid_core::types::{BoundingBox3, Point3, Vector3};
 
 /// `min(a, b)`. Preserves 1-Lipschitz; exact only where the nearest surface
 /// point of the winning operand lies on the union boundary.
@@ -31,6 +32,11 @@ impl<A: Sdf, B: Sdf> Sdf for Union<A, B> {
         } else {
             self.b.grad(p)
         }
+    }
+
+    // Pointwise min propagates exactly: no widening beyond the children's.
+    fn eval_interval(&self, b: &BoundingBox3) -> Interval {
+        self.a.eval_interval(b).min(&self.b.eval_interval(b))
     }
 }
 
@@ -52,6 +58,11 @@ impl<A: Sdf, B: Sdf> Sdf for Intersection<A, B> {
         } else {
             self.b.grad(p)
         }
+    }
+
+    // Pointwise max propagates exactly: no widening beyond the children's.
+    fn eval_interval(&self, b: &BoundingBox3) -> Interval {
+        self.a.eval_interval(b).max(&self.b.eval_interval(b))
     }
 }
 
@@ -75,6 +86,11 @@ impl<A: Sdf, B: Sdf> Sdf for Subtraction<A, B> {
             -self.b.grad(p)
         }
     }
+
+    // max(a, -b): negation and pointwise max both propagate exactly.
+    fn eval_interval(&self, b: &BoundingBox3) -> Interval {
+        self.a.eval_interval(b).max(&(-self.b.eval_interval(b)))
+    }
 }
 
 #[cfg(test)]
@@ -95,6 +111,65 @@ mod tests {
         let u = Union { a, b };
         assert!(u.eval(&Point3::origin()) < 0.0);
         assert!(u.eval(&Point3::new(5.0, 0.0, 0.0)) > 0.0);
+    }
+
+    fn sphere(x: f64, r: f64) -> Sphere {
+        Sphere {
+            center: Point3::new(x, 0.0, 0.0),
+            radius: r,
+        }
+    }
+
+    #[test]
+    fn union_interval_containment() {
+        let u = Union {
+            a: sphere(-0.5, 1.0),
+            b: sphere(0.5, 0.7),
+        };
+        crate::test_util::assert_interval_containment(&u, 11);
+    }
+
+    #[test]
+    fn intersection_interval_containment() {
+        let i = Intersection {
+            a: sphere(-0.3, 1.2),
+            b: sphere(0.3, 1.0),
+        };
+        crate::test_util::assert_interval_containment(&i, 12);
+    }
+
+    #[test]
+    fn subtraction_interval_containment() {
+        let s = Subtraction {
+            a: sphere(0.0, 1.5),
+            b: sphere(0.2, 0.8),
+        };
+        crate::test_util::assert_interval_containment(&s, 13);
+    }
+
+    // min/max/negate propagation is exact: with exact children the CSG
+    // interval equals the min/max of the child intervals, no widening.
+    #[test]
+    fn csg_intervals_propagate_exactly() {
+        let a = sphere(-0.5, 1.0);
+        let b = sphere(0.5, 0.7);
+        let bx = BoundingBox3::new(Point3::new(0.1, -0.4, -0.2), Point3::new(1.3, 0.6, 0.9));
+        let (ia, ib) = (a.eval_interval(&bx), b.eval_interval(&bx));
+        let u = Union {
+            a: sphere(-0.5, 1.0),
+            b: sphere(0.5, 0.7),
+        };
+        assert_eq!(u.eval_interval(&bx), ia.min(&ib));
+        let i = Intersection {
+            a: sphere(-0.5, 1.0),
+            b: sphere(0.5, 0.7),
+        };
+        assert_eq!(i.eval_interval(&bx), ia.max(&ib));
+        let s = Subtraction {
+            a: sphere(-0.5, 1.0),
+            b: sphere(0.5, 0.7),
+        };
+        assert_eq!(s.eval_interval(&bx), ia.max(&(-ib)));
     }
 
     #[test]

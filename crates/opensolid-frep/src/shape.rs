@@ -1,7 +1,8 @@
 use crate::blend::SmoothUnion;
 use crate::csg::{Intersection, Subtraction, Union};
 use crate::primitives::Sdf;
-use opensolid_core::types::{Point3, Vector3};
+use opensolid_core::interval::Interval;
+use opensolid_core::types::{BoundingBox3, Point3, Vector3};
 use std::sync::Arc;
 
 /// Runtime-composable handle to an SDF tree. Cloning is cheap (shared
@@ -51,6 +52,12 @@ impl Sdf for Shape {
 
     fn grad(&self, p: &Point3) -> Vector3 {
         self.0.grad(p)
+    }
+
+    // Must forward: falling back to the trait default would discard the
+    // tree's analytic bounds (and be wrong for non-metric inner fields).
+    fn eval_interval(&self, b: &BoundingBox3) -> Interval {
+        self.0.eval_interval(b)
     }
 }
 
@@ -147,6 +154,30 @@ mod tests {
         for p in sample_points() {
             assert_eq!(shape.eval(&p), generic.eval(&p), "at {p:?}");
         }
+    }
+
+    #[test]
+    fn shape_forwards_eval_interval() {
+        use opensolid_core::types::BoundingBox3;
+        let s = sphere(0.0, 1.0);
+        let shape = Shape::new(sphere(0.0, 1.0));
+        // A box where the exact sphere interval is strictly tighter than
+        // the Lipschitz default, so falling back would be detected.
+        let b = BoundingBox3::new(Point3::new(1.0, 1.0, 1.0), Point3::new(3.0, 2.0, 2.0));
+        let exact = s.eval_interval(&b);
+        assert_eq!(shape.eval_interval(&b), exact);
+        let center_d = s.eval(&b.center());
+        let r = 0.5 * b.extents().norm();
+        assert!(exact.lo > center_d - r && exact.hi < center_d + r);
+    }
+
+    #[test]
+    fn composed_shape_interval_containment() {
+        let shape = Shape::new(sphere(-0.5, 1.0))
+            .union(Shape::new(sphere(0.5, 1.0)))
+            .subtract(Shape::new(sphere(0.0, 0.4)))
+            .smooth_union(Shape::new(sphere(1.2, 0.8)), 0.3);
+        crate::test_util::assert_interval_containment(&shape, 41);
     }
 
     #[test]

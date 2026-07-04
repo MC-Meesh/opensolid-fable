@@ -1,6 +1,7 @@
 use crate::primitives::Sdf;
 use opensolid_core::error::{CoreError, CoreResult};
-use opensolid_core::types::{Point3, Transform3, Vector3};
+use opensolid_core::interval::Interval;
+use opensolid_core::types::{BoundingBox3, Point3, Transform3, Vector3};
 
 /// An SDF placed by a rigid transform (rotation + translation).
 ///
@@ -24,6 +25,21 @@ impl<S> Transformed<S> {
 impl<S: Sdf> Sdf for Transformed<S> {
     fn eval(&self, p: &Point3) -> f64 {
         self.sdf.eval(&(self.inverse * p))
+    }
+
+    fn eval_interval(&self, b: &BoundingBox3) -> Interval {
+        // The inverse image of `b` is a rotated box; bound it by the AABB of
+        // its corners. Conservative: the AABB is a superset of the rotated
+        // box, and rigid motion preserves field values.
+        let corners = (0..8).map(|i| {
+            let p = Point3::new(
+                if i & 1 == 0 { b.min.x } else { b.max.x },
+                if i & 2 == 0 { b.min.y } else { b.max.y },
+                if i & 4 == 0 { b.min.z } else { b.max.z },
+            );
+            self.inverse * p
+        });
+        self.sdf.eval_interval(&BoundingBox3::from_points(corners))
     }
 }
 
@@ -62,6 +78,17 @@ impl<S> UniformScale<S> {
 impl<S: Sdf> Sdf for UniformScale<S> {
     fn eval(&self, p: &Point3) -> f64 {
         self.sdf.eval(&Point3::from(p.coords / self.factor)) * self.factor
+    }
+
+    fn eval_interval(&self, b: &BoundingBox3) -> Interval {
+        // Exact given the inner bound: shrink the box into the inner frame
+        // and rescale the resulting interval (factor > 0 preserves order).
+        let inner = BoundingBox3::new(
+            Point3::from(b.min.coords / self.factor),
+            Point3::from(b.max.coords / self.factor),
+        );
+        let i = self.sdf.eval_interval(&inner);
+        Interval::new(i.lo * self.factor, i.hi * self.factor)
     }
 }
 
@@ -216,6 +243,48 @@ mod tests {
         let s = unit_sphere().scaled(0.25).expect("valid scale");
         assert!(s.eval(&Point3::new(0.25, 0.0, 0.0)).abs() < 1e-12);
         assert!((s.eval(&Point3::new(1.25, 0.0, 0.0)) - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn transformed_interval_containment() {
+        let b = Box3 {
+            center: Point3::origin(),
+            half_extents: [1.0, 0.5, 0.25],
+        }
+        .rotated(Vector3::new(0.3, -0.2, 0.9))
+        .translated(Vector3::new(0.4, -0.1, 0.2));
+        crate::test_util::assert_interval_containment(&b, 31);
+    }
+
+    #[test]
+    fn scaled_interval_containment() {
+        let s = Box3 {
+            center: Point3::new(0.2, -0.1, 0.3),
+            half_extents: [0.8, 0.4, 0.6],
+        }
+        .scaled(1.7)
+        .expect("valid scale");
+        crate::test_util::assert_interval_containment(&s, 32);
+    }
+
+    // The corner-AABB of the inverse-rotated box is a superset of the box,
+    // so the rotated interval must contain the exact one (conservative),
+    // while a pure translation leaves the box axis-aligned and stays exact.
+    #[test]
+    fn rotated_sphere_interval_contains_exact_translated_stays_exact() {
+        use opensolid_core::types::BoundingBox3;
+        let b = BoundingBox3::new(Point3::new(1.0, 1.0, 1.0), Point3::new(2.0, 2.0, 2.0));
+        let exact = unit_sphere().eval_interval(&b);
+
+        let rotated = unit_sphere().rotated(Vector3::new(0.0, 0.0, 1.2));
+        let j = rotated.eval_interval(&b);
+        assert!(j.lo <= exact.lo + 1e-12 && exact.hi <= j.hi + 1e-12);
+
+        let shift = Vector3::new(0.5, -0.25, 1.0);
+        let translated = unit_sphere().translated(shift);
+        let moved_box = BoundingBox3::new(b.min + shift, b.max + shift);
+        let k = translated.eval_interval(&moved_box);
+        assert!((k.lo - exact.lo).abs() < 1e-12 && (k.hi - exact.hi).abs() < 1e-12);
     }
 
     #[test]

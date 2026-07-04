@@ -31,7 +31,8 @@
 
 use crate::primitives::Sdf;
 use opensolid_core::error::{CoreError, CoreResult};
-use opensolid_core::types::{Point3, Vector3};
+use opensolid_core::interval::Interval;
+use opensolid_core::types::{BoundingBox3, Point3, Vector3};
 
 /// The solid offset by `distance`: `eval(p) = f(p) - distance`.
 ///
@@ -65,6 +66,12 @@ impl<S: Sdf> Sdf for Offset<S> {
     // A constant shift leaves the gradient untouched.
     fn grad(&self, p: &Point3) -> Vector3 {
         self.sdf.grad(p)
+    }
+
+    // A constant shift propagates exactly.
+    fn eval_interval(&self, b: &BoundingBox3) -> Interval {
+        let i = self.sdf.eval_interval(b);
+        Interval::new(i.lo - self.distance, i.hi - self.distance)
     }
 }
 
@@ -107,6 +114,12 @@ impl<S: Sdf> Sdf for Shell<S> {
         let g = self.sdf.grad(p);
         if self.sdf.eval(p) >= 0.0 { g } else { -g }
     }
+
+    // |f| propagates exactly through the interval abs.
+    fn eval_interval(&self, b: &BoundingBox3) -> Interval {
+        let i = self.sdf.eval_interval(b).abs();
+        Interval::new(i.lo - self.thickness / 2.0, i.hi - self.thickness / 2.0)
+    }
 }
 
 /// The outward half of a rounding offset pair: `eval(p) = f(p) - radius`.
@@ -144,6 +157,12 @@ impl<S: Sdf> Sdf for Rounded<S> {
 
     fn grad(&self, p: &Point3) -> Vector3 {
         self.sdf.grad(p)
+    }
+
+    // A constant shift propagates exactly.
+    fn eval_interval(&self, b: &BoundingBox3) -> Interval {
+        let i = self.sdf.eval_interval(b);
+        Interval::new(i.lo - self.radius, i.hi - self.radius)
     }
 }
 
@@ -412,6 +431,40 @@ mod tests {
                 "radius {bad}: got {err}"
             );
         }
+    }
+
+    #[test]
+    fn offset_interval_containment() {
+        let grown = unit_sphere().offset(0.25).expect("valid offset");
+        crate::test_util::assert_interval_containment(&grown, 51);
+        let shrunk = unit_box().offset(-0.2).expect("valid offset");
+        crate::test_util::assert_interval_containment(&shrunk, 52);
+    }
+
+    #[test]
+    fn shell_interval_containment() {
+        let shell = unit_box().shell(0.3).expect("valid shell");
+        crate::test_util::assert_interval_containment(&shell, 53);
+    }
+
+    #[test]
+    fn rounded_interval_containment() {
+        let rounded = unit_box().rounded(0.2).expect("valid radius");
+        crate::test_util::assert_interval_containment(&rounded, 54);
+    }
+
+    // An offset sphere is exactly a bigger sphere, and the interval
+    // machinery must agree: exact propagation, no widening.
+    #[test]
+    fn offset_sphere_interval_matches_reference_sphere() {
+        let grown = unit_sphere().offset(0.25).expect("valid offset");
+        let reference = Sphere {
+            center: Point3::origin(),
+            radius: 1.25,
+        };
+        let b = BoundingBox3::new(Point3::new(0.5, -0.5, 0.0), Point3::new(2.0, 1.0, 1.5));
+        let (i, j) = (grown.eval_interval(&b), reference.eval_interval(&b));
+        assert!((i.lo - j.lo).abs() < 1e-12 && (i.hi - j.hi).abs() < 1e-12);
     }
 
     #[test]

@@ -11,7 +11,8 @@
 //! primitives, not for blended fields.
 
 use crate::primitives::Sdf;
-use opensolid_core::types::{Point3, Vector3};
+use opensolid_core::interval::Interval;
+use opensolid_core::types::{BoundingBox3, Point3, Vector3};
 
 pub struct SmoothUnion<A, B> {
     pub a: A,
@@ -34,6 +35,14 @@ impl<A: Sdf, B: Sdf> Sdf for SmoothUnion<A, B> {
         let db = self.b.eval(p);
         let h = (0.5 + 0.5 * (db - da) / self.radius).clamp(0.0, 1.0);
         self.a.grad(p) * h + self.b.grad(p) * (1.0 - h)
+    }
+
+    // Conservative widening: the polynomial smooth min deviates from the
+    // sharp min by at most radius/4 (attained at da == db), always downward,
+    // so [min.lo - r/4, min.hi] contains the blended field.
+    fn eval_interval(&self, b: &BoundingBox3) -> Interval {
+        let sharp = self.a.eval_interval(b).min(&self.b.eval_interval(b));
+        Interval::new(sharp.lo - 0.25 * self.radius, sharp.hi)
     }
 }
 
@@ -61,6 +70,13 @@ impl<A: Sdf, B: Sdf> Sdf for SmoothSubtraction<A, B> {
         let db = self.b.eval(p);
         let h = (0.5 - 0.5 * (da + db) / self.radius).clamp(0.0, 1.0);
         self.a.grad(p) * (1.0 - h) - self.b.grad(p) * h
+    }
+
+    // Smooth subtraction is -smin(-da, db, r), so it deviates from the
+    // sharp max(da, -db) by at most radius/4, always upward.
+    fn eval_interval(&self, b: &BoundingBox3) -> Interval {
+        let sharp = self.a.eval_interval(b).max(&(-self.b.eval_interval(b)));
+        Interval::new(sharp.lo, sharp.hi + 0.25 * self.radius)
     }
 }
 
@@ -100,6 +116,63 @@ mod tests {
             center: Point3::origin(),
             radius: 1.0,
         }
+    }
+
+    #[test]
+    fn smooth_union_interval_containment() {
+        let su = SmoothUnion {
+            a: Sphere {
+                center: Point3::new(-0.5, 0.0, 0.0),
+                radius: 1.0,
+            },
+            b: Sphere {
+                center: Point3::new(0.5, 0.2, -0.1),
+                radius: 0.8,
+            },
+            radius: 0.3,
+        };
+        crate::test_util::assert_interval_containment(&su, 21);
+    }
+
+    #[test]
+    fn smooth_subtraction_interval_containment() {
+        let ss = SmoothSubtraction {
+            a: Sphere {
+                center: Point3::origin(),
+                radius: 1.2,
+            },
+            b: Sphere {
+                center: Point3::new(0.6, 0.1, -0.2),
+                radius: 0.7,
+            },
+            radius: 0.25,
+        };
+        crate::test_util::assert_interval_containment(&ss, 22);
+    }
+
+    // The widening is bounded: exactly radius/4 beyond the sharp interval,
+    // on the blending side only.
+    #[test]
+    fn smooth_interval_widens_by_quarter_radius() {
+        use opensolid_core::types::BoundingBox3;
+        let a = || Sphere {
+            center: Point3::new(-0.5, 0.0, 0.0),
+            radius: 1.0,
+        };
+        let b = || Sphere {
+            center: Point3::new(0.5, 0.0, 0.0),
+            radius: 1.0,
+        };
+        let bx = BoundingBox3::new(Point3::new(-0.4, -0.4, -0.4), Point3::new(0.4, 0.4, 0.4));
+        let sharp = a().eval_interval(&bx).min(&b().eval_interval(&bx));
+        let su = SmoothUnion {
+            a: a(),
+            b: b(),
+            radius: 0.3,
+        };
+        let i = su.eval_interval(&bx);
+        assert_eq!(i.hi, sharp.hi);
+        assert!((i.lo - (sharp.lo - 0.075)).abs() < 1e-12);
     }
 
     #[test]
