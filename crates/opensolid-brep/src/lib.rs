@@ -7,14 +7,17 @@
 //! surfaces ([`NurbsSurface`]), closest-point projection ([`project`]:
 //! [`CurveProject`], [`SurfaceProject`]), the topology graph
 //! ([`TopologyStore`]: Body > Shell > Face > Loop > Fin > Edge > Vertex),
-//! and the Euler operators ([`euler`]: MVFS/MEV/MEF/KEMR/KFMRH with
-//! Euler-Poincaré invariant checking). Tolerant modeling lands here next.
+//! the Euler operators ([`euler`]: MVFS/MEV/MEF/KEMR/KFMRH with
+//! Euler-Poincaré invariant checking), and body validation
+//! ([`check`]: [`TopologyStore::check`] returning structured
+//! [`CheckFailure`]s). Tolerant modeling lands here next.
 //!
 //! This crate follows the OpenSolid error handling policy documented at the
 //! [`opensolid_core`] crate level: fallible public APIs (e.g. the [`Curve3`]
 //! and [`Surface3`] constructors) return [`opensolid_core::CoreResult`]
 //! instead of panicking on invalid input.
 
+pub mod check;
 pub mod curve;
 pub mod euler;
 pub mod nurbs;
@@ -23,6 +26,7 @@ pub mod ssi;
 pub mod surface;
 pub mod topology;
 
+pub use check::{CheckFailure, EntityRef, MAX_ALLOWED_TOLERANCE};
 pub use curve::{Curve3, CurveEval};
 pub use euler::{EulerCounts, EulerError};
 pub use nurbs::{KnotVector, NurbsCurve, NurbsError, NurbsSurface};
