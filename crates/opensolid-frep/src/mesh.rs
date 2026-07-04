@@ -8,6 +8,14 @@
 //!
 //! The surface must lie strictly inside `bounds`; crossings on the boundary
 //! layer of cells are not stitched and would leave holes.
+//!
+//! Grid cells are kept near-cubic regardless of the aspect ratio of
+//! `bounds`: [`MeshOptions::resolution`] sets the cell count along the
+//! longest axis and the other axes get proportionally fewer cells.
+//! Strongly anisotropic cells alias near-tangent surface regions into
+//! ambiguous faces (all four edges of one grid face crossed), which dual
+//! contouring cannot stitch into a manifold — four quads would share one
+//! mesh edge (of-6f8).
 
 use crate::eval::gradient;
 use crate::primitives::Sdf;
@@ -19,9 +27,13 @@ pub use opensolid_core::mesh::{Triangle, TriangleMesh};
 /// Options controlling SDF meshing.
 #[derive(Debug, Clone, Copy)]
 pub struct MeshOptions {
-    /// Region to mesh. Must strictly contain the surface.
+    /// Region to mesh. Must strictly contain the surface, with at least one
+    /// grid cell of clearance on every side (roughly `longest extent /
+    /// resolution`).
     pub bounds: BoundingBox3,
-    /// Number of grid cells along each axis.
+    /// Number of grid cells along the longest axis of `bounds`. Shorter
+    /// axes get proportionally fewer cells so cells stay near-cubic; for
+    /// cubic bounds every axis gets exactly `resolution` cells.
     pub resolution: usize,
 }
 
@@ -59,25 +71,40 @@ pub(crate) const CELL_EDGES: [(usize, usize); 12] = [
     (3, 7), // z-aligned
 ];
 
-/// Geometry shared by the meshing passes.
+/// Geometry shared by the meshing passes. Cell counts are per-axis: the
+/// longest axis gets `resolution` cells, shorter axes proportionally fewer
+/// (at least one), so cells stay near-cubic on anisotropic bounds.
 struct Grid {
-    n: usize,
-    np: usize,
+    /// Cells along x, y, z.
+    n: [usize; 3],
+    /// Grid points along x, y, z (`n + 1`).
+    np: [usize; 3],
     min: Point3,
     step: Vector3,
 }
 
 impl Grid {
-    fn new(opts: &MeshOptions) -> Self {
-        let n = opts.resolution;
+    /// `None` if the grid is unusable: zero resolution, or bounds whose
+    /// longest extent is not a positive finite number.
+    fn new(opts: &MeshOptions) -> Option<Self> {
+        let res = opts.resolution;
         let size = opts.bounds.max - opts.bounds.min;
-        let nf = n as f64;
-        Self {
-            n,
-            np: n + 1,
-            min: opts.bounds.min,
-            step: Vector3::new(size.x / nf, size.y / nf, size.z / nf),
+        let longest = size.x.max(size.y).max(size.z);
+        if res == 0 || longest <= 0.0 || !longest.is_finite() {
+            return None;
         }
+        let cells = |extent: f64| ((res as f64 * extent / longest).round() as usize).max(1);
+        let n = [cells(size.x), cells(size.y), cells(size.z)];
+        Some(Self {
+            n,
+            np: [n[0] + 1, n[1] + 1, n[2] + 1],
+            min: opts.bounds.min,
+            step: Vector3::new(
+                size.x / n[0] as f64,
+                size.y / n[1] as f64,
+                size.z / n[2] as f64,
+            ),
+        })
     }
 
     fn point_at(&self, i: usize, j: usize, k: usize) -> Point3 {
@@ -89,11 +116,11 @@ impl Grid {
     }
 
     fn vidx(&self, i: usize, j: usize, k: usize) -> usize {
-        (i * self.np + j) * self.np + k
+        (i * self.np[1] + j) * self.np[2] + k
     }
 
     fn cidx(&self, i: usize, j: usize, k: usize) -> usize {
-        (i * self.n + j) * self.n + k
+        (i * self.n[1] + j) * self.n[2] + k
     }
 }
 
@@ -136,12 +163,11 @@ fn slab_triangles(
     d: usize,
     gd: usize,
 ) -> Vec<[usize; 3]> {
-    let n = g.n;
     let u = (d + 1) % 3;
     let v = (d + 2) % 3;
     let mut tris = Vec::new();
-    for gu in 1..n {
-        for gv in 1..n {
+    for gu in 1..g.n[u] {
+        for gv in 1..g.n[v] {
             let mut g0 = [0usize; 3];
             g0[d] = gd;
             g0[u] = gu;
@@ -176,42 +202,42 @@ fn slab_triangles(
 /// vertices) and preserves the serial iteration order, so the output is
 /// identical to [`build_mesh_serial`] triangle-for-triangle.
 fn build_mesh(sdf: &dyn Sdf, opts: &MeshOptions) -> TriangleMesh {
-    let n = opts.resolution;
     let mut mesh = TriangleMesh::new();
-    if n == 0 {
+    let Some(g) = Grid::new(opts) else {
         return mesh;
-    }
-    let g = &Grid::new(opts);
-    let np = g.np;
+    };
+    let g = &g;
+    let [nx, ny, nz] = g.n;
+    let [_, npy, npz] = g.np;
 
     // Sample the SDF at every grid point, one parallel task per x-slab
     // (each slab is a contiguous run of the i-major value array).
-    let mut values = vec![0.0f64; np * np * np];
+    let mut values = vec![0.0f64; g.np[0] * npy * npz];
     values
-        .par_chunks_mut(np * np)
+        .par_chunks_mut(npy * npz)
         .enumerate()
         .for_each(|(i, slab)| {
-            for j in 0..np {
-                for k in 0..np {
-                    slab[j * np + k] = sdf.eval(&g.point_at(i, j, k));
+            for j in 0..npy {
+                for k in 0..npz {
+                    slab[j * npz + k] = sdf.eval(&g.point_at(i, j, k));
                 }
             }
         });
 
     // Compute cell vertices in parallel, then number them in serial scan
     // order so vertex indices match the serial mesher exactly.
-    let mut candidates: Vec<Option<Point3>> = vec![None; n * n * n];
+    let mut candidates: Vec<Option<Point3>> = vec![None; nx * ny * nz];
     candidates
-        .par_chunks_mut(n * n)
+        .par_chunks_mut(ny * nz)
         .enumerate()
         .for_each(|(i, slab)| {
-            for j in 0..n {
-                for k in 0..n {
-                    slab[j * n + k] = cell_candidate(g, &values, i, j, k);
+            for j in 0..ny {
+                for k in 0..nz {
+                    slab[j * nz + k] = cell_candidate(g, &values, i, j, k);
                 }
             }
         });
-    let mut cell_vertex: Vec<Option<usize>> = vec![None; n * n * n];
+    let mut cell_vertex: Vec<Option<usize>> = vec![None; nx * ny * nz];
     for (c, candidate) in candidates.into_iter().enumerate() {
         if let Some(p) = candidate {
             cell_vertex[c] = Some(mesh.positions.len());
@@ -236,7 +262,9 @@ fn build_mesh(sdf: &dyn Sdf, opts: &MeshOptions) -> TriangleMesh {
 
     // Emit quads per (axis, depth) slab in parallel, concatenated in the
     // serial loop order.
-    let slabs: Vec<(usize, usize)> = (0..3).flat_map(|d| (0..n).map(move |gd| (d, gd))).collect();
+    let slabs: Vec<(usize, usize)> = (0..3)
+        .flat_map(|d| (0..g.n[d]).map(move |gd| (d, gd)))
+        .collect();
     let per_slab: Vec<Vec<[usize; 3]>> = slabs
         .par_iter()
         .map(|&(d, gd)| slab_triangles(g, &values, &cell_vertex, d, gd))
@@ -252,27 +280,27 @@ fn build_mesh(sdf: &dyn Sdf, opts: &MeshOptions) -> TriangleMesh {
 /// truth the parallel mesher must reproduce exactly.
 #[cfg(test)]
 fn build_mesh_serial(sdf: &dyn Sdf, opts: &MeshOptions) -> TriangleMesh {
-    let n = opts.resolution;
     let mut mesh = TriangleMesh::new();
-    if n == 0 {
+    let Some(g) = Grid::new(opts) else {
         return mesh;
-    }
-    let g = &Grid::new(opts);
-    let np = g.np;
+    };
+    let g = &g;
+    let [nx, ny, nz] = g.n;
+    let [npx, npy, npz] = g.np;
 
-    let mut values = vec![0.0f64; np * np * np];
-    for i in 0..np {
-        for j in 0..np {
-            for k in 0..np {
+    let mut values = vec![0.0f64; npx * npy * npz];
+    for i in 0..npx {
+        for j in 0..npy {
+            for k in 0..npz {
                 values[g.vidx(i, j, k)] = sdf.eval(&g.point_at(i, j, k));
             }
         }
     }
 
-    let mut cell_vertex: Vec<Option<usize>> = vec![None; n * n * n];
-    for i in 0..n {
-        for j in 0..n {
-            for k in 0..n {
+    let mut cell_vertex: Vec<Option<usize>> = vec![None; nx * ny * nz];
+    for i in 0..nx {
+        for j in 0..ny {
+            for k in 0..nz {
                 if let Some(p) = cell_candidate(g, &values, i, j, k) {
                     cell_vertex[g.cidx(i, j, k)] = Some(mesh.positions.len());
                     mesh.positions.push(p);
@@ -292,7 +320,7 @@ fn build_mesh_serial(sdf: &dyn Sdf, opts: &MeshOptions) -> TriangleMesh {
     }
 
     for d in 0..3 {
-        for gd in 0..n {
+        for gd in 0..g.n[d] {
             mesh.indices
                 .extend(slab_triangles(g, &values, &cell_vertex, d, gd));
         }
@@ -306,7 +334,7 @@ mod tests {
     use super::*;
     use crate::blend::SmoothSubtraction;
     use crate::csg::Union;
-    use crate::primitives::{Box3, Cylinder, Sphere};
+    use crate::primitives::{Box3, Cylinder, Sphere, Torus};
 
     fn bounds(half: f64) -> BoundingBox3 {
         BoundingBox3::new(
@@ -549,6 +577,125 @@ mod tests {
         for p in &mesh.positions {
             assert!(shape.eval(p).abs() < cell, "vertex {p:?} off the surface");
         }
+    }
+
+    /// The torus in the x-z plane with its tight bounds dilated per-axis:
+    /// a strongly anisotropic sampling region (roughly 5x1x5).
+    fn torus_and_tight_bounds(margin_frac: f64) -> (Torus, BoundingBox3) {
+        let t = Torus {
+            center: Point3::origin(),
+            major_radius: 2.0,
+            minor_radius: 0.5,
+        };
+        let half = Vector3::new(2.5, 0.5, 2.5) * (1.0 + 2.0 * margin_frac);
+        let b = BoundingBox3::new(Point3::from(-half), Point3::from(half));
+        (t, b)
+    }
+
+    /// Regression for of-6f8: meshing over tight anisotropic bounds used to
+    /// give cells with a ~5:1 aspect ratio, which aliases near-tangent
+    /// surface regions into ambiguous faces (all four edges of a grid face
+    /// crossed) — the four quads around such a face share one mesh edge, so
+    /// the output had edges used by four triangles and was not manifold.
+    /// Cells are now kept near-cubic, so tight bounds must mesh closed.
+    #[test]
+    fn torus_tight_anisotropic_bounds_manifold() {
+        // (margin, resolution) pairs that produced 4-triangle edges before
+        // the fix, plus surrounding combinations that happened to pass.
+        for (margin_frac, resolution) in [
+            (0.02, 32),
+            (0.02, 48),
+            (0.05, 64),
+            (0.10, 32),
+            (0.20, 32),
+            (0.20, 48),
+        ] {
+            let (t, bounds) = torus_and_tight_bounds(margin_frac);
+            let mesh = mesh_sdf_indexed(&t, &MeshOptions { bounds, resolution });
+            assert!(
+                !mesh.is_empty(),
+                "empty mesh at ({margin_frac}, {resolution})"
+            );
+            assert!(
+                mesh.is_closed_manifold(),
+                "not a closed manifold at margin {margin_frac}, resolution {resolution}"
+            );
+            // Vertices must still sit within one (near-cubic) cell of the
+            // surface: anisotropy handling must not cost accuracy.
+            let size = bounds.max - bounds.min;
+            let cell = size.x.max(size.y).max(size.z) / resolution as f64;
+            let diagonal = cell * 3.0f64.sqrt();
+            for p in &mesh.positions {
+                assert!(
+                    t.eval(p).abs() < diagonal,
+                    "vertex {p:?} too far from surface at ({margin_frac}, {resolution})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parallel_matches_serial_anisotropic_torus() {
+        let (t, bounds) = torus_and_tight_bounds(0.1);
+        let opts = MeshOptions {
+            bounds,
+            resolution: 32,
+        };
+        assert_parallel_matches_serial(&t, &opts);
+    }
+
+    /// Anisotropic bounds must yield near-cubic cells: `resolution` cells
+    /// along the longest axes, proportionally fewer along the short one.
+    #[test]
+    fn anisotropic_bounds_get_near_cubic_cells() {
+        let (t, bounds) = torus_and_tight_bounds(0.1);
+        let opts = MeshOptions {
+            bounds,
+            resolution: 32,
+        };
+        let mesh = mesh_sdf_indexed(&t, &opts);
+        // The tight torus bounds are 6x1.2x6, so y gets round(32/5) = 6
+        // cells of size 0.2 and no mesh vertex may sit outside the y slab
+        // reachable by interior cells.
+        let size = bounds.max - bounds.min;
+        assert!((size.y / 6.0 - size.x / 32.0) / (size.x / 32.0) < 0.1);
+        for p in &mesh.positions {
+            assert!(p.y.abs() <= 0.6, "vertex {p:?} outside the y extent");
+        }
+    }
+
+    #[test]
+    fn degenerate_bounds_return_empty() {
+        let s = Sphere {
+            center: Point3::origin(),
+            radius: 1.0,
+        };
+        // Inverted (max < min) and point-sized bounds must not panic.
+        for b in [
+            BoundingBox3::new(Point3::new(1.0, 1.0, 1.0), Point3::new(-1.0, -1.0, -1.0)),
+            BoundingBox3::new(Point3::origin(), Point3::origin()),
+        ] {
+            let opts = MeshOptions {
+                bounds: b,
+                resolution: 8,
+            };
+            assert!(mesh_sdf(&s, &opts).is_empty());
+        }
+    }
+
+    /// A zero-extent axis gets one cell rather than dividing by zero; the
+    /// surface cannot be strictly interior, so the mesh is empty but sane.
+    #[test]
+    fn flat_bounds_do_not_panic() {
+        let s = Sphere {
+            center: Point3::origin(),
+            radius: 1.0,
+        };
+        let opts = MeshOptions {
+            bounds: BoundingBox3::new(Point3::new(-2.0, 0.0, -2.0), Point3::new(2.0, 0.0, 2.0)),
+            resolution: 8,
+        };
+        assert!(mesh_sdf(&s, &opts).is_empty());
     }
 
     #[test]
