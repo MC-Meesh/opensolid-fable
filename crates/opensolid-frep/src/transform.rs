@@ -27,6 +27,13 @@ impl<S: Sdf> Sdf for Transformed<S> {
         self.sdf.eval(&(self.inverse * p))
     }
 
+    fn grad(&self, p: &Point3) -> Vector3 {
+        // Chain rule through the isometry: ∇(g ∘ T⁻¹)(p) = R ∇g(T⁻¹p) with R
+        // the forward rotation, i.e. the inverse of the stored inverse's.
+        self.inverse
+            .inverse_transform_vector(&self.sdf.grad(&(self.inverse * p)))
+    }
+
     fn eval_interval(&self, b: &BoundingBox3) -> Interval {
         // The inverse image of `b` is a rotated box; bound it by the AABB of
         // its corners. Conservative: the AABB is a superset of the rotated
@@ -78,6 +85,11 @@ impl<S> UniformScale<S> {
 impl<S: Sdf> Sdf for UniformScale<S> {
     fn eval(&self, p: &Point3) -> f64 {
         self.sdf.eval(&Point3::from(p.coords / self.factor)) * self.factor
+    }
+
+    fn grad(&self, p: &Point3) -> Vector3 {
+        // ∇(k · g(p/k)) = k · (1/k) ∇g(p/k): the factors cancel exactly.
+        self.sdf.grad(&Point3::from(p.coords / self.factor))
     }
 
     fn eval_interval(&self, b: &BoundingBox3) -> Interval {
@@ -285,6 +297,86 @@ mod tests {
         let moved_box = BoundingBox3::new(b.min + shift, b.max + shift);
         let k = translated.eval_interval(&moved_box);
         assert!((k.lo - exact.lo).abs() < 1e-12 && (k.hi - exact.hi).abs() < 1e-12);
+    }
+
+    // Flat field with a sentinel analytic gradient: the finite-difference
+    // fallback would return zero, so any non-zero result through a wrapper
+    // proves the wrapper forwarded to the inner `grad`.
+    struct GradProbe;
+    impl Sdf for GradProbe {
+        fn eval(&self, _p: &Point3) -> f64 {
+            0.0
+        }
+        fn grad(&self, p: &Point3) -> Vector3 {
+            p.coords
+        }
+    }
+
+    #[test]
+    fn transformed_grad_forwards_and_rotates() {
+        // grad(p) = R · inner_grad(T⁻¹p). With inner_grad = identity on
+        // coords and T = translate ∘ rotate, the expectation is R(R⁻¹(p-t))
+        // = p - t; check against a hand-rotated probe too.
+        let t = Vector3::new(1.0, 2.0, 3.0);
+        let probe = GradProbe
+            .rotated(Vector3::new(0.0, 0.0, FRAC_PI_2))
+            .translated(t);
+        let p = Point3::new(4.0, 5.0, 6.0);
+        let g = probe.grad(&p);
+        assert!((g - (p.coords - t)).norm() < 1e-14, "got {g:?}");
+
+        // Pure rotation: inner sees R⁻¹p, result is R(R⁻¹p) = p — but the
+        // intermediate must really have been rotated, so probe a point where
+        // R⁻¹p differs from p and check via the fallback-is-zero property.
+        let rotated = GradProbe.rotated(Vector3::new(0.0, 0.0, FRAC_PI_2));
+        let q = Point3::new(1.0, 0.0, 0.0);
+        let g = rotated.grad(&q);
+        assert!((g - q.coords).norm() < 1e-15, "got {g:?}");
+        assert!(g.norm() > 0.5, "fell back to finite differences");
+    }
+
+    #[test]
+    fn scaled_grad_forwards_at_unscaled_point() {
+        // ∇(k·g(p/k)) = ∇g(p/k); with the probe this is p/k, and a
+        // finite-difference fallback on the flat field would give zero.
+        let s = GradProbe.scaled(4.0).expect("valid scale");
+        let p = Point3::new(8.0, -4.0, 2.0);
+        let g = s.grad(&p);
+        assert!((g - p.coords / 4.0).norm() < 1e-15, "got {g:?}");
+    }
+
+    #[test]
+    fn transformed_sphere_grad_is_exact_normal() {
+        // Sphere carried to center c: gradient at p is (p - c)/|p - c|,
+        // exact to machine precision only if forwarding is analytic.
+        let c = Point3::new(1.0, 2.0, -0.5);
+        let s = unit_sphere()
+            .rotated(Vector3::new(0.3, -0.2, 0.9))
+            .translated(c.coords);
+        for p in [
+            Point3::new(3.0, 2.5, 0.1),
+            Point3::new(0.9, 1.8, -0.6),
+            Point3::new(1.0, 2.0, 4.0),
+        ] {
+            let g = s.grad(&p);
+            let expected = (p - c).normalize();
+            assert!((g - expected).norm() < 1e-14, "at {p:?}: got {g:?}");
+            assert!((g.norm() - 1.0).abs() < 1e-14);
+        }
+    }
+
+    #[test]
+    fn scaled_sphere_grad_is_exact_normal() {
+        let s = unit_sphere().scaled(2.5).expect("valid scale");
+        for p in [
+            Point3::new(3.0, 0.0, 0.0),
+            Point3::new(1.0, -2.0, 0.5),
+            Point3::new(0.1, 0.2, 0.3),
+        ] {
+            let g = s.grad(&p);
+            let expected = p.coords.normalize();
+            assert!((g - expected).norm() < 1e-14, "at {p:?}: got {g:?}");
+        }
     }
 
     #[test]
