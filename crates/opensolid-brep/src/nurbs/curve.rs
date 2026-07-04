@@ -45,6 +45,16 @@ pub enum NurbsError {
     KnotOutOfDomain { knot: f64, start: f64, end: f64 },
     #[error("inserting knot {knot} would raise its multiplicity above degree {degree}")]
     MultiplicityExceedsDegree { knot: f64, degree: usize },
+    #[error("control grid has {got} rows, u knot vector expects {expected}")]
+    GridRowCountMismatch { got: usize, expected: usize },
+    #[error("control grid row {row} has {got} points, v knot vector expects {expected}")]
+    GridColumnCountMismatch {
+        row: usize,
+        got: usize,
+        expected: usize,
+    },
+    #[error("weight grid shape does not match the control grid at row {row}")]
+    WeightGridShapeMismatch { row: usize },
 }
 
 /// Validated knot vector of a fixed degree.
@@ -156,7 +166,7 @@ impl KnotVector {
     }
 
     /// Non-zero basis functions `N_{span-p..=span, p}(u)` (BasisFuns, A2.2).
-    fn basis_funs(&self, span: usize, u: f64) -> Vec<f64> {
+    pub(crate) fn basis_funs(&self, span: usize, u: f64) -> Vec<f64> {
         let p = self.degree;
         let mut n = vec![0.0; p + 1];
         let mut left = vec![0.0; p + 1];
@@ -179,7 +189,7 @@ impl KnotVector {
     /// Basis functions and their derivatives up to `order`
     /// (DersBasisFuns, A2.3). Returns `ders[k][j]` = k-th derivative of
     /// `N_{span-p+j, p}` at `u`; rows with `k > degree` are zero.
-    fn ders_basis_funs(&self, span: usize, u: f64, order: usize) -> Vec<Vec<f64>> {
+    pub(crate) fn ders_basis_funs(&self, span: usize, u: f64, order: usize) -> Vec<Vec<f64>> {
         let p = self.degree;
         let max_k = order.min(p);
 
@@ -438,7 +448,7 @@ impl CurveEval for NurbsCurve {
     }
 }
 
-fn binomial(n: usize, k: usize) -> f64 {
+pub(crate) fn binomial(n: usize, k: usize) -> f64 {
     let k = k.min(n - k);
     let mut result = 1.0;
     for i in 0..k {
