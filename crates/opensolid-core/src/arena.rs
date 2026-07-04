@@ -169,6 +169,18 @@ impl<T> Arena<T> {
         self.free_list = snapshot.free_list.clone();
         self.len = snapshot.len;
     }
+
+    /// Iterate over every live entity as `(id, &value)`, in slot order.
+    /// Freed slots are skipped; the yielded ids resolve via [`Arena::get`].
+    pub fn iter(&self) -> impl Iterator<Item = (EntityId<T>, &T)> {
+        self.chunks.iter().enumerate().flat_map(|(ci, chunk)| {
+            chunk.iter().enumerate().filter_map(move |(i, entry)| {
+                let value = entry.value.as_ref()?;
+                let index = (ci * CHUNK_SIZE + i) as u32;
+                Some((EntityId::new(index, entry.generation), value))
+            })
+        })
+    }
 }
 
 impl<T: Clone> Arena<T> {
@@ -272,6 +284,26 @@ mod tests {
         // Double remove is a no-op, not a double free.
         assert_eq!(arena.remove(id), None);
         assert_eq!(arena.len(), 0);
+    }
+
+    #[test]
+    fn iter_visits_live_entities_with_resolvable_ids() {
+        let mut arena: Arena<i32> = Arena::new();
+        let a = arena.insert(1);
+        let b = arena.insert(2);
+        let c = arena.insert(3);
+        arena.remove(b);
+
+        let seen: Vec<_> = arena.iter().map(|(id, &v)| (id, v)).collect();
+        assert_eq!(seen, vec![(a, 1), (c, 3)]);
+        for (id, &v) in arena.iter() {
+            assert_eq!(arena.get(id), Some(&v));
+        }
+
+        // A reused slot must yield the new id, not the stale one.
+        let d = arena.insert(4);
+        assert!(arena.iter().any(|(id, &v)| id == d && v == 4));
+        assert!(arena.iter().all(|(id, _)| id != b));
     }
 
     #[test]

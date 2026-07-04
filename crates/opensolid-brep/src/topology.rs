@@ -19,7 +19,8 @@
 //! - `Edge::fins` is a `Vec` rather than `[EntityId<Fin>; 2]` so free edges
 //!   (1 fin) and non-manifold edges (>2 fins) are representable.
 //! - `Region`, attribute sets, and body transforms are deferred to later
-//!   issues, as are Euler operators and validation.
+//!   issues, as is full body validation. Euler operators live in
+//!   [`crate::euler`].
 //!
 //! Tolerant-modeling fields exist from day one (`spec/08-tolerances.md`):
 //! every [`Edge`] and [`Vertex`] carries a `tolerance`, and every [`Fin`] has
@@ -135,6 +136,10 @@ pub struct Shell {
     /// true = watertight (encloses volume).
     pub is_closed: bool,
     pub orientation: ShellOrientation,
+    /// Genus: number of through-holes (handles) of this shell. Maintained by
+    /// the Euler operators (KFMRH increments it); the `H` term of the
+    /// Euler-Poincaré formula `V - E + F - R = 2(S - H)`.
+    pub genus: u32,
 }
 
 /// A bounded region on a surface: one outer loop plus zero or more holes.
@@ -154,8 +159,12 @@ pub struct Face {
 pub struct Loop {
     pub face: EntityId<Face>,
     /// Fins in traversal order (each fin's end vertex is the next fin's start).
+    /// Empty exactly for a degenerate vertex loop (see [`Loop::vertex`]).
     pub fins: Vec<EntityId<Fin>>,
     pub loop_type: LoopType,
+    /// The single vertex of a degenerate loop with no fins (the loop created
+    /// by MVFS, or a cone-apex loop). `None` whenever `fins` is non-empty.
+    pub vertex: Option<EntityId<Vertex>>,
 }
 
 /// Half-edge: one face's directed use of an edge.
@@ -265,6 +274,7 @@ impl TopologyStore {
             faces: Vec::new(),
             is_closed,
             orientation,
+            genus: 0,
         });
         self.bodies
             .get_mut(body)
@@ -365,6 +375,7 @@ impl TopologyStore {
             face,
             fins: Vec::new(),
             loop_type,
+            vertex: None,
         });
 
         let fin_ids: Vec<EntityId<Fin>> = edges
