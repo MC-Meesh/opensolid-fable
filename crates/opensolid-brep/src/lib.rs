@@ -34,7 +34,10 @@ pub use curve::{Curve3, CurveEval};
 pub use euler::{EulerCounts, EulerError};
 pub use nurbs::{KnotVector, NurbsCurve, NurbsError, NurbsSurface};
 pub use project::{CurveProject, CurveProjection, SurfaceProject, SurfaceProjection};
-pub use ssi::{IntersectionCurve, IntersectionKind, SurfaceIntersection, intersect};
+pub use ssi::{
+    IntersectionCurve, IntersectionKind, MarchedCurve, SurfaceIntersection, intersect,
+    intersect_nurbs,
+};
 pub use surface::{Surface3, SurfaceEval};
 pub use sweep::{Profile, ProfileSegment, SweptBody, extrude, revolve};
 pub use topology::{
