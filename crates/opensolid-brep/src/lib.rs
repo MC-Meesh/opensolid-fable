@@ -4,7 +4,8 @@
 //! ([`Surface3`]) with their evaluation traits ([`CurveEval`],
 //! [`SurfaceEval`]), analytic surface-surface intersection ([`ssi`]),
 //! NURBS curves ([`NurbsCurve`]) and tensor-product
-//! surfaces ([`NurbsSurface`]), the topology graph
+//! surfaces ([`NurbsSurface`]), closest-point projection ([`project`]:
+//! [`CurveProject`], [`SurfaceProject`]), the topology graph
 //! ([`TopologyStore`]: Body > Shell > Face > Loop > Fin > Edge > Vertex),
 //! and the Euler operators ([`euler`]: MVFS/MEV/MEF/KEMR/KFMRH with
 //! Euler-Poincaré invariant checking). Tolerant modeling lands here next.
@@ -17,6 +18,7 @@
 pub mod curve;
 pub mod euler;
 pub mod nurbs;
+pub mod project;
 pub mod ssi;
 pub mod surface;
 pub mod topology;
@@ -24,6 +26,7 @@ pub mod topology;
 pub use curve::{Curve3, CurveEval};
 pub use euler::{EulerCounts, EulerError};
 pub use nurbs::{KnotVector, NurbsCurve, NurbsError, NurbsSurface};
+pub use project::{CurveProject, CurveProjection, SurfaceProject, SurfaceProjection};
 pub use ssi::{IntersectionCurve, IntersectionKind, SurfaceIntersection, intersect};
 pub use surface::{Surface3, SurfaceEval};
 pub use topology::{
