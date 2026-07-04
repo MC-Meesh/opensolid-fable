@@ -239,17 +239,8 @@ mod tests {
     /// whose vertices lie on the SDF surface — this fails if the tracked
     /// bounding box ever fails to contain the surface with enough padding.
     fn assert_meshes_cleanly(s: &BoundedShape) -> TriangleMesh {
-        let mesh = assert_meshes_on_surface(s);
-        assert!(mesh.is_closed_manifold(), "auto-bounds mesh not manifold");
-        mesh
-    }
-
-    /// Like [`assert_meshes_cleanly`] but without the manifold check, for
-    /// shapes with sharp concave creases (e.g. subtractions) where the dual
-    /// contouring mesher is known to emit non-manifold edges at moderate
-    /// resolutions.
-    fn assert_meshes_on_surface(s: &BoundedShape) -> TriangleMesh {
         let mesh = s.mesh(RES, None);
+        assert!(mesh.is_closed_manifold(), "auto-bounds mesh not manifold");
         assert!(!mesh.is_empty(), "auto-bounds mesh is empty");
         let b = s.mesh_bounds(RES);
         let cell = max_extent(&b) / RES as f64;
@@ -327,7 +318,7 @@ mod tests {
         let d = a.subtract(&b);
         assert_eq!(d.bounds.min, a.bounds.min);
         assert_eq!(d.bounds.max, a.bounds.max);
-        assert_meshes_on_surface(&d);
+        assert_meshes_cleanly(&d);
     }
 
     #[test]

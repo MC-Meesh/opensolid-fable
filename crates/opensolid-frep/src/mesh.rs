@@ -2,9 +2,28 @@
 //!
 //! The algorithm samples the SDF on a uniform grid over a bounding region,
 //! finds grid edges where the sign changes (surface crossings), places one
-//! vertex per crossed cell using Hermite data (linear interpolation of SDF
-//! values along crossed edges, normals from the SDF gradient), and connects
-//! vertices of the four cells around each crossed edge into a quad.
+//! vertex per surface component of each crossed cell using Hermite data
+//! (linear interpolation of SDF values along crossed edges, normals from
+//! the SDF gradient), and connects, for each crossed edge, the vertices of
+//! that edge's component in the four surrounding cells into a quad.
+//!
+//! A cell's surface components are the connected groups of its crossed
+//! edges, traced across the cell faces: a face crossed twice links its two
+//! crossings, a face crossed four times (checkerboard corner signs) is
+//! split by the asymptotic decider on the face's bilinear interpolant. The
+//! decider uses only face-local data, so the two cells sharing a face
+//! always agree and every mesh edge is stitched by exactly two quads.
+//! Single-vertex-per-cell dual contouring cannot represent two surface
+//! sheets crossing one cell — e.g. the crease circle of a CSG subtraction —
+//! and emitted non-manifold four-quad edges there (of-1ad).
+//!
+//! One doubly-crossed face remains: a component may pass through a face
+//! twice (all four crossings of an ambiguous face in one component). If
+//! that happens on *both* sides of the face, its four quads would all
+//! connect the same two cell vertices — a four-quad edge again. Such faces
+//! are split before stitching: each contour arc gets an extra vertex at
+//! the midpoint of its two crossings, and the arc's two quads route
+//! through it as pentagons, restoring exactly-two-polygons-per-edge.
 //!
 //! The surface must lie strictly inside `bounds`; crossings on the boundary
 //! layer of cells are not stitched and would leave holes.
@@ -13,9 +32,7 @@
 //! `bounds`: [`MeshOptions::resolution`] sets the cell count along the
 //! longest axis and the other axes get proportionally fewer cells.
 //! Strongly anisotropic cells alias near-tangent surface regions into
-//! ambiguous faces (all four edges of one grid face crossed), which dual
-//! contouring cannot stitch into a manifold — four quads would share one
-//! mesh edge (of-6f8).
+//! ambiguous faces, needlessly splitting surface components (of-6f8).
 
 use crate::eval::gradient;
 use crate::primitives::Sdf;
@@ -128,43 +145,246 @@ pub(crate) fn corner(c: usize) -> (usize, usize, usize) {
     (c & 1, (c >> 1) & 1, (c >> 2) & 1)
 }
 
-/// Hermite vertex for one cell: centroid of the sign-change crossings on its
-/// edges (linear interpolation of the SDF along each crossed edge), or `None`
-/// if no edge crosses the surface.
-fn cell_candidate(g: &Grid, values: &[f64], i: usize, j: usize, k: usize) -> Option<Point3> {
-    let mut sum = Vector3::zeros();
-    let mut count = 0usize;
-    for &(a, b) in &CELL_EDGES {
-        let (ax, ay, az) = corner(a);
-        let (bx, by, bz) = corner(b);
-        let va = values[g.vidx(i + ax, j + ay, k + az)];
-        let vb = values[g.vidx(i + bx, j + by, k + bz)];
-        if (va < 0.0) == (vb < 0.0) {
+/// Cell faces as (corner cycle, edge cycle): `corners[i]` and
+/// `corners[(i+1)%4]` are the endpoints of `CELL_EDGES[edges[i]]`, so
+/// `edges[(i+3)%4]` and `edges[i]` are the two face edges meeting at
+/// `corners[i]`. Order: x=0, x=1, y=0, y=1, z=0, z=1.
+const CELL_FACES: [([usize; 4], [usize; 4]); 6] = [
+    ([0, 2, 6, 4], [4, 10, 6, 8]),
+    ([1, 3, 7, 5], [5, 11, 7, 9]),
+    ([0, 1, 5, 4], [0, 9, 2, 8]),
+    ([2, 3, 7, 6], [1, 11, 3, 10]),
+    ([0, 1, 3, 2], [0, 5, 1, 4]),
+    ([4, 5, 7, 6], [2, 7, 3, 6]),
+];
+
+/// Marker for cell edges without a sign change in [`CellVerts::comp_of_edge`].
+const NO_COMP: u8 = u8::MAX;
+
+/// Dual vertices for one cell: one Hermite vertex (centroid of the edge
+/// crossings) per surface component. Every crossed edge is paired with
+/// exactly one partner on each of its two faces, so components are cycles
+/// of at least three edges — at most four fit in twelve slots.
+struct CellVerts {
+    /// Component id per [`CELL_EDGES`] slot; [`NO_COMP`] where the edge has
+    /// no sign change.
+    comp_of_edge: [u8; 12],
+    /// Number of components (1..=4).
+    count: u8,
+    /// Vertex per component, in first-crossed-edge order.
+    points: [Point3; 4],
+}
+
+fn uf_find(parent: &mut [u8; 12], mut x: u8) -> u8 {
+    while parent[x as usize] != x {
+        parent[x as usize] = parent[parent[x as usize] as usize];
+        x = parent[x as usize];
+    }
+    x
+}
+
+fn uf_union(parent: &mut [u8; 12], a: u8, b: u8) {
+    let ra = uf_find(parent, a);
+    let rb = uf_find(parent, b);
+    parent[ra as usize] = rb;
+}
+
+/// Dual vertices for one cell, or `None` if no edge crosses the surface.
+///
+/// Crossed edges are grouped into surface components by tracing across the
+/// six faces: a face with two crossings links them; a face with four
+/// (checkerboard corner signs) is resolved by the asymptotic decider —
+/// the sign of the face's bilinear interpolant at its saddle point picks
+/// which diagonal corner pair the two contour arcs separate. The decider
+/// reads only face data, so adjacent cells always agree.
+fn cell_verts(g: &Grid, values: &[f64], i: usize, j: usize, k: usize) -> Option<Box<CellVerts>> {
+    let v: [f64; 8] = core::array::from_fn(|c| {
+        let (cx, cy, cz) = corner(c);
+        values[g.vidx(i + cx, j + cy, k + cz)]
+    });
+    let inside = |c: usize| v[c] < 0.0;
+
+    let mut crossing = [None::<Vector3>; 12];
+    let mut any = false;
+    for (e, &(a, b)) in CELL_EDGES.iter().enumerate() {
+        if inside(a) == inside(b) {
             continue;
         }
-        let t = va / (va - vb);
+        let t = v[a] / (v[a] - v[b]);
+        let (ax, ay, az) = corner(a);
+        let (bx, by, bz) = corner(b);
         let pa = g.point_at(i + ax, j + ay, k + az);
         let pb = g.point_at(i + bx, j + by, k + bz);
-        sum += pa.coords + (pb.coords - pa.coords) * t;
-        count += 1;
+        crossing[e] = Some(pa.coords + (pb.coords - pa.coords) * t);
+        any = true;
     }
-    (count > 0).then(|| Point3::from(sum / count as f64))
+    if !any {
+        return None;
+    }
+
+    let mut parent: [u8; 12] = core::array::from_fn(|e| e as u8);
+    for &(corners, edges) in &CELL_FACES {
+        let crossed: Vec<usize> = (0..4).filter(|&n| crossing[edges[n]].is_some()).collect();
+        match crossed[..] {
+            [p, q] => uf_union(&mut parent, edges[p] as u8, edges[q] as u8),
+            [_, _, _, _] => {
+                // Checkerboard face: corners alternate inside/outside, all
+                // four edges crossed. The two contour arcs wrap the diagonal
+                // corner pair whose sign differs from the bilinear saddle.
+                let f: [f64; 4] = core::array::from_fn(|n| v[corners[n]]);
+                let saddle = (f[0] * f[2] - f[1] * f[3]) / (f[0] + f[2] - f[1] - f[3]);
+                let wrap_even = inside(corners[0]) != (saddle < 0.0);
+                let (m, n) = if wrap_even { (0, 2) } else { (1, 3) };
+                for w in [m, n] {
+                    uf_union(&mut parent, edges[(w + 3) % 4] as u8, edges[w] as u8);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut comp_of_edge = [NO_COMP; 12];
+    let mut root_comp = [NO_COMP; 12];
+    let mut sums = [Vector3::zeros(); 4];
+    let mut counts = [0usize; 4];
+    let mut ncomp = 0u8;
+    for e in 0..12 {
+        let Some(x) = crossing[e] else { continue };
+        let r = uf_find(&mut parent, e as u8) as usize;
+        if root_comp[r] == NO_COMP {
+            debug_assert!(ncomp < 4, "more than four edge components in a cell");
+            root_comp[r] = ncomp;
+            ncomp += 1;
+        }
+        let c = root_comp[r];
+        comp_of_edge[e] = c;
+        sums[c as usize] += x;
+        counts[c as usize] += 1;
+    }
+    let mut points = [Point3::origin(); 4];
+    for c in 0..ncomp as usize {
+        points[c] = Point3::from(sums[c] / counts[c] as f64);
+    }
+    Some(Box::new(CellVerts {
+        comp_of_edge,
+        count: ncomp,
+        points,
+    }))
+}
+
+/// Numbered dual vertices for one cell: the component vertices occupy mesh
+/// positions `base..base + count`, so the vertex for a crossed edge slot is
+/// `base + comp_of_edge[slot]`.
+struct CellRef {
+    base: usize,
+    comp_of_edge: [u8; 12],
+}
+
+/// Extra vertices splitting doubly-crossed faces, keyed by (face axis,
+/// minus-side cell, crossed-edge slot in that cell). Both crossed edges of
+/// one contour arc map to the arc's shared vertex.
+type FaceSplits = std::collections::HashMap<(usize, [usize; 3], usize), usize>;
+
+/// Find faces whose four crossings belong to a single component in *both*
+/// adjacent cells — the component passes through the face twice, so the four
+/// quads around the face would all share one mesh edge (a four-quad edge).
+/// For each contour arc of such a face, append an extra vertex at the
+/// midpoint of the arc's two crossings; [`slab_triangles`] routes the arc's
+/// two quads through it.
+fn doubled_face_splits(
+    g: &Grid,
+    values: &[f64],
+    cell_vertex: &[Option<CellRef>],
+    positions: &mut Vec<Point3>,
+) -> FaceSplits {
+    let mut splits = FaceSplits::new();
+    for i in 0..g.n[0] {
+        for j in 0..g.n[1] {
+            for k in 0..g.n[2] {
+                let Some(c1) = cell_vertex[g.cidx(i, j, k)].as_ref() else {
+                    continue;
+                };
+                for axis in 0..3 {
+                    let mut nb = [i, j, k];
+                    nb[axis] += 1;
+                    if nb[axis] >= g.n[axis] {
+                        continue;
+                    }
+                    let Some(c2) = cell_vertex[g.cidx(nb[0], nb[1], nb[2])].as_ref() else {
+                        continue;
+                    };
+                    // The shared face: this cell's plus face and the
+                    // neighbor's minus face along `axis`.
+                    let (corners, edges) = CELL_FACES[2 * axis + 1];
+                    let nb_edges = CELL_FACES[2 * axis].1;
+                    let single = |cr: &CellRef, es: [usize; 4]| {
+                        cr.comp_of_edge[es[0]] != NO_COMP
+                            && es
+                                .iter()
+                                .all(|&e| cr.comp_of_edge[e] == cr.comp_of_edge[es[0]])
+                    };
+                    if !single(c1, edges) || !single(c2, nb_edges) {
+                        continue;
+                    }
+                    // Same asymptotic decider as `cell_verts`, so the arcs
+                    // match the component tracing on both sides.
+                    let f: [f64; 4] = core::array::from_fn(|n| {
+                        let (cx, cy, cz) = corner(corners[n]);
+                        values[g.vidx(i + cx, j + cy, k + cz)]
+                    });
+                    let saddle = (f[0] * f[2] - f[1] * f[3]) / (f[0] + f[2] - f[1] - f[3]);
+                    let wrap_even = (f[0] < 0.0) != (saddle < 0.0);
+                    let wraps = if wrap_even { [0, 2] } else { [1, 3] };
+                    for w in wraps {
+                        let slots = [edges[(w + 3) % 4], edges[w]];
+                        let mut sum = Vector3::zeros();
+                        for &s in &slots {
+                            let (a, b) = CELL_EDGES[s];
+                            let (ax, ay, az) = corner(a);
+                            let (bx, by, bz) = corner(b);
+                            let va = values[g.vidx(i + ax, j + ay, k + az)];
+                            let vb = values[g.vidx(i + bx, j + by, k + bz)];
+                            let pa = g.point_at(i + ax, j + ay, k + az);
+                            let pb = g.point_at(i + bx, j + by, k + bz);
+                            sum += pa.coords + (pb.coords - pa.coords) * (va / (va - vb));
+                        }
+                        let split_vertex = positions.len();
+                        positions.push(Point3::from(sum / 2.0));
+                        for &s in &slots {
+                            splits.insert((axis, [i, j, k], s), split_vertex);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    splits
 }
 
 /// Triangles for one `(d, gd)` slab of the quad-emission pass: for each
 /// interior grid edge along axis `d` at depth `gd` with a sign change,
-/// connect the vertices of the four cells sharing that edge. Winding: with
-/// perpendicular axes u = (d+1)%3 and v = (d+2)%3, the quad order
+/// connect the vertices of the four cells sharing that edge — a quad, with
+/// a split vertex inserted on any side crossing a doubled face (see
+/// [`doubled_face_splits`]) — and fan-triangulate. Winding: with
+/// perpendicular axes u = (d+1)%3 and v = (d+2)%3, the order
 /// (0,0),(1,0),(1,1),(0,1) faces +d; reversed when the surface faces -d.
 fn slab_triangles(
     g: &Grid,
     values: &[f64],
-    cell_vertex: &[Option<usize>],
+    cell_vertex: &[Option<CellRef>],
+    splits: &FaceSplits,
     d: usize,
     gd: usize,
 ) -> Vec<[usize; 3]> {
     let u = (d + 1) % 3;
     let v = (d + 2) % 3;
+    // Perpendicular axes in increasing order: within each CELL_EDGES axis
+    // group the slot layout is `offset(p) + 2 * offset(q)`.
+    let (p, q) = match d {
+        0 => (1, 2),
+        1 => (0, 2),
+        _ => (0, 1),
+    };
     let mut tris = Vec::new();
     for gu in 1..g.n[u] {
         for gv in 1..g.n[v] {
@@ -184,15 +404,46 @@ fn slab_triangles(
                 let mut c = g0;
                 c[u] = c[u] - 1 + a;
                 c[v] = c[v] - 1 + b;
-                cell_vertex[g.cidx(c[0], c[1], c[2])]
-                    .expect("cell adjacent to a sign-change edge must have a vertex")
+                // This grid edge's slot within the cell's CELL_EDGES.
+                let mut delta = [0usize; 3];
+                delta[u] = 1 - a;
+                delta[v] = 1 - b;
+                let slot = 4 * d + delta[p] + 2 * delta[q];
+                let cr = cell_vertex[g.cidx(c[0], c[1], c[2])]
+                    .as_ref()
+                    .expect("cell adjacent to a sign-change edge must have a vertex");
+                let comp = cr.comp_of_edge[slot];
+                debug_assert_ne!(comp, NO_COMP, "crossed edge missing from its cell");
+                (cr.base + comp as usize, c, slot)
             };
-            let mut quad = [cell(0, 0), cell(1, 0), cell(1, 1), cell(0, 1)];
-            if !inside0 {
-                quad.reverse();
+            let cells = [cell(0, 0), cell(1, 0), cell(1, 1), cell(0, 1)];
+            // Quad side `s` joins `cells[s]` and `cells[(s + 1) % 4]`; the
+            // face between them is keyed in `splits` by its minus-side cell.
+            let side_minus = [(0, u), (1, v), (3, u), (0, v)];
+            let mut poly: Vec<usize> = Vec::with_capacity(8);
+            let mut lead = None;
+            for (s, &(vertex, _, _)) in cells.iter().enumerate() {
+                poly.push(vertex);
+                let (m, axis) = side_minus[s];
+                let (_, coords, slot) = cells[m];
+                if let Some(&split_vertex) = splits.get(&(axis, coords, slot)) {
+                    poly.push(split_vertex);
+                    lead = Some(split_vertex);
+                }
             }
-            tris.push([quad[0], quad[1], quad[2]]);
-            tris.push([quad[0], quad[2], quad[3]]);
+            if !inside0 {
+                poly.reverse();
+            }
+            // Fan from a split vertex when there is one: every chord is then
+            // incident to it, so no chord can recreate the doubled edge the
+            // split vertex exists to divide.
+            if let Some(sv) = lead {
+                let at = poly.iter().position(|&x| x == sv).unwrap();
+                poly.rotate_left(at);
+            }
+            for t in 1..poly.len() - 1 {
+                tris.push([poly[0], poly[t], poly[t + 1]]);
+            }
         }
     }
     tris
@@ -226,24 +477,33 @@ fn build_mesh(sdf: &dyn Sdf, opts: &MeshOptions) -> TriangleMesh {
 
     // Compute cell vertices in parallel, then number them in serial scan
     // order so vertex indices match the serial mesher exactly.
-    let mut candidates: Vec<Option<Point3>> = vec![None; nx * ny * nz];
+    let mut candidates: Vec<Option<Box<CellVerts>>> = Vec::with_capacity(nx * ny * nz);
+    candidates.resize_with(nx * ny * nz, || None);
     candidates
         .par_chunks_mut(ny * nz)
         .enumerate()
         .for_each(|(i, slab)| {
             for j in 0..ny {
                 for k in 0..nz {
-                    slab[j * nz + k] = cell_candidate(g, &values, i, j, k);
+                    slab[j * nz + k] = cell_verts(g, &values, i, j, k);
                 }
             }
         });
-    let mut cell_vertex: Vec<Option<usize>> = vec![None; nx * ny * nz];
+    let mut cell_vertex: Vec<Option<CellRef>> = Vec::with_capacity(nx * ny * nz);
+    cell_vertex.resize_with(nx * ny * nz, || None);
     for (c, candidate) in candidates.into_iter().enumerate() {
-        if let Some(p) = candidate {
-            cell_vertex[c] = Some(mesh.positions.len());
-            mesh.positions.push(p);
+        if let Some(cv) = candidate {
+            let base = mesh.positions.len();
+            mesh.positions
+                .extend_from_slice(&cv.points[..cv.count as usize]);
+            cell_vertex[c] = Some(CellRef {
+                base,
+                comp_of_edge: cv.comp_of_edge,
+            });
         }
     }
+
+    let splits = doubled_face_splits(g, &values, &cell_vertex, &mut mesh.positions);
 
     // Normals per vertex; parallel collect preserves order.
     mesh.normals = mesh
@@ -267,7 +527,7 @@ fn build_mesh(sdf: &dyn Sdf, opts: &MeshOptions) -> TriangleMesh {
         .collect();
     let per_slab: Vec<Vec<[usize; 3]>> = slabs
         .par_iter()
-        .map(|&(d, gd)| slab_triangles(g, &values, &cell_vertex, d, gd))
+        .map(|&(d, gd)| slab_triangles(g, &values, &cell_vertex, &splits, d, gd))
         .collect();
     for tris in per_slab {
         mesh.indices.extend(tris);
@@ -297,17 +557,25 @@ fn build_mesh_serial(sdf: &dyn Sdf, opts: &MeshOptions) -> TriangleMesh {
         }
     }
 
-    let mut cell_vertex: Vec<Option<usize>> = vec![None; nx * ny * nz];
+    let mut cell_vertex: Vec<Option<CellRef>> = Vec::with_capacity(nx * ny * nz);
+    cell_vertex.resize_with(nx * ny * nz, || None);
     for i in 0..nx {
         for j in 0..ny {
             for k in 0..nz {
-                if let Some(p) = cell_candidate(g, &values, i, j, k) {
-                    cell_vertex[g.cidx(i, j, k)] = Some(mesh.positions.len());
-                    mesh.positions.push(p);
+                if let Some(cv) = cell_verts(g, &values, i, j, k) {
+                    let base = mesh.positions.len();
+                    mesh.positions
+                        .extend_from_slice(&cv.points[..cv.count as usize]);
+                    cell_vertex[g.cidx(i, j, k)] = Some(CellRef {
+                        base,
+                        comp_of_edge: cv.comp_of_edge,
+                    });
                 }
             }
         }
     }
+
+    let splits = doubled_face_splits(g, &values, &cell_vertex, &mut mesh.positions);
 
     for p in &mesh.positions {
         let grad = gradient(sdf, p);
@@ -322,7 +590,7 @@ fn build_mesh_serial(sdf: &dyn Sdf, opts: &MeshOptions) -> TriangleMesh {
     for d in 0..3 {
         for gd in 0..g.n[d] {
             mesh.indices
-                .extend(slab_triangles(g, &values, &cell_vertex, d, gd));
+                .extend(slab_triangles(g, &values, &cell_vertex, &splits, d, gd));
         }
     }
 
@@ -333,7 +601,7 @@ fn build_mesh_serial(sdf: &dyn Sdf, opts: &MeshOptions) -> TriangleMesh {
 mod tests {
     use super::*;
     use crate::blend::SmoothSubtraction;
-    use crate::csg::Union;
+    use crate::csg::{Intersection, Subtraction, Union};
     use crate::primitives::{Box3, Cylinder, Sphere, Torus};
 
     fn bounds(half: f64) -> BoundingBox3 {
@@ -495,6 +763,81 @@ mod tests {
         }
     }
 
+    /// Two overlapping unit spheres, subtracted: the boundary of the
+    /// difference has a sharp concave crease circle where the two sphere
+    /// sheets meet, so cells along the crease are crossed by both sheets.
+    fn subtracted_spheres() -> Subtraction<Sphere, Sphere> {
+        Subtraction {
+            a: Sphere {
+                center: Point3::origin(),
+                radius: 1.0,
+            },
+            b: Sphere {
+                center: Point3::new(1.0, 0.0, 0.0),
+                radius: 1.0,
+            },
+        }
+    }
+
+    /// Regression for of-1ad: single-vertex-per-cell dual contouring could
+    /// not represent the crease circle of a CSG subtraction — grid faces
+    /// there have checkerboard corner signs (all four edges crossed), so
+    /// four quads shared one mesh edge and the mesh was not manifold at
+    /// most resolutions. Cells now place one vertex per surface component.
+    #[test]
+    fn csg_subtraction_crease_manifold() {
+        let shape = subtracted_spheres();
+        for resolution in [16, 24, 32, 48, 64] {
+            let opts = MeshOptions {
+                bounds: bounds(1.4),
+                resolution,
+            };
+            let mesh = mesh_sdf_indexed(&shape, &opts);
+            assert!(!mesh.is_empty(), "empty mesh at resolution {resolution}");
+            assert!(
+                mesh.is_closed_manifold(),
+                "not a closed manifold at resolution {resolution}"
+            );
+            // Component vertices must stay on the surface: within one cell
+            // diagonal, like single-vertex cells.
+            let diagonal = 2.8 / resolution as f64 * 3.0f64.sqrt();
+            for p in &mesh.positions {
+                assert!(
+                    shape.eval(p).abs() < diagonal,
+                    "vertex {p:?} too far from surface at resolution {resolution}"
+                );
+            }
+        }
+    }
+
+    /// The convex counterpart creases too (lens-shaped intersection): must
+    /// also mesh closed across the same resolutions.
+    #[test]
+    fn csg_intersection_crease_manifold() {
+        let shape = Intersection {
+            a: Sphere {
+                center: Point3::origin(),
+                radius: 1.0,
+            },
+            b: Sphere {
+                center: Point3::new(1.0, 0.0, 0.0),
+                radius: 1.0,
+            },
+        };
+        for resolution in [16, 24, 32, 48, 64] {
+            let opts = MeshOptions {
+                bounds: bounds(1.6),
+                resolution,
+            };
+            let mesh = mesh_sdf_indexed(&shape, &opts);
+            assert!(!mesh.is_empty(), "empty mesh at resolution {resolution}");
+            assert!(
+                mesh.is_closed_manifold(),
+                "not a closed manifold at resolution {resolution}"
+            );
+        }
+    }
+
     /// The parallel mesher must reproduce the serial reference bit-for-bit:
     /// same vertices in the same order, same normals, same triangles.
     fn assert_parallel_matches_serial(sdf: &dyn Sdf, opts: &MeshOptions) {
@@ -517,6 +860,18 @@ mod tests {
             resolution: 20,
         };
         assert_parallel_matches_serial(&s, &opts);
+    }
+
+    /// Exercises the multi-component cell path (crease cells hold two
+    /// vertices) in both meshers.
+    #[test]
+    fn parallel_matches_serial_csg_subtraction() {
+        let shape = subtracted_spheres();
+        let opts = MeshOptions {
+            bounds: bounds(1.4),
+            resolution: 32,
+        };
+        assert_parallel_matches_serial(&shape, &opts);
     }
 
     #[test]
@@ -709,6 +1064,62 @@ mod tests {
             resolution: 8,
         };
         assert!(mesh_sdf(&s, &opts).is_empty());
+    }
+
+    /// Off-axis subtraction that lands one surface component on both sides
+    /// of a doubly-crossed face at these resolutions: a cell along the
+    /// crease is crossed by a single surface sheet that passes through one
+    /// face twice (all four crossings of an ambiguous face in one
+    /// component, in both adjacent cells). Without splitting such faces the
+    /// four quads around them shared one mesh edge (of-1ad residual).
+    fn offset_subtracted_spheres() -> Subtraction<Sphere, Sphere> {
+        Subtraction {
+            a: Sphere {
+                center: Point3::origin(),
+                radius: 1.0,
+            },
+            b: Sphere {
+                center: Point3::new(0.7, 0.31, 0.13),
+                radius: 0.8,
+            },
+        }
+    }
+
+    #[test]
+    fn doubled_face_split_keeps_mesh_manifold() {
+        let shape = offset_subtracted_spheres();
+        for resolution in [48, 84, 88, 94] {
+            let opts = MeshOptions {
+                bounds: bounds(1.4),
+                resolution,
+            };
+            let mesh = mesh_sdf_indexed(&shape, &opts);
+            assert!(!mesh.is_empty(), "empty mesh at resolution {resolution}");
+            assert!(
+                mesh.is_closed_manifold(),
+                "not a closed manifold at resolution {resolution}"
+            );
+            // Split vertices sit at crossing midpoints, so they obey the
+            // same one-cell-diagonal surface distance bound as cell
+            // vertices.
+            let diagonal = 2.8 / resolution as f64 * 3.0f64.sqrt();
+            for p in &mesh.positions {
+                assert!(
+                    shape.eval(p).abs() < diagonal,
+                    "vertex {p:?} too far from surface at resolution {resolution}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parallel_matches_serial_doubled_face_split() {
+        let shape = offset_subtracted_spheres();
+        let opts = MeshOptions {
+            bounds: bounds(1.4),
+            resolution: 48,
+        };
+        assert_parallel_matches_serial(&shape, &opts);
     }
 
     #[test]
