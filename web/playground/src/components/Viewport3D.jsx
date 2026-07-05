@@ -2,14 +2,38 @@ import { useEffect, useRef } from 'react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { TransformControls } from 'three/addons/controls/TransformControls.js';
+import {
+  easeInOutCubic,
+  gridLevels,
+  orthoHalfExtents,
+  planeIndicatorSize,
+  sketchViewPose,
+} from '../lib/sketchView.js';
 
-function frameCamera({ camera, controls }, { center, radius }) {
+function frameCamera(ctx, { center, radius }) {
+  const { camera, controls } = ctx;
+  // Clip planes are owned by the render loop (adapted to camera distance
+  // every frame), so framing only has to place the camera.
+  // Mid-sketch reframes (script edited while sketching) must stay normal to
+  // the sketch plane instead of snapping back to the oblique house view.
+  if (ctx.activeSketchPlane) {
+    const pose = sketchViewPose(ctx.activeSketchPlane, center, radius * 2.6);
+    if (pose) {
+      // Jump straight to the pose (cancelling any fly-to in flight) and make
+      // sure the orthographic projection is on.
+      ctx.cameraAnim = null;
+      ctx.sketchOrtho = true;
+      controls.enabled = true;
+      camera.position.set(...pose.position);
+      camera.up.set(...pose.up);
+      controls.target.set(...pose.target);
+      camera.lookAt(controls.target);
+      return;
+    }
+  }
   const target = new THREE.Vector3(...center);
   const direction = new THREE.Vector3(1, 0.7, 1.2).normalize();
   camera.position.copy(target).addScaledVector(direction, radius * 2.6);
-  camera.near = radius / 100;
-  camera.far = radius * 100;
-  camera.updateProjectionMatrix();
   controls.target.copy(target);
 }
 
@@ -18,6 +42,115 @@ const SKETCH_PLANES = {
   XZ: { rotation: [-Math.PI / 2, 0, 0], color: 0x5fdf8a },
   YZ: { rotation: [0, Math.PI / 2, 0], color: 0xef6f6f },
 };
+
+const SKETCH_VIEW_ANIM_MS = 300;
+
+/**
+ * Unbounded adaptive ground grid: a camera-tracking quad whose fragment
+ * shader draws world-space minor/major lines with fwidth anti-aliasing and a
+ * radial distance fade. Spacing uniforms are re-derived from the camera
+ * distance every frame (see gridLevels), so the grid never runs out no
+ * matter how large the scene gets.
+ */
+function createInfiniteGrid() {
+  const material = new THREE.ShaderMaterial({
+    transparent: true,
+    depthWrite: false,
+    side: THREE.DoubleSide,
+    uniforms: {
+      uMinor: { value: 0.5 },
+      uMajor: { value: 5 },
+      uMinorAlpha: { value: 1 },
+      uFadeDist: { value: 40 },
+      uCamPos: { value: new THREE.Vector3() },
+      uMinorColor: { value: new THREE.Color(0x22272f) },
+      uMajorColor: { value: new THREE.Color(0x2f3742) },
+    },
+    vertexShader: /* glsl */ `
+      varying vec3 vWorldPos;
+      void main() {
+        vec4 wp = modelMatrix * vec4(position, 1.0);
+        vWorldPos = wp.xyz;
+        gl_Position = projectionMatrix * viewMatrix * wp;
+      }
+    `,
+    fragmentShader: /* glsl */ `
+      varying vec3 vWorldPos;
+      uniform float uMinor;
+      uniform float uMajor;
+      uniform float uMinorAlpha;
+      uniform float uFadeDist;
+      uniform vec3 uCamPos;
+      uniform vec3 uMinorColor;
+      uniform vec3 uMajorColor;
+
+      float gridLine(vec2 coord, float spacing) {
+        vec2 g = coord / spacing;
+        vec2 d = abs(fract(g - 0.5) - 0.5) / fwidth(g);
+        return 1.0 - min(min(d.x, d.y), 1.0);
+      }
+
+      void main() {
+        vec2 p = vWorldPos.xz;
+        // Three decade levels crossfaded by uMinorAlpha so lines promote
+        // smoothly from minor to major strength as the camera pulls back.
+        float wMinor = 0.45 * uMinorAlpha;
+        float wMajor = mix(0.45, 0.8, uMinorAlpha);
+        float lineA = gridLine(p, uMinor) * wMinor;
+        float lineB = gridLine(p, uMajor) * wMajor;
+        float lineC = gridLine(p, uMajor * 10.0) * 0.8;
+        float dist = distance(vWorldPos, uCamPos);
+        float fade = 1.0 - smoothstep(uFadeDist * 0.3, uFadeDist, dist);
+        float alpha = max(max(lineA, lineB), lineC) * fade;
+        if (alpha < 0.003) discard;
+        vec3 colorB = mix(uMinorColor, uMajorColor, uMinorAlpha);
+        vec3 color = (lineC >= lineB && lineC >= lineA) ? uMajorColor
+          : (lineB >= lineA ? colorB : uMinorColor);
+        gl_FragColor = vec4(color, alpha);
+      }
+    `,
+  });
+  const mesh = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), material);
+  mesh.rotation.x = -Math.PI / 2;
+  mesh.renderOrder = -1;
+  return mesh;
+}
+
+/**
+ * Kick off a short camera fly-to processed by the render loop. Orbit input is
+ * suspended for the duration; the loop re-enables it and fires onDone.
+ */
+function startViewAnimation(ctx, pose, onDone = null) {
+  const { camera, controls } = ctx;
+  controls.enabled = false;
+  ctx.cameraAnim = {
+    fromPos: camera.position.clone(),
+    fromUp: camera.up.clone(),
+    fromTarget: controls.target.clone(),
+    toPos: new THREE.Vector3(...pose.position),
+    toUp: new THREE.Vector3(...pose.up),
+    toTarget: new THREE.Vector3(...pose.target),
+    start: null,
+    duration: SKETCH_VIEW_ANIM_MS,
+    onDone,
+  };
+}
+
+/** Per-frame grid upkeep: recenter under the view, cover it, adapt spacing. */
+function updateInfiniteGrid(grid, camera, target) {
+  const dist = Math.max(camera.position.distanceTo(target), 1e-3);
+  const levels = gridLevels(dist);
+  const u = grid.material.uniforms;
+  u.uMinor.value = levels.minor;
+  u.uMajor.value = levels.major;
+  u.uMinorAlpha.value = levels.minorAlpha;
+  u.uFadeDist.value = levels.fadeDist;
+  u.uCamPos.value.copy(camera.position);
+  // The line pattern is anchored in world space, so moving/scaling the quad
+  // only changes coverage, never the pattern itself.
+  grid.position.set(target.x, 0, target.z);
+  grid.scale.setScalar(levels.fadeDist * 2);
+}
 
 const HIGHLIGHT_MATERIAL = new THREE.MeshStandardMaterial({
   color: 0x4fc3f7,
@@ -64,6 +197,11 @@ export default function Viewport3D({
     const camera = new THREE.PerspectiveCamera(45, 1, 0.01, 1000);
     camera.position.set(3, 2.5, 4);
 
+    // Orthographic twin used while sketching (no perspective distortion of
+    // dimensions). OrbitControls always drives the perspective camera; the
+    // ortho camera mirrors its pose each frame with a matched frustum.
+    const orthoCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.01, 1000);
+
     const orbitControls = new OrbitControls(camera, renderer.domElement);
     orbitControls.enableDamping = true;
 
@@ -75,7 +213,7 @@ export default function Viewport3D({
     fillLight.position.set(-4, -2, -3);
     scene.add(fillLight);
 
-    const grid = new THREE.GridHelper(10, 20, 0x2b323d, 0x22272f);
+    const grid = createInfiniteGrid();
     scene.add(grid);
 
     const material = new THREE.MeshStandardMaterial({
@@ -159,9 +297,56 @@ export default function Viewport3D({
     observer.observe(container);
     resize();
 
+    // Mirror the perspective camera's pose with a frustum matched to its
+    // apparent size at the orbit target, so dollying still reads as zoom.
+    function syncOrthoCamera() {
+      const dist = Math.max(camera.position.distanceTo(orbitControls.target), 1e-3);
+      const { halfW, halfH } = orthoHalfExtents(dist, camera.fov, camera.aspect);
+      orthoCamera.left = -halfW;
+      orthoCamera.right = halfW;
+      orthoCamera.top = halfH;
+      orthoCamera.bottom = -halfH;
+      orthoCamera.near = dist / 100;
+      orthoCamera.far = dist * 100;
+      orthoCamera.position.copy(camera.position);
+      orthoCamera.quaternion.copy(camera.quaternion);
+      orthoCamera.up.copy(camera.up);
+      orthoCamera.updateProjectionMatrix();
+    }
+
     renderer.setAnimationLoop(() => {
-      orbitControls.update();
-      renderer.render(scene, camera);
+      const ctx = sceneRef.current;
+      const anim = ctx?.cameraAnim;
+      if (anim) {
+        const now = performance.now();
+        anim.start ??= now;
+        const t = easeInOutCubic((now - anim.start) / anim.duration);
+        camera.position.lerpVectors(anim.fromPos, anim.toPos, t);
+        camera.up.lerpVectors(anim.fromUp, anim.toUp, t).normalize();
+        orbitControls.target.lerpVectors(anim.fromTarget, anim.toTarget, t);
+        camera.lookAt(orbitControls.target);
+        if (now - anim.start >= anim.duration) {
+          ctx.cameraAnim = null;
+          orbitControls.enabled = true;
+          orbitControls.update();
+          anim.onDone?.();
+        }
+      } else {
+        orbitControls.update();
+      }
+
+      // Adapt clip planes to the view distance so zooming far out (or in)
+      // never clips the scene or the grid away.
+      const viewDist = Math.max(camera.position.distanceTo(orbitControls.target), 1e-3);
+      camera.near = viewDist / 500;
+      camera.far = viewDist * 500;
+      camera.updateProjectionMatrix();
+
+      const sketching = Boolean(ctx?.sketchOrtho);
+      const activeCamera = sketching ? orthoCamera : camera;
+      if (sketching) syncOrthoCamera();
+      updateInfiniteGrid(grid, activeCamera, orbitControls.target);
+      renderer.render(scene, activeCamera);
     });
 
     function onKeyDown(event) {
@@ -193,6 +378,10 @@ export default function Viewport3D({
       anchor,
       ghostMesh,
       previewObject,
+      cameraAnim: null,
+      sketchOrtho: false,
+      savedView: null,
+      activeSketchPlane: null,
       _onPick: null,
       _onTransform: null,
     };
@@ -252,6 +441,35 @@ export default function Viewport3D({
     }
   }, [previewMesh]);
 
+  // SolidWorks-style "Normal To": entering sketch mode (or switching planes
+  // mid-sketch) flies the camera orthogonal to the sketch plane and switches
+  // to orthographic projection; exiting restores the saved perspective view.
+  useEffect(() => {
+    const ctx = sceneRef.current;
+    if (!ctx) return;
+    const { camera, controls } = ctx;
+    ctx.activeSketchPlane = sketchPlane && SKETCH_PLANES[sketchPlane] ? sketchPlane : null;
+    if (ctx.activeSketchPlane) {
+      if (!ctx.savedView) {
+        ctx.savedView = {
+          position: camera.position.toArray(),
+          target: controls.target.toArray(),
+          up: camera.up.toArray(),
+        };
+      }
+      const dist = Math.max(camera.position.distanceTo(controls.target), 1e-3);
+      const pose = sketchViewPose(sketchPlane, controls.target.toArray(), dist);
+      startViewAnimation(ctx, pose, () => {
+        ctx.sketchOrtho = true;
+      });
+    } else if (ctx.savedView) {
+      const saved = ctx.savedView;
+      ctx.savedView = null;
+      ctx.sketchOrtho = false;
+      startViewAnimation(ctx, saved);
+    }
+  }, [sketchPlane]);
+
   useEffect(() => {
     const ctx = sceneRef.current;
     if (!ctx || !sketchPlane) return undefined;
@@ -262,7 +480,19 @@ export default function Viewport3D({
     const group = new THREE.Group();
     group.rotation.set(...spec.rotation);
 
-    const fillGeometry = new THREE.PlaneGeometry(10, 10);
+    // Size the indicator from the scene bounds so drawn geometry never
+    // outruns it; it is a visual aid, not a physical object.
+    const meshGeometry = ctx.meshObject.geometry;
+    if (!meshGeometry.boundingSphere) meshGeometry.computeBoundingSphere();
+    const sphere = meshGeometry.boundingSphere;
+    const hasBounds =
+      sphere && Number.isFinite(sphere.radius) && sphere.radius > 0;
+    const size = planeIndicatorSize(
+      hasBounds ? sphere.center.toArray() : [0, 0, 0],
+      hasBounds ? sphere.radius : 0
+    );
+
+    const fillGeometry = new THREE.PlaneGeometry(size, size);
     const fillMaterial = new THREE.MeshBasicMaterial({
       color: spec.color,
       transparent: true,
@@ -288,7 +518,7 @@ export default function Viewport3D({
       edgeGeometry.dispose();
       edgeMaterial.dispose();
     };
-  }, [sketchPlane]);
+  }, [sketchPlane, mesh]);
 
   useEffect(() => {
     const ctx = sceneRef.current;
