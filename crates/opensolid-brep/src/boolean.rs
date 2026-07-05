@@ -917,7 +917,7 @@ impl<'a> Pipeline<'a> {
                 if !matches!(fp.chart, Chart::Cylinder { .. }) {
                     continue;
                 }
-                let Some(seam_point) = seam_crossing(fp, &imp.sampled.points) else {
+                let Some(seam_point) = seam_crossing(fp, &imp.curve, &imp.sampled.points) else {
                     continue;
                 };
                 events.push((CurveSource::Imprint { index: ii }, seam_point));
@@ -1350,10 +1350,25 @@ fn polyline_length(points: &[Point3]) -> f64 {
     points.windows(2).map(|w| (w[1] - w[0]).norm()).sum()
 }
 
-/// Where a closed 3D polyline on a periodic face crosses the face's seam
+/// Where a closed imprint on a periodic face crosses the face's seam
 /// meridian (the minimum-u side of its cover window), if it wraps the
-/// period. Linear interpolation between the bracketing samples.
-fn seam_crossing(face_poly: &FaceRegionPoly, points: &[Point3]) -> Option<Point3> {
+/// period. The sampled polyline `points` locates the bracketing samples;
+/// the crossing is then refined against the exact `curve` by bisecting
+/// `u(t) = level`, so the returned point lies on the curve (and on the
+/// seam meridian) to root-find precision. Interpolating the bracketing
+/// chord instead would leave the point off the curve by up to the sagitta
+/// `r * (1 - cos(pi / SAMPLES_PER_CIRCLE)) ≈ 5.4e-4 * r`, which crosses
+/// [`MAX_ALLOWED_TOLERANCE`](crate::check::MAX_ALLOWED_TOLERANCE) once
+/// r ≳ 19 and would be recorded as the seam vertex's tolerance.
+///
+/// Only the FIRST crossing of the seam level is returned. That is exact
+/// for the current SSI repertoire — lines, circles, and ellipses are
+/// u-monotonic graphs on a cylinder cover, so a closed imprint that wraps
+/// the period crosses each seam level exactly once. Future non-monotonic
+/// imprints (unequal-radius cylinder-cylinder quartics, NURBS SSI) can
+/// cross a level several times; each crossing would need its own split or
+/// the imprint is left as a non-chordable chain.
+fn seam_crossing(face_poly: &FaceRegionPoly, curve: &Curve3, points: &[Point3]) -> Option<Point3> {
     let uv = map_polyline(&face_poly.chart, points);
     // Closing segment: unwrap the first point relative to the last.
     let close_u = {
@@ -1401,13 +1416,70 @@ fn seam_crossing(face_poly: &FaceRegionPoly, points: &[Point3]) -> Option<Point3
         let (u0, _) = uv[i];
         let u1 = if i + 1 < n { uv[i + 1].0 } else { close_u };
         if (u0 - level) * (u1 - level) <= 0.0 && (u1 - u0).abs() > 1e-15 {
-            let t = (level - u0) / (u1 - u0);
             let p0 = points[i];
             let p1 = points[(i + 1) % n];
-            return Some(p0 + (p1 - p0) * t);
+            return Some(refine_seam_point(
+                &face_poly.chart,
+                curve,
+                level,
+                (u0, u1),
+                (&p0, &p1),
+            ));
         }
     }
     None
+}
+
+/// Refine a seam crossing bracketed by consecutive imprint samples
+/// `p0`/`p1` (unwrapped angles `u0`/`u1` straddling `level`) to a point on
+/// the exact `curve` at chart angle `level`, by bisecting `u(t) = level`
+/// over the curve-parameter bracket recovered by closest-point projection.
+fn refine_seam_point(
+    chart: &Chart,
+    curve: &Curve3,
+    level: f64,
+    (u0, u1): (f64, f64),
+    (p0, p1): (&Point3, &Point3),
+) -> Point3 {
+    let t0 = curve.project_point(p0).t;
+    let mut t1 = curve.project_point(p1).t;
+    if let Some(period) = curve.period() {
+        // Samples advance in curve parameter; unwrap the far bracket
+        // forward past a period seam.
+        while t1 <= t0 {
+            t1 += period;
+        }
+    }
+    // Angles along the bracket stay within a sample step of `u0`, far
+    // inside the ±π unwrap window of the hint.
+    let residual = |t: f64| chart.param(&curve.point(t), Some((u0, 0.0))).0 - level;
+    let (mut fa, fb) = (u0 - level, u1 - level);
+    if fa == 0.0 {
+        return curve.point(t0);
+    }
+    if fb == 0.0 {
+        return curve.point(t1);
+    }
+    if fa * fb > 0.0 || t1 <= t0 {
+        // Projection disagrees with the polyline bracketing (degenerate
+        // segment); fall back to the chord point.
+        return *p0 + (*p1 - *p0) * ((level - u0) / (u1 - u0));
+    }
+    let (mut ta, mut tb) = (t0, t1);
+    for _ in 0..CLIP_REFINE_ITERATIONS {
+        let tm = 0.5 * (ta + tb);
+        let fm = residual(tm);
+        if fm == 0.0 {
+            return curve.point(tm);
+        }
+        if (fm > 0.0) == (fa > 0.0) {
+            ta = tm;
+            fa = fm;
+        } else {
+            tb = tm;
+        }
+    }
+    curve.point(0.5 * (ta + tb))
 }
 
 // ---------------------------------------------------------------------
@@ -2717,5 +2789,115 @@ mod tests {
             err.to_string().contains("tangent"),
             "unhelpful error: {err}"
         );
+    }
+
+    /// A cylinder-wall cover polygon (one rectangular loop in `(u, v)`)
+    /// whose seam meridian sits at `seam_u`, plus the matching chart.
+    fn wall_poly(radius: f64, seam_u: f64, half_height: f64) -> FaceRegionPoly {
+        let origin = Point3::new(0.0, 0.0, 0.0);
+        let axis = Vector3::new(0.0, 0.0, 1.0);
+        let e_u = Vector3::new(1.0, 0.0, 0.0);
+        let e_v = Vector3::new(0.0, 1.0, 0.0);
+        let corner = |u: f64, v: f64| {
+            let p = origin + (e_u * u.cos() + e_v * u.sin()) * radius + axis * v;
+            ((u, v), p)
+        };
+        FaceRegionPoly {
+            chart: Chart::Cylinder {
+                origin,
+                axis,
+                e_u,
+                e_v,
+                radius,
+            },
+            loops: vec![vec![
+                corner(seam_u, -half_height),
+                corner(seam_u + TWO_PI, -half_height),
+                corner(seam_u + TWO_PI, half_height),
+                corner(seam_u, half_height),
+            ]],
+        }
+    }
+
+    /// Sample a closed curve exactly as [`clip_imprint`] does for a full
+    /// ring: `SAMPLES_PER_CIRCLE` points uniform over one period.
+    fn ring_samples(curve: &Curve3) -> Vec<Point3> {
+        (0..SAMPLES_PER_CIRCLE)
+            .map(|i| curve.point(TWO_PI * i as f64 / SAMPLES_PER_CIRCLE as f64))
+            .collect()
+    }
+
+    #[test]
+    fn seam_crossing_lands_on_curve_for_phase_misaligned_ring() {
+        // A circular ring on an r = 25 wall, parameterized with its basis
+        // rotated 0.3 rad against the chart (an equal-radius ellipse):
+        // samples straddle the seam instead of landing on it, so a chord
+        // point would be off the curve by the sagitta ≈ 5.35e-4 * 25 ≈
+        // 0.013 > MAX_ALLOWED_TOLERANCE. The refined point must sit on
+        // the curve at exactly the seam angle.
+        let r = 25.0;
+        let phase: f64 = 0.3;
+        let fp = wall_poly(r, -std::f64::consts::PI, 2.0 * r);
+        let curve = Curve3::Ellipse {
+            center: Point3::new(0.0, 0.0, 0.0),
+            axis: Vector3::new(0.0, 0.0, 1.0),
+            major_dir: Vector3::new(phase.cos(), phase.sin(), 0.0),
+            major_radius: r,
+            minor_radius: r,
+        };
+        let points = ring_samples(&curve);
+        let p = seam_crossing(&fp, &curve, &points).expect("ring wraps the period");
+        // Seam angle u = π on this ring is curve parameter t = π - phase.
+        let expected = curve.point(std::f64::consts::PI - phase);
+        assert!(
+            (p - expected).norm() < 1e-9,
+            "seam vertex off the exact curve by {:.3e}",
+            (p - expected).norm()
+        );
+    }
+
+    #[test]
+    fn seam_crossing_lands_on_curve_for_tilted_section_ellipse() {
+        // Tilted-plane section of an r = 50 cylinder (the ellipse-imprint
+        // shape a tilted tool would produce): semi-minor r on the wall,
+        // semi-major r / cos(alpha). The seam is placed off the sample
+        // grid so linear interpolation would err by ~0.02.
+        let r = 50.0;
+        let alpha: f64 = 0.5;
+        let seam_u = -3.0; // not a multiple of the 2π/96 sample spacing
+        let fp = wall_poly(r, seam_u, 2.0 * r);
+        let curve = Curve3::Ellipse {
+            center: Point3::new(0.0, 0.0, 0.0),
+            axis: Vector3::new(alpha.sin(), 0.0, alpha.cos()),
+            major_dir: Vector3::new(alpha.cos(), 0.0, -alpha.sin()),
+            major_radius: r / alpha.cos(),
+            minor_radius: r,
+        };
+        let points = ring_samples(&curve);
+        let p = seam_crossing(&fp, &curve, &points).expect("ring wraps the period");
+        // This section satisfies u(t) = t, so the seam angle is hit at
+        // t = seam_u (mod 2π).
+        let expected = curve.point(seam_u);
+        assert!(
+            (p - expected).norm() < 1e-9,
+            "seam vertex off the exact curve by {:.3e}",
+            (p - expected).norm()
+        );
+    }
+
+    #[test]
+    fn large_radius_through_hole_stays_within_tolerance_cap() {
+        // r = 25 is past the radius where a chord-interpolated seam
+        // vertex would exceed MAX_ALLOWED_TOLERANCE (r ≈ 19); the result
+        // must still validate with honestly recorded tolerances.
+        let (mut store, mut geo) = stores();
+        let block = block_at(&mut store, &mut geo, (100.0, 100.0, 10.0), (0.0, 0.0, 0.0));
+        let tool = cylinder_at(&mut store, &mut geo, 25.0, 20.0, (0.0, 0.0, 0.0));
+        let out = subtract(&store, &geo, block, tool, &tol()).unwrap();
+        assert_eq!(out.face_count(), 7, "6 block faces + 1 cylinder band");
+        assert_valid(&out, "large block minus r=25 cylinder");
+        assert_geometry_bound(&out, "large block minus r=25 cylinder");
+        let counts = out.store.euler_counts(out.body);
+        assert_eq!(counts.genus, 1, "through hole must give genus 1");
     }
 }
