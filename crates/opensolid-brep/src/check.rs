@@ -17,8 +17,13 @@
 //!   loop-less faces, or fin-less non-vertex loops.
 //! - **Loop connectivity**: `next`/`prev` links agree with each loop's fin
 //!   order, and each fin's end vertex is the next fin's start vertex.
-//! - **Closure and manifoldness**: every edge of a closed shell has exactly
-//!   two fins; no edge anywhere has more than two.
+//! - **Closure and manifoldness**: every edge of a shell that must be
+//!   closed — flagged `is_closed`, or any shell of a
+//!   [`BodyType::Solid`](crate::BodyType::Solid) body — has exactly two
+//!   fins; no edge anywhere has more than two. The producer-supplied
+//!   `is_closed` flag is not trusted: a solid shell flagged open fails
+//!   outright, and a flagged-open shell whose every edge is two-fin is
+//!   reported as inconsistent regardless of body type.
 //! - **Orientation consistency**: the two fins of a manifold edge traverse
 //!   it in opposite directions. This is the topological form of "adjacent
 //!   faces are consistently oriented"; [`FaceSense`](crate::FaceSense)
@@ -29,7 +34,10 @@
 //! - **Euler–Poincaré formula** `V - E + F - R = 2(S - H)`: checked only
 //!   when every other check passed *and* all shells are closed — the formula
 //!   applies to closed surfaces, and on a structurally broken graph the
-//!   counts are meaningless noise.
+//!   counts are meaningless noise. For solid bodies this bypass is never
+//!   silent: a solid with a non-closed shell has already failed the closure
+//!   checks above, so the formula is only ever skipped on a body that
+//!   reports at least one other failure.
 //!
 //! Geometric checks from the spec (edge-on-surface, vertex-on-edge,
 //! self-intersection) are deferred until faces and edges carry real
@@ -37,7 +45,8 @@
 
 use crate::euler::EulerCounts;
 use crate::topology::{
-    Body, Edge, Face, Fin, FinSense, Loop, SYSTEM_RESOLUTION, Shell, TopologyStore, Vertex,
+    Body, BodyType, Edge, Face, Fin, FinSense, Loop, SYSTEM_RESOLUTION, Shell, TopologyStore,
+    Vertex,
 };
 use opensolid_core::EntityId;
 use thiserror::Error;
@@ -128,12 +137,28 @@ pub enum CheckFailure {
         vertex: EntityId<Vertex>,
     },
 
-    /// A single-fin (boundary) edge inside a shell that claims to be closed.
-    #[error("closed shell {shell:?} has open (single-fin) edge {edge:?}")]
+    /// A single-fin (boundary) edge inside a shell that must be closed —
+    /// one flagged `is_closed`, or any shell of a
+    /// [`BodyType::Solid`](crate::BodyType::Solid) body.
+    #[error("shell {shell:?} must be closed but has open (single-fin) edge {edge:?}")]
     OpenEdgeInClosedShell {
         shell: EntityId<Shell>,
         edge: EntityId<Edge>,
     },
+
+    /// A shell of a [`BodyType::Solid`](crate::BodyType::Solid) body flagged
+    /// `is_closed = false`: solids must be bounded by closed shells,
+    /// whatever the producer-supplied flag claims.
+    #[error("solid body {body:?} has shell {shell:?} flagged open (is_closed = false)")]
+    OpenShellInSolid {
+        body: EntityId<Body>,
+        shell: EntityId<Shell>,
+    },
+
+    /// A shell flagged `is_closed = false` whose every edge has two fins:
+    /// the structure is closed, so the flag is inconsistent with it.
+    #[error("shell {0:?} is flagged open but every edge has two fins (structurally closed)")]
+    ShellFlaggedOpenButClosed(EntityId<Shell>),
 
     /// An edge with more than two fins.
     #[error("edge {edge:?} is non-manifold ({fins} fins)")]
@@ -250,8 +275,17 @@ impl TopologyStore {
                 );
             }
 
-            // Closure: every edge of a closed shell must be two-sided.
-            if shell.is_closed {
+            // Closure. The is_closed flag is producer-supplied and not
+            // trusted: solids must be bounded by closed shells whatever the
+            // flag says, and the flag is cross-checked against the structure
+            // in both directions.
+            if b.body_type == BodyType::Solid && !shell.is_closed {
+                failures.push(CheckFailure::OpenShellInSolid {
+                    body,
+                    shell: shell_id,
+                });
+            }
+            if shell.is_closed || b.body_type == BodyType::Solid {
                 for &edge_id in &shell_edges {
                     if let Some(edge) = self.edges.get(edge_id) {
                         if edge.fins.len() == 1 {
@@ -262,6 +296,14 @@ impl TopologyStore {
                         }
                     }
                 }
+            }
+            if !shell.is_closed
+                && !shell_edges.is_empty()
+                && shell_edges
+                    .iter()
+                    .all(|&e| self.edges.get(e).is_some_and(|edge| edge.fins.len() == 2))
+            {
+                failures.push(CheckFailure::ShellFlaggedOpenButClosed(shell_id));
             }
             for edge_id in shell_edges {
                 push_unique(&mut edges, edge_id);
@@ -287,6 +329,8 @@ impl TopologyStore {
         // The Euler–Poincaré formula only applies to closed surfaces, and
         // on a broken graph the counts are meaningless — so it is checked
         // last, only when everything else passed and all shells are closed.
+        // Skipping it is never silent for solids: a solid with a non-closed
+        // shell already failed the closure checks above.
         let all_closed = b
             .shells
             .iter()
@@ -590,6 +634,7 @@ mod tests {
 
     /// A single triangular sheet face. `is_closed` sets the shell's flag.
     fn build_triangle_sheet(
+        body_type: BodyType,
         is_closed: bool,
     ) -> (
         TopologyStore,
@@ -598,7 +643,7 @@ mod tests {
         [EntityId<Edge>; 3],
     ) {
         let mut store = TopologyStore::new();
-        let body = store.create_body(BodyType::Sheet);
+        let body = store.create_body(body_type);
         let shell = store.create_shell(body, is_closed, ShellOrientation::Outward);
         let face = store.create_face(shell, FaceSense::Positive);
         let v: Vec<_> = [p(0.0, 0.0, 0.0), p(1.0, 0.0, 0.0), p(0.0, 1.0, 0.0)]
@@ -633,13 +678,13 @@ mod tests {
 
     #[test]
     fn open_sheet_passes() {
-        let (store, body, _shell, _edges) = build_triangle_sheet(false);
+        let (store, body, _shell, _edges) = build_triangle_sheet(BodyType::Sheet, false);
         assert_eq!(store.check(body), Vec::new());
     }
 
     #[test]
     fn closed_flag_on_open_sheet_reports_every_boundary_edge() {
-        let (store, body, shell, edges) = build_triangle_sheet(true);
+        let (store, body, shell, edges) = build_triangle_sheet(BodyType::Sheet, true);
         let failures = store.check(body);
         assert_eq!(failures.len(), 3);
         for edge in edges {
@@ -648,6 +693,56 @@ mod tests {
                 "missing open-edge failure for {edge:?} in {failures:?}"
             );
         }
+    }
+
+    #[test]
+    fn solid_with_flagged_open_sheet_fails() {
+        // The lying producer: an open sheet on a Solid body whose shell
+        // honestly reports is_closed = false. Previously passed with zero
+        // failures because every closure check trusted the flag.
+        let (store, body, shell, edges) = build_triangle_sheet(BodyType::Solid, false);
+        let failures = store.check(body);
+        assert!(
+            failures.contains(&CheckFailure::OpenShellInSolid { body, shell }),
+            "expected OpenShellInSolid in {failures:?}"
+        );
+        for edge in edges {
+            assert!(
+                failures.contains(&CheckFailure::OpenEdgeInClosedShell { shell, edge }),
+                "missing open-edge failure for {edge:?} in {failures:?}"
+            );
+        }
+        assert_eq!(failures.len(), 4);
+    }
+
+    #[test]
+    fn solid_shell_flagged_open_but_structurally_closed() {
+        // A watertight cube whose shell flag lies the other way: the flag
+        // itself fails for a solid, and the flag/structure mismatch is
+        // reported. Euler stays skipped (failures are non-empty), but not
+        // silently.
+        let (mut store, body, shell) = build_cube();
+        store.shells.get_mut(shell).unwrap().is_closed = false;
+
+        let failures = store.check(body);
+        assert!(failures.contains(&CheckFailure::OpenShellInSolid { body, shell }));
+        assert!(failures.contains(&CheckFailure::ShellFlaggedOpenButClosed(shell)));
+        assert_eq!(failures.len(), 2);
+    }
+
+    #[test]
+    fn flag_structure_mismatch_reported_independent_of_body_type() {
+        // Same watertight topology on a Sheet body: no solid-closure
+        // requirement, but the flag still contradicts the structure.
+        let (mut store, body, shell) = build_cube();
+        store.bodies.get_mut(body).unwrap().body_type = BodyType::Sheet;
+        store.shells.get_mut(shell).unwrap().is_closed = false;
+
+        let failures = store.check(body);
+        assert_eq!(
+            failures,
+            vec![CheckFailure::ShellFlaggedOpenButClosed(shell)]
+        );
     }
 
     #[test]
