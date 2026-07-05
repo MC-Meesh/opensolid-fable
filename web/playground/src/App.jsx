@@ -5,6 +5,7 @@ import WasmErrorScreen from './components/WasmErrorScreen.jsx';
 import ScriptEditor from './components/ScriptEditor.jsx';
 import Viewport3D from './components/Viewport3D.jsx';
 import Toolbar from './components/Toolbar.jsx';
+import MainToolbar from './components/MainToolbar.jsx';
 import StatusBar from './components/StatusBar.jsx';
 import ScenePanel from './components/ScenePanel.jsx';
 import SceneTree from './components/SceneTree.jsx';
@@ -17,6 +18,8 @@ import { buildBinaryStl } from './lib/stl.js';
 import { pickCandidates, pickNodeAt } from './lib/picking.js';
 import { applyTranslate, applyRotate, applyScale, pathTo, nodeAt } from './lib/transformEdit.js';
 import { setNodeArg, setBooleanOp } from './lib/propertyEdit.js';
+import { deleteNode } from './lib/deleteNode.js';
+import { VIEW_SHORTCUTS } from './lib/views.js';
 import {
   addShape,
   deleteShape,
@@ -28,6 +31,8 @@ import { buildSweepShape, opsBounds, profileToOps, sweepTreeNode } from './lib/s
 
 const DEFAULT_RESOLUTION = 64;
 const EDIT_DEBOUNCE_MS = 400;
+// Hover ghosts are transient; a coarse mesh keeps pointer moves cheap.
+const HOVER_RESOLUTION = 32;
 
 function meshShape(shape, resolution) {
   const data = shape.mesh(resolution);
@@ -66,7 +71,12 @@ export default function App() {
   const [sweep, setSweep] = useState(null);
   const [sweepError, setSweepError] = useState(null);
   const [previewMesh, setPreviewMesh] = useState(null);
+  const [hoverMesh, setHoverMesh] = useState(null);
+  const [profileClosed, setProfileClosed] = useState(false);
   const profileRef = useRef(null);
+  const viewportRef = useRef(null);
+  const hoverCacheRef = useRef(new Map());
+  const hoveredIdRef = useRef(null);
 
   // Bidirectional sync: the shape operation graph parsed from the script.
   // GUI mutations (palette, parameter edits) rewrite individual statements
@@ -154,6 +164,10 @@ export default function App() {
       setError(String(err?.stack || err));
       return;
     }
+    // Node identities (and their WASM shapes) change on every run.
+    hoverCacheRef.current.clear();
+    hoveredIdRef.current = null;
+    setHoverMesh(null);
     if (tracedRef.current) freeNodes(tracedRef.current.nodes);
     tracedRef.current = traced;
     setTree(traced.root);
@@ -287,6 +301,51 @@ export default function App() {
     },
     [selectNode, clearSelection]
   );
+
+  // Hover highlight: resolve the pointer to a leaf node (same query as
+  // click-picking) and show a faint ghost, distinct from the selection ghost.
+  const handleHover = useCallback(
+    (point) => {
+      const root = tracedRef.current?.root;
+      const picked = root && point ? pickNodeAt(pickCandidates(root), point) : null;
+      const id = picked?.id ?? null;
+      if (id === hoveredIdRef.current) return;
+      hoveredIdRef.current = id;
+      if (!picked?.shape || picked.id === selectedNode?.id) {
+        setHoverMesh(null);
+        return;
+      }
+      let ghost = hoverCacheRef.current.get(id);
+      if (!ghost) {
+        try {
+          ghost = meshShape(picked.shape, HOVER_RESOLUTION);
+          hoverCacheRef.current.set(id, ghost);
+        } catch {
+          ghost = null;
+        }
+      }
+      setHoverMesh(ghost);
+    },
+    [selectedNode]
+  );
+
+  // SolidWorks Delete gesture: remove the selected body/branch from the tree
+  // and push the rewritten script through the usual sync path.
+  const handleDeleteSelected = useCallback(() => {
+    const root = tracedRef.current?.root;
+    if (!root || !selectedNode) return;
+    const result = deleteNode(root, selectedNode.id);
+    if (result.error) {
+      setError(result.error);
+      return;
+    }
+    clearSelection();
+    const script = serializeTree(result.root);
+    scriptRef.current = script;
+    editorRef.current?.setDoc(script);
+    commitGraph();
+    evaluateScript();
+  }, [selectedNode, clearSelection, commitGraph, evaluateScript]);
 
   const handleTransform = useCallback(
     (event) => {
@@ -467,6 +526,17 @@ export default function App() {
         setGizmoMode('rotate');
       } else if (event.key === 's' || event.key === 'S') {
         setGizmoMode('scale');
+      } else if (event.key === 'f' || event.key === 'F' || event.key === ' ') {
+        // SolidWorks F / Space: zoom to fit.
+        event.preventDefault();
+        viewportRef.current?.zoomToFit();
+      } else if (!event.ctrlKey && !event.metaKey && !event.altKey && VIEW_SHORTCUTS[event.key]) {
+        // 1-7: standard views in SolidWorks Ctrl+1..7 order (plain digits —
+        // browsers reserve Ctrl/Cmd+digit for tab switching).
+        viewportRef.current?.snapView(VIEW_SHORTCUTS[event.key]);
+      } else if (event.key === 'Delete' || event.key === 'Backspace') {
+        event.preventDefault();
+        handleDeleteSelected();
       } else if (event.key === 'Escape') {
         if (sweep) cancelSweep();
         else clearSelection();
@@ -474,7 +544,7 @@ export default function App() {
     }
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [clearSelection, sweep, cancelSweep, sketchOpen]);
+  }, [clearSelection, sweep, cancelSweep, sketchOpen, handleDeleteSelected]);
 
   const handleResolutionChange = useCallback((value) => {
     resolutionRef.current = value;
@@ -487,6 +557,7 @@ export default function App() {
 
   const handleProfileChange = useCallback((profile) => {
     profileRef.current = profile;
+    setProfileClosed(Boolean(profile?.closed));
   }, []);
 
   const graphNodes = useMemo(() => listNodes(graph), [graph]);
@@ -521,16 +592,31 @@ export default function App() {
           resolution={resolution}
           onResolutionChange={handleResolutionChange}
           onResolutionCommit={handleResolutionCommit}
-          wireframe={wireframe}
-          onWireframeChange={setWireframe}
           onRun={runNow}
           onDownloadStl={downloadStl}
           disabled={!wasmReady}
         />
       </div>
       <div className="right">
+        <MainToolbar
+          disabled={!wasmReady}
+          sketchOpen={sketchOpen}
+          onSketchToggle={handleSketchToggle}
+          canSweep={sketchOpen && profileClosed && !sweep}
+          sweepDisabledReason={
+            sketchOpen
+              ? 'Close the profile loop in the sketch first'
+              : 'Open a sketch and draw a closed profile first'
+          }
+          onSweep={handleSweepStart}
+          onView={(name) => viewportRef.current?.snapView(name)}
+          onFit={() => viewportRef.current?.zoomToFit()}
+          wireframe={wireframe}
+          onWireframeChange={setWireframe}
+        />
         <ErrorBoundary name="3D viewport">
           <Viewport3D
+            ref={viewportRef}
             mesh={mesh}
             wireframe={wireframe}
             sketchPlane={sketchOpen ? sketchPlane : null}
@@ -539,8 +625,10 @@ export default function App() {
             gizmoMode={gizmoMode}
             selectedMesh={selectedMesh}
             selectedPivot={selectedPivot}
+            hoverMesh={hoverMesh}
             previewMesh={previewMesh}
             onPick={handlePick}
+            onHover={handleHover}
             onTransform={handleTransform}
           />
         </ErrorBoundary>
@@ -575,7 +663,14 @@ export default function App() {
               Scale
             </button>
             <span className="gizmo-label">{nodeLabel(selectedNode)}</span>
-            <button className="secondary" onClick={clearSelection}>
+            <button
+              className="secondary danger"
+              onClick={handleDeleteSelected}
+              title="Delete this body (Delete)"
+            >
+              Delete
+            </button>
+            <button className="secondary" onClick={clearSelection} title="Deselect (Esc)">
               Deselect
             </button>
           </div>
@@ -600,12 +695,6 @@ export default function App() {
             onExit={() => setSketchOpen(false)}
           />
         </ErrorBoundary>
-        <button
-          className={`secondary sketch-toggle${sketchOpen ? ' active' : ''}`}
-          onClick={handleSketchToggle}
-        >
-          {sketchOpen ? 'Exit sketch' : 'Sketch'}
-        </button>
         {stats && !sketchOpen && <StatusBar stats={stats} />}
         {(wasmStatus === 'idle' || wasmStatus === 'loading') && (
           <div className="loading">Loading WASM…</div>

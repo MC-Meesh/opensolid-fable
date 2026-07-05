@@ -1,11 +1,17 @@
+/* One accent (blue) for interaction; green/yellow are reserved for the
+   semantic ok/warn states (valid profile, snap hints). */
 :root {
   --bg: #14171c;
   --panel: #1c2129;
   --border: #2b323d;
   --text: #d7dde6;
-  --muted: #8a94a3;
+  --muted: #96a0b0;
   --accent: #4f9cf9;
+  --on-accent: #0b1220;
+  --ok: #7ce38b;
+  --warn: #ffd66b;
   --error: #ff7b72;
+  --radius: 6px;
 }
 * { box-sizing: border-box; }
 html, body, #root { height: 100%; margin: 0; }
@@ -186,7 +192,7 @@ header p { margin: 2px 0 0; font-size: 12px; color: var(--muted); }
 }
 .gizmo-bar {
   position: absolute;
-  top: 10px;
+  top: 46px;
   left: 10px;
   display: flex;
   align-items: center;
@@ -204,7 +210,7 @@ header p { margin: 2px 0 0; font-size: 12px; color: var(--muted); }
 }
 .gizmo-bar .gizmo-active {
   background: var(--accent);
-  color: #0b1220;
+  color: var(--on-accent);
   border: none;
 }
 .gizmo-label {
@@ -241,7 +247,7 @@ header p { margin: 2px 0 0; font-size: 12px; color: var(--muted); }
 }
 button {
   background: var(--accent);
-  color: #0b1220;
+  color: var(--on-accent);
   border: none;
   border-radius: 6px;
   padding: 7px 16px;
@@ -257,6 +263,11 @@ button.secondary {
   border: 1px solid var(--border);
   font-weight: 500;
 }
+button.danger:hover:not(:disabled) {
+  color: var(--error);
+  border-color: var(--error);
+  filter: none;
+}
 .error {
   margin: 0;
   padding: 10px 14px;
@@ -270,11 +281,95 @@ button.secondary {
 }
 .right { position: relative; min-width: 0; }
 .viewport { position: absolute; inset: 0; }
+.viewport-canvas { position: absolute; inset: 0; }
 .viewport canvas { display: block; }
+
+/* ---- main toolbar (Sketch | Features | View) ---- */
+.main-toolbar {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 4;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 5px 10px;
+  background: color-mix(in srgb, var(--panel) 94%, transparent);
+  border-bottom: 1px solid var(--border);
+  backdrop-filter: blur(6px);
+  overflow-x: auto;
+}
+.tool-group {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+.tool-group-label {
+  color: var(--muted);
+  font-size: 10.5px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin: 0 6px 0 2px;
+  user-select: none;
+}
+.tool-sep {
+  width: 1px;
+  align-self: stretch;
+  margin: 2px 8px;
+  background: var(--border);
+}
+.tool-wrap { display: inline-flex; }
+button.main-tool {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: transparent;
+  color: var(--text);
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  padding: 5px 9px;
+  font-size: 12px;
+  font-weight: 500;
+}
+button.main-tool:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  filter: none;
+}
+button.main-tool.active {
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+button.main-tool svg { flex: none; }
+.tool-label { white-space: nowrap; }
+
+/* ---- orientation triad ---- */
+.view-triad {
+  position: absolute;
+  left: 6px;
+  bottom: 6px;
+  z-index: 1;
+  pointer-events: none;
+}
+.view-triad .triad-tip { pointer-events: auto; cursor: pointer; }
+.view-triad .triad-tip:hover { stroke-width: 3; }
+.view-triad .triad-label {
+  pointer-events: auto;
+  cursor: pointer;
+  font-size: 10px;
+  font-weight: 700;
+  text-anchor: middle;
+  dominant-baseline: central;
+  user-select: none;
+  font-family: system-ui, -apple-system, sans-serif;
+}
+
 .stats {
   position: absolute;
   bottom: 10px;
-  left: 10px;
+  right: 10px;
   font-size: 12px;
   color: var(--muted);
   background: color-mix(in srgb, var(--panel) 88%, transparent);
@@ -349,7 +444,7 @@ button.secondary {
 /* ---- property panel ---- */
 .prop-panel {
   position: absolute;
-  top: 48px;
+  top: 46px;
   right: 10px;
   width: 236px;
   max-height: calc(100% - 110px);
@@ -442,7 +537,7 @@ button.secondary {
 /* ---- extrude / revolve parameter panel ---- */
 .sweep-panel {
   position: absolute;
-  top: 10px;
+  top: 46px;
   left: 10px;
   z-index: 2;
   display: flex;
@@ -492,13 +587,6 @@ button.secondary {
 .sweep-actions button { padding: 5px 14px; font-size: 12.5px; }
 
 /* ---- 2D sketch overlay ---- */
-.sketch-toggle {
-  position: absolute;
-  top: 10px;
-  right: 10px;
-  z-index: 3;
-}
-.sketch-toggle.active { border-color: var(--accent); color: var(--accent); }
 .sketch-overlay {
   position: absolute;
   inset: 0;
@@ -551,12 +639,12 @@ button.secondary {
 }
 .sketch-svg .draft.faint { opacity: 0.35; }
 .sketch-svg .snap-indicator {
-  stroke: #ffd66b;
+  stroke: var(--warn);
   stroke-width: 1.5;
   pointer-events: none;
 }
 .sketch-svg .snap-indicator.close-loop {
-  stroke: #7ce38b;
+  stroke: var(--ok);
   stroke-width: 2.5;
 }
 .sketch-svg .draft-anchor {
@@ -564,9 +652,9 @@ button.secondary {
   pointer-events: none;
 }
 .sketch-svg .profile-fill {
-  fill: #7ce38b;
+  fill: var(--ok);
   fill-opacity: 0.14;
-  stroke: #7ce38b;
+  stroke: var(--ok);
   stroke-opacity: 0.55;
   stroke-width: 1;
   pointer-events: none;
@@ -577,7 +665,7 @@ button.secondary {
   100% { fill-opacity: 0.14; }
 }
 .sketch-svg .glyph {
-  fill: #ffd66b;
+  fill: var(--warn);
   stroke: none;
   font-size: 11px;
   font-weight: 600;
@@ -585,14 +673,14 @@ button.secondary {
   user-select: none;
 }
 .sketch-svg .glyph.dim { text-decoration: underline dotted; cursor: text; }
-.sketch-svg circle.glyph { fill: none; stroke: #ffd66b; stroke-width: 1.2; }
+.sketch-svg circle.glyph { fill: none; stroke: var(--warn); stroke-width: 1.2; }
 .sketch-svg .glyph.selected { fill: var(--accent); }
 .sketch-svg circle.glyph.selected { stroke: var(--accent); }
 .sketch-toolbar {
   position: absolute;
-  top: 10px;
+  top: 46px;
   left: 10px;
-  right: 110px;
+  right: 10px;
   display: flex;
   flex-wrap: wrap;
   gap: 8px 14px;
@@ -626,7 +714,7 @@ button.secondary {
 }
 .tool-btn.active {
   background: var(--accent);
-  color: #0b1220;
+  color: var(--on-accent);
   border-color: var(--accent);
 }
 .tool-btn:disabled { opacity: 0.4; }
@@ -657,14 +745,14 @@ button.secondary {
   background: color-mix(in srgb, var(--panel) 92%, transparent);
   color: var(--muted);
 }
-.profile-chip.ok { color: #7ce38b; border-color: #2e5136; }
-.sketch-message { color: #ffd66b; }
+.profile-chip.ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 35%, transparent); }
+.sketch-message { color: var(--warn); }
 .sketch-hint { color: var(--muted); }
 .tool-chip {
   padding: 4px 10px;
   border-radius: 6px;
   background: var(--accent);
-  color: #0b1220;
+  color: var(--on-accent);
   font-weight: 600;
 }
 .dim-readout {
@@ -699,12 +787,12 @@ button.secondary {
 }
 .dim-edit:focus { outline: none; }
 .sweep-btn.ready {
-  border-color: #2e5136;
-  color: #7ce38b;
+  border-color: color-mix(in srgb, var(--ok) 35%, transparent);
+  color: var(--ok);
 }
 .finish-btn {
   background: var(--accent);
-  color: #0b1220;
+  color: var(--on-accent);
   border-color: var(--accent);
   font-weight: 600;
 }

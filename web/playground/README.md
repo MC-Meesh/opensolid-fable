@@ -11,8 +11,10 @@ React + Vite SPA. The UI is componentized under `src/components/`:
 - **SceneTree** — collapsible view of the script's construction tree; click
   a node to isolate that intermediate shape in the viewport
 - **ScriptEditor** — CodeMirror 6 editor with JS syntax highlighting
-- **Viewport3D** — three.js canvas with OrbitControls
-- **Toolbar** — Run / Download STL buttons, resolution slider, wireframe toggle
+- **Viewport3D** — three.js canvas with OrbitControls and the orientation triad
+- **MainToolbar** — workflow-grouped toolbar over the viewport
+  (Sketch | Features | View)
+- **Toolbar** — Run / Download STL buttons, resolution slider
 - **StatusBar** — triangle/vertex counts, grid size, mesh time
 
 The only non-npm generated piece is `pkg/`, the wasm-bindgen output for the
@@ -77,6 +79,34 @@ cargo build --release --target wasm32-unknown-unknown -p opensolid-wasm
 wasm-bindgen --target web --no-typescript --out-dir web/playground/pkg \
     target/wasm32-unknown-unknown/release/opensolid_wasm.wasm
 ```
+
+## Viewport conventions (SolidWorks-style)
+
+**World convention: Y is up.** The ground grid lies in the XZ plane, the
+front view looks along −Z, and every primitive's "up" is +Y (matching
+three.js and the Shape API). Standard view directions are defined in
+`src/lib/views.js`.
+
+Mouse (SolidWorks mapping):
+
+- **Middle-drag** rotates; **Shift+middle-drag** pans; **scroll** zooms
+  toward the cursor. Left-drag also rotates, right-drag also pans.
+- **Hover** shows a faint ghost of the body under the cursor; **click**
+  selects it (accent ghost + gizmo + property panel); **click empty space**
+  deselects.
+
+Keyboard (outside sketch mode):
+
+| Key | Action |
+|---|---|
+| `F` or `Space` | Zoom to fit |
+| `1`–`7` | Front / Back / Left / Right / Top / Bottom / Isometric |
+| `T` / `R` / `S` | Translate / rotate / scale gizmo |
+| `Delete` | Delete the selected body |
+| `Esc` | Deselect (or cancel the pending sweep) |
+
+The **orientation triad** (bottom-left) tracks the camera; click an axis tip
+to snap to the view looking down that axis (hollow tip = negative direction).
 
 ## Using the playground
 

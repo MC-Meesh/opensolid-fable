@@ -1,7 +1,9 @@
-import { useCallback, useEffect, useRef } from 'react';
+import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState } from 'react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { TransformControls } from 'three/addons/controls/TransformControls.js';
+import ViewTriad from './ViewTriad.jsx';
+import { FIT_DISTANCE_FACTOR, MIN_FIT_RADIUS, viewDirection } from '../lib/views.js';
 import {
   cameraFromSketchView,
   easeInOutCubic,
@@ -12,6 +14,9 @@ import {
   sketchViewPose,
 } from '../lib/sketchView.js';
 
+// World convention: Y up, ground grid in the XZ plane, front view looks
+// along -Z. Standard view directions live in lib/views.js.
+
 function frameCamera(ctx, { center, radius }) {
   const { camera, controls } = ctx;
   // Clip planes are owned by the render loop (adapted to camera distance
@@ -21,8 +26,8 @@ function frameCamera(ctx, { center, radius }) {
   // transform, so the view is owned by the overlay until the sketch closes.
   if (ctx.activeSketchPlane) return;
   const target = new THREE.Vector3(...center);
-  const direction = new THREE.Vector3(1, 0.7, 1.2).normalize();
-  camera.position.copy(target).addScaledVector(direction, radius * 2.6);
+  const direction = new THREE.Vector3(...viewDirection('iso'));
+  camera.position.copy(target).addScaledVector(direction, radius * FIT_DISTANCE_FACTOR);
   controls.target.copy(target);
 }
 
@@ -141,12 +146,23 @@ function updateInfiniteGrid(grid, camera, target) {
   grid.scale.setScalar(levels.fadeDist * 2);
 }
 
+// Selection ghost: solid accent tint. Hover ghost: fainter neutral wash so
+// the two states read differently at a glance.
 const HIGHLIGHT_MATERIAL = new THREE.MeshStandardMaterial({
   color: 0x4fc3f7,
   metalness: 0.1,
   roughness: 0.4,
   transparent: true,
   opacity: 0.35,
+  depthWrite: false,
+});
+
+const HOVER_MATERIAL = new THREE.MeshStandardMaterial({
+  color: 0xdde6f2,
+  metalness: 0.05,
+  roughness: 0.6,
+  transparent: true,
+  opacity: 0.16,
   depthWrite: false,
 });
 
@@ -159,21 +175,27 @@ const PREVIEW_MATERIAL = new THREE.MeshStandardMaterial({
   depthWrite: false,
 });
 
-export default function Viewport3D({
-  mesh,
-  wireframe,
-  sketchPlane,
-  sketchView,
-  onSketchViewChange,
-  gizmoMode,
-  selectedMesh,
-  selectedPivot,
-  previewMesh,
-  onPick,
-  onTransform,
-}) {
+const Viewport3D = forwardRef(function Viewport3D(
+  {
+    mesh,
+    wireframe,
+    sketchPlane,
+    sketchView,
+    onSketchViewChange,
+    gizmoMode,
+    selectedMesh,
+    selectedPivot,
+    hoverMesh,
+    previewMesh,
+    onPick,
+    onHover,
+    onTransform,
+  },
+  ref
+) {
   const containerRef = useRef(null);
   const sceneRef = useRef(null);
+  const [triadQuat, setTriadQuat] = useState([0, 0, 0, 1]);
   const onSketchViewChangeRef = useRef(onSketchViewChange);
   onSketchViewChangeRef.current = onSketchViewChange;
 
@@ -216,8 +238,26 @@ export default function Viewport3D({
     // ortho camera mirrors its pose each frame with a matched frustum.
     const orthoCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.01, 1000);
 
+    // SolidWorks mouse mapping: middle-drag rotates, Shift+middle pans,
+    // scroll zooms toward the cursor. Left-drag also rotates so trackpad
+    // users aren't stranded; right-drag pans.
     const orbitControls = new OrbitControls(camera, renderer.domElement);
     orbitControls.enableDamping = true;
+    orbitControls.zoomToCursor = true;
+    orbitControls.mouseButtons = {
+      LEFT: THREE.MOUSE.ROTATE,
+      MIDDLE: THREE.MOUSE.ROTATE,
+      RIGHT: THREE.MOUSE.PAN,
+    };
+
+    function onPointerDownCapture(event) {
+      if (event.button === 1) {
+        orbitControls.mouseButtons.MIDDLE = event.shiftKey
+          ? THREE.MOUSE.PAN
+          : THREE.MOUSE.ROTATE;
+      }
+    }
+    container.addEventListener('pointerdown', onPointerDownCapture, true);
 
     scene.add(new THREE.HemisphereLight(0xbfd4ff, 0x3a3226, 0.9));
     const keyLight = new THREE.DirectionalLight(0xffffff, 1.6);
@@ -237,6 +277,11 @@ export default function Viewport3D({
     });
     const meshObject = new THREE.Mesh(new THREE.BufferGeometry(), material);
     scene.add(meshObject);
+
+    const hoverObject = new THREE.Mesh(new THREE.BufferGeometry(), HOVER_MATERIAL);
+    hoverObject.renderOrder = 1;
+    hoverObject.visible = false;
+    scene.add(hoverObject);
 
     const ghostMesh = new THREE.Mesh(new THREE.BufferGeometry(), HIGHLIGHT_MATERIAL);
     ghostMesh.renderOrder = 1;
@@ -266,6 +311,17 @@ export default function Viewport3D({
     const pointerDown = new THREE.Vector2();
     let pointerDownTime = 0;
 
+    function castAt(clientX, clientY) {
+      const rect = container.getBoundingClientRect();
+      const ndc = new THREE.Vector2(
+        ((clientX - rect.left) / rect.width) * 2 - 1,
+        -((clientY - rect.top) / rect.height) * 2 + 1
+      );
+      raycaster.setFromCamera(ndc, sceneRef.current?.sketchOrtho ? orthoCamera : camera);
+      const hits = raycaster.intersectObject(meshObject);
+      return hits.length > 0 ? hits[0].point : null;
+    }
+
     function onPointerDown(event) {
       const rect = container.getBoundingClientRect();
       pointerDown.set(event.clientX - rect.left, event.clientY - rect.top);
@@ -273,6 +329,7 @@ export default function Viewport3D({
     }
 
     function onPointerUp(event) {
+      if (event.button !== 0) return;
       if (performance.now() - pointerDownTime > 500) return;
       const rect = container.getBoundingClientRect();
       const upX = event.clientX - rect.left;
@@ -281,24 +338,45 @@ export default function Viewport3D({
       if (dist > 5) return;
       if (transformControls.axis) return;
 
-      const ndc = new THREE.Vector2(
-        (upX / rect.width) * 2 - 1,
-        -(upY / rect.height) * 2 + 1,
-      );
-      raycaster.setFromCamera(ndc, camera);
-      const hits = raycaster.intersectObject(meshObject);
       const cb = sceneRef.current?._onPick;
       if (!cb) return;
-      if (hits.length > 0) {
-        const p = hits[0].point;
-        cb([p.x, p.y, p.z]);
-      } else {
-        cb(null);
-      }
+      const p = castAt(event.clientX, event.clientY);
+      // A miss clicks empty space: deselect.
+      cb(p ? [p.x, p.y, p.z] : null);
+    }
+
+    // Hover highlight: rAF-throttled raycast while no button is held.
+    let hoverPending = false;
+    let hoverX = 0;
+    let hoverY = 0;
+
+    function onPointerMove(event) {
+      if (event.buttons !== 0) return;
+      hoverX = event.clientX;
+      hoverY = event.clientY;
+      if (hoverPending) return;
+      hoverPending = true;
+      requestAnimationFrame(() => {
+        hoverPending = false;
+        const cb = sceneRef.current?._onHover;
+        if (!cb) return;
+        if (transformControls.axis) {
+          cb(null);
+          return;
+        }
+        const p = castAt(hoverX, hoverY);
+        cb(p ? [p.x, p.y, p.z] : null);
+      });
+    }
+
+    function onPointerLeave() {
+      sceneRef.current?._onHover?.(null);
     }
 
     container.addEventListener('pointerdown', onPointerDown);
     container.addEventListener('pointerup', onPointerUp);
+    container.addEventListener('pointermove', onPointerMove);
+    container.addEventListener('pointerleave', onPointerLeave);
 
     function resize() {
       const { clientWidth: w, clientHeight: h } = container;
@@ -331,6 +409,8 @@ export default function Viewport3D({
       orthoCamera.updateProjectionMatrix();
     }
 
+    // Keep the orientation triad in sync with the camera.
+    const lastQuat = new THREE.Quaternion(0, 0, 0, 1);
     renderer.setAnimationLoop(() => {
       const ctx = sceneRef.current;
       const anim = ctx?.cameraAnim;
@@ -364,6 +444,12 @@ export default function Viewport3D({
       if (sketching) syncOrthoCamera();
       updateInfiniteGrid(grid, activeCamera, orbitControls.target);
       renderer.render(scene, activeCamera);
+
+      if (camera.quaternion.angleTo(lastQuat) > 1e-4) {
+        lastQuat.copy(camera.quaternion);
+        const q = camera.quaternion;
+        setTriadQuat([q.x, q.y, q.z, q.w]);
+      }
     });
 
     function onKeyDown(event) {
@@ -394,18 +480,23 @@ export default function Viewport3D({
       transformControls,
       anchor,
       ghostMesh,
+      hoverObject,
       previewObject,
       cameraAnim: null,
       sketchOrtho: false,
       savedView: null,
       activeSketchPlane: null,
       _onPick: null,
+      _onHover: null,
       _onTransform: null,
     };
 
     return () => {
+      container.removeEventListener('pointerdown', onPointerDownCapture, true);
       container.removeEventListener('pointerdown', onPointerDown);
       container.removeEventListener('pointerup', onPointerUp);
+      container.removeEventListener('pointermove', onPointerMove);
+      container.removeEventListener('pointerleave', onPointerLeave);
       window.removeEventListener('keydown', onKeyDown);
       window.removeEventListener('keyup', onKeyUp);
       observer.disconnect();
@@ -415,6 +506,7 @@ export default function Viewport3D({
       orbitControls.dispose();
       meshObject.geometry.dispose();
       ghostMesh.geometry.dispose();
+      hoverObject.geometry.dispose();
       previewObject.geometry.dispose();
       material.dispose();
       grid.geometry.dispose();
@@ -424,6 +516,40 @@ export default function Viewport3D({
       sceneRef.current = null;
     };
   }, [reportSketchView]);
+
+  /** Snap the camera to a standard view, keeping target and distance. */
+  const snapView = useCallback((name) => {
+    const ctx = sceneRef.current;
+    const dir = viewDirection(name);
+    if (!ctx || !dir) return;
+    const dist = Math.max(ctx.camera.position.distanceTo(ctx.controls.target), 1e-6);
+    ctx.camera.position
+      .copy(ctx.controls.target)
+      .addScaledVector(new THREE.Vector3(...dir), dist);
+  }, []);
+
+  /** Frame the current mesh, preserving the view direction. */
+  const zoomToFit = useCallback(() => {
+    const ctx = sceneRef.current;
+    if (!ctx) return;
+    const geometry = ctx.meshObject.geometry;
+    if (!geometry.getAttribute('position')?.count) return;
+    geometry.computeBoundingSphere();
+    const sphere = geometry.boundingSphere;
+    if (!sphere || !Number.isFinite(sphere.radius) || sphere.radius <= 0) return;
+
+    const direction = ctx.camera.position.clone().sub(ctx.controls.target);
+    if (direction.lengthSq() < 1e-12) direction.set(...viewDirection('iso'));
+    direction.normalize();
+
+    const radius = Math.max(sphere.radius, MIN_FIT_RADIUS);
+    ctx.controls.target.copy(sphere.center);
+    ctx.camera.position
+      .copy(sphere.center)
+      .addScaledVector(direction, radius * FIT_DISTANCE_FACTOR);
+  }, []);
+
+  useImperativeHandle(ref, () => ({ snapView, zoomToFit }), [snapView, zoomToFit]);
 
   useEffect(() => {
     const ctx = sceneRef.current;
@@ -457,6 +583,22 @@ export default function Viewport3D({
       ctx.previewObject.visible = false;
     }
   }, [previewMesh]);
+
+  useEffect(() => {
+    const ctx = sceneRef.current;
+    if (!ctx) return;
+    if (hoverMesh) {
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.BufferAttribute(hoverMesh.positions, 3));
+      geo.setAttribute('normal', new THREE.BufferAttribute(hoverMesh.normals, 3));
+      geo.setIndex(new THREE.BufferAttribute(hoverMesh.indices, 1));
+      ctx.hoverObject.geometry.dispose();
+      ctx.hoverObject.geometry = geo;
+      ctx.hoverObject.visible = true;
+    } else {
+      ctx.hoverObject.visible = false;
+    }
+  }, [hoverMesh]);
 
   // SolidWorks-style "Normal To": entering sketch mode (or switching planes
   // mid-sketch) flies the camera orthogonal to the sketch plane and switches
@@ -606,11 +748,14 @@ export default function Viewport3D({
   onTransformRef.current = onTransform;
   const onPickRef = useRef(onPick);
   onPickRef.current = onPick;
+  const onHoverRef = useRef(onHover);
+  onHoverRef.current = onHover;
 
   useEffect(() => {
     const ctx = sceneRef.current;
     if (!ctx) return;
     ctx._onPick = (...args) => onPickRef.current?.(...args);
+    ctx._onHover = (...args) => onHoverRef.current?.(...args);
   });
 
   useEffect(() => {
@@ -664,5 +809,12 @@ export default function Viewport3D({
     };
   }, []);
 
-  return <div className="viewport" ref={containerRef} />;
-}
+  return (
+    <div className="viewport">
+      <div className="viewport-canvas" ref={containerRef} />
+      <ViewTriad quat={triadQuat} onSelectView={snapView} />
+    </div>
+  );
+});
+
+export default Viewport3D;

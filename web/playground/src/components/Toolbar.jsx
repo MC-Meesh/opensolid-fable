@@ -10,7 +10,8 @@ const COMMIT_KEYS = new Set([
 ]);
 
 /**
- * Run / STL buttons plus meshing controls.
+ * Run / STL buttons plus meshing controls. Display toggles (wireframe,
+ * views) live in the viewport's MainToolbar.
  *
  * The resolution slider reports every movement through `onResolutionChange`
  * (live label update) but only fires `onResolutionCommit` when the drag or
@@ -20,8 +21,6 @@ export default function Toolbar({
   resolution,
   onResolutionChange,
   onResolutionCommit,
-  wireframe,
-  onWireframeChange,
   onRun,
   onDownloadStl,
   disabled,
@@ -50,14 +49,6 @@ export default function Toolbar({
           }}
         />
         <span className="resolution-value">{resolution}</span>
-      </label>
-      <label>
-        <input
-          type="checkbox"
-          checked={wireframe}
-          onChange={(event) => onWireframeChange(event.target.checked)}
-        />{' '}
-        Wireframe
       </label>
     </div>
   );
