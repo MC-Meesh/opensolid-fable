@@ -2,6 +2,7 @@
 // Both conversion directions live in `convert`.
 pub mod builder;
 pub mod convert;
+pub mod hybrid;
 pub mod io;
 pub mod massprops;
 pub mod mesh;
@@ -17,6 +18,7 @@ pub use opensolid_core::bvh;
 
 pub use builder::{Part, shape};
 pub use convert::{MeshSdf, SdfToBrepOptions, sdf_to_brep};
+pub use hybrid::{HybridBody, HybridBoolean, HybridOptions, HybridPath};
 pub use io::{write_obj, write_stl_ascii, write_stl_binary};
 pub use massprops::{MassProperties, MassPropertiesError, mass_properties};
 pub use mesh::{MeshOptions, Triangle, TriangleMesh, mesh_sdf, mesh_sdf_indexed};

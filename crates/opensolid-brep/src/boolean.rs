@@ -282,8 +282,25 @@ impl BooleanOutput {
 
     /// Tessellate the result into a triangle mesh (closed and manifold for
     /// valid results). Boundary polylines are shared exactly between
-    /// adjacent faces, so the welded mesh is watertight.
+    /// adjacent faces, so the welded mesh is watertight. Same as
+    /// [`BooleanOutput::tessellate_measured`] with the deviation discarded.
     pub fn tessellate(&self) -> CoreResult<TriangleMesh> {
+        Ok(self.tessellate_measured()?.0)
+    }
+
+    /// Tessellate the result, also reporting the mesh's worst chordal
+    /// deviation from the analytic face surfaces.
+    ///
+    /// Trimmed faces are triangulated from their boundary samples alone
+    /// (ear clipping), so a wide curved face — e.g. the full-wrap cylinder
+    /// band left by a through-hole subtract — can be covered by long
+    /// parameter-space chords that cut far inside the true surface while
+    /// the mesh stays closed and manifold. The returned deviation is the
+    /// largest distance from any triangle edge's 3D midpoint to the
+    /// surface point at its parameter-space midpoint — use it to decide
+    /// whether the mesh's geometric fidelity is acceptable (the kernel's
+    /// hybrid boolean falls back to F-Rep meshing when it is not).
+    pub fn tessellate_measured(&self) -> CoreResult<(TriangleMesh, f64)> {
         let mut triangles = Vec::new();
         let mut scale: f64 = 0.0;
         for mf in &self.mesh_faces {
@@ -294,10 +311,16 @@ impl BooleanOutput {
             }
         }
         let weld_eps = 1e-9 * (1.0 + scale);
+        let mut deviation: f64 = 0.0;
         for mf in &self.mesh_faces {
-            triangles.extend(triangulate_mesh_face(mf, weld_eps)?);
+            let (tris, dev) = triangulate_mesh_face(mf, weld_eps)?;
+            triangles.extend(tris);
+            deviation = deviation.max(dev);
         }
-        Ok(TriangleMesh::from_triangles(&triangles).weld(weld_eps))
+        Ok((
+            TriangleMesh::from_triangles(&triangles).weld(weld_eps),
+            deviation,
+        ))
     }
 }
 
@@ -2149,7 +2172,15 @@ fn shell_counts(
 // Tessellation (ear clipping with hole bridging)
 // ---------------------------------------------------------------------
 
-fn triangulate_mesh_face(mf: &MeshFace, weld_eps: f64) -> CoreResult<Vec<Triangle>> {
+/// Triangulate one face into 3D triangles. The second return value is the
+/// face's worst chordal deviation: the largest distance between a triangle
+/// edge's 3D midpoint and the surface point at its parameter-space
+/// midpoint. Zero for planes (chords are exact); on curved charts it
+/// exposes how badly wide ear-clip chords cut through the surface (a
+/// trimmed full-wrap cylinder band is triangulated from its boundary
+/// samples alone, so chords can stray by up to the radius), letting
+/// callers judge the mesh instead of trusting it blindly.
+fn triangulate_mesh_face(mf: &MeshFace, weld_eps: f64) -> CoreResult<(Vec<Triangle>, f64)> {
     // Combine outer ring and holes into a single polygon via bridges.
     let outer: Vec<usize> = (0..mf.rings[0].uv.len()).collect();
     let mut all_uv: Vec<(f64, f64)> = mf.rings[0].uv.clone();
@@ -2280,6 +2311,8 @@ fn triangulate_mesh_face(mf: &MeshFace, weld_eps: f64) -> CoreResult<Vec<Triangl
 
     // Emit 3D triangles; flip winding when the outward normal opposes the
     // chart normal (param-space CCW maps to the chart normal side).
+    let planar = matches!(mf.chart, Chart::Plane { .. });
+    let mut deviation: f64 = 0.0;
     let mut out = Vec::with_capacity(tris.len());
     for t in tris {
         let (mut i0, i1, mut i2) = (t[0], t[1], t[2]);
@@ -2301,13 +2334,24 @@ fn triangulate_mesh_face(mf: &MeshFace, weld_eps: f64) -> CoreResult<Vec<Triangl
             || (ps[2] - ps[1]).norm() <= weld_eps
             || (ps[0] - ps[2]).norm() <= weld_eps;
         if !zero_length {
+            if !planar {
+                for k in 0..3 {
+                    let (i, j) = (t[k], t[(k + 1) % 3]);
+                    let mid_uv = (
+                        0.5 * (all_uv[i].0 + all_uv[j].0),
+                        0.5 * (all_uv[i].1 + all_uv[j].1),
+                    );
+                    let mid_p = Point3::from((all_p[i].coords + all_p[j].coords) * 0.5);
+                    deviation = deviation.max((chart_point(&mf.chart, mid_uv) - mid_p).norm());
+                }
+            }
             out.push(Triangle {
                 positions: ps,
                 normals,
             });
         }
     }
-    Ok(out)
+    Ok((out, deviation))
 }
 
 fn dist2(a: (f64, f64), b: (f64, f64)) -> f64 {
