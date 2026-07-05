@@ -1,12 +1,14 @@
-import { useEffect, useRef } from 'react';
+import { useCallback, useEffect, useRef } from 'react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { TransformControls } from 'three/addons/controls/TransformControls.js';
 import {
+  cameraFromSketchView,
   easeInOutCubic,
   gridLevels,
   orthoHalfExtents,
   planeIndicatorSize,
+  sketchViewFromCamera,
   sketchViewPose,
 } from '../lib/sketchView.js';
 
@@ -14,23 +16,10 @@ function frameCamera(ctx, { center, radius }) {
   const { camera, controls } = ctx;
   // Clip planes are owned by the render loop (adapted to camera distance
   // every frame), so framing only has to place the camera.
-  // Mid-sketch reframes (script edited while sketching) must stay normal to
-  // the sketch plane instead of snapping back to the oblique house view.
-  if (ctx.activeSketchPlane) {
-    const pose = sketchViewPose(ctx.activeSketchPlane, center, radius * 2.6);
-    if (pose) {
-      // Jump straight to the pose (cancelling any fly-to in flight) and make
-      // sure the orthographic projection is on.
-      ctx.cameraAnim = null;
-      ctx.sketchOrtho = true;
-      controls.enabled = true;
-      camera.position.set(...pose.position);
-      camera.up.set(...pose.up);
-      controls.target.set(...pose.target);
-      camera.lookAt(controls.target);
-      return;
-    }
-  }
+  // Mid-sketch reframes (script edited while sketching) must NOT move the
+  // camera: the sketch overlay is glued to the camera's world-to-screen
+  // transform, so the view is owned by the overlay until the sketch closes.
+  if (ctx.activeSketchPlane) return;
   const target = new THREE.Vector3(...center);
   const direction = new THREE.Vector3(1, 0.7, 1.2).normalize();
   camera.position.copy(target).addScaledVector(direction, radius * 2.6);
@@ -174,6 +163,8 @@ export default function Viewport3D({
   mesh,
   wireframe,
   sketchPlane,
+  sketchView,
+  onSketchViewChange,
   gizmoMode,
   selectedMesh,
   selectedPivot,
@@ -183,6 +174,29 @@ export default function Viewport3D({
 }) {
   const containerRef = useRef(null);
   const sceneRef = useRef(null);
+  const onSketchViewChangeRef = useRef(onSketchViewChange);
+  onSketchViewChangeRef.current = onSketchViewChange;
+
+  // Publish the camera's current (or fly-to destination) world-to-screen
+  // mapping as a sketch overlay view, so the overlay can mirror it exactly.
+  const reportSketchView = useCallback(() => {
+    const ctx = sceneRef.current;
+    const height = containerRef.current?.clientHeight;
+    if (!ctx?.activeSketchPlane || !height) return;
+    const anim = ctx.cameraAnim;
+    const pos = anim ? anim.toPos : ctx.camera.position;
+    const target = anim ? anim.toTarget : ctx.controls.target;
+    const dist = Math.max(pos.distanceTo(target), 1e-3);
+    onSketchViewChangeRef.current?.(
+      sketchViewFromCamera(
+        ctx.activeSketchPlane,
+        target.toArray(),
+        dist,
+        ctx.camera.fov,
+        height
+      )
+    );
+  }, []);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -292,6 +306,9 @@ export default function Viewport3D({
       renderer.setSize(w, h);
       camera.aspect = w / h;
       camera.updateProjectionMatrix();
+      // The px-per-world-unit factor depends on the viewport height, so a
+      // resize while sketching changes the overlay mapping.
+      reportSketchView();
     }
     const observer = new ResizeObserver(resize);
     observer.observe(container);
@@ -406,7 +423,7 @@ export default function Viewport3D({
       renderer.domElement.remove();
       sceneRef.current = null;
     };
-  }, []);
+  }, [reportSketchView]);
 
   useEffect(() => {
     const ctx = sceneRef.current;
@@ -462,13 +479,41 @@ export default function Viewport3D({
       startViewAnimation(ctx, pose, () => {
         ctx.sketchOrtho = true;
       });
+      // Hand the destination pose's world-to-screen mapping to the overlay.
+      reportSketchView();
     } else if (ctx.savedView) {
       const saved = ctx.savedView;
       ctx.savedView = null;
       ctx.sketchOrtho = false;
       startViewAnimation(ctx, saved);
     }
-  }, [sketchPlane]);
+  }, [sketchPlane, reportSketchView]);
+
+  // Overlay -> camera: the sketch overlay owns pan/zoom while sketching;
+  // apply its view so the rendered model stays exactly under the sketch.
+  useEffect(() => {
+    const ctx = sceneRef.current;
+    const height = containerRef.current?.clientHeight;
+    if (!ctx?.activeSketchPlane || !sketchView || !height) return;
+    const pose = cameraFromSketchView(
+      ctx.activeSketchPlane,
+      sketchView,
+      ctx.camera.fov,
+      height
+    );
+    if (!pose) return;
+    if (ctx.cameraAnim) {
+      // Mid fly-in: retarget the animation instead of fighting it.
+      ctx.cameraAnim.toPos.set(...pose.position);
+      ctx.cameraAnim.toUp.set(...pose.up);
+      ctx.cameraAnim.toTarget.set(...pose.target);
+    } else {
+      ctx.camera.position.set(...pose.position);
+      ctx.camera.up.set(...pose.up);
+      ctx.controls.target.set(...pose.target);
+      ctx.camera.lookAt(ctx.controls.target);
+    }
+  }, [sketchView]);
 
   useEffect(() => {
     const ctx = sceneRef.current;

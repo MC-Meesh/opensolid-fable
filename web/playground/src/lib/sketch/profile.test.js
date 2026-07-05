@@ -15,6 +15,7 @@ import {
   profileTo3D,
   segmentEnd2D,
   segmentStart2D,
+  worldToPlane,
 } from './profile.js';
 
 function triangle() {
@@ -203,9 +204,33 @@ describe('extractProfile', () => {
 describe('plane mapping', () => {
   it('planeToWorld maps sketch axes onto world planes', () => {
     expect(planeToWorld('XY', 1, 2)).toEqual([1, 2, 0]);
-    expect(planeToWorld('XZ', 1, 2)).toEqual([1, 0, 2]);
-    expect(planeToWorld('YZ', 1, 2)).toEqual([0, 1, 2]);
+    // Top view: +Z runs down-screen, so sketch v maps to -z.
+    expect(planeToWorld('XZ', 1, 2)).toEqual([1, 0, -2]);
+    // Right view: +Z runs left on screen, so sketch u maps to -z, v to y.
+    expect(planeToWorld('YZ', 1, 2)).toEqual([0, 2, -1]);
     expect(() => planeToWorld('AB', 0, 0)).toThrow(/unknown/);
+  });
+
+  it('worldToPlane inverts planeToWorld on every plane', () => {
+    for (const plane of ['XY', 'XZ', 'YZ']) {
+      expect(worldToPlane(plane, planeToWorld(plane, 1.5, -2.5))).toEqual([
+        1.5, -2.5,
+      ]);
+    }
+    expect(() => worldToPlane('AB', [0, 0, 0])).toThrow(/unknown/);
+  });
+
+  it('sketch bases are right-handed: e_u x e_v equals the plane normal', () => {
+    for (const plane of ['XY', 'XZ', 'YZ']) {
+      const eu = planeToWorld(plane, 1, 0);
+      const ev = planeToWorld(plane, 0, 1);
+      const cross = [
+        eu[1] * ev[2] - eu[2] * ev[1],
+        eu[2] * ev[0] - eu[0] * ev[2],
+        eu[0] * ev[1] - eu[1] * ev[0],
+      ];
+      expect(cross).toEqual(planeNormal(plane));
+    }
   });
 
   it('planeNormal matches each plane', () => {

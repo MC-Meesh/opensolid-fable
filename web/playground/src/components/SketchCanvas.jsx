@@ -43,12 +43,18 @@ import {
   formatNumber,
   parseDimension,
 } from '../lib/sketch/format.js';
+import {
+  sketchScreenToWorld,
+  sketchWorldToScreen,
+} from '../lib/sketchView.js';
 
 const SNAP_PX = 10;
 const HIT_PX = 8;
 const DRAG_PX = 4; // click vs drag threshold for press-drag tools
 const MIN_SCALE = 2;
 const MAX_SCALE = 5000;
+// Placeholder until Viewport3D reports the camera-derived view.
+const DEFAULT_VIEW = { cx: 0, cy: 0, scale: 60 };
 
 const TOOLS = [
   {
@@ -85,8 +91,12 @@ const TOOLS = [
 ];
 
 const PLANES = ['XY', 'XZ', 'YZ'];
-/** Sketch-axis names (u, v) per plane, for the axis labels. */
-const PLANE_AXES = { XY: ['X', 'Y'], XZ: ['X', 'Z'], YZ: ['Y', 'Z'] };
+/**
+ * World-axis names of the sketch (u, v) axis lines, for the axis labels.
+ * Matches planeToWorld: on YZ the horizontal axis line is world Z (u = -z)
+ * and the vertical one is world Y.
+ */
+const PLANE_AXES = { XY: ['X', 'Y'], XZ: ['X', 'Z'], YZ: ['Z', 'Y'] };
 
 /** Decade grid: minor step sized to stay >= 8 screen px. */
 function gridSteps(scale) {
@@ -112,9 +122,15 @@ function arcScreenGeometry(sketch, entity) {
 }
 
 /**
- * 2D sketch canvas: an SVG overlay with its own pan/zoom coordinate system
- * (world units, Y up), drawing tools, direct manipulation, dimension entry,
- * undo/redo, and live closed-profile extraction.
+ * 2D sketch canvas: an SVG overlay in world units (v up), with drawing
+ * tools, direct manipulation, dimension entry, undo/redo, and live
+ * closed-profile extraction.
+ *
+ * The pan/zoom view `{ cx, cy, scale }` is owned by the parent (`view` /
+ * `onViewChange`): it is initialized from the 3D sketch camera and every
+ * change is applied back to that camera, so the overlay's px-per-world-unit
+ * mapping is exactly the camera's world-to-screen transform — what you draw
+ * over the rendered model is what extrudes (of-4eh.14).
  *
  * Interaction model (Onshape-style):
  *  - Line: click-click chaining with rubber band; clicking the chain's first
@@ -135,6 +151,8 @@ function arcScreenGeometry(sketch, entity) {
 export default function SketchCanvas({
   open,
   plane,
+  view: viewProp,
+  onViewChange,
   onPlaneChange,
   onProfileChange,
   onSweep,
@@ -145,7 +163,11 @@ export default function SketchCanvas({
   const svgRef = useRef(null);
   const [rev, setRev] = useState(0);
   const [size, setSize] = useState({ w: 0, h: 0 });
-  const [view, setView] = useState({ cx: 0, cy: 0, scale: 60 });
+  const view = viewProp ?? DEFAULT_VIEW;
+  const viewRef = useRef(view);
+  viewRef.current = view;
+  const onViewChangeRef = useRef(onViewChange);
+  onViewChangeRef.current = onViewChange;
   const [tool, setTool] = useState('line');
   const [selection, setSelection] = useState([]);
   const [draft, setDraft] = useState(null);
@@ -219,18 +241,12 @@ export default function SketchCanvas({
   // ---- coordinate transforms ----------------------------------------------
 
   const worldToScreen = useCallback(
-    (x, y) => [
-      (x - view.cx) * view.scale + size.w / 2,
-      size.h / 2 - (y - view.cy) * view.scale,
-    ],
+    (x, y) => sketchWorldToScreen(view, size, x, y),
     [view, size]
   );
 
   const screenToWorld = useCallback(
-    (sx, sy) => ({
-      x: (sx - size.w / 2) / view.scale + view.cx,
-      y: (size.h / 2 - sy) / view.scale + view.cy,
-    }),
+    (sx, sy) => sketchScreenToWorld(view, size, sx, sy),
     [view, size]
   );
 
@@ -260,17 +276,16 @@ export default function SketchCanvas({
       const rect = el.getBoundingClientRect();
       const sx = event.clientX - rect.left;
       const sy = event.clientY - rect.top;
-      setView((v) => {
-        const factor = Math.exp(-event.deltaY * 0.0015);
-        const scale = Math.min(MAX_SCALE, Math.max(MIN_SCALE, v.scale * factor));
-        // Keep the world point under the cursor stationary.
-        const wx = (sx - el.clientWidth / 2) / v.scale + v.cx;
-        const wy = (el.clientHeight / 2 - sy) / v.scale + v.cy;
-        return {
-          scale,
-          cx: wx - (sx - el.clientWidth / 2) / scale,
-          cy: wy - (el.clientHeight / 2 - sy) / scale,
-        };
+      const v = viewRef.current;
+      const factor = Math.exp(-event.deltaY * 0.0015);
+      const scale = Math.min(MAX_SCALE, Math.max(MIN_SCALE, v.scale * factor));
+      // Keep the world point under the cursor stationary.
+      const wx = (sx - el.clientWidth / 2) / v.scale + v.cx;
+      const wy = (el.clientHeight / 2 - sy) / v.scale + v.cy;
+      onViewChangeRef.current?.({
+        scale,
+        cx: wx - (sx - el.clientWidth / 2) / scale,
+        cy: wy - (el.clientHeight / 2 - sy) / scale,
       });
     };
     el.addEventListener('wheel', onWheel, { passive: false });
@@ -760,7 +775,7 @@ export default function SketchCanvas({
       if (drag?.mode === 'pan') {
         const dx = (event.clientX - drag.startX) / drag.view0.scale;
         const dy = (event.clientY - drag.startY) / drag.view0.scale;
-        setView({
+        onViewChangeRef.current?.({
           ...drag.view0,
           cx: drag.view0.cx - dx,
           cy: drag.view0.cy + dy,

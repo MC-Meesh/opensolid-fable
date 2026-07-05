@@ -1,12 +1,25 @@
 import { describe, expect, it } from 'vitest';
 import {
   SKETCH_VIEW_POSES,
+  cameraFromSketchView,
   easeInOutCubic,
   gridLevels,
   orthoHalfExtents,
   planeIndicatorSize,
+  sketchDistForPxPerUnit,
+  sketchPxPerUnit,
+  sketchScreenToWorld,
+  sketchViewFromCamera,
   sketchViewPose,
+  sketchWorldToScreen,
 } from './sketchView.js';
+import { addRectangle, createSketch } from './sketch/model.js';
+import {
+  extractProfile,
+  planeToWorld,
+  segmentEnd2D,
+  segmentStart2D,
+} from './sketch/profile.js';
 
 describe('sketchViewPose', () => {
   it('places the camera along +Z for the XY plane (front view)', () => {
@@ -81,6 +94,109 @@ describe('orthoHalfExtents', () => {
     const near = orthoHalfExtents(5, 45, 1);
     const far = orthoHalfExtents(10, 45, 1);
     expect(far.halfH).toBeCloseTo(near.halfH * 2);
+  });
+});
+
+describe('px <-> world mapping (of-4eh.14)', () => {
+  const FOV = 45;
+  const HEIGHT = 800;
+
+  it('pxPerUnit is the viewport height over the ortho frustum height', () => {
+    for (const dist of [0.5, 3, 42]) {
+      const { halfH } = orthoHalfExtents(dist, FOV, 1.7);
+      expect(sketchPxPerUnit(dist, FOV, HEIGHT) * 2 * halfH).toBeCloseTo(HEIGHT);
+    }
+  });
+
+  it('sketchDistForPxPerUnit inverts sketchPxPerUnit', () => {
+    for (const dist of [0.25, 1, 12, 300]) {
+      const scale = sketchPxPerUnit(dist, FOV, HEIGHT);
+      expect(sketchDistForPxPerUnit(scale, FOV, HEIGHT)).toBeCloseTo(dist);
+    }
+  });
+
+  it('world<->screen round-trips and scales uniformly in x and y', () => {
+    const view = { cx: 1.5, cy: -2, scale: 37 };
+    const size = { w: 1200, h: 800 };
+    const [sx, sy] = sketchWorldToScreen(view, size, 3, 4);
+    const back = sketchScreenToWorld(view, size, sx, sy);
+    expect(back.x).toBeCloseTo(3);
+    expect(back.y).toBeCloseTo(4);
+    // One world unit is `scale` px along both axes; screen y grows downward.
+    const [sx1, sy1] = sketchWorldToScreen(view, size, 4, 5);
+    expect(sx1 - sx).toBeCloseTo(view.scale);
+    expect(sy1 - sy).toBeCloseTo(-view.scale);
+    // The view center maps to the viewport center.
+    expect(sketchWorldToScreen(view, size, 1.5, -2)).toEqual([600, 400]);
+  });
+
+  it('camera <-> overlay view round-trips on every plane', () => {
+    for (const plane of Object.keys(SKETCH_VIEW_POSES)) {
+      const view = { cx: 2.5, cy: -1.25, scale: 90 };
+      const pose = cameraFromSketchView(plane, view, FOV, HEIGHT);
+      const back = sketchViewFromCamera(plane, pose.target, pose.dist, FOV, HEIGHT);
+      expect(back.cx).toBeCloseTo(view.cx);
+      expect(back.cy).toBeCloseTo(view.cy);
+      expect(back.scale).toBeCloseTo(view.scale);
+      // The camera sits `dist` off the plane, over the view center.
+      expect(pose.target).toEqual(planeToWorld(plane, view.cx, view.cy));
+      const n = SKETCH_VIEW_POSES[plane].normal;
+      for (let i = 0; i < 3; i += 1) {
+        expect(pose.position[i]).toBeCloseTo(pose.target[i] + n[i] * pose.dist);
+      }
+    }
+    expect(cameraFromSketchView('AB', { cx: 0, cy: 0, scale: 1 }, FOV, HEIGHT)).toBeNull();
+  });
+
+  it('sketch (u, v) axes match the normal-to camera screen axes', () => {
+    // The overlay draws u right and v up; the camera must show
+    // planeToWorld(u, v) at that same spot, so e_u == camera-right and
+    // e_v == camera-up for every plane. This pins overlay orientation to
+    // the 3D render (regression: XZ/YZ used to be mirrored).
+    for (const plane of Object.keys(SKETCH_VIEW_POSES)) {
+      const { normal: n, up } = SKETCH_VIEW_POSES[plane];
+      const right = [
+        up[1] * n[2] - up[2] * n[1],
+        up[2] * n[0] - up[0] * n[2],
+        up[0] * n[1] - up[1] * n[0],
+      ];
+      const eu = planeToWorld(plane, 1, 0);
+      const ev = planeToWorld(plane, 0, 1);
+      for (let i = 0; i < 3; i += 1) {
+        expect(eu[i]).toBeCloseTo(right[i]);
+        expect(ev[i]).toBeCloseTo(up[i]);
+      }
+    }
+  });
+
+  it('regression: profile bbox in model units == drawn px bbox / pxPerUnit', () => {
+    // Simulate drawing a rectangle on screen with the camera-matched view,
+    // exactly as SketchCanvas does: screen px -> world via the shared
+    // mapping, then extract the profile the extrude consumes.
+    const dist = 7.3;
+    const scale = sketchPxPerUnit(dist, FOV, HEIGHT);
+    const view = { cx: 0.4, cy: -0.7, scale };
+    const size = { w: 1280, h: HEIGHT };
+    const pxA = [300, 620];
+    const pxB = [640, 180]; // 340 x 440 px on screen
+    const a = sketchScreenToWorld(view, size, ...pxA);
+    const b = sketchScreenToWorld(view, size, ...pxB);
+    const sketch = createSketch();
+    addRectangle(sketch, a.x, a.y, b.x, b.y);
+    const profile = extractProfile(sketch, 'XY');
+    expect(profile.closed).toBe(true);
+    const us = [];
+    const vs = [];
+    for (const seg of profile.segments) {
+      for (const [u, v] of [segmentStart2D(seg), segmentEnd2D(seg)]) {
+        us.push(u);
+        vs.push(v);
+      }
+    }
+    const bboxW = Math.max(...us) - Math.min(...us);
+    const bboxH = Math.max(...vs) - Math.min(...vs);
+    expect(bboxW).toBeCloseTo(Math.abs(pxB[0] - pxA[0]) / scale, 9);
+    expect(bboxH).toBeCloseTo(Math.abs(pxB[1] - pxA[1]) / scale, 9);
   });
 });
 

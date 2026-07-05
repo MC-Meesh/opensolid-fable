@@ -1,6 +1,10 @@
 // Pure math for the sketch-mode viewport: SolidWorks-style "Normal To"
-// camera poses, orthographic frustum sizing, and adaptive grid spacing.
-// Kept free of three.js so it can be unit-tested in isolation.
+// camera poses, orthographic frustum sizing, adaptive grid spacing, and the
+// px <-> world-unit mapping shared by the 2D sketch overlay and the 3D
+// orthographic camera. Kept free of three.js so it can be unit-tested in
+// isolation.
+
+import { planeToWorld, worldToPlane } from './sketch/profile.js';
 
 /**
  * Per-plane view poses. `normal` is the direction from the plane toward the
@@ -53,6 +57,63 @@ export function sketchViewPose(plane, target, dist) {
 export function orthoHalfExtents(dist, fovDeg, aspect) {
   const halfH = dist * Math.tan((fovDeg * Math.PI) / 180 / 2);
   return { halfW: halfH * aspect, halfH };
+}
+
+/**
+ * Screen pixels per world unit of the sketch orthographic camera: the ortho
+ * frustum height is 2 * dist * tan(fov / 2) (matched to the perspective
+ * camera's apparent size at the target), mapped onto the viewport height.
+ * The factor is uniform in x and y because the frustum width uses the same
+ * aspect ratio as the viewport.
+ */
+export function sketchPxPerUnit(dist, fovDeg, viewportHeightPx) {
+  const { halfH } = orthoHalfExtents(dist, fovDeg, 1);
+  return viewportHeightPx / (2 * halfH);
+}
+
+/** Camera distance that yields `pxPerUnit` — inverse of `sketchPxPerUnit`. */
+export function sketchDistForPxPerUnit(pxPerUnit, fovDeg, viewportHeightPx) {
+  return viewportHeightPx / (2 * pxPerUnit * Math.tan((fovDeg * Math.PI) / 180 / 2));
+}
+
+/**
+ * The 2D overlay view `{ cx, cy, scale }` (view center in sketch-plane
+ * coordinates, px per world unit) that exactly matches the sketch camera
+ * looking at `target` (a point on the plane) from distance `dist`.
+ */
+export function sketchViewFromCamera(plane, target, dist, fovDeg, viewportHeightPx) {
+  const [cx, cy] = worldToPlane(plane, target);
+  return { cx, cy, scale: sketchPxPerUnit(dist, fovDeg, viewportHeightPx) };
+}
+
+/**
+ * Inverse of `sketchViewFromCamera`: the normal-to camera pose (plus its
+ * distance) whose world-to-screen transform equals the overlay view.
+ */
+export function cameraFromSketchView(plane, view, fovDeg, viewportHeightPx) {
+  if (!SKETCH_VIEW_POSES[plane]) return null;
+  const dist = sketchDistForPxPerUnit(view.scale, fovDeg, viewportHeightPx);
+  const target = planeToWorld(plane, view.cx, view.cy);
+  return { ...sketchViewPose(plane, target, dist), dist };
+}
+
+/**
+ * Sketch-plane (u, v) to overlay screen px for view `{ cx, cy, scale }` and
+ * viewport `size` `{ w, h }`. Screen y grows downward; v grows up.
+ */
+export function sketchWorldToScreen(view, size, u, v) {
+  return [
+    (u - view.cx) * view.scale + size.w / 2,
+    size.h / 2 - (v - view.cy) * view.scale,
+  ];
+}
+
+/** Inverse of `sketchWorldToScreen`. */
+export function sketchScreenToWorld(view, size, sx, sy) {
+  return {
+    x: (sx - size.w / 2) / view.scale + view.cx,
+    y: (size.h / 2 - sy) / view.scale + view.cy,
+  };
 }
 
 /**

@@ -25,15 +25,39 @@ import { entityRadius } from './model.js';
 
 const ARC_SAMPLES = 32;
 
-/** Map sketch-plane (u, v) to world [x, y, z] for a named plane. */
+/**
+ * Map sketch-plane (u, v) to world [x, y, z] for a named plane.
+ *
+ * The (u, v) basis of each plane is chosen to match the normal-to sketch
+ * camera (SKETCH_VIEW_POSES in lib/sketchView.js): u runs along screen-right
+ * and v along screen-up of that camera, and e_u × e_v equals the plane
+ * normal. That makes the 2D overlay WYSIWYG — geometry drawn at (u, v)
+ * projects to the exact same spot the 3D camera shows planeToWorld(u, v).
+ * Concretely: the top view (XZ) has +Z running down-screen, so v = -z; the
+ * right view (YZ) has +Y up and +Z running left, so u = -z, v = y.
+ */
 export function planeToWorld(plane, u, v) {
   switch (plane) {
     case 'XY':
       return [u, v, 0];
     case 'XZ':
-      return [u, 0, v];
+      return [u, 0, -v];
     case 'YZ':
-      return [0, u, v];
+      return [0, v, -u];
+    default:
+      throw new Error(`unknown sketch plane: ${plane}`);
+  }
+}
+
+/** Inverse of `planeToWorld` for points on the plane: world -> [u, v]. */
+export function worldToPlane(plane, [x, y, z]) {
+  switch (plane) {
+    case 'XY':
+      return [x, y];
+    case 'XZ':
+      return [x, -z];
+    case 'YZ':
+      return [-z, y];
     default:
       throw new Error(`unknown sketch plane: ${plane}`);
   }

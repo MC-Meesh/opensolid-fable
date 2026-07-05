@@ -6,8 +6,13 @@
 // (x, z) and spans y ∈ [0, height]; revolve spins profile (u = radius,
 // v = height) around the world Y axis starting from the +X half-plane. The
 // per-plane post-ops below rotate (and for extrude translate) that native
-// result so the profile lands on the chosen sketch plane, extruded along
-// the plane's +normal / revolved around the sketch's v axis.
+// result so the profile lands on the chosen sketch plane — at exactly
+// `planeToWorld(u, v)` (see lib/sketch/profile.js) — extruded along the
+// plane's +normal / revolved around the sketch's v axis.
+//
+// The XZ and YZ sketch frames map v to -z / u to -z, which the extrude
+// post-rotations alone cannot reach (a rotation cannot mirror), so extrude
+// on those planes additionally mirrors the profile ops (`nativeSweepOps`).
 //
 // Kept free of React and WASM imports so it can be unit-tested with
 // stand-in Shape/Profile classes (same pattern as sceneTree.js).
@@ -38,8 +43,38 @@ export function profileToOps(profile) {
 }
 
 /**
+ * Mirror profile ops across the u axis (v -> -v) while preserving the
+ * counterclockwise traversal the kernel expects: the mirrored loop is walked
+ * in reverse (mirror and reversal each negate a bulge, so bulges carry over
+ * unchanged). The start vertex stays the loop's anchor.
+ */
+export function mirrorOpsV(ops) {
+  // Loop vertices v0..vn-1 (segs[i] runs v_i -> v_i+1, the last back to v0).
+  const verts = [ops.start, ...ops.segs.slice(0, -1).map((s) => [s.x, s.y])];
+  const segs = [];
+  for (let i = ops.segs.length - 1; i >= 0; i -= 1) {
+    const [x, y] = verts[i];
+    segs.push({ x, y: -y, bulge: ops.segs[i].bulge });
+  }
+  return { start: [ops.start[0], -ops.start[1]], segs };
+}
+
+/**
+ * Profile ops in the kernel's native sweep frame for the given plane and
+ * sweep kind. Extrude on XZ/YZ needs the mirror (those frames map sketch v /
+ * u to -z); revolve feeds (radius, height) directly for every plane.
+ */
+export function nativeSweepOps(ops, plane, kind) {
+  if (kind === 'extrude' && (plane === 'XZ' || plane === 'YZ')) {
+    return mirrorOpsV(ops);
+  }
+  return ops;
+}
+
+/**
  * Ops (applied in order) that carry the native sweep result onto the sketch
- * plane: `[{ op: 'rotate'|'translate', args }]`.
+ * plane: `[{ op: 'rotate'|'translate', args }]`, paired with
+ * `nativeSweepOps` for the same plane and kind.
  *
  * Extrude goes along the plane's +normal starting at the plane; revolve
  * spins around the sketch's v axis with the profile's u as radius.
@@ -48,7 +83,8 @@ export function sweepPostOps(plane, kind, param) {
   if (kind === 'extrude') {
     switch (plane) {
       case 'XZ':
-        // Native frame: profile (u, v) -> (x, z), swept along +Y.
+        // Mirrored ops already sit at (x, z) = planeToWorld(u, v); the
+        // native sweep along +Y is the plane normal.
         return [];
       case 'XY':
         return [
@@ -56,10 +92,9 @@ export function sweepPostOps(plane, kind, param) {
           { op: 'translate', args: [0, 0, param] },
         ];
       case 'YZ':
-        return [
-          { op: 'rotate', args: [0, 0, 1, Math.PI / 2] },
-          { op: 'translate', args: [param, 0, 0] },
-        ];
+        // 120° about (1, 1, -1): x -> -z, native sweep +Y -> +X (the plane
+        // normal), z -> -y; with mirrored ops this lands (u, v) on (y, -z).
+        return [{ op: 'rotate', args: [1, 1, -1, (2 * Math.PI) / 3] }];
       default:
         throw new Error(`unknown sketch plane: ${plane}`);
     }
@@ -70,10 +105,11 @@ export function sweepPostOps(plane, kind, param) {
         // Native frame: profile (u, v) -> (radius, y), around the Y axis.
         return [];
       case 'XZ':
-        return [{ op: 'rotate', args: [1, 0, 0, Math.PI / 2] }];
+        // Y axis -> -Z: the sketch's v axis, with the profile on the plane.
+        return [{ op: 'rotate', args: [1, 0, 0, -Math.PI / 2] }];
       case 'YZ':
-        // Cyclic axis permutation x->y->z->x (120° about (1,1,1)).
-        return [{ op: 'rotate', args: [1, 1, 1, (2 * Math.PI) / 3] }];
+        // Y axis stays put; the +X start half-plane rotates onto -Z (= +u).
+        return [{ op: 'rotate', args: [0, 1, 0, Math.PI / 2] }];
       default:
         throw new Error(`unknown sketch plane: ${plane}`);
     }
@@ -87,7 +123,8 @@ export function sweepPostOps(plane, kind, param) {
  * intermediate shape; the caller owns the returned shape.
  */
 export function buildSweepShape(ShapeClass, ProfileClass, sweep) {
-  const { kind, plane, ops, value } = sweep;
+  const { kind, plane, value } = sweep;
+  const ops = nativeSweepOps(sweep.ops, plane, kind);
   const profile = new ProfileClass(ops.start[0], ops.start[1]);
   let shape;
   try {
@@ -112,7 +149,8 @@ export function buildSweepShape(ShapeClass, ProfileClass, sweep) {
  * collide with traced ids; the tree is only serialized, then re-evaluated.
  */
 export function sweepTreeNode(root, sweep) {
-  const { kind, plane, ops, value } = sweep;
+  const { kind, plane, value } = sweep;
+  const ops = nativeSweepOps(sweep.ops, plane, kind);
   let id = -1;
   let node = {
     id: id--,

@@ -59,6 +59,10 @@ export default function App() {
   const [gizmoMode, setGizmoMode] = useState('translate');
   const [sketchOpen, setSketchOpen] = useState(false);
   const [sketchPlane, setSketchPlane] = useState('XY');
+  // Shared sketch-mode view (plane coords + px per world unit): initialized
+  // from the camera by Viewport3D, panned/zoomed by SketchCanvas, applied
+  // back to the camera — one world-to-screen transform for both layers.
+  const [sketchView, setSketchView] = useState(null);
   const [sweep, setSweep] = useState(null);
   const [sweepError, setSweepError] = useState(null);
   const [previewMesh, setPreviewMesh] = useState(null);
@@ -530,6 +534,8 @@ export default function App() {
             mesh={mesh}
             wireframe={wireframe}
             sketchPlane={sketchOpen ? sketchPlane : null}
+            sketchView={sketchView}
+            onSketchViewChange={setSketchView}
             gizmoMode={gizmoMode}
             selectedMesh={selectedMesh}
             selectedPivot={selectedPivot}
@@ -586,6 +592,8 @@ export default function App() {
           <SketchCanvas
             open={sketchOpen}
             plane={sketchPlane}
+            view={sketchView}
+            onViewChange={setSketchView}
             onPlaneChange={setSketchPlane}
             onProfileChange={handleProfileChange}
             onSweep={handleSweepStart}
