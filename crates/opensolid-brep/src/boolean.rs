@@ -523,6 +523,28 @@ impl FaceRegionPoly {
         inside
     }
 
+    /// Containment for imprint clipping: like `contains` after
+    /// `localize`, but robust on periodic charts. A sample that lands
+    /// exactly on the parameter cover's seam meridian (u = 0 / u = 2π on
+    /// a cylinder) sits on the cover polygon's boundary, where the strict
+    /// even-odd test is a float coin flip — yet such a point is
+    /// geometrically interior to the face whenever its v is. Resolve by
+    /// retrying with the angle nudged off the seam by a sub-tolerance
+    /// step (`snap` expressed as an angle at the chart radius); a point
+    /// genuinely outside the region stays outside under the nudge.
+    fn contains_for_clip(&self, uv: (f64, f64), snap: f64) -> bool {
+        let local = self.localize(uv);
+        if self.contains(local) {
+            return true;
+        }
+        let Chart::Cylinder { radius, .. } = self.chart else {
+            return false;
+        };
+        let eps = (snap / radius).max(1e-12);
+        self.contains(self.localize((local.0 + eps, local.1)))
+            || self.contains(self.localize((local.0 - eps, local.1)))
+    }
+
     /// Bring an angle-like `u` into this polygon's neighborhood by shifting
     /// whole periods (no-op for planes).
     fn localize(&self, uv: (f64, f64)) -> (f64, f64) {
@@ -822,9 +844,10 @@ impl<'a> Pipeline<'a> {
             .collect();
         let inside = |t: f64| -> bool {
             let p = curve.point(t);
-            let pa = self.face_polys[0][fa].localize(self.face_polys[0][fa].chart.param(&p, None));
-            let pb = self.face_polys[1][fb].localize(self.face_polys[1][fb].chart.param(&p, None));
-            self.face_polys[0][fa].contains(pa) && self.face_polys[1][fb].contains(pb)
+            let pa = self.face_polys[0][fa].chart.param(&p, None);
+            let pb = self.face_polys[1][fb].chart.param(&p, None);
+            self.face_polys[0][fa].contains_for_clip(pa, self.snap)
+                && self.face_polys[1][fb].contains_for_clip(pb, self.snap)
         };
         let flags: Vec<bool> = ts.iter().map(|&t| inside(t)).collect();
 
@@ -914,6 +937,21 @@ impl<'a> Pipeline<'a> {
                     sampled: SampledCurve {
                         points: pts,
                         closed: false,
+                    },
+                });
+            } else if closed_curve && polyline_length(&pts) > self.snap * 4.0 {
+                // A run on a closed curve whose refined endpoints coincide
+                // (within snap) is the full ring minus a zero-width gap:
+                // the excluded stretch is below resolution, so the ring is
+                // inside. Dropping it instead would silently no-op the
+                // boolean (of-ipt.5).
+                self.imprints.push(Imprint {
+                    face_a: fa,
+                    face_b: fb,
+                    curve: curve.clone(),
+                    sampled: SampledCurve {
+                        points: ts.iter().map(|&t| curve.point(t)).collect(),
+                        closed: true,
                     },
                 });
             }
@@ -2607,7 +2645,7 @@ mod tests {
     use super::*;
     use crate::check::MAX_ALLOWED_TOLERANCE;
     use crate::primitives;
-    use crate::transform::translate_body;
+    use crate::transform::{rotate_body, translate_body};
 
     fn tol() -> ToleranceContext {
         ToleranceContext::default()
@@ -2724,6 +2762,41 @@ mod tests {
         assert_valid(&out, "block minus cylinder");
         assert_geometry_bound(&out, "block minus cylinder");
         // Through-hole: genus 1.
+        let counts = out.store.euler_counts(out.body);
+        assert_eq!(counts.genus, 1, "through hole must give genus 1");
+    }
+
+    #[test]
+    fn subtract_tilted_cylinder_seam_aligned_makes_through_hole() {
+        // of-ipt.5 regression: a tool cylinder tilted 15° in the YZ plane
+        // pierces the slab top and bottom. Both plane∩cylinder ellipses
+        // cross the wall chart's seam meridian exactly (the configuration
+        // is x-symmetric and the chart's e_u is x-aligned), so one clip
+        // sample per ellipse lands exactly on the seam. That sample used
+        // to coin-flip to "outside", demote the ring to an open run with
+        // coincident refined endpoints, and silently drop the whole
+        // imprint — subtract returned the slab unchanged with Ok.
+        let (mut store, mut geo) = stores();
+        let slab = block_at(&mut store, &mut geo, (6.0, 6.0, 2.0), (3.0, 3.0, 1.0));
+        let theta = 15f64.to_radians();
+        let tool = primitives::cylinder(&mut store, &mut geo, 0.5, 8.0).expect("valid cylinder");
+        // Tilt the +Z axis to (0, sin θ, cos θ), then move to the slab.
+        rotate_body(
+            &mut store,
+            &mut geo,
+            tool,
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(1.0, 0.0, 0.0),
+            -theta,
+        )
+        .expect("finite rotation");
+        translate_body(&mut store, &mut geo, tool, Vector3::new(3.0, 3.0, 1.0))
+            .expect("finite offset");
+        let out = subtract(&store, &geo, slab, tool, &tol()).unwrap();
+        assert_eq!(out.face_count(), 7, "6 slab faces + 1 tilted cylinder band");
+        assert_eq!(out.shell_count(), 1);
+        assert_valid(&out, "slab minus 15° tilted cylinder");
+        assert_geometry_bound(&out, "slab minus 15° tilted cylinder");
         let counts = out.store.euler_counts(out.body);
         assert_eq!(counts.genus, 1, "through hole must give genus 1");
     }
@@ -2989,6 +3062,32 @@ mod tests {
                 corner(seam_u + TWO_PI, half_height),
                 corner(seam_u, half_height),
             ]],
+        }
+    }
+
+    #[test]
+    fn contains_for_clip_is_stable_on_the_seam_meridian() {
+        // Points exactly on a cylinder cover's seam meridian sit on the
+        // cover polygon's boundary, where plain even-odd containment is a
+        // float coin flip (of-ipt.5). The clip-purpose test must read
+        // them as inside — in every equivalent angle spelling — while
+        // still rejecting points genuinely outside the region.
+        let snap = 8e-9;
+        let fp = wall_poly(0.5, 0.0, 4.0);
+        for u in [0.0, -0.0, TWO_PI, -TWO_PI] {
+            assert!(
+                fp.contains_for_clip((u, 1.0), snap),
+                "seam-meridian point (u = {u}) must be inside"
+            );
+        }
+        // Interior point stays inside; outside-v stays outside in every
+        // angle spelling, seam or not.
+        assert!(fp.contains_for_clip((std::f64::consts::PI, 0.0), snap));
+        for u in [0.0, std::f64::consts::PI, TWO_PI] {
+            assert!(
+                !fp.contains_for_clip((u, 4.5), snap),
+                "point beyond the wall's v range (u = {u}) must stay outside"
+            );
         }
     }
 

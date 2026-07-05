@@ -383,34 +383,26 @@ fn rotated_tool_through_hole(angle_deg: f64) {
 }
 
 #[test]
-#[ignore = "of-ipt.6: 0.5°–5° tilt yields output failing check() and non-manifold tessellation"]
 fn rotated_tool_through_hole_0_5_deg() {
     rotated_tool_through_hole(0.5);
 }
 
 #[test]
-#[ignore = "of-ipt.6: 0.5°–5° tilt yields output failing check() and non-manifold tessellation"]
 fn rotated_tool_through_hole_5_deg() {
     rotated_tool_through_hole(5.0);
 }
 
 #[test]
-#[ignore = "of-ipt.5: 15° tilt drops all imprints — subtract silently returns A unchanged \
-            (unchanged by of-k3u)"]
 fn rotated_tool_through_hole_15_deg() {
     rotated_tool_through_hole(15.0);
 }
 
 #[test]
-#[ignore = "of-ipt.5: post-of-k3u the 30° imprint is accepted (7 faces) but the output fails \
-            check() (OpenEdgeInClosedShell) and tessellates non-manifold, like of-ipt.6"]
 fn rotated_tool_through_hole_30_deg() {
     rotated_tool_through_hole(30.0);
 }
 
 #[test]
-#[ignore = "of-ipt.5: post-of-k3u the 45° imprint is accepted (7 faces) but the output fails \
-            check() (OpenEdgeInClosedShell) and tessellates non-manifold, like of-ipt.6"]
 fn rotated_tool_through_hole_45_deg() {
     rotated_tool_through_hole(45.0);
 }
