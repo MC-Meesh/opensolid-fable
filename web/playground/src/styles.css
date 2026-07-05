@@ -32,6 +32,83 @@ header {
 }
 header h1 { font-size: 15px; margin: 0; font-weight: 600; }
 header p { margin: 2px 0 0; font-size: 12px; color: var(--muted); }
+.scene-tree {
+  display: flex;
+  flex-direction: column;
+  max-height: 32%;
+  border-bottom: 1px solid var(--border);
+}
+.scene-tree-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  padding: 8px 14px 6px;
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+}
+.scene-tree-hint {
+  font-weight: 400;
+  text-transform: none;
+  letter-spacing: normal;
+  font-size: 11px;
+}
+.scene-tree-body {
+  overflow: auto;
+  padding-bottom: 6px;
+}
+.tree-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding-top: 3px;
+  padding-bottom: 3px;
+  padding-right: 10px;
+  font-size: 12.5px;
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+.tree-row:hover { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+.tree-row.selected {
+  background: color-mix(in srgb, var(--accent) 24%, transparent);
+  color: #fff;
+}
+.tree-row:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+.tree-toggle {
+  width: 14px;
+  flex: none;
+  text-align: center;
+  color: var(--muted);
+  font-size: 10px;
+}
+.scene-tree-empty {
+  padding: 4px 14px 8px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.isolate-banner {
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12.5px;
+  background: color-mix(in srgb, var(--panel) 88%, transparent);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 10px;
+}
+.isolate-banner button {
+  padding: 3px 10px;
+  font-size: 12px;
+}
 .editor {
   flex: 1;
   min-height: 0;

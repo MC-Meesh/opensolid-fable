@@ -4,8 +4,9 @@ import ScriptEditor from './components/ScriptEditor.jsx';
 import Viewport3D from './components/Viewport3D.jsx';
 import Toolbar from './components/Toolbar.jsx';
 import StatusBar from './components/StatusBar.jsx';
+import SceneTree from './components/SceneTree.jsx';
 import { DEFAULT_SCRIPT } from './lib/defaultScript.js';
-import { runScript } from './lib/runScript.js';
+import { freeNodes, nodeLabel, runTracedScript } from './lib/sceneTree.js';
 import { buildBinaryStl } from './lib/stl.js';
 
 // Single WASM instantiation shared across (strict-mode re-)mounts.
@@ -24,10 +25,13 @@ export default function App() {
   const [wireframe, setWireframe] = useState(false);
   const [mesh, setMesh] = useState(null); // { positions, normals, indices, frame, key }
   const [stats, setStats] = useState(null); // { triangles, vertices, resolution, elapsedMs }
+  const [tree, setTree] = useState(null); // root node of the construction tree
+  const [selected, setSelected] = useState(null); // isolated tree node, or null
 
   const scriptRef = useRef(DEFAULT_SCRIPT); // live editor contents
   const resolutionRef = useRef(DEFAULT_RESOLUTION); // committed slider value
-  const shapeRef = useRef(null); // last successfully evaluated WasmShape
+  const shapeRef = useRef(null); // WasmShape currently shown (full model or isolated node)
+  const tracedRef = useRef(null); // { root, nodes } from the last successful run
   const meshRef = useRef(null); // last mesh buffers, for STL export
   const meshKeyRef = useRef(0);
 
@@ -82,17 +86,34 @@ export default function App() {
 
   const evaluateScript = useCallback(() => {
     setError(null);
-    let shape;
+    let traced;
     try {
-      shape = runScript(scriptRef.current, WasmShape);
+      traced = runTracedScript(scriptRef.current, WasmShape);
     } catch (err) {
       setError(String(err?.stack || err));
       return;
     }
-    if (shapeRef.current) shapeRef.current.free();
-    shapeRef.current = shape;
+    // The tree nodes own the intermediate WasmShapes (including the root's).
+    if (tracedRef.current) freeNodes(tracedRef.current.nodes);
+    tracedRef.current = traced;
+    setTree(traced.root);
+    setSelected(null);
+    shapeRef.current = traced.root.shape;
     remesh({ reframe: true });
   }, [remesh]);
+
+  const selectNode = useCallback(
+    (node) => {
+      const root = tracedRef.current?.root;
+      if (!root) return;
+      // Clicking the current selection, the root, or clearing → full model.
+      const isolate = node && node !== root && node.id !== selected?.id ? node : null;
+      setSelected(isolate);
+      shapeRef.current = (isolate ?? root).shape;
+      remesh({ reframe: true });
+    },
+    [remesh, selected]
+  );
 
   const downloadStl = useCallback(() => {
     const current = meshRef.current;
@@ -148,6 +169,7 @@ export default function App() {
           <h1>OpenSolid Playground</h1>
           <p>Write a script that returns a Shape, then Run (Ctrl/Cmd+Enter).</p>
         </header>
+        <SceneTree root={tree} selectedId={selected?.id} onSelect={selectNode} />
         <ScriptEditor
           initialDoc={DEFAULT_SCRIPT}
           onChange={handleScriptChange}
@@ -167,6 +189,16 @@ export default function App() {
       </div>
       <div className="right">
         <Viewport3D mesh={mesh} wireframe={wireframe} />
+        {selected && (
+          <div className="isolate-banner">
+            <span>
+              Isolated: <strong>{nodeLabel(selected)}</strong>
+            </span>
+            <button className="secondary" onClick={() => selectNode(null)}>
+              Show full model
+            </button>
+          </div>
+        )}
         {stats && <StatusBar stats={stats} />}
         {!wasmReady && <div className="loading">Loading WASM…</div>}
       </div>
