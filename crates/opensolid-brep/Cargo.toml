@@ -9,3 +9,9 @@ description = "B-Rep topology and parametric geometry: NURBS curves/surfaces, fa
 opensolid-core = { path = "../opensolid-core" }
 nalgebra = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+# Dev-only dependency cycle (kernel depends on brep normally): the boolean
+# stress suite cross-checks tessellations against kernel mass properties
+# and the MeshSdf round-trip. Cargo permits cycles through dev-dependencies.
+opensolid-kernel = { path = "../opensolid-kernel" }
