@@ -29,11 +29,16 @@
 //!   check() and correct hexahedron topology.
 //!
 //! Re-verified after the of-k3u seam-refinement fix (of-ipt.12,
-//! 2026-07-05): all 15 ignored cases still fail. 15° tilt is still a
-//! silent no-op; 30°/45° now accept the imprint but fail check()
-//! (OpenEdgeInClosedShell) like of-ipt.6; the 25° skew case no longer
-//! errors — it builds correct topology (genus 1, clean check) but
-//! tessellates non-manifold. of-ipt.4/6/8/9 and of-ny6 are unchanged.
+//! 2026-07-05): 15° tilt is still a silent no-op; 30°/45° now accept the
+//! imprint but fail check() (OpenEdgeInClosedShell) like of-ipt.6; the
+//! 25° skew case no longer errors — it builds correct topology (genus 1,
+//! clean check) but tessellates non-manifold. of-ipt.6/8/9 and of-ny6
+//! are unchanged.
+//!
+//! of-ipt.4 FIXED (2026-07-05): full-wrap curved-chart bands now refine
+//! wide uv chords on-surface during tessellation; the block×cylinder
+//! through-hole cases (all scales), the near-tangent wall case, and the
+//! block−cylinder round trip are un-ignored and pass.
 //!
 //! Invariants asserted throughout:
 //! - `BooleanOutput::check()` reports no failures,
@@ -692,7 +697,6 @@ fn rotated_block_pair_intersection_manifold() {
 /// Every gap here is above the default linear tolerance (1e-6), so the
 /// configuration is still formally transversal and must succeed.
 #[test]
-#[ignore = "of-ipt.4: block×cylinder hole volume off by ~12× (bottom hole never cut, partial band)"]
 fn wall_almost_tangent_to_side_face() {
     for gap in [1e-3, 1e-4, 1e-5] {
         let context = format!("cylinder wall {gap:.0e} away from face x=0");
@@ -863,7 +867,6 @@ fn round_trip_volume(out: &BooleanOutput, context: &str) {
 }
 
 #[test]
-#[ignore = "of-ipt.9: tessellate() emits sliver triangles that MeshSdf::new rejects (then of-ipt.4)"]
 fn round_trip_block_minus_cylinder() {
     let mut scene = Scene::new();
     let slab = scene.block([0.0, 0.0, 0.0], [4.0, 4.0, 2.0]);
@@ -907,19 +910,16 @@ fn scaled_through_hole(scale: f64) {
 }
 
 #[test]
-#[ignore = "of-ipt.4: block×cylinder hole volume off by ~12× (bottom hole never cut, partial band)"]
 fn through_hole_at_scale_1() {
     scaled_through_hole(1.0);
 }
 
 #[test]
-#[ignore = "of-ipt.4: block×cylinder hole volume off by ~12× (bottom hole never cut, partial band)"]
 fn through_hole_at_scale_0_001() {
     scaled_through_hole(0.001);
 }
 
 #[test]
-#[ignore = "of-ipt.4: block×cylinder hole volume off by ~12× (bottom hole never cut, partial band)"]
 fn through_hole_at_scale_1000() {
     scaled_through_hole(1000.0);
 }
