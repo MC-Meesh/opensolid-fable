@@ -8,7 +8,7 @@ function round4(v) {
   return Math.round(v * 10000) / 10000;
 }
 
-function replaceById(root, targetId, replacement) {
+export function replaceById(root, targetId, replacement) {
   const memo = new Map();
   function walk(node) {
     if (memo.has(node.id)) return memo.get(node.id);

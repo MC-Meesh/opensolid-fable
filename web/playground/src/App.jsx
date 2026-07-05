@@ -6,12 +6,14 @@ import Toolbar from './components/Toolbar.jsx';
 import StatusBar from './components/StatusBar.jsx';
 import ScenePanel from './components/ScenePanel.jsx';
 import SceneTree from './components/SceneTree.jsx';
+import PropertyPanel from './components/PropertyPanel.jsx';
 import SketchCanvas from './components/SketchCanvas.jsx';
 import { DEFAULT_SCRIPT } from './lib/defaultScript.js';
 import { freeNodes, nodeLabel, runTracedScript, serializeTree } from './lib/sceneTree.js';
 import { buildBinaryStl } from './lib/stl.js';
 import { pickCandidates, pickNodeAt } from './lib/picking.js';
 import { applyTranslate, applyRotate, applyScale, pathTo, nodeAt } from './lib/transformEdit.js';
+import { setNodeArg, setBooleanOp } from './lib/propertyEdit.js';
 import {
   addShape,
   deleteShape,
@@ -303,6 +305,43 @@ export default function App() {
     [selectedNode, commitGraph, evaluateScript]
   );
 
+  // Property panel edits: mutate the traced tree, then push the serialized
+  // script through the same sync path the gizmo uses.
+  const applyTreeEdit = useCallback(
+    (result, nodeId) => {
+      if (result.error) {
+        setError(result.error);
+        return;
+      }
+      if (result.root === tracedRef.current?.root) return;
+      selectedPathRef.current = pathTo(result.root, nodeId) ?? selectedPathRef.current;
+      const script = serializeTree(result.root);
+      scriptRef.current = script;
+      editorRef.current?.setDoc(script);
+      commitGraph();
+      evaluateScript();
+    },
+    [commitGraph, evaluateScript]
+  );
+
+  const handleEditArg = useCallback(
+    (nodeId, argIndex, value) => {
+      const root = tracedRef.current?.root;
+      if (!root) return;
+      applyTreeEdit(setNodeArg(root, nodeId, argIndex, value), nodeId);
+    },
+    [applyTreeEdit]
+  );
+
+  const handleChangeOp = useCallback(
+    (nodeId, op) => {
+      const root = tracedRef.current?.root;
+      if (!root) return;
+      applyTreeEdit(setBooleanOp(root, nodeId, op), nodeId);
+    },
+    [applyTreeEdit]
+  );
+
   const downloadStl = useCallback(() => {
     const current = meshRef.current;
     if (!current || current.indices.length === 0) {
@@ -446,6 +485,14 @@ export default function App() {
               Deselect
             </button>
           </div>
+        )}
+        {selectedNode && !sketchOpen && (
+          <PropertyPanel
+            node={selectedNode}
+            disabled={!wasmReady}
+            onEditArg={handleEditArg}
+            onChangeOp={handleChangeOp}
+          />
         )}
         <SketchCanvas
           open={sketchOpen}
