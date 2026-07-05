@@ -170,20 +170,20 @@ fn tessellate_face_into(
             fan_planar_face(store, geo, face_id, face, surface, options, mesh)
         }
         Surface3::Cylinder { .. } | Surface3::Cone { .. } => {
-            let (v_lo, v_hi) = boundary_v_range(store, geo, face_id, face, surface)?;
-            grid_face(surface, v_lo, v_hi, false, 1, options, mesh);
+            let (u_anchor, v_lo, v_hi) = boundary_param_range(store, geo, face_id, face, surface)?;
+            grid_face(surface, u_anchor, v_lo, v_hi, false, 1, options, mesh);
             Ok(())
         }
         Surface3::Sphere { .. } => {
             let (v_lo, v_hi) = surface.domain_v();
             let n_v = angular_segments(v_hi - v_lo, options);
-            grid_face(surface, v_lo, v_hi, false, n_v, options, mesh);
+            grid_face(surface, 0.0, v_lo, v_hi, false, n_v, options, mesh);
             Ok(())
         }
         Surface3::Torus { .. } => {
             let period = surface.period_v().expect("torus is v-periodic");
             let n_v = angular_segments(period, options);
-            grid_face(surface, 0.0, period, true, n_v, options, mesh);
+            grid_face(surface, 0.0, 0.0, period, true, n_v, options, mesh);
             Ok(())
         }
     }
@@ -284,16 +284,23 @@ fn fin_curve<'g>(
     Ok((curve, t_from, t_to))
 }
 
-/// The `v` range spanned by a face's boundary, recovered by projecting
-/// boundary-edge samples onto the surface (for surfaces with an unbounded
-/// `v` domain: cylinders and cones).
-fn boundary_v_range(
+/// The `u` anchor and `v` range spanned by a face's boundary, recovered by
+/// projecting boundary-edge samples onto the surface (for surfaces with an
+/// unbounded `v` domain: cylinders and cones).
+///
+/// The anchor is the `u` of the first boundary sample — a rim vertex. The
+/// boundary circles of a transformed body are re-anchored to start at an
+/// arbitrary angle ([`crate::transform`]), so the grid's `u` columns must
+/// start at the same angle for its rim vertices to coincide with the
+/// adjacent faces' boundary samples and weld watertight.
+fn boundary_param_range(
     store: &TopologyStore,
     geo: &GeometryStore,
     face_id: EntityId<Face>,
     face: &Face,
     surface: &Surface3,
-) -> CoreResult<(f64, f64)> {
+) -> CoreResult<(f64, f64, f64)> {
+    let mut u_anchor = None;
     let mut lo = f64::INFINITY;
     let mut hi = f64::NEG_INFINITY;
     for loop_id in face
@@ -305,9 +312,12 @@ fn boundary_v_range(
             let (curve, t_from, t_to) = fin_curve(store, geo, face_id, fin_id)?;
             for k in 0..=4 {
                 let t = t_from + (t_to - t_from) * k as f64 / 4.0;
-                let v = surface.project_point(&curve.point(t)).v;
-                lo = lo.min(v);
-                hi = hi.max(v);
+                let projected = surface.project_point(&curve.point(t));
+                if u_anchor.is_none() {
+                    u_anchor = Some(projected.u);
+                }
+                lo = lo.min(projected.v);
+                hi = hi.max(projected.v);
             }
         }
     }
@@ -317,15 +327,17 @@ fn boundary_v_range(
             "boundary does not span a v range on its unbounded surface",
         ));
     }
-    Ok((lo, hi))
+    Ok((u_anchor.expect("v range implies samples"), lo, hi))
 }
 
 /// Tessellate a quadric face over its parameter rectangle:
-/// `u` over the full period (wrapped by index), `v` over `[v_lo, v_hi]`
-/// with `n_v` segments (wrapped if `wrap_v`). Singular rows (sphere poles,
-/// cone apex) collapse to a single vertex.
+/// `u` over the full period starting at `u_anchor` (wrapped by index), `v`
+/// over `[v_lo, v_hi]` with `n_v` segments (wrapped if `wrap_v`). Singular
+/// rows (sphere poles, cone apex) collapse to a single vertex.
+#[allow(clippy::too_many_arguments)]
 fn grid_face(
     surface: &Surface3,
+    u_anchor: f64,
     v_lo: f64,
     v_hi: f64,
     wrap_v: bool,
@@ -346,11 +358,11 @@ fn grid_face(
         } else {
             v_lo + (v_hi - v_lo) * j as f64 / n_v as f64
         };
-        let singular = surface.is_singular(0.0, v);
+        let singular = surface.is_singular(u_anchor, v);
         let columns = if singular { 1 } else { n_u };
         let mut row = Vec::with_capacity(columns);
         for i in 0..columns {
-            let u = period * i as f64 / n_u as f64;
+            let u = u_anchor + period * i as f64 / n_u as f64;
             row.push(mesh.positions.len());
             mesh.positions.push(surface.point(u, v));
             mesh.normals.push(grid_normal(surface, u, v, v_lo, v_hi));
