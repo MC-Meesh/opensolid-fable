@@ -671,6 +671,65 @@ fn quantize(p: &Point3, snap: f64) -> (i64, i64, i64) {
     )
 }
 
+/// Spatial hash merging points within `tol` of each other. Lookups probe
+/// the 3×3×3 cell neighborhood with a true distance test, so coincident
+/// points that straddle a quantization cell boundary still match — a
+/// single-cell exact-key lookup would split them into distinct entries.
+struct SnapMap<V> {
+    cells: HashMap<(i64, i64, i64), Vec<(Point3, V)>>,
+    tol: f64,
+    /// Cell size is `2 * tol`: two points within `tol` then land at most
+    /// one cell index apart on every axis (round(a) and round(b) can only
+    /// differ by ≥ 2 when |a − b| > 1/2 in cell units), so the ±1 probe
+    /// in [`Self::matches`] is exhaustive.
+    cell: f64,
+}
+
+impl<V: Copy> SnapMap<V> {
+    fn new(tol: f64) -> Self {
+        SnapMap {
+            cells: HashMap::new(),
+            tol,
+            cell: tol * 2.0,
+        }
+    }
+
+    fn insert(&mut self, p: Point3, v: V) {
+        self.cells
+            .entry(quantize(&p, self.cell))
+            .or_default()
+            .push((p, v));
+    }
+
+    /// All values stored within `tol` of `p`, nearest first.
+    fn matches(&self, p: &Point3) -> Vec<V> {
+        let (i, j, k) = quantize(p, self.cell);
+        let mut found: Vec<(f64, V)> = Vec::new();
+        for di in -1..=1 {
+            for dj in -1..=1 {
+                for dk in -1..=1 {
+                    let Some(entries) = self.cells.get(&(i + di, j + dj, k + dk)) else {
+                        continue;
+                    };
+                    for &(q, v) in entries {
+                        let d = (q - *p).norm();
+                        if d <= self.tol {
+                            found.push((d, v));
+                        }
+                    }
+                }
+            }
+        }
+        found.sort_by(|a, b| a.0.total_cmp(&b.0));
+        found.into_iter().map(|(_, v)| v).collect()
+    }
+
+    /// The stored value nearest to `p` within `tol`, if any.
+    fn nearest(&self, p: &Point3) -> Option<V> {
+        self.matches(p).into_iter().next()
+    }
+}
+
 // ---------------------------------------------------------------------
 // The pipeline
 // ---------------------------------------------------------------------
@@ -1715,17 +1774,10 @@ fn merge_imprint_chains(atoms: &[Atom], ids: &[usize], snap: f64) -> Vec<DartCha
         .copied()
         .filter(|&ai| !atoms[ai].closed)
         .collect();
-    let key = |p: &Point3| quantize(p, snap * 4.0);
-    let mut adjacency: HashMap<(i64, i64, i64), Vec<(usize, bool)>> = HashMap::new();
+    let mut adjacency: SnapMap<(usize, bool)> = SnapMap::new(snap * 4.0);
     for &ai in &open {
-        adjacency
-            .entry(key(&atoms[ai].points[0]))
-            .or_default()
-            .push((ai, true));
-        adjacency
-            .entry(key(&atoms[ai].points[atoms[ai].points.len() - 1]))
-            .or_default()
-            .push((ai, false));
+        adjacency.insert(atoms[ai].points[0], (ai, true));
+        adjacency.insert(atoms[ai].points[atoms[ai].points.len() - 1], (ai, false));
     }
     let mut used: HashSet<usize> = HashSet::new();
     for &seed in &open {
@@ -1737,9 +1789,7 @@ fn merge_imprint_chains(atoms: &[Atom], ids: &[usize], snap: f64) -> Vec<DartCha
         loop {
             let &(a, fwd) = chain.back().expect("non-empty");
             let (_, end) = dart_endpoints(&atoms[a], fwd);
-            let Some(cands) = adjacency.get(&key(&end)) else {
-                break;
-            };
+            let cands = adjacency.matches(&end);
             match cands.iter().find(|(c, _)| !used.contains(c)) {
                 Some(&(c, at_start)) => {
                     used.insert(c);
@@ -1751,9 +1801,7 @@ fn merge_imprint_chains(atoms: &[Atom], ids: &[usize], snap: f64) -> Vec<DartCha
         loop {
             let &(a, fwd) = chain.front().expect("non-empty");
             let (start, _) = dart_endpoints(&atoms[a], fwd);
-            let Some(cands) = adjacency.get(&key(&start)) else {
-                break;
-            };
+            let cands = adjacency.matches(&start);
             match cands.iter().find(|(c, _)| !used.contains(c)) {
                 Some(&(c, at_start)) => {
                     used.insert(c);
@@ -2108,10 +2156,10 @@ fn build_output(
     }
     let mut shells: HashMap<usize, EntityId<crate::topology::Shell>> = HashMap::new();
 
-    // Vertices and edges, deduplicated by quantized 3D position / atom id.
+    // Vertices and edges, deduplicated by snapped 3D position / atom id.
     // Geometry is shared: one output surface id per host face (all regions
     // split from it), one output curve id per source curve.
-    let mut vertex_of: HashMap<(i64, i64, i64), EntityId<crate::topology::Vertex>> = HashMap::new();
+    let mut vertex_of: SnapMap<EntityId<crate::topology::Vertex>> = SnapMap::new(snap * 4.0);
     let mut edge_of_atom: HashMap<usize, EntityId<crate::topology::Edge>> = HashMap::new();
     let mut surface_of_host: HashMap<(SolidTag, usize), EntityId<Surface3>> = HashMap::new();
     let mut curve_of_source: HashMap<CurveSource, EntityId<Curve3>> = HashMap::new();
@@ -2168,12 +2216,16 @@ fn build_output(
                         } else {
                             atom.points[atom.points.len() - 1]
                         };
-                        let sv = *vertex_of
-                            .entry(quantize(&start_p, snap * 4.0))
-                            .or_insert_with(|| store.create_vertex(start_p, SYSTEM_RESOLUTION));
-                        let ev = *vertex_of
-                            .entry(quantize(&end_p, snap * 4.0))
-                            .or_insert_with(|| store.create_vertex(end_p, SYSTEM_RESOLUTION));
+                        let sv = vertex_of.nearest(&start_p).unwrap_or_else(|| {
+                            let v = store.create_vertex(start_p, SYSTEM_RESOLUTION);
+                            vertex_of.insert(start_p, v);
+                            v
+                        });
+                        let ev = vertex_of.nearest(&end_p).unwrap_or_else(|| {
+                            let v = store.create_vertex(end_p, SYSTEM_RESOLUTION);
+                            vertex_of.insert(end_p, v);
+                            v
+                        });
 
                         // Bind the atom's source curve with the parameter
                         // range recovered by exact closest-point projection.
@@ -3254,5 +3306,75 @@ mod tests {
             (area - expected).abs() < 1e-9,
             "triangulated area {area} != expected {expected}"
         );
+    }
+
+    #[test]
+    fn snap_map_merges_points_straddling_cell_boundary() {
+        // of-do9: two float-noise-identical points on opposite sides of a
+        // quantization cell boundary. Exact single-cell keys split them;
+        // the neighbor-probing SnapMap must merge them.
+        let tol = 4e-9;
+        let boundary = 0.5 * tol; // old scheme's cell edge for cell size `tol`
+        let p1 = Point3::new(boundary - 1e-15, 1.0, -2.0);
+        let p2 = Point3::new(boundary + 1e-15, 1.0, -2.0);
+        assert_ne!(
+            quantize(&p1, tol),
+            quantize(&p2, tol),
+            "test premise: the points straddle a single-cell boundary"
+        );
+        let mut map: SnapMap<u32> = SnapMap::new(tol);
+        map.insert(p1, 7);
+        assert_eq!(map.nearest(&p2), Some(7), "straddling point must match");
+
+        // Sign-flip worst case: round() ties at ±0.5 cells away from zero.
+        let q1 = Point3::new(-1e-15, 0.0, 0.0);
+        let q2 = Point3::new(1e-15, 0.0, 0.0);
+        let mut map: SnapMap<u32> = SnapMap::new(tol);
+        map.insert(q1, 9);
+        assert_eq!(map.nearest(&q2), Some(9));
+    }
+
+    #[test]
+    fn snap_map_keeps_far_points_distinct_and_orders_by_distance() {
+        let tol = 4e-9;
+        let mut map: SnapMap<u32> = SnapMap::new(tol);
+        map.insert(Point3::new(0.0, 0.0, 0.0), 1);
+        map.insert(Point3::new(0.8 * tol, 0.0, 0.0), 2);
+        map.insert(Point3::new(3.0 * tol, 0.0, 0.0), 3);
+        assert_eq!(
+            map.nearest(&Point3::new(3.0 * tol, 0.0, 0.0)),
+            Some(3),
+            "exact hit"
+        );
+        assert_eq!(
+            map.nearest(&Point3::new(1.9 * tol, 0.0, 0.0)),
+            None,
+            "nothing within tol"
+        );
+        assert_eq!(
+            map.matches(&Point3::new(0.1 * tol, 0.0, 0.0)),
+            vec![1, 2],
+            "in-tolerance values nearest first"
+        );
+    }
+
+    #[test]
+    fn boolean_output_valid_across_cell_boundary_sweep() {
+        // of-do9 regression sweep: nudge the tool in sub-cell steps so
+        // junction coordinates land at varying offsets relative to the
+        // vertex-dedup quantization grid (cell size ≈ 1.6e-8 here). With
+        // single-cell dedup, corners whose float-noise copies straddled a
+        // cell boundary intermittently produced duplicate vertices (open /
+        // non-manifold edges) or Degenerate chain-merge failures.
+        for i in 0..16 {
+            let dx = i as f64 * 1e-9;
+            let (mut store, mut geo) = stores();
+            let block = block_at(&mut store, &mut geo, (4.0, 4.0, 2.0), (2.0, 2.0, 1.0));
+            let tool = cylinder_at(&mut store, &mut geo, 1.0, 4.0, (2.0 + dx, 2.0, 1.0));
+            let out = subtract(&store, &geo, block, tool, &tol()).unwrap();
+            let context = format!("sweep step {i} (dx = {dx:e})");
+            assert_valid(&out, &context);
+            assert_geometry_bound(&out, &context);
+        }
     }
 }
