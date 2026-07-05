@@ -28,6 +28,15 @@ const HIGHLIGHT_MATERIAL = new THREE.MeshStandardMaterial({
   depthWrite: false,
 });
 
+const PREVIEW_MATERIAL = new THREE.MeshStandardMaterial({
+  color: 0x7ce38b,
+  metalness: 0.1,
+  roughness: 0.45,
+  transparent: true,
+  opacity: 0.55,
+  depthWrite: false,
+});
+
 export default function Viewport3D({
   mesh,
   wireframe,
@@ -35,6 +44,7 @@ export default function Viewport3D({
   gizmoMode,
   selectedMesh,
   selectedPivot,
+  previewMesh,
   onPick,
   onTransform,
 }) {
@@ -79,6 +89,11 @@ export default function Viewport3D({
     const ghostMesh = new THREE.Mesh(new THREE.BufferGeometry(), HIGHLIGHT_MATERIAL);
     ghostMesh.renderOrder = 1;
     ghostMesh.visible = false;
+
+    const previewObject = new THREE.Mesh(new THREE.BufferGeometry(), PREVIEW_MATERIAL);
+    previewObject.renderOrder = 2;
+    previewObject.visible = false;
+    scene.add(previewObject);
 
     const anchor = new THREE.Group();
     anchor.add(ghostMesh);
@@ -177,6 +192,7 @@ export default function Viewport3D({
       transformControls,
       anchor,
       ghostMesh,
+      previewObject,
       _onPick: null,
       _onTransform: null,
     };
@@ -193,6 +209,7 @@ export default function Viewport3D({
       orbitControls.dispose();
       meshObject.geometry.dispose();
       ghostMesh.geometry.dispose();
+      previewObject.geometry.dispose();
       material.dispose();
       grid.geometry.dispose();
       grid.material.dispose();
@@ -218,6 +235,22 @@ export default function Viewport3D({
     const ctx = sceneRef.current;
     if (ctx) ctx.material.wireframe = wireframe;
   }, [wireframe]);
+
+  useEffect(() => {
+    const ctx = sceneRef.current;
+    if (!ctx) return;
+    if (previewMesh) {
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.BufferAttribute(previewMesh.positions, 3));
+      geo.setAttribute('normal', new THREE.BufferAttribute(previewMesh.normals, 3));
+      geo.setIndex(new THREE.BufferAttribute(previewMesh.indices, 1));
+      ctx.previewObject.geometry.dispose();
+      ctx.previewObject.geometry = geo;
+      ctx.previewObject.visible = true;
+    } else {
+      ctx.previewObject.visible = false;
+    }
+  }, [previewMesh]);
 
   useEffect(() => {
     const ctx = sceneRef.current;

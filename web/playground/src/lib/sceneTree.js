@@ -30,6 +30,11 @@ export const UNARY_OPS = ['translate', 'rotate', 'scale', 'uniformScale'];
 // Two children: the receiver, then the other shape.
 export const BINARY_OPS = ['union', 'intersect', 'subtract', 'smoothUnion'];
 
+// Static constructors sweeping a 2D profile (a `Profile` instance, then
+// numeric args). No children; the node carries a `profile` snapshot:
+// `{ start: [x, y], segs: [{ x, y, bulge }] }`.
+export const SWEEP_OPS = ['extrude', 'revolve'];
+
 const OP_LABELS = {
   sphere: 'Sphere',
   box3: 'Box3',
@@ -45,6 +50,8 @@ const OP_LABELS = {
   intersect: 'Intersect',
   subtract: 'Subtract',
   smoothUnion: 'Smooth Union',
+  extrude: 'Extrude',
+  revolve: 'Revolve',
 };
 
 function formatArg(value) {
@@ -63,20 +70,24 @@ export function nodeLabel(node) {
 }
 
 /**
- * Create a Shape-compatible tracing class that records a construction node
- * for every operation while delegating to `ShapeClass`.
+ * Create Shape/Profile-compatible tracing classes that record a construction
+ * node for every operation while delegating to `ShapeClass` / `ProfileClass`.
  *
- * Returns `{ TracingShape, nodes }` where `nodes` accumulates every node
- * created (including ones a script builds but never uses), so callers can
- * free the underlying shapes.
+ * Returns `{ TracingShape, TracingProfile, nodes, profiles }`: `nodes`
+ * accumulates every node created (including ones a script builds but never
+ * uses) so callers can free the underlying shapes; `profiles` accumulates
+ * every profile so its real instance can be freed after the script runs.
  *
  * Node shape: `{ id, op, args, children, shape }` — `args` are the numeric
  * arguments, `children` reference other nodes, and `shape` is the retained
- * `ShapeClass` instance for that intermediate result.
+ * `ShapeClass` instance for that intermediate result. Sweep nodes
+ * additionally carry `profile`, a plain-data snapshot of the profile at the
+ * moment of the sweep call.
  */
-export function createTracer(ShapeClass) {
+export function createTracer(ShapeClass, ProfileClass) {
   let nextId = 1;
   const nodes = [];
+  const profiles = [];
 
   class TracingShape {
     constructor(node) {
@@ -84,6 +95,27 @@ export function createTracer(ShapeClass) {
     }
     get shape() {
       return this.node.shape;
+    }
+  }
+
+  class TracingProfile {
+    constructor(x, y) {
+      this.real = new ProfileClass(x, y);
+      this.start = [x, y];
+      this.segs = [];
+      this.closed = false;
+      profiles.push(this);
+    }
+    lineTo(x, y) {
+      this.arcTo(x, y, 0);
+    }
+    arcTo(x, y, bulge) {
+      if (!this.closed) this.segs.push({ x, y, bulge });
+      this.real.arcTo(x, y, bulge);
+    }
+    close() {
+      this.closed = true;
+      this.real.close();
     }
   }
 
@@ -95,6 +127,28 @@ export function createTracer(ShapeClass) {
 
   for (const op of PRIMITIVE_OPS) {
     TracingShape[op] = (...args) => record(op, args, [], ShapeClass[op](...args));
+  }
+
+  for (const op of SWEEP_OPS) {
+    TracingShape[op] = (profile, ...args) => {
+      if (!(profile instanceof TracingProfile)) {
+        throw new Error(
+          `Shape.${op}(...) expects a Profile as its first argument`
+        );
+      }
+      const traced = record(
+        op,
+        args,
+        [],
+        ShapeClass[op](profile.real, ...args)
+      );
+      // Snapshot so later mutation of the profile can't change this node.
+      traced.node.profile = {
+        start: [...profile.start],
+        segs: profile.segs.map((s) => ({ ...s })),
+      };
+      return traced;
+    };
   }
 
   for (const op of UNARY_OPS) {
@@ -120,7 +174,7 @@ export function createTracer(ShapeClass) {
     };
   }
 
-  return { TracingShape, nodes };
+  return { TracingShape, TracingProfile, nodes, profiles };
 }
 
 /**
@@ -128,17 +182,26 @@ export function createTracer(ShapeClass) {
  *
  * Returns `{ root, nodes }`: `root` is the node of the returned shape (its
  * `.shape` is the real `ShapeClass` instance), `nodes` is every node created.
- * On error, any shapes created before the failure are freed, then the error
- * is rethrown.
+ * Real profile instances are freed once the script finishes (sweep nodes keep
+ * only the plain-data snapshot). On error, any shapes created before the
+ * failure are freed, then the error is rethrown.
  */
-export function runTracedScript(source, ShapeClass) {
-  const { TracingShape, nodes } = createTracer(ShapeClass);
+export function runTracedScript(source, ShapeClass, ProfileClass) {
+  const { TracingShape, TracingProfile, nodes, profiles } = createTracer(
+    ShapeClass,
+    ProfileClass
+  );
   let result;
   try {
-    result = runScript(source, TracingShape);
+    result = runScript(source, TracingShape, TracingProfile);
   } catch (err) {
     freeNodes(nodes);
     throw err;
+  } finally {
+    for (const profile of profiles) {
+      if (typeof profile.real?.free === 'function') profile.real.free();
+      profile.real = null;
+    }
   }
   return { root: result.node, nodes };
 }
@@ -158,7 +221,8 @@ export function freeNodes(nodes) {
  *
  * Single-use nodes are inlined into their parent expression; nodes referenced
  * more than once are hoisted into `const s<N> = ...;` bindings so the DAG
- * structure survives a round trip through the script.
+ * structure survives a round trip through the script. Sweep nodes emit their
+ * profile as `const p<N> = new Profile(...)` builder statements first.
  */
 export function serializeTree(root) {
   const refs = new Map();
@@ -171,12 +235,31 @@ export function serializeTree(root) {
 
   const names = new Map();
   const lines = [];
+  let profileCount = 0;
+
+  const emitProfile = (profile) => {
+    const name = `p${++profileCount}`;
+    lines.push(`const ${name} = new Profile(${profile.start.map(String).join(', ')});`);
+    for (const seg of profile.segs) {
+      lines.push(
+        seg.bulge === 0
+          ? `${name}.lineTo(${seg.x}, ${seg.y});`
+          : `${name}.arcTo(${seg.x}, ${seg.y}, ${seg.bulge});`
+      );
+    }
+    lines.push(`${name}.close();`);
+    return name;
+  };
 
   const exprOf = (node) => {
     if (names.has(node.id)) return names.get(node.id);
     const args = node.args.map(String);
     let text;
-    if (node.children.length === 0) {
+    if (node.profile) {
+      const pname = emitProfile(node.profile);
+      const rest = args.length > 0 ? `, ${args.join(', ')}` : '';
+      text = `Shape.${node.op}(${pname}${rest})`;
+    } else if (node.children.length === 0) {
       text = `Shape.${node.op}(${args.join(', ')})`;
     } else if (node.children.length === 1) {
       text = `${exprOf(node.children[0])}.${node.op}(${args.join(', ')})`;

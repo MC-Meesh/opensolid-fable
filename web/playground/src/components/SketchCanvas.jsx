@@ -81,7 +81,7 @@ function arcScreenGeometry(sketch, entity) {
  * trigger re-render. Keep the component mounted (hidden via CSS) so the
  * sketch survives toggling the overlay.
  */
-export default function SketchCanvas({ open, plane, onPlaneChange, onProfileChange }) {
+export default function SketchCanvas({ open, plane, onPlaneChange, onProfileChange, onSweep }) {
   const sketchRef = useRef(createSketch());
   const svgRef = useRef(null);
   const [rev, setRev] = useState(0);
@@ -960,6 +960,25 @@ export default function SketchCanvas({ open, plane, onPlaneChange, onProfileChan
             onClick={applyDimension}
           >
             Set
+          </button>
+        </div>
+        <div className="group">
+          <span className="group-label">Solid</span>
+          <button
+            className="tool-btn"
+            disabled={!profile.closed}
+            title="Extrude the closed profile along the plane normal"
+            onClick={() => onSweep?.('extrude')}
+          >
+            Extrude
+          </button>
+          <button
+            className="tool-btn"
+            disabled={!profile.closed}
+            title="Revolve the closed profile around the sketch's vertical axis"
+            onClick={() => onSweep?.('revolve')}
+          >
+            Revolve
           </button>
         </div>
         <div className="group">

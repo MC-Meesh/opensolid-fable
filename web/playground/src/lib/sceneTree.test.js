@@ -34,6 +34,12 @@ class FakeShape {
   static capsule(x1, y1, z1, x2, y2, z2, r) {
     return new FakeShape(['capsule', x1, y1, z1, x2, y2, z2, r]);
   }
+  static extrude(profile, height) {
+    return new FakeShape(['extrude', profile.trace.slice(), height]);
+  }
+  static revolve(profile, angle) {
+    return new FakeShape(['revolve', profile.trace.slice(), angle]);
+  }
   translate(x, y, z) {
     return new FakeShape(['translate', this.desc, x, y, z]);
   }
@@ -60,6 +66,26 @@ class FakeShape {
   }
   smoothUnion(other, radius) {
     return new FakeShape(['smoothUnion', this.desc, other.desc, radius]);
+  }
+}
+
+// Stand-in for WasmProfile2D: records calls so tests can assert delegation.
+class FakeProfile {
+  constructor(x, y) {
+    this.trace = [['new', x, y]];
+    this.freed = false;
+  }
+  lineTo(x, y) {
+    this.trace.push(['lineTo', x, y]);
+  }
+  arcTo(x, y, bulge) {
+    this.trace.push(['arcTo', x, y, bulge]);
+  }
+  close() {
+    this.trace.push(['close']);
+  }
+  free() {
+    this.freed = true;
   }
 }
 
@@ -254,5 +280,144 @@ describe('freeNodes', () => {
     expect(root.shape).toBeNull();
     // Idempotent.
     expect(() => freeNodes(nodes)).not.toThrow();
+  });
+});
+
+describe('sweep ops (extrude / revolve)', () => {
+  const SQUARE = `
+    const p = new Profile(0, 0);
+    p.lineTo(2, 0);
+    p.lineTo(2, 1);
+    p.lineTo(0, 1);
+    p.close();
+    return Shape.extrude(p, 5);
+  `;
+
+  it('traces extrude with a profile snapshot and delegates to the real classes', () => {
+    const { root } = runTracedScript(SQUARE, FakeShape, FakeProfile);
+    expect(root.op).toBe('extrude');
+    expect(root.args).toEqual([5]);
+    expect(root.children).toEqual([]);
+    expect(root.profile).toEqual({
+      start: [0, 0],
+      segs: [
+        { x: 2, y: 0, bulge: 0 },
+        { x: 2, y: 1, bulge: 0 },
+        { x: 0, y: 1, bulge: 0 },
+      ],
+    });
+    // Real profile calls flowed through (lineTo delegates as arcTo bulge 0).
+    expect(root.shape.desc[1]).toEqual([
+      ['new', 0, 0],
+      ['arcTo', 2, 0, 0],
+      ['arcTo', 2, 1, 0],
+      ['arcTo', 0, 1, 0],
+      ['close'],
+    ]);
+  });
+
+  it('snapshots the profile at sweep time — later mutation is invisible', () => {
+    const source = `
+      const p = new Profile(0, 0);
+      p.lineTo(1, 0);
+      p.lineTo(1, 1);
+      p.close();
+      const solid = Shape.extrude(p, 2);
+      p.lineTo(9, 9);
+      return solid;
+    `;
+    const { root } = runTracedScript(source, FakeShape, FakeProfile);
+    expect(root.profile.segs).toEqual([
+      { x: 1, y: 0, bulge: 0 },
+      { x: 1, y: 1, bulge: 0 },
+    ]);
+  });
+
+  it('rejects a non-profile first argument with a helpful message', () => {
+    expect(() =>
+      runTracedScript('return Shape.extrude(42, 1);', FakeShape, FakeProfile)
+    ).toThrow(/Shape\.extrude\(\.\.\.\) expects a Profile/);
+  });
+
+  it('frees real profiles once the script finishes', () => {
+    const created = [];
+    class TrackingProfile extends FakeProfile {
+      constructor(x, y) {
+        super(x, y);
+        created.push(this);
+      }
+    }
+    runTracedScript(SQUARE, FakeShape, TrackingProfile);
+    expect(created).toHaveLength(1);
+    expect(created[0].freed).toBe(true);
+  });
+
+  it('frees real profiles even when the script throws', () => {
+    const created = [];
+    class TrackingProfile extends FakeProfile {
+      constructor(x, y) {
+        super(x, y);
+        created.push(this);
+      }
+    }
+    expect(() =>
+      runTracedScript(
+        'const p = new Profile(0, 0); throw new Error("boom");',
+        FakeShape,
+        TrackingProfile
+      )
+    ).toThrow('boom');
+    expect(created[0].freed).toBe(true);
+  });
+
+  it('labels sweep nodes', () => {
+    const { root } = runTracedScript(SQUARE, FakeShape, FakeProfile);
+    expect(nodeLabel(root)).toBe('Extrude [5]');
+  });
+
+  it('serializes a sweep as profile statements plus the sweep call', () => {
+    const { root } = runTracedScript(SQUARE, FakeShape, FakeProfile);
+    expect(serializeTree(root)).toBe(
+      'const p1 = new Profile(0, 0);\n' +
+        'p1.lineTo(2, 0);\n' +
+        'p1.lineTo(2, 1);\n' +
+        'p1.lineTo(0, 1);\n' +
+        'p1.close();\n' +
+        'return Shape.extrude(p1, 5);\n'
+    );
+  });
+
+  it('serializes arcs with arcTo and round-trips revolve', () => {
+    const source = `
+      const p = new Profile(1, 0);
+      p.arcTo(3, 0, 1);
+      p.arcTo(1, 0, 1);
+      p.close();
+      return Shape.revolve(p, 360).rotate(1, 0, 0, 1.5707963267948966);
+    `;
+    const { root } = runTracedScript(source, FakeShape, FakeProfile);
+    const script = serializeTree(root);
+    expect(script).toContain('p1.arcTo(3, 0, 1);');
+    expect(script).toContain('Shape.revolve(p1, 360)');
+    const again = runTracedScript(script, FakeShape, FakeProfile);
+    expect(serializeTree(again.root)).toBe(script);
+    expect(skeleton(again.root)).toEqual(skeleton(root));
+  });
+
+  it('hoists a shared sweep node once, profile included', () => {
+    const source = `
+      const p = new Profile(0, 0);
+      p.lineTo(1, 0);
+      p.lineTo(1, 1);
+      p.close();
+      const solid = Shape.extrude(p, 2);
+      return solid.union(solid.translate(3, 0, 0));
+    `;
+    const { root } = runTracedScript(source, FakeShape, FakeProfile);
+    const script = serializeTree(root);
+    expect(script.match(/new Profile/g)).toHaveLength(1);
+    expect(script).toContain('const s1 = Shape.extrude(p1, 2);');
+    const again = runTracedScript(script, FakeShape, FakeProfile);
+    expect(serializeTree(again.root)).toBe(script);
   });
 });

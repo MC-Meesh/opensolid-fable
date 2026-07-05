@@ -19,7 +19,7 @@ describe('SketchCanvas', () => {
     );
     expect(html).toContain('sketch-overlay');
     expect(html).toContain('sketch-toolbar');
-    for (const label of ['Select', 'Line', 'Rect', 'Circle', 'Arc']) {
+    for (const label of ['Select', 'Line', 'Rect', 'Circle', 'Arc', 'Extrude', 'Revolve']) {
       expect(html).toContain(label);
     }
     for (const plane of ['XY', 'XZ', 'YZ']) {

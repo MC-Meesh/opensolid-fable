@@ -17,9 +17,24 @@ describe('runScript', () => {
     expect(shape.r).toBe(2);
   });
 
-  it('exposes only the Shape binding, in strict mode', () => {
+  it('exposes only the Shape and Profile bindings, in strict mode', () => {
     expect(() => runScript('undeclared = 1; return Shape.sphere(1);', FakeShape))
       .toThrow(ReferenceError);
+  });
+
+  it('binds Profile when a profile class is given', () => {
+    class FakeProfile {
+      constructor(x, y) {
+        this.x = x;
+        this.y = y;
+      }
+    }
+    const shape = runScript(
+      'const p = new Profile(1, 2); return Shape.sphere(p.x + p.y);',
+      FakeShape,
+      FakeProfile
+    );
+    expect(shape.r).toBe(3);
   });
 
   it('propagates syntax errors', () => {

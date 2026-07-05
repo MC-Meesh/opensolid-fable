@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import init, { WasmShape } from '../pkg/opensolid_wasm.js';
+import init, { WasmProfile2D, WasmShape } from '../pkg/opensolid_wasm.js';
 import ScriptEditor from './components/ScriptEditor.jsx';
 import Viewport3D from './components/Viewport3D.jsx';
 import Toolbar from './components/Toolbar.jsx';
@@ -8,6 +8,7 @@ import ScenePanel from './components/ScenePanel.jsx';
 import SceneTree from './components/SceneTree.jsx';
 import PropertyPanel from './components/PropertyPanel.jsx';
 import SketchCanvas from './components/SketchCanvas.jsx';
+import SweepPanel from './components/SweepPanel.jsx';
 import { DEFAULT_SCRIPT } from './lib/defaultScript.js';
 import { freeNodes, nodeLabel, runTracedScript, serializeTree } from './lib/sceneTree.js';
 import { buildBinaryStl } from './lib/stl.js';
@@ -21,6 +22,7 @@ import {
   parseScript,
   updateNumericArg,
 } from './lib/shapeGraph.js';
+import { buildSweepShape, opsBounds, profileToOps, sweepTreeNode } from './lib/sweep.js';
 
 let wasmInit = null;
 function ensureWasm() {
@@ -59,6 +61,9 @@ export default function App() {
   const [gizmoMode, setGizmoMode] = useState('translate');
   const [sketchOpen, setSketchOpen] = useState(false);
   const [sketchPlane, setSketchPlane] = useState('XY');
+  const [sweep, setSweep] = useState(null);
+  const [sweepError, setSweepError] = useState(null);
+  const [previewMesh, setPreviewMesh] = useState(null);
   const profileRef = useRef(null);
 
   // Bidirectional sync: the shape operation graph parsed from the script.
@@ -138,7 +143,7 @@ export default function App() {
     setError(null);
     let traced;
     try {
-      traced = runTracedScript(scriptRef.current, WasmShape);
+      traced = runTracedScript(scriptRef.current, WasmShape, WasmProfile2D);
     } catch (err) {
       setError(String(err?.stack || err));
       return;
@@ -357,6 +362,82 @@ export default function App() {
     URL.revokeObjectURL(link.href);
   }, []);
 
+  // ---- extrude / revolve workflow -----------------------------------------
+
+  const handleSweepStart = useCallback(
+    (kind) => {
+      const profile = profileRef.current;
+      if (!profile?.closed) return;
+      let ops;
+      try {
+        ops = profileToOps(profile);
+      } catch (err) {
+        setError(String(err));
+        return;
+      }
+      const { min, max } = opsBounds(ops);
+      const extent = Math.max(max[0] - min[0], max[1] - min[1]) || 1;
+      clearSelection();
+      setSweepError(null);
+      setSketchOpen(false);
+      setSweep(
+        kind === 'extrude'
+          ? { kind, plane: profile.plane, ops, value: extent, range: extent * 4 }
+          : { kind, plane: profile.plane, ops, value: 360, range: 360 }
+      );
+    },
+    [clearSelection]
+  );
+
+  const handleSweepChange = useCallback((value) => {
+    setSweep((current) => (current ? { ...current, value } : current));
+  }, []);
+
+  const cancelSweep = useCallback(() => {
+    setSweep(null);
+    setSweepError(null);
+    setSketchOpen(true);
+  }, []);
+
+  // Commit the pending sweep: graft it onto the tree (unioned with any
+  // existing shape), then push the serialized script through the same sync
+  // path the gizmo uses.
+  const applySweep = useCallback(() => {
+    if (!sweep) return;
+    const script = serializeTree(sweepTreeNode(tracedRef.current?.root ?? null, sweep));
+    scriptRef.current = script;
+    editorRef.current?.setDoc(script);
+    setSweep(null);
+    setSweepError(null);
+    commitGraph();
+    evaluateScript();
+  }, [sweep, commitGraph, evaluateScript]);
+
+  // Live preview: remesh the pending sweep whenever its parameters change.
+  useEffect(() => {
+    if (!sweep || !wasmReady) {
+      setPreviewMesh(null);
+      return;
+    }
+    let shape = null;
+    try {
+      shape = buildSweepShape(WasmShape, WasmProfile2D, sweep);
+      setPreviewMesh(meshShape(shape, resolutionRef.current));
+      setSweepError(null);
+    } catch (err) {
+      setPreviewMesh(null);
+      setSweepError(String(err));
+    } finally {
+      shape?.free?.();
+    }
+  }, [sweep, wasmReady]);
+
+  const handleSketchToggle = useCallback(() => {
+    setSweep(null);
+    setSweepError(null);
+    setSketchOpen((v) => !v);
+  }, []);
+
   const bootedRef = useRef(false);
   useEffect(() => {
     let cancelled = false;
@@ -389,12 +470,13 @@ export default function App() {
       } else if (event.key === 's' || event.key === 'S') {
         setGizmoMode('scale');
       } else if (event.key === 'Escape') {
-        clearSelection();
+        if (sweep) cancelSweep();
+        else clearSelection();
       }
     }
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [clearSelection]);
+  }, [clearSelection, sweep, cancelSweep]);
 
   const handleResolutionChange = useCallback((value) => {
     resolutionRef.current = value;
@@ -454,8 +536,16 @@ export default function App() {
           gizmoMode={gizmoMode}
           selectedMesh={selectedMesh}
           selectedPivot={selectedPivot}
+          previewMesh={previewMesh}
           onPick={handlePick}
           onTransform={handleTransform}
+        />
+        <SweepPanel
+          sweep={sweep}
+          error={sweepError}
+          onChange={handleSweepChange}
+          onApply={applySweep}
+          onCancel={cancelSweep}
         />
         {selectedNode && (
           <div className="gizmo-bar">
@@ -499,10 +589,11 @@ export default function App() {
           plane={sketchPlane}
           onPlaneChange={setSketchPlane}
           onProfileChange={handleProfileChange}
+          onSweep={handleSweepStart}
         />
         <button
           className={`secondary sketch-toggle${sketchOpen ? ' active' : ''}`}
-          onClick={() => setSketchOpen((v) => !v)}
+          onClick={handleSketchToggle}
         >
           {sketchOpen ? 'Exit sketch' : 'Sketch'}
         </button>
