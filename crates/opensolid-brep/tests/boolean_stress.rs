@@ -606,8 +606,6 @@ fn random_transversal_block_pairs_volume_identity() {
 /// BOTH operands (the configuration is congruent, only the coordinates
 /// change). Catches axis-aligned fast paths and chart-dependent bugs.
 #[test]
-#[ignore = "of-ny6: case 5 (seed 0x0707_4713) tessellates non-manifold — minimal repro \
-            in rotated_block_pair_intersection_manifold"]
 fn random_block_pairs_rotation_invariance() {
     let mut rng = Rng::new(0x0707_4713);
     for case in 0..8 {
@@ -647,15 +645,13 @@ fn random_block_pairs_rotation_invariance() {
 }
 
 /// Minimal repro extracted from `random_block_pairs_rotation_invariance`
-/// case 5 (seed 0x0707_4713). Two transversal blocks rotated rigidly about
-/// a generic (off-axis) axis: `intersect` returns Ok, `check()` is clean,
-/// euler_counts give a perfect hexahedron (8V/12E/6F, genus 0) — yet the
-/// tessellation has one edge shared by FOUR triangles (overlapping facets)
-/// and is not a closed manifold, so mass properties are unmeasurable.
-/// Pure z- or x-axis rotations of the same pair pass; the failure needs a
-/// generic axis (both 0.3 and 0.8165 rad fail, so it is not a knife-edge).
+/// case 5 (seed 0x0707_4713), the of-ny6 bug. Two transversal blocks
+/// rotated rigidly about a generic (off-axis) axis: dense collinear
+/// boundary sampling made BOTH faces adjacent to one edge skip the same
+/// collinear midpoint with a chord + zero-area sliver, putting four
+/// triangles on the chord edge. Fixed by thinning interior samples of
+/// straight darts from the tessellation rings; kept as a regression test.
 #[test]
-#[ignore = "of-ny6: non-manifold tessellation (edge shared by 4 triangles)"]
 fn rotated_block_pair_intersection_manifold() {
     let context = "generic-axis rotated block pair intersection";
     let a_max = [2.976154433844907, 1.6850031873777522, 2.0507148739253545];

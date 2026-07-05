@@ -2231,15 +2231,48 @@ fn build_output(
             store.create_loop(face_id, loop_type, &entries);
         }
 
-        // Tessellation payload.
+        // Tessellation payload. Interior samples of straight (Line-sourced)
+        // open darts are dropped: they are pure oversampling (a straight
+        // segment needs only its endpoints), and the collinear runs they
+        // form break ear clipping — when the SAME run lies on two adjacent
+        // faces, both ear clippers skip a collinear midpoint with a chord
+        // and emit the compensating zero-area sliver, putting FOUR
+        // triangles on the chord edge (of-ny6). Both faces share the
+        // atom's polyline, so they drop identical points and rim welding
+        // is preserved; dart start points (the true topology vertices)
+        // always survive.
         let fp = &pipe.face_polys[kr.solid][kr.face];
         let rings = kr
             .region
             .cycles
             .iter()
-            .map(|cy| MeshRing {
-                uv: cy.poly.iter().map(|(uv, _)| *uv).collect(),
-                points: cy.poly.iter().map(|(_, p)| *p).collect(),
+            .map(|cy| {
+                let n = cy.poly.len();
+                let dart_count = cy.dart_offsets.len();
+                let mut keep = vec![true; n];
+                for (k, &(ai, _)) in cy.darts.iter().enumerate() {
+                    let straight =
+                        matches!(source_curve(pipe, atom_source[ai]), Curve3::Line { .. });
+                    if !straight || atoms[ai].closed {
+                        continue;
+                    }
+                    let start = cy.dart_offsets[k];
+                    let end = if k + 1 < dart_count {
+                        cy.dart_offsets[k + 1]
+                    } else {
+                        n
+                    };
+                    for flag in &mut keep[start + 1..end] {
+                        *flag = false;
+                    }
+                }
+                let mut uv = Vec::with_capacity(n);
+                let mut points = Vec::with_capacity(n);
+                for ((q, p), _) in cy.poly.iter().zip(&keep).filter(|&(_, &k)| k) {
+                    uv.push(*q);
+                    points.push(*p);
+                }
+                MeshRing { uv, points }
             })
             .collect();
         let base_sign = if face_data.outward_along_normal {
