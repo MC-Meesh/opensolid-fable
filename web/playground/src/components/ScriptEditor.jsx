@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react';
+import { forwardRef, useEffect, useImperativeHandle, useRef } from 'react';
 import { EditorView, keymap } from '@codemirror/view';
 import { Prec } from '@codemirror/state';
 import { basicSetup } from 'codemirror';
@@ -19,19 +19,25 @@ const editorTheme = EditorView.theme({
   '&.cm-focused': { outline: 'none' },
 });
 
-/**
- * CodeMirror 6 editor for the shape script.
- *
- * Uncontrolled: `initialDoc` seeds the document on mount; edits flow out
- * through `onChange`. Mod-Enter (Cmd on macOS, Ctrl elsewhere) fires `onRun`.
- */
-export default function ScriptEditor({ initialDoc, onChange, onRun }) {
+const ScriptEditor = forwardRef(function ScriptEditor({ initialDoc, onChange, onRun }, ref) {
   const hostRef = useRef(null);
+  const viewRef = useRef(null);
   const onChangeRef = useRef(onChange);
   const onRunRef = useRef(onRun);
   onChangeRef.current = onChange;
   onRunRef.current = onRun;
   const initialDocRef = useRef(initialDoc);
+
+  useImperativeHandle(ref, () => ({
+    setDoc(text) {
+      const view = viewRef.current;
+      if (view) {
+        view.dispatch({
+          changes: { from: 0, to: view.state.doc.length, insert: text },
+        });
+      }
+    },
+  }));
 
   useEffect(() => {
     const view = new EditorView({
@@ -60,8 +66,14 @@ export default function ScriptEditor({ initialDoc, onChange, onRun }) {
         }),
       ],
     });
-    return () => view.destroy();
+    viewRef.current = view;
+    return () => {
+      view.destroy();
+      viewRef.current = null;
+    };
   }, []);
 
   return <div className="editor" ref={hostRef} />;
-}
+});
+
+export default ScriptEditor;

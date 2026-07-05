@@ -7,10 +7,11 @@ import StatusBar from './components/StatusBar.jsx';
 import SceneTree from './components/SceneTree.jsx';
 import SketchCanvas from './components/SketchCanvas.jsx';
 import { DEFAULT_SCRIPT } from './lib/defaultScript.js';
-import { freeNodes, nodeLabel, runTracedScript } from './lib/sceneTree.js';
+import { freeNodes, nodeLabel, runTracedScript, serializeTree } from './lib/sceneTree.js';
 import { buildBinaryStl } from './lib/stl.js';
+import { pickCandidates, pickNodeAt } from './lib/picking.js';
+import { applyTranslate, applyRotate, applyScale, pathTo, nodeAt } from './lib/transformEdit.js';
 
-// Single WASM instantiation shared across (strict-mode re-)mounts.
 let wasmInit = null;
 function ensureWasm() {
   wasmInit ??= init();
@@ -19,25 +20,51 @@ function ensureWasm() {
 
 const DEFAULT_RESOLUTION = 64;
 
+function meshShape(shape, resolution) {
+  const data = shape.mesh(resolution);
+  const positions = data.positions;
+  const normals = data.normals;
+  const indices = data.indices;
+  data.free();
+  return { positions, normals, indices };
+}
+
+function shapePivot(shape) {
+  const b = shape.bounds();
+  return [(b[0] + b[3]) / 2, (b[1] + b[4]) / 2, (b[2] + b[5]) / 2];
+}
+
 export default function App() {
   const [wasmReady, setWasmReady] = useState(false);
   const [error, setError] = useState(null);
   const [resolution, setResolution] = useState(DEFAULT_RESOLUTION);
   const [wireframe, setWireframe] = useState(false);
-  const [mesh, setMesh] = useState(null); // { positions, normals, indices, frame, key }
-  const [stats, setStats] = useState(null); // { triangles, vertices, resolution, elapsedMs }
-  const [tree, setTree] = useState(null); // root node of the construction tree
-  const [selected, setSelected] = useState(null); // isolated tree node, or null
+  const [mesh, setMesh] = useState(null);
+  const [stats, setStats] = useState(null);
+  const [tree, setTree] = useState(null);
+  const [selectedNode, setSelectedNode] = useState(null);
+  const [selectedMesh, setSelectedMesh] = useState(null);
+  const [selectedPivot, setSelectedPivot] = useState(null);
+  const [gizmoMode, setGizmoMode] = useState('translate');
   const [sketchOpen, setSketchOpen] = useState(false);
   const [sketchPlane, setSketchPlane] = useState('XY');
-  const profileRef = useRef(null); // latest sketch profile (for extrude, of-4eh.6)
+  const profileRef = useRef(null);
 
-  const scriptRef = useRef(DEFAULT_SCRIPT); // live editor contents
-  const resolutionRef = useRef(DEFAULT_RESOLUTION); // committed slider value
-  const shapeRef = useRef(null); // WasmShape currently shown (full model or isolated node)
-  const tracedRef = useRef(null); // { root, nodes } from the last successful run
-  const meshRef = useRef(null); // last mesh buffers, for STL export
+  const scriptRef = useRef(DEFAULT_SCRIPT);
+  const resolutionRef = useRef(DEFAULT_RESOLUTION);
+  const shapeRef = useRef(null);
+  const tracedRef = useRef(null);
+  const meshRef = useRef(null);
   const meshKeyRef = useRef(0);
+  const editorRef = useRef(null);
+  const selectedPathRef = useRef(null);
+
+  const clearSelection = useCallback(() => {
+    setSelectedNode(null);
+    setSelectedMesh(null);
+    setSelectedPivot(null);
+    selectedPathRef.current = null;
+  }, []);
 
   const remesh = useCallback(({ reframe = false } = {}) => {
     const shape = shapeRef.current;
@@ -97,26 +124,98 @@ export default function App() {
       setError(String(err?.stack || err));
       return;
     }
-    // The tree nodes own the intermediate WasmShapes (including the root's).
     if (tracedRef.current) freeNodes(tracedRef.current.nodes);
     tracedRef.current = traced;
     setTree(traced.root);
-    setSelected(null);
     shapeRef.current = traced.root.shape;
     remesh({ reframe: true });
-  }, [remesh]);
+
+    if (selectedPathRef.current) {
+      const restored = nodeAt(traced.root, selectedPathRef.current);
+      if (restored && restored.shape) {
+        setSelectedNode(restored);
+        try {
+          const res = resolutionRef.current;
+          setSelectedMesh(meshShape(restored.shape, res));
+          setSelectedPivot(shapePivot(restored.shape));
+        } catch {
+          clearSelection();
+        }
+      } else {
+        clearSelection();
+      }
+    } else {
+      clearSelection();
+    }
+  }, [remesh, clearSelection]);
 
   const selectNode = useCallback(
     (node) => {
       const root = tracedRef.current?.root;
       if (!root) return;
-      // Clicking the current selection, the root, or clearing → full model.
-      const isolate = node && node !== root && node.id !== selected?.id ? node : null;
-      setSelected(isolate);
-      shapeRef.current = (isolate ?? root).shape;
-      remesh({ reframe: true });
+      if (!node || node === root || node.id === selectedNode?.id) {
+        clearSelection();
+        return;
+      }
+      setSelectedNode(node);
+      selectedPathRef.current = pathTo(root, node.id);
+      if (node.shape) {
+        try {
+          const res = resolutionRef.current;
+          setSelectedMesh(meshShape(node.shape, res));
+          setSelectedPivot(shapePivot(node.shape));
+        } catch {
+          clearSelection();
+        }
+      }
     },
-    [remesh, selected]
+    [selectedNode, clearSelection]
+  );
+
+  const handlePick = useCallback(
+    (point) => {
+      const root = tracedRef.current?.root;
+      if (!root) return;
+      if (!point) {
+        clearSelection();
+        return;
+      }
+      const candidates = pickCandidates(root);
+      const picked = pickNodeAt(candidates, point);
+      if (picked) {
+        selectNode(picked);
+      } else {
+        clearSelection();
+      }
+    },
+    [selectNode, clearSelection]
+  );
+
+  const handleTransform = useCallback(
+    (event) => {
+      const root = tracedRef.current?.root;
+      if (!root || !selectedNode) return;
+
+      const path = pathTo(root, selectedNode.id);
+      let newRoot;
+
+      if (event.mode === 'translate') {
+        newRoot = applyTranslate(root, selectedNode.id, event.delta);
+      } else if (event.mode === 'rotate') {
+        newRoot = applyRotate(root, selectedNode.id, event.axis, event.angle, event.pivot);
+      } else if (event.mode === 'scale') {
+        newRoot = applyScale(root, selectedNode.id, event.factors, event.pivot);
+      } else {
+        return;
+      }
+
+      selectedPathRef.current = path;
+      const script = serializeTree(newRoot);
+      scriptRef.current = script;
+      editorRef.current?.setDoc(script);
+      evaluateScript();
+    },
+    [selectedNode, evaluateScript]
   );
 
   const downloadStl = useCallback(() => {
@@ -134,7 +233,6 @@ export default function App() {
     URL.revokeObjectURL(link.href);
   }, []);
 
-  // Boot: instantiate WASM, then evaluate the default script once.
   const bootedRef = useRef(false);
   useEffect(() => {
     let cancelled = false;
@@ -152,6 +250,27 @@ export default function App() {
       cancelled = true;
     };
   }, [evaluateScript]);
+
+  useEffect(() => {
+    function onKeyDown(event) {
+      const tag = event.target.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+      const cm = event.target.closest('.cm-editor');
+      if (cm) return;
+
+      if (event.key === 't' || event.key === 'T') {
+        setGizmoMode('translate');
+      } else if (event.key === 'r' || event.key === 'R') {
+        setGizmoMode('rotate');
+      } else if (event.key === 's' || event.key === 'S') {
+        setGizmoMode('scale');
+      } else if (event.key === 'Escape') {
+        clearSelection();
+      }
+    }
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [clearSelection]);
 
   const handleResolutionChange = useCallback((value) => {
     resolutionRef.current = value;
@@ -177,8 +296,9 @@ export default function App() {
           <h1>OpenSolid Playground</h1>
           <p>Write a script that returns a Shape, then Run (Ctrl/Cmd+Enter).</p>
         </header>
-        <SceneTree root={tree} selectedId={selected?.id} onSelect={selectNode} />
+        <SceneTree root={tree} selectedId={selectedNode?.id} onSelect={selectNode} />
         <ScriptEditor
+          ref={editorRef}
           initialDoc={DEFAULT_SCRIPT}
           onChange={handleScriptChange}
           onRun={evaluateScript}
@@ -200,14 +320,38 @@ export default function App() {
           mesh={mesh}
           wireframe={wireframe}
           sketchPlane={sketchOpen ? sketchPlane : null}
+          gizmoMode={gizmoMode}
+          selectedMesh={selectedMesh}
+          selectedPivot={selectedPivot}
+          onPick={handlePick}
+          onTransform={handleTransform}
         />
-        {selected && (
-          <div className="isolate-banner">
-            <span>
-              Isolated: <strong>{nodeLabel(selected)}</strong>
-            </span>
-            <button className="secondary" onClick={() => selectNode(null)}>
-              Show full model
+        {selectedNode && (
+          <div className="gizmo-bar">
+            <button
+              className={gizmoMode === 'translate' ? 'gizmo-active' : 'secondary'}
+              onClick={() => setGizmoMode('translate')}
+              title="Translate (T)"
+            >
+              Move
+            </button>
+            <button
+              className={gizmoMode === 'rotate' ? 'gizmo-active' : 'secondary'}
+              onClick={() => setGizmoMode('rotate')}
+              title="Rotate (R)"
+            >
+              Rotate
+            </button>
+            <button
+              className={gizmoMode === 'scale' ? 'gizmo-active' : 'secondary'}
+              onClick={() => setGizmoMode('scale')}
+              title="Scale (S)"
+            >
+              Scale
+            </button>
+            <span className="gizmo-label">{nodeLabel(selectedNode)}</span>
+            <button className="secondary" onClick={clearSelection}>
+              Deselect
             </button>
           </div>
         )}

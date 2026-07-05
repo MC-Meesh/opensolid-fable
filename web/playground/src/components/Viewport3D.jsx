@@ -1,6 +1,7 @@
 import { useEffect, useRef } from 'react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { TransformControls } from 'three/addons/controls/TransformControls.js';
 
 function frameCamera({ camera, controls }, { center, radius }) {
   const target = new THREE.Vector3(...center);
@@ -12,23 +13,31 @@ function frameCamera({ camera, controls }, { center, radius }) {
   controls.target.copy(target);
 }
 
-/** Orientation and tint for each selectable sketch plane. */
 const SKETCH_PLANES = {
-  XY: { rotation: [0, 0, 0], color: 0x4f9cf9 }, // normal +Z
-  XZ: { rotation: [-Math.PI / 2, 0, 0], color: 0x5fdf8a }, // normal +Y
-  YZ: { rotation: [0, Math.PI / 2, 0], color: 0xef6f6f }, // normal +X
+  XY: { rotation: [0, 0, 0], color: 0x4f9cf9 },
+  XZ: { rotation: [-Math.PI / 2, 0, 0], color: 0x5fdf8a },
+  YZ: { rotation: [0, Math.PI / 2, 0], color: 0xef6f6f },
 };
 
-/**
- * three.js canvas with orbit controls.
- *
- * `mesh` carries flat buffers ({ positions, normals, indices }) plus an
- * optional `frame` ({ center, radius }) that recenters the camera, and a
- * monotonically increasing `key` so identical-looking remeshes still apply.
- * `sketchPlane` ('XY' | 'XZ' | 'YZ' | null) shows a translucent plane
- * indicating the active sketch plane's orientation.
- */
-export default function Viewport3D({ mesh, wireframe, sketchPlane }) {
+const HIGHLIGHT_MATERIAL = new THREE.MeshStandardMaterial({
+  color: 0x4fc3f7,
+  metalness: 0.1,
+  roughness: 0.4,
+  transparent: true,
+  opacity: 0.35,
+  depthWrite: false,
+});
+
+export default function Viewport3D({
+  mesh,
+  wireframe,
+  sketchPlane,
+  gizmoMode,
+  selectedMesh,
+  selectedPivot,
+  onPick,
+  onTransform,
+}) {
   const containerRef = useRef(null);
   const sceneRef = useRef(null);
 
@@ -45,8 +54,8 @@ export default function Viewport3D({ mesh, wireframe, sketchPlane }) {
     const camera = new THREE.PerspectiveCamera(45, 1, 0.01, 1000);
     camera.position.set(3, 2.5, 4);
 
-    const controls = new OrbitControls(camera, renderer.domElement);
-    controls.enableDamping = true;
+    const orbitControls = new OrbitControls(camera, renderer.domElement);
+    orbitControls.enableDamping = true;
 
     scene.add(new THREE.HemisphereLight(0xbfd4ff, 0x3a3226, 0.9));
     const keyLight = new THREE.DirectionalLight(0xffffff, 1.6);
@@ -67,6 +76,63 @@ export default function Viewport3D({ mesh, wireframe, sketchPlane }) {
     const meshObject = new THREE.Mesh(new THREE.BufferGeometry(), material);
     scene.add(meshObject);
 
+    const ghostMesh = new THREE.Mesh(new THREE.BufferGeometry(), HIGHLIGHT_MATERIAL);
+    ghostMesh.renderOrder = 1;
+    ghostMesh.visible = false;
+
+    const anchor = new THREE.Group();
+    anchor.add(ghostMesh);
+    anchor.visible = false;
+    scene.add(anchor);
+
+    const transformControls = new TransformControls(camera, renderer.domElement);
+    transformControls.attach(anchor);
+    transformControls.visible = false;
+    transformControls.enabled = false;
+    scene.add(transformControls.getHelper());
+
+    transformControls.addEventListener('dragging-changed', (event) => {
+      orbitControls.enabled = !event.value;
+    });
+
+    const raycaster = new THREE.Raycaster();
+    const pointerDown = new THREE.Vector2();
+    let pointerDownTime = 0;
+
+    function onPointerDown(event) {
+      const rect = container.getBoundingClientRect();
+      pointerDown.set(event.clientX - rect.left, event.clientY - rect.top);
+      pointerDownTime = performance.now();
+    }
+
+    function onPointerUp(event) {
+      if (performance.now() - pointerDownTime > 500) return;
+      const rect = container.getBoundingClientRect();
+      const upX = event.clientX - rect.left;
+      const upY = event.clientY - rect.top;
+      const dist = Math.hypot(upX - pointerDown.x, upY - pointerDown.y);
+      if (dist > 5) return;
+      if (transformControls.axis) return;
+
+      const ndc = new THREE.Vector2(
+        (upX / rect.width) * 2 - 1,
+        -(upY / rect.height) * 2 + 1,
+      );
+      raycaster.setFromCamera(ndc, camera);
+      const hits = raycaster.intersectObject(meshObject);
+      const cb = sceneRef.current?._onPick;
+      if (!cb) return;
+      if (hits.length > 0) {
+        const p = hits[0].point;
+        cb([p.x, p.y, p.z]);
+      } else {
+        cb(null);
+      }
+    }
+
+    container.addEventListener('pointerdown', onPointerDown);
+    container.addEventListener('pointerup', onPointerUp);
+
     function resize() {
       const { clientWidth: w, clientHeight: h } = container;
       if (w === 0 || h === 0) return;
@@ -79,17 +145,54 @@ export default function Viewport3D({ mesh, wireframe, sketchPlane }) {
     resize();
 
     renderer.setAnimationLoop(() => {
-      controls.update();
+      orbitControls.update();
       renderer.render(scene, camera);
     });
 
-    sceneRef.current = { renderer, camera, controls, material, meshObject };
+    function onKeyDown(event) {
+      if (event.shiftKey && transformControls.enabled) {
+        transformControls.setTranslationSnap(0.5);
+        transformControls.setRotationSnap(THREE.MathUtils.degToRad(15));
+        transformControls.setScaleSnap(0.25);
+      }
+    }
+
+    function onKeyUp(event) {
+      if (!event.shiftKey) {
+        transformControls.setTranslationSnap(null);
+        transformControls.setRotationSnap(null);
+        transformControls.setScaleSnap(null);
+      }
+    }
+
+    window.addEventListener('keydown', onKeyDown);
+    window.addEventListener('keyup', onKeyUp);
+
+    sceneRef.current = {
+      renderer,
+      camera,
+      controls: orbitControls,
+      material,
+      meshObject,
+      transformControls,
+      anchor,
+      ghostMesh,
+      _onPick: null,
+      _onTransform: null,
+    };
 
     return () => {
+      container.removeEventListener('pointerdown', onPointerDown);
+      container.removeEventListener('pointerup', onPointerUp);
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('keyup', onKeyUp);
       observer.disconnect();
       renderer.setAnimationLoop(null);
-      controls.dispose();
+      transformControls.detach();
+      transformControls.dispose();
+      orbitControls.dispose();
       meshObject.geometry.dispose();
+      ghostMesh.geometry.dispose();
       material.dispose();
       grid.geometry.dispose();
       grid.material.dispose();
@@ -153,6 +256,105 @@ export default function Viewport3D({ mesh, wireframe, sketchPlane }) {
       edgeMaterial.dispose();
     };
   }, [sketchPlane]);
+
+  useEffect(() => {
+    const ctx = sceneRef.current;
+    if (!ctx) return;
+    if (selectedMesh && selectedPivot) {
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.BufferAttribute(selectedMesh.positions, 3));
+      geo.setAttribute('normal', new THREE.BufferAttribute(selectedMesh.normals, 3));
+      geo.setIndex(new THREE.BufferAttribute(selectedMesh.indices, 1));
+      ctx.ghostMesh.geometry.dispose();
+      ctx.ghostMesh.geometry = geo;
+      ctx.ghostMesh.visible = true;
+
+      const [px, py, pz] = selectedPivot;
+      ctx.anchor.position.set(px, py, pz);
+      ctx.ghostMesh.position.set(-px, -py, -pz);
+      ctx.anchor.quaternion.identity();
+      ctx.anchor.scale.set(1, 1, 1);
+      ctx.anchor.visible = true;
+
+      ctx.transformControls.visible = true;
+      ctx.transformControls.enabled = true;
+    } else {
+      ctx.ghostMesh.visible = false;
+      ctx.anchor.visible = false;
+      ctx.transformControls.visible = false;
+      ctx.transformControls.enabled = false;
+    }
+  }, [selectedMesh, selectedPivot]);
+
+  useEffect(() => {
+    const ctx = sceneRef.current;
+    if (!ctx) return;
+    if (gizmoMode && ctx.transformControls.enabled) {
+      ctx.transformControls.setMode(gizmoMode);
+    }
+  }, [gizmoMode]);
+
+  const onTransformRef = useRef(onTransform);
+  onTransformRef.current = onTransform;
+  const onPickRef = useRef(onPick);
+  onPickRef.current = onPick;
+
+  useEffect(() => {
+    const ctx = sceneRef.current;
+    if (!ctx) return;
+    ctx._onPick = (...args) => onPickRef.current?.(...args);
+  });
+
+  useEffect(() => {
+    const ctx = sceneRef.current;
+    if (!ctx) return;
+
+    function onDragEnd() {
+      const cb = onTransformRef.current;
+      if (!cb) return;
+      const pivot = [ctx.anchor.position.x, ctx.anchor.position.y, ctx.anchor.position.z];
+      const mode = ctx.transformControls.mode;
+
+      if (mode === 'translate') {
+        const startPivot = sceneRef.current?._startPivot;
+        if (startPivot) {
+          cb({
+            mode: 'translate',
+            delta: [pivot[0] - startPivot[0], pivot[1] - startPivot[1], pivot[2] - startPivot[2]],
+            pivot: startPivot,
+          });
+        }
+      } else if (mode === 'rotate') {
+        const q = ctx.anchor.quaternion;
+        const angle = 2 * Math.acos(Math.min(1, Math.abs(q.w)));
+        if (angle > 1e-6) {
+          const s = Math.sin(angle / 2);
+          const axis = [q.x / s, q.y / s, q.z / s];
+          cb({ mode: 'rotate', axis, angle, pivot });
+        }
+      } else if (mode === 'scale') {
+        const sc = ctx.anchor.scale;
+        if (Math.abs(sc.x - 1) > 1e-6 || Math.abs(sc.y - 1) > 1e-6 || Math.abs(sc.z - 1) > 1e-6) {
+          cb({ mode: 'scale', factors: [sc.x, sc.y, sc.z], pivot });
+        }
+      }
+
+      ctx.anchor.quaternion.identity();
+      ctx.anchor.scale.set(1, 1, 1);
+    }
+
+    function onDragStart() {
+      const pos = ctx.anchor.position;
+      sceneRef.current._startPivot = [pos.x, pos.y, pos.z];
+    }
+
+    ctx.transformControls.addEventListener('mouseDown', onDragStart);
+    ctx.transformControls.addEventListener('mouseUp', onDragEnd);
+    return () => {
+      ctx.transformControls.removeEventListener('mouseDown', onDragStart);
+      ctx.transformControls.removeEventListener('mouseUp', onDragEnd);
+    };
+  }, []);
 
   return <div className="viewport" ref={containerRef} />;
 }

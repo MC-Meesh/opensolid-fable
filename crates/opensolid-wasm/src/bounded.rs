@@ -9,7 +9,7 @@ use opensolid_core::error::CoreResult;
 use opensolid_core::mesh::TriangleMesh;
 use opensolid_core::types::{BoundingBox3, Point3, Transform3, Vector3};
 use opensolid_frep::mesh::{MeshOptions, mesh_sdf_indexed};
-use opensolid_frep::primitives::{Box3, Capsule, Cylinder, RoundedBox, Sphere, Torus};
+use opensolid_frep::primitives::{Box3, Capsule, Cylinder, RoundedBox, Sdf, Sphere, Torus};
 use opensolid_frep::{Extrude, Profile2D, Revolve, SdfTransformExt, Shape};
 
 /// A runtime-composable shape that carries a conservative axis-aligned
@@ -267,6 +267,14 @@ impl BoundedShape {
         }
     }
 
+    /// Signed distance from `point` to the surface: negative inside,
+    /// positive outside. After smooth blends or anisotropic scaling the
+    /// field is not an exact Euclidean distance, but its sign and zero set
+    /// stay correct, so nearest-surface queries can compare magnitudes.
+    pub fn distance(&self, point: Point3) -> f64 {
+        self.shape.eval(&point)
+    }
+
     /// Mesh the shape on a `resolution`³ grid. With `bound` set, the grid
     /// covers the explicit cube `[-bound, bound]³`; otherwise bounds are
     /// auto-derived from the tracked bounding box (see [`Self::mesh_bounds`]).
@@ -329,7 +337,6 @@ pub fn flatten_mesh(mesh: &TriangleMesh) -> FlatMesh {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use opensolid_frep::primitives::Sdf;
 
     const RES: usize = 24;
 
@@ -383,6 +390,29 @@ mod tests {
         assert!(r.shape.eval(&r.bounds.max) > 0.0);
         assert!(r.shape.eval(&Point3::new(1.0, 0.0, 0.0)).abs() < 1e-12);
         assert!(r.shape.eval(&Point3::new(0.0, 0.5, 0.0)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn distance_is_signed_and_zero_on_surface() {
+        let s = BoundedShape::sphere(1.0);
+        assert!((s.distance(Point3::new(2.0, 0.0, 0.0)) - 1.0).abs() < 1e-12);
+        assert!((s.distance(Point3::origin()) + 1.0).abs() < 1e-12);
+        assert!(s.distance(Point3::new(0.0, 1.0, 0.0)).abs() < 1e-12);
+
+        // Follows transforms: the moved sphere's surface is at x = 4.
+        let moved = s.translate(Vector3::new(3.0, 0.0, 0.0));
+        assert!(moved.distance(Point3::new(4.0, 0.0, 0.0)).abs() < 1e-12);
+        assert!(moved.distance(Point3::origin()) > 1.0);
+
+        // CSG: a point inside the subtracted hole is outside the result but
+        // inside (negative for) the hole shape — magnitude comparison picks
+        // the hole as the nearest feature.
+        let plate = BoundedShape::box3(1.0, 0.2, 1.0);
+        let hole = BoundedShape::cylinder(0.3, 1.0);
+        let part = plate.subtract(&hole);
+        let inside_hole = Point3::new(0.0, 0.0, 0.0);
+        assert!(part.distance(inside_hole) > 0.0);
+        assert!(hole.distance(inside_hole) < 0.0);
     }
 
     #[test]

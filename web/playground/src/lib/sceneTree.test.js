@@ -37,6 +37,18 @@ class FakeShape {
   translate(x, y, z) {
     return new FakeShape(['translate', this.desc, x, y, z]);
   }
+  rotate(ax, ay, az, angle) {
+    return new FakeShape(['rotate', this.desc, ax, ay, az, angle]);
+  }
+  scale(sx, sy, sz) {
+    return new FakeShape(['scale', this.desc, sx, sy, sz]);
+  }
+  uniformScale(factor) {
+    return new FakeShape(['uniformScale', this.desc, factor]);
+  }
+  distance(x, y, z) {
+    return 1.0;
+  }
   union(other) {
     return new FakeShape(['union', this.desc, other.desc]);
   }

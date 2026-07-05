@@ -231,6 +231,14 @@ impl WasmShape {
         WasmShape(self.0.smooth_union(&other.0, radius))
     }
 
+    /// Signed distance from `(x, y, z)` to the surface: negative inside,
+    /// positive outside. After smooth blends or anisotropic scaling this is
+    /// not an exact Euclidean distance, but the sign and zero set stay
+    /// correct, so nearest-surface queries can compare magnitudes.
+    pub fn distance(&self, x: f64, y: f64, z: f64) -> f64 {
+        self.0.distance(Point3::new(x, y, z))
+    }
+
     /// Conservative axis-aligned bounding box of the surface as
     /// `[min_x, min_y, min_z, max_x, max_y, max_z]` (useful for camera
     /// framing).
@@ -304,6 +312,14 @@ mod tests {
         let cap = WasmShape::capsule(-0.5, 0.0, 0.0, 0.5, 0.5, 0.0, 0.3);
         assert_valid(&cap.mesh(24, None));
         assert_valid(&cap.mesh(24, Some(2.0)));
+    }
+
+    #[test]
+    fn distance_via_wasm_api() {
+        let s = WasmShape::sphere(1.0).translate(2.0, 0.0, 0.0);
+        assert!((s.distance(4.0, 0.0, 0.0) - 1.0).abs() < 1e-12);
+        assert!(s.distance(3.0, 0.0, 0.0).abs() < 1e-12);
+        assert!(s.distance(2.0, 0.0, 0.0) < 0.0);
     }
 
     #[test]
