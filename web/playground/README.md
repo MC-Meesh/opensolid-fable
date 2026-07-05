@@ -7,9 +7,13 @@ orbit it in a three.js viewer, and download the result as binary STL.
 React + Vite SPA. The UI is componentized under `src/components/`:
 
 - **App** — owns all state (script, resolution, wireframe, mesh, stats,
-  scene tree selection) and the WASM shape lifecycle
-- **SceneTree** — collapsible view of the script's construction tree; click
-  a node to isolate that intermediate shape in the viewport
+  feature selection) and the WASM shape lifecycle
+- **FeatureTree** — CAD feature history docked on the left edge (SolidWorks
+  FeatureManager style): chronological features (Box1, Sketch1, Extrude1,
+  Union1 …) derived from the construction tree, with renameable rows, an eye
+  visibility toggle, suppress and delete actions. Clicking a sketch feature
+  re-enters sketch mode on it; clicking any other feature isolates it and
+  opens its parameters. Collapsible to a thin strip.
 - **ScriptEditor** — CodeMirror 6 editor with JS syntax highlighting
 - **Viewport3D** — three.js canvas with OrbitControls and the orientation triad
 - **MainToolbar** — workflow-grouped toolbar over the viewport
@@ -114,12 +118,16 @@ to snap to the view looking down that axis (hollow tip = negative direction).
   binding in scope, `Shape` (the `WasmShape` class). Press **Run** or
   Ctrl/Cmd+Enter to re-evaluate and re-mesh. Errors (syntax, thrown
   exceptions, wrong return type) appear below the editor.
-- **Scene panel** — every run traces the script's shape operations into a
-  construction tree (see `src/lib/sceneTree.js`); the final shape is the
-  root. Click a step to isolate that intermediate shape in the viewport
-  (it re-meshes just that subtree); click it again, click the root, or use
-  the *Show full model* button to go back. A shape reused in several places
-  (e.g. built in a loop) is one shared node shown under each parent.
+- **Feature tree (docked left)** — every run traces the script's shape
+  operations into a construction tree (see `src/lib/sceneTree.js`), and
+  `src/lib/featureTree.js` presents it as a chronological feature history.
+  Click a feature to isolate it and edit its parameters in the property
+  panel; click a sketch feature to re-open its profile in the sketch canvas
+  (apply replaces just that profile). The eye toggle and *suppress* recompute
+  the displayed mesh with that feature bypassed — the script itself is never
+  modified; *delete* rewrites the script without the feature. Double-click a
+  name to rename it (display-only). A shape reused in several places (e.g.
+  built in a loop) appears once, at its creation position.
 - **Resolution slider** — dual-contouring grid resolution (32–128 cells per
   axis). Re-meshes the current shape without re-running the script.
 - **Wireframe** — toggles wireframe rendering.

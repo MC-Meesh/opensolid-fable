@@ -28,6 +28,7 @@ describe('App', () => {
     );
     expect(html).toContain('OpenSolid Playground');
     expect(html).toContain('Sketch');
+    expect(html).toContain('Features'); // docked feature tree
     expect(html).toContain('Loading WASM');
   });
 

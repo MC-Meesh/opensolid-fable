@@ -8,7 +8,7 @@ import Toolbar from './components/Toolbar.jsx';
 import MainToolbar from './components/MainToolbar.jsx';
 import StatusBar from './components/StatusBar.jsx';
 import ScenePanel from './components/ScenePanel.jsx';
-import SceneTree from './components/SceneTree.jsx';
+import FeatureTree from './components/FeatureTree.jsx';
 import PropertyPanel from './components/PropertyPanel.jsx';
 import SketchCanvas from './components/SketchCanvas.jsx';
 import SweepPanel from './components/SweepPanel.jsx';
@@ -16,10 +16,11 @@ import { DEFAULT_SCRIPT } from './lib/defaultScript.js';
 import { freeNodes, nodeLabel, runTracedScript, serializeTree } from './lib/sceneTree.js';
 import { buildBinaryStl } from './lib/stl.js';
 import { pickCandidates, pickNodeAt } from './lib/picking.js';
-import { applyTranslate, applyRotate, applyScale, pathTo, nodeAt } from './lib/transformEdit.js';
+import { applyTranslate, applyRotate, applyScale, pathTo, nodeAt, replaceById } from './lib/transformEdit.js';
 import { setNodeArg, setBooleanOp } from './lib/propertyEdit.js';
 import { deleteNode } from './lib/deleteNode.js';
 import { VIEW_SHORTCUTS } from './lib/views.js';
+import { buildFeatures, pruneTree, resolveKeys } from './lib/featureTree.js';
 import {
   addShape,
   deleteShape,
@@ -78,6 +79,21 @@ export default function App() {
   const hoverCacheRef = useRef(new Map());
   const hoveredIdRef = useRef(null);
 
+  // Feature tree (presentation layer over the traced tree): user renames,
+  // per-feature visibility/suppression, panel collapse, and the sketch
+  // feature currently open for editing. All keyed by feature keys
+  // (`type:ordinal`), which are deterministic for a given script.
+  const [featureNames, setFeatureNames] = useState({});
+  const [hiddenKeys, setHiddenKeys] = useState(() => new Set());
+  const [suppressedKeys, setSuppressedKeys] = useState(() => new Set());
+  const [featuresCollapsed, setFeaturesCollapsed] = useState(false);
+  const [editingSketch, setEditingSketch] = useState(null); // { nodeId, name }
+  const sketchCanvasRef = useRef(null);
+  // What the viewport shows: the full model, a pruned re-evaluation (some
+  // features hidden/suppressed), or nothing (everything hidden). Pruned mode
+  // owns its traced nodes and frees them when replaced.
+  const displayRef = useRef({ mode: 'full' });
+
   // Bidirectional sync: the shape operation graph parsed from the script.
   // GUI mutations (palette, parameter edits) rewrite individual statements
   // and push the new script text into the editor, preserving all hand-written
@@ -105,7 +121,20 @@ export default function App() {
   }, []);
 
   const remesh = useCallback(({ reframe = false } = {}) => {
-    const shape = shapeRef.current;
+    const display = displayRef.current;
+    if (display.mode === 'empty') {
+      meshRef.current = { positions: new Float32Array(0), indices: new Uint32Array(0) };
+      setMesh({
+        positions: new Float32Array(0),
+        normals: new Float32Array(0),
+        indices: new Uint32Array(0),
+        frame: null,
+        key: ++meshKeyRef.current,
+      });
+      setStats(null);
+      return;
+    }
+    const shape = display.mode === 'pruned' ? display.shape : shapeRef.current;
     if (!shape) return;
     setError(null);
     const res = resolutionRef.current;
@@ -261,10 +290,13 @@ export default function App() {
   );
 
   const selectNode = useCallback(
-    (node) => {
+    (node, { allowRoot = false } = {}) => {
       const root = tracedRef.current?.root;
       if (!root) return;
-      if (!node || node === root || node.id === selectedNode?.id) {
+      // Viewport picks treat the root as "deselect" (isolating the whole
+      // model is a no-op); feature-tree clicks pass allowRoot so the final
+      // feature can still open its parameters.
+      if (!node || (node === root && !allowRoot) || node.id === selectedNode?.id) {
         clearSelection();
         return;
       }
@@ -412,6 +444,164 @@ export default function App() {
     [applyTreeEdit]
   );
 
+  // ---- feature tree --------------------------------------------------------
+
+  const features = useMemo(() => buildFeatures(tree, featureNames), [tree, featureNames]);
+
+  // Hide/suppress are view-layer: recompute the displayed mesh from a pruned
+  // copy of the tree; the script (source of truth) is untouched. The pruned
+  // tree is serialized and re-run because bypassed operations need fresh
+  // intermediate shapes.
+  useEffect(() => {
+    const api = wasmRef.current;
+    const root = tracedRef.current?.root;
+    if (!api || !root) return;
+    const ids = resolveKeys(
+      buildFeatures(root),
+      [...hiddenKeys, ...suppressedKeys]
+    );
+    const previous = displayRef.current;
+    const freePrevious = () => {
+      if (previous.mode === 'pruned') freeNodes(previous.nodes);
+    };
+    if (ids.size === 0) {
+      if (previous.mode === 'full') return;
+      freePrevious();
+      displayRef.current = { mode: 'full' };
+      remesh();
+      return;
+    }
+    const pruned = pruneTree(root, ids);
+    if (pruned === root) return;
+    freePrevious();
+    if (!pruned) {
+      displayRef.current = { mode: 'empty' };
+      remesh();
+      return;
+    }
+    let traced;
+    try {
+      traced = runTracedScript(serializeTree(pruned), api.WasmShape, api.WasmProfile2D);
+    } catch (err) {
+      setError(`Recomputing without hidden features failed: ${String(err)}`);
+      displayRef.current = { mode: 'full' };
+      remesh();
+      return;
+    }
+    displayRef.current = { mode: 'pruned', shape: traced.root.shape, nodes: traced.nodes };
+    remesh();
+  }, [tree, hiddenKeys, suppressedKeys, wasmReady, remesh]);
+
+  const handleFeatureRename = useCallback((key, name) => {
+    setFeatureNames((prev) => {
+      const next = { ...prev };
+      if (name) next[key] = name;
+      else delete next[key]; // empty rename reverts to the default name
+      return next;
+    });
+  }, []);
+
+  const handleToggleHide = useCallback((key) => {
+    setHiddenKeys((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }, []);
+
+  const handleToggleSuppress = useCallback((key) => {
+    setSuppressedKeys((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }, []);
+
+  // Committing a whole-tree edit (delete, sketch replacement): serialize and
+  // push through the same sync path the gizmo uses, with no selection carry.
+  const commitRoot = useCallback(
+    (newRoot) => {
+      selectedPathRef.current = null;
+      const script = serializeTree(newRoot);
+      scriptRef.current = script;
+      editorRef.current?.setDoc(script);
+      commitGraph();
+      evaluateScript();
+    },
+    [commitGraph, evaluateScript]
+  );
+
+  const handleFeatureDelete = useCallback(
+    (feature) => {
+      const root = tracedRef.current?.root;
+      if (!root) return;
+      const pruned = pruneTree(root, new Set([feature.id]));
+      if (!pruned) {
+        setError('Cannot delete the last feature.');
+        return;
+      }
+      if (pruned === root) return;
+      clearSelection();
+      commitRoot(pruned);
+    },
+    [clearSelection, commitRoot]
+  );
+
+  const enterSketchEdit = useCallback(
+    (feature) => {
+      const node = feature.node;
+      if (!node?.profile) return;
+      clearSelection();
+      setSweep(null);
+      setSweepError(null);
+      sketchCanvasRef.current?.loadProfile(node.profile);
+      setEditingSketch({ nodeId: node.id, name: feature.name });
+      setSketchOpen(true);
+    },
+    [clearSelection]
+  );
+
+  const handleFeatureSelect = useCallback(
+    (feature) => {
+      if (feature.kind === 'sketch') {
+        enterSketchEdit(feature);
+        return;
+      }
+      selectNode(feature.node, { allowRoot: true });
+    },
+    [enterSketchEdit, selectNode]
+  );
+
+  // Apply an edited sketch back onto its sweep feature: only the profile
+  // snapshot is replaced — the sweep parameter and the plane-orientation
+  // wrappers around the node stay valid because the profile is expressed in
+  // the sweep's native (u, v) frame.
+  const handleApplySketchEdit = useCallback(() => {
+    const root = tracedRef.current?.root;
+    const profile = profileRef.current;
+    if (!editingSketch || !root || !profile?.closed) return;
+    let ops;
+    try {
+      ops = profileToOps(profile);
+    } catch (err) {
+      setError(String(err));
+      return;
+    }
+    const path = pathTo(root, editingSketch.nodeId);
+    const target = path !== null ? nodeAt(root, path) : null;
+    setEditingSketch(null);
+    setSketchOpen(false);
+    if (!target) return; // feature vanished (script edited meanwhile)
+    const newNode = {
+      ...target,
+      profile: { start: [...ops.start], segs: ops.segs.map((s) => ({ ...s })) },
+      shape: null,
+    };
+    commitRoot(replaceById(root, editingSketch.nodeId, newNode));
+  }, [editingSketch, commitRoot]);
+
   const downloadStl = useCallback(() => {
     const current = meshRef.current;
     if (!current || current.indices.length === 0) {
@@ -500,7 +690,14 @@ export default function App() {
   const handleSketchToggle = useCallback(() => {
     setSweep(null);
     setSweepError(null);
+    setEditingSketch(null);
     setSketchOpen((v) => !v);
+  }, []);
+
+  // Leaving sketch mode without applying abandons a pending feature edit.
+  const handleSketchExit = useCallback(() => {
+    setEditingSketch(null);
+    setSketchOpen(false);
   }, []);
 
   // First successful WASM init runs the default script once.
@@ -564,6 +761,20 @@ export default function App() {
 
   return (
     <div className="app">
+      <FeatureTree
+        features={features}
+        selectedId={selectedNode?.id}
+        hiddenKeys={hiddenKeys}
+        suppressedKeys={suppressedKeys}
+        collapsed={featuresCollapsed}
+        disabled={!wasmReady}
+        onToggleCollapse={() => setFeaturesCollapsed((v) => !v)}
+        onSelect={handleFeatureSelect}
+        onRename={handleFeatureRename}
+        onToggleHide={handleToggleHide}
+        onToggleSuppress={handleToggleSuppress}
+        onDelete={handleFeatureDelete}
+      />
       <div className="left">
         <header>
           <h1>OpenSolid Playground</h1>
@@ -578,7 +789,6 @@ export default function App() {
           onUpdateArg={handleUpdateArg}
           disabled={!wasmReady}
         />
-        <SceneTree root={tree} selectedId={selectedNode?.id} onSelect={selectNode} />
         <ErrorBoundary name="Script editor">
           <ScriptEditor
             ref={editorRef}
@@ -685,6 +895,7 @@ export default function App() {
         )}
         <ErrorBoundary name="Sketch canvas">
           <SketchCanvas
+            ref={sketchCanvasRef}
             open={sketchOpen}
             plane={sketchPlane}
             view={sketchView}
@@ -692,7 +903,9 @@ export default function App() {
             onPlaneChange={setSketchPlane}
             onProfileChange={handleProfileChange}
             onSweep={handleSweepStart}
-            onExit={() => setSketchOpen(false)}
+            onExit={handleSketchExit}
+            editing={editingSketch ? { name: editingSketch.name } : null}
+            onApplyEdit={handleApplySketchEdit}
           />
         </ErrorBoundary>
         {stats && !sketchOpen && <StatusBar stats={stats} />}

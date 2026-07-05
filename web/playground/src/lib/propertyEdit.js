@@ -123,6 +123,22 @@ export const OP_SPECS = {
     title: 'Uniform scale',
     groups: [{ label: 'Scale', fields: [factor(0, 'f')] }],
   },
+  extrude: {
+    kind: 'sweep',
+    title: 'Extrude',
+    groups: [{ label: 'Depth', fields: [size(0, 'h')] }],
+  },
+  revolve: {
+    kind: 'sweep',
+    title: 'Revolve',
+    // The revolve angle is stored in degrees already (kernel contract).
+    groups: [
+      {
+        label: 'Rotation',
+        fields: [field(0, 'θ', { unit: '°', min: 0.1, max: 360, step: 1 })],
+      },
+    ],
+  },
   union: { kind: 'boolean', title: 'Boolean', groups: [] },
   intersect: { kind: 'boolean', title: 'Boolean', groups: [] },
   subtract: { kind: 'boolean', title: 'Boolean', groups: [] },

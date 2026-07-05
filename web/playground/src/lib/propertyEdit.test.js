@@ -131,6 +131,26 @@ describe('setBooleanOp', () => {
   });
 });
 
+describe('sweep specs', () => {
+  it('covers extrude and revolve so feature-tree clicks open parameters', () => {
+    expect(opSpec('extrude').kind).toBe('sweep');
+    expect(opSpec('extrude').groups[0].fields[0].arg).toBe(0);
+    expect(opSpec('revolve').kind).toBe('sweep');
+    // Revolve angle is stored in degrees — no display conversion.
+    expect(opSpec('revolve').groups[0].fields[0].toDisplay).toBeNull();
+    expect(opSpec('revolve').groups[0].fields[0].max).toBe(360);
+  });
+
+  it('setNodeArg edits a sweep parameter and keeps the profile snapshot', () => {
+    const profile = { start: [0, 0], segs: [{ x: 1, y: 0, bulge: 0 }] };
+    const ext = { id: 1, op: 'extrude', args: [2], children: [], shape: null, profile };
+    const result = setNodeArg(ext, 1, 0, 3.5);
+    expect(result.error).toBeUndefined();
+    expect(result.root.args).toEqual([3.5]);
+    expect(result.root.profile).toBe(profile);
+  });
+});
+
 describe('display helpers', () => {
   it('displayValue converts stored radians to degrees for angle fields', () => {
     const rot = { id: 1, op: 'rotate', args: [0, 0, 1, Math.PI], children: [], shape: null };

@@ -1,4 +1,12 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  forwardRef,
+  useCallback,
+  useEffect,
+  useImperativeHandle,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 import {
   addArc,
   addCircle,
@@ -47,6 +55,8 @@ import {
   sketchScreenToWorld,
   sketchWorldToScreen,
 } from '../lib/sketchView.js';
+import { sketchFromOps } from '../lib/sketch/fromOps.js';
+import { opsBounds } from '../lib/sweep.js';
 
 const SNAP_PX = 10;
 const HIT_PX = 8;
@@ -148,16 +158,25 @@ function arcScreenGeometry(sketch, entity) {
  * trigger re-render. Keep the component mounted (hidden via CSS) so the
  * sketch survives toggling the overlay.
  */
-export default function SketchCanvas({
-  open,
-  plane,
-  view: viewProp,
-  onViewChange,
-  onPlaneChange,
-  onProfileChange,
-  onSweep,
-  onExit,
-}) {
+export default forwardRef(function SketchCanvas(
+  {
+    open,
+    plane,
+    view: viewProp,
+    onViewChange,
+    onPlaneChange,
+    onProfileChange,
+    onSweep,
+    onExit,
+    // Feature-tree sketch editing: `{ name }` of the feature being edited.
+    // The sweep buttons become a single "Apply" that fires onApplyEdit, and
+    // the plane is locked (the original plane is baked into the tree's
+    // orientation wrappers, so changing it here would lie).
+    editing = null,
+    onApplyEdit,
+  },
+  ref
+) {
   const sketchRef = useRef(createSketch());
   const historyRef = useRef(createHistory());
   const svgRef = useRef(null);
@@ -953,6 +972,37 @@ export default function SketchCanvas({
     touch();
   }, [takeBefore, commitRecord, resetTransient, touch]);
 
+  // Feature-tree "edit sketch": replace the working sketch with one rebuilt
+  // from a sweep node's profile snapshot and frame the view on it. History
+  // restarts — undo cannot cross back into the previous sketch.
+  useImperativeHandle(
+    ref,
+    () => ({
+      loadProfile(ops) {
+        sketchRef.current = sketchFromOps(ops);
+        historyRef.current = createHistory();
+        resetTransient();
+        setTool('select');
+        const { min, max } = opsBounds(ops);
+        const extent = Math.max(max[0] - min[0], max[1] - min[1]) || 1;
+        setView((v) => ({
+          cx: (min[0] + max[0]) / 2,
+          cy: (min[1] + max[1]) / 2,
+          scale:
+            Math.min(
+              MAX_SCALE,
+              Math.max(
+                MIN_SCALE,
+                (0.6 * Math.min(size.w || 800, size.h || 600)) / extent
+              )
+            ) || v.scale,
+        }));
+        touch();
+      },
+    }),
+    [resetTransient, touch, size]
+  );
+
   // ---- dimension editing (click a dimension label) ------------------------
 
   const openDimEdit = useCallback((constraint, wx, wy) => {
@@ -1501,6 +1551,12 @@ export default function SketchCanvas({
             <button
               key={p}
               className={`tool-btn${plane === p ? ' active' : ''}`}
+              disabled={Boolean(editing)}
+              title={
+                editing
+                  ? 'The plane is fixed while editing an existing sketch'
+                  : undefined
+              }
               onClick={() => onPlaneChange(p)}
             >
               {p}
@@ -1605,22 +1661,35 @@ export default function SketchCanvas({
           </button>
         </div>
         <div className="group">
-          <button
-            className={`tool-btn sweep-btn${profile.closed ? ' ready' : ''}`}
-            disabled={!profile.closed}
-            title="Extrude the closed profile along the plane normal"
-            onClick={() => onSweep?.('extrude')}
-          >
-            Extrude
-          </button>
-          <button
-            className={`tool-btn sweep-btn${profile.closed ? ' ready' : ''}`}
-            disabled={!profile.closed}
-            title="Revolve the closed profile around the sketch's vertical axis"
-            onClick={() => onSweep?.('revolve')}
-          >
-            Revolve
-          </button>
+          {editing ? (
+            <button
+              className={`tool-btn sweep-btn${profile.closed ? ' ready' : ''}`}
+              disabled={!profile.closed}
+              title={`Replace the profile of ${editing.name} with this sketch`}
+              onClick={() => onApplyEdit?.()}
+            >
+              ✓ Apply to {editing.name}
+            </button>
+          ) : (
+            <>
+              <button
+                className={`tool-btn sweep-btn${profile.closed ? ' ready' : ''}`}
+                disabled={!profile.closed}
+                title="Extrude the closed profile along the plane normal"
+                onClick={() => onSweep?.('extrude')}
+              >
+                Extrude
+              </button>
+              <button
+                className={`tool-btn sweep-btn${profile.closed ? ' ready' : ''}`}
+                disabled={!profile.closed}
+                title="Revolve the closed profile around the sketch's vertical axis"
+                onClick={() => onSweep?.('revolve')}
+              >
+                Revolve
+              </button>
+            </>
+          )}
         </div>
         <div className="group">
           <button className="tool-btn" onClick={clearSketch}>
@@ -1642,7 +1711,9 @@ export default function SketchCanvas({
           {profile.closed
             ? `Profile closed · ${profile.segments.length} segment${
                 profile.segments.length === 1 ? '' : 's'
-              } on ${plane} — Extrude or Revolve it`
+              } on ${plane} — ${
+                editing ? `Apply to ${editing.name}` : 'Extrude or Revolve it'
+              }`
             : `Open profile: ${profile.reason}`}
         </span>
         {message && <span className="sketch-message">{message}</span>}
@@ -1650,4 +1721,4 @@ export default function SketchCanvas({
       </div>
     </div>
   );
-}
+});

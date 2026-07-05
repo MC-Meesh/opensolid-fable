@@ -22,7 +22,7 @@ body {
 }
 .app {
   display: grid;
-  grid-template-columns: minmax(340px, 30%) 1fr;
+  grid-template-columns: auto minmax(300px, 28%) 1fr;
   height: 100%;
 }
 .left {
@@ -130,66 +130,152 @@ header p { margin: 2px 0 0; font-size: 12px; color: var(--muted); }
   outline: none;
   border-color: var(--accent);
 }
-.scene-tree {
+/* ---- feature tree (docked left, SolidWorks FeatureManager style) ---- */
+.feature-tree {
   display: flex;
   flex-direction: column;
-  max-height: 32%;
-  border-bottom: 1px solid var(--border);
+  width: 216px;
+  min-width: 0;
+  border-right: 1px solid var(--border);
+  background: var(--panel);
+  font-size: 12.5px;
 }
-.scene-tree-header {
+.feature-tree.collapsed {
+  width: 26px;
+  align-items: center;
+  padding-top: 6px;
+  gap: 8px;
+}
+.feature-tree-side-label {
+  writing-mode: vertical-rl;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+  user-select: none;
+}
+.feature-tree-header {
   display: flex;
-  align-items: baseline;
+  align-items: center;
   justify-content: space-between;
-  padding: 8px 14px 6px;
+  padding: 8px 8px 6px 14px;
   font-size: 12px;
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.05em;
   color: var(--muted);
+  border-bottom: 1px solid var(--border);
 }
-.scene-tree-hint {
-  font-weight: 400;
-  text-transform: none;
-  letter-spacing: normal;
-  font-size: 11px;
+.feature-collapse {
+  background: transparent;
+  color: var(--muted);
+  border: none;
+  padding: 0 4px;
+  font-size: 12px;
+  line-height: 1;
 }
-.scene-tree-body {
-  overflow: auto;
-  padding-bottom: 6px;
+.feature-collapse:hover:not(:disabled) { color: var(--text); filter: none; }
+.feature-tree-body {
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 4px 0 6px;
+  flex: 1;
 }
-.tree-row {
+.feature-tree-empty {
+  padding: 6px 14px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.feature-row {
   display: flex;
   align-items: center;
-  gap: 4px;
-  padding-top: 3px;
-  padding-bottom: 3px;
-  padding-right: 10px;
-  font-size: 12.5px;
+  gap: 5px;
+  padding: 3px 6px 3px 6px;
   cursor: pointer;
   user-select: none;
   white-space: nowrap;
 }
-.tree-row:hover { background: color-mix(in srgb, var(--accent) 12%, transparent); }
-.tree-row.selected {
+.feature-row:hover { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+.feature-row.selected {
   background: color-mix(in srgb, var(--accent) 24%, transparent);
   color: #fff;
 }
-.tree-row:focus-visible {
+.feature-row:focus-visible {
   outline: 1px solid var(--accent);
   outline-offset: -1px;
 }
-.tree-toggle {
-  width: 14px;
+.feature-row.suppressed .feature-name {
+  color: var(--muted);
+  font-style: italic;
+  text-decoration: line-through;
+}
+.feature-row.suppressed .feature-icon,
+.feature-row.hidden-feature .feature-icon { opacity: 0.35; }
+.feature-expander {
+  width: 12px;
   flex: none;
   text-align: center;
   color: var(--muted);
   font-size: 10px;
 }
-.scene-tree-empty {
-  padding: 4px 14px 8px;
-  font-size: 12px;
-  color: var(--muted);
+.feature-icon {
+  width: 14px;
+  height: 14px;
+  flex: none;
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 1.1;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
+.feature-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.feature-rename {
+  flex: 1;
+  min-width: 0;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  padding: 1px 4px;
+  font-size: 12px;
+}
+.feature-rename:focus { outline: none; }
+.feature-actions {
+  display: none;
+  align-items: center;
+  gap: 2px;
+  flex: none;
+}
+.feature-row:hover .feature-actions,
+.feature-row.hidden-feature .feature-actions,
+.feature-row.suppressed .feature-actions { display: flex; }
+.feature-action {
+  background: transparent;
+  color: var(--muted);
+  border: none;
+  padding: 0 2px;
+  font-size: 10px;
+  line-height: 1;
+  display: flex;
+  align-items: center;
+}
+.feature-action:hover:not(:disabled) { color: var(--text); filter: none; }
+.feature-action.delete { font-size: 13px; }
+.feature-action.delete:hover:not(:disabled) { color: var(--error); }
+.feature-action.eye svg {
+  width: 13px;
+  height: 13px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.1;
+}
+.feature-action.eye.off { color: color-mix(in srgb, var(--muted) 55%, transparent); }
+.feature-action.eye .eye-slash { stroke: var(--error); }
 .gizmo-bar {
   position: absolute;
   top: 46px;
