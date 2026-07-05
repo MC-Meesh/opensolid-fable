@@ -23,6 +23,7 @@
 //! and [`Surface3`] constructors) return [`opensolid_core::CoreResult`]
 //! instead of panicking on invalid input.
 
+pub mod boolean;
 pub mod check;
 pub mod curve;
 pub mod euler;
@@ -36,6 +37,7 @@ pub mod sweep;
 pub mod tessellate;
 pub mod topology;
 
+pub use boolean::{AnalyticFace, AnalyticSolid, BooleanOp, BooleanOutput, SolidEdge};
 pub use check::{CheckFailure, EntityRef, MAX_ALLOWED_TOLERANCE};
 pub use curve::{Curve3, CurveEval};
 pub use euler::{EulerCounts, EulerError};

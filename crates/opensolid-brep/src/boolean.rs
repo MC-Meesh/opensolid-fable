@@ -1,0 +1,2494 @@
+//! B-Rep boolean pipeline MVP: clash, imprint, classify, reconstruct
+//! (`spec/04-booleans.md` at the spec/12 "minimum viable" level).
+//!
+//! [`unite`], [`subtract`], and [`intersect`] combine two transversal
+//! [`AnalyticSolid`]s — closed outward-oriented shells whose faces carry
+//! analytic surfaces ([`Surface3`], planes and cylinders for now) and whose
+//! edges carry exact [`Curve3`] geometry — through the spec pipeline:
+//!
+//! 1. **Clash**: dilated face bounding boxes (from sampled boundaries) are
+//!    tested pairwise for overlap to find candidate face pairs. (The BVH
+//!    from of-pb7.1 lives in `opensolid-kernel`, downstream of this crate;
+//!    the pairwise test is O(faces²) with tiny constants at MVP face
+//!    counts. Hooking the BVH up is future work.)
+//! 2. **SSI**: each candidate pair is intersected analytically
+//!    ([`crate::ssi::intersect`]); the resulting curves are clipped to the
+//!    trimmed regions of *both* faces and become imprint curves.
+//! 3. **Imprint**: imprint curves and original edges are split at their
+//!    mutual meeting points *globally* (one canonical 3D split set per
+//!    curve), so both sides of every future shared edge agree exactly.
+//! 4. **Split & classify**: each face's parameter-space arrangement of
+//!    boundary and imprint polylines is traced into regions; each region is
+//!    classified inside/outside the other solid by ray casting from an
+//!    interior sample point.
+//! 5. **Reconstruct**: kept regions (per the operation's table) become the
+//!    result's faces; shared atoms become manifold edges; shells are the
+//!    connected components, with genus recovered from the Euler-Poincaré
+//!    formula. The result carries a validated [`TopologyStore`]
+//!    ([`BooleanOutput::check`]) and tessellates to a closed manifold mesh
+//!    ([`BooleanOutput::tessellate`]).
+//!
+//! **Transversal only.** Coincident faces, tangent contacts (surfaces
+//! touching without crossing, including single-point tangencies) are
+//! rejected with a structured [`CoreError::NotImplemented`] — the
+//! degeneracy ladder of spec/04 §10 is the hardening pass. Faces other
+//! than planes and cylinders are likewise `NotImplemented` for now (the
+//! parameter charts and ray intersections below extend naturally).
+//!
+//! Like [`crate::sweep`], the result keeps its defining geometry beside the
+//! topology store because the store's geometry slots (`Edge::curve`,
+//! `Face::surface`) are still placeholders; binding real geometry to the
+//! topology is a later issue.
+
+use crate::check::CheckFailure;
+use crate::curve::{Curve3, CurveEval, TWO_PI, plane_basis};
+use crate::ssi::{IntersectionKind, SurfaceIntersection, intersect as ssi_intersect};
+use crate::surface::Surface3;
+use crate::topology::{
+    Body, BodyType, FaceSense, FinSense, LoopType, SYSTEM_RESOLUTION, ShellOrientation,
+    TopologyStore,
+};
+use opensolid_core::EntityId;
+use opensolid_core::error::{CoreError, CoreResult};
+use opensolid_core::mesh::{Triangle, TriangleMesh};
+use opensolid_core::tolerance::ToleranceContext;
+use opensolid_core::types::{Point3, Vector3};
+use std::collections::HashMap;
+
+/// Samples for a full circular edge or imprint curve.
+const SAMPLES_PER_CIRCLE: usize = 96;
+/// Samples for a straight edge.
+const LINE_SAMPLES: usize = 8;
+/// Samples for a straight imprint curve piece.
+const IMPRINT_LINE_SAMPLES: usize = 64;
+/// Bisection iterations when refining an imprint's exit point through a
+/// face boundary.
+const CLIP_REFINE_ITERATIONS: usize = 50;
+/// Fixed ray directions for point classification; each is retried in turn
+/// when a cast grazes a surface or hits near a face boundary.
+const RAY_DIRECTIONS: [[f64; 3]; 6] = [
+    [0.7716, 0.3123, 0.5541],
+    [-0.3661, 0.8151, 0.4489],
+    [0.1741, -0.5389, 0.8242],
+    [-0.6928, -0.4127, -0.5906],
+    [0.9032, -0.1211, -0.4118],
+    [-0.2113, 0.6934, -0.6892],
+];
+
+/// The boolean operation to perform.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BooleanOp {
+    /// Material of A or B.
+    Unite,
+    /// Material of A and not B.
+    Subtract,
+    /// Material of A and B.
+    Intersect,
+}
+
+/// A directed use of a solid's edge in a face loop.
+#[derive(Debug, Clone, Copy)]
+pub struct DirectedEdge {
+    /// Index into [`AnalyticSolid`]'s edge list.
+    pub edge: usize,
+    /// Traversal direction relative to the edge's parameterization.
+    pub forward: bool,
+}
+
+/// An exact edge of an [`AnalyticSolid`]: a [`Curve3`] restricted to
+/// `[t0, t1]`. A closed edge (full circle) has `t1 - t0` equal to the
+/// period and identical endpoints.
+#[derive(Debug, Clone)]
+pub struct SolidEdge {
+    pub curve: Curve3,
+    pub t0: f64,
+    pub t1: f64,
+    /// Whether the edge is a closed ring (start point = end point).
+    pub closed: bool,
+}
+
+/// A face of an [`AnalyticSolid`]: an analytic surface trimmed by loops of
+/// directed edges. `loops[0]` is the outer loop; loops wind
+/// counterclockwise (outer) / clockwise (holes) as seen from the face's
+/// outward side.
+#[derive(Debug, Clone)]
+pub struct AnalyticFace {
+    pub surface: Surface3,
+    /// Whether the face's outward normal equals the surface normal.
+    pub outward_along_normal: bool,
+    pub loops: Vec<Vec<DirectedEdge>>,
+}
+
+/// A closed, outward-oriented solid with exact analytic geometry: the
+/// input (and conceptual output) representation of the boolean pipeline.
+#[derive(Debug, Clone)]
+pub struct AnalyticSolid {
+    pub edges: Vec<SolidEdge>,
+    pub faces: Vec<AnalyticFace>,
+}
+
+impl AnalyticSolid {
+    /// Axis-aligned block spanning `min` to `max`.
+    ///
+    /// # Errors
+    /// [`CoreError::InvalidArgument`] if any extent is not strictly
+    /// positive and finite.
+    pub fn block(min: Point3, max: Point3) -> CoreResult<Self> {
+        let d = max - min;
+        if !(d.x > 0.0 && d.y > 0.0 && d.z > 0.0 && d.iter().all(|c| c.is_finite())) {
+            return Err(CoreError::InvalidArgument {
+                argument: "max",
+                reason: format!("block extents must be positive and finite, got {d:?}"),
+            });
+        }
+        // Corner index bit k set = max along axis k (x=1, y=2, z=4).
+        let corner = |mask: usize| {
+            Point3::new(
+                if mask & 1 != 0 { max.x } else { min.x },
+                if mask & 2 != 0 { max.y } else { min.y },
+                if mask & 4 != 0 { max.z } else { min.z },
+            )
+        };
+        let mut edges = Vec::new();
+        let mut edge_between = HashMap::new();
+        let mut edge_index = |edges: &mut Vec<SolidEdge>, a: usize, b: usize| {
+            let key = (a.min(b), a.max(b));
+            *edge_between.entry(key).or_insert_with(|| {
+                let (pa, pb) = (corner(key.0), corner(key.1));
+                let curve = Curve3::line(pa, pb - pa).expect("distinct corners");
+                let len = (pb - pa).norm();
+                edges.push(SolidEdge {
+                    curve,
+                    t0: 0.0,
+                    t1: len,
+                    closed: false,
+                });
+                edges.len() - 1
+            })
+        };
+        // Each face: (fixed axis bit, at max?, corner cycle CCW from outside).
+        let face_cycles: [(Vector3, [usize; 4]); 6] = [
+            (-Vector3::x(), [0, 4, 6, 2]), // x = min
+            (Vector3::x(), [1, 3, 7, 5]),  // x = max
+            (-Vector3::y(), [0, 1, 5, 4]), // y = min
+            (Vector3::y(), [2, 6, 7, 3]),  // y = max
+            (-Vector3::z(), [0, 2, 3, 1]), // z = min
+            (Vector3::z(), [4, 5, 7, 6]),  // z = max
+        ];
+        let mut faces = Vec::new();
+        for (normal, cycle) in face_cycles {
+            let origin = corner(cycle[0]);
+            let surface = Surface3::plane(origin, normal).expect("unit normal");
+            let mut boundary = Vec::new();
+            for i in 0..4 {
+                let (a, b) = (cycle[i], cycle[(i + 1) % 4]);
+                let idx = edge_index(&mut edges, a, b);
+                boundary.push(DirectedEdge {
+                    edge: idx,
+                    forward: a < b,
+                });
+            }
+            faces.push(AnalyticFace {
+                surface,
+                outward_along_normal: true,
+                loops: vec![boundary],
+            });
+        }
+        Ok(Self { edges, faces })
+    }
+
+    /// Capped right circular cylinder: radius `radius` about the axis from
+    /// `base` along `axis`, of the given `height`.
+    ///
+    /// # Errors
+    /// [`CoreError::InvalidArgument`] / [`CoreError::Degenerate`] for
+    /// non-positive radius or height, or a degenerate axis.
+    pub fn cylinder(base: Point3, axis: Vector3, radius: f64, height: f64) -> CoreResult<Self> {
+        if height <= 0.0 || !height.is_finite() {
+            return Err(CoreError::InvalidArgument {
+                argument: "height",
+                reason: format!("must be positive and finite, got {height}"),
+            });
+        }
+        let side = Surface3::cylinder(base, axis, radius)?;
+        let Surface3::Cylinder { axis: unit, .. } = &side else {
+            unreachable!("cylinder constructor returns Cylinder")
+        };
+        let unit = *unit;
+        let top_center = base + unit * height;
+        let bottom_circle = Curve3::circle(base, unit, radius)?;
+        let top_circle = Curve3::circle(top_center, unit, radius)?;
+        // Seam meridian at angle 0 (plane_basis of the axis), shared frame
+        // between the circles and the cylinder surface.
+        let (e_u, _) = plane_basis(&unit);
+        let seam_bottom = base + e_u * radius;
+        let seam = Curve3::line(seam_bottom, unit)?;
+        let edges = vec![
+            SolidEdge {
+                curve: bottom_circle,
+                t0: 0.0,
+                t1: TWO_PI,
+                closed: true,
+            },
+            SolidEdge {
+                curve: top_circle,
+                t0: 0.0,
+                t1: TWO_PI,
+                closed: true,
+            },
+            SolidEdge {
+                curve: seam,
+                t0: 0.0,
+                t1: height,
+                closed: false,
+            },
+        ];
+        let de = |edge: usize, forward: bool| DirectedEdge { edge, forward };
+        // Side face: parameter rectangle [0, 2π] x [0, h] traversed CCW
+        // (outward normal is radial): bottom circle forward, seam up at
+        // u = 2π, top circle backward, seam down at u = 0. The seam edge is
+        // used twice with opposite senses (self-mated).
+        let side_face = AnalyticFace {
+            surface: side,
+            outward_along_normal: true,
+            loops: vec![vec![de(0, true), de(2, true), de(1, false), de(2, false)]],
+        };
+        let top_face = AnalyticFace {
+            surface: Surface3::plane(top_center, unit)?,
+            outward_along_normal: true,
+            loops: vec![vec![de(1, true)]],
+        };
+        let bottom_face = AnalyticFace {
+            surface: Surface3::plane(base, -unit)?,
+            outward_along_normal: true,
+            loops: vec![vec![de(0, false)]],
+        };
+        Ok(Self {
+            edges,
+            faces: vec![side_face, top_face, bottom_face],
+        })
+    }
+}
+
+/// The result of a boolean operation: reconstructed topology plus the
+/// per-face data needed to tessellate (the store's geometry slots are
+/// still placeholders).
+pub struct BooleanOutput {
+    /// The reconstructed topology graph.
+    pub store: TopologyStore,
+    /// The result body inside [`BooleanOutput::store`].
+    pub body: EntityId<Body>,
+    /// Tessellation payload: one entry per kept face region.
+    mesh_faces: Vec<MeshFace>,
+    face_count: usize,
+    shell_count: usize,
+}
+
+impl std::fmt::Debug for BooleanOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BooleanOutput")
+            .field("body", &self.body)
+            .field("face_count", &self.face_count)
+            .field("shell_count", &self.shell_count)
+            .finish_non_exhaustive()
+    }
+}
+
+impl BooleanOutput {
+    /// Number of faces in the result.
+    pub fn face_count(&self) -> usize {
+        self.face_count
+    }
+
+    /// Number of shells in the result.
+    pub fn shell_count(&self) -> usize {
+        self.shell_count
+    }
+
+    /// Validate the result body with the full checker
+    /// ([`TopologyStore::check`]). Empty means valid.
+    pub fn check(&self) -> Vec<CheckFailure> {
+        self.store.check(self.body)
+    }
+
+    /// Tessellate the result into a triangle mesh (closed and manifold for
+    /// valid results). Boundary polylines are shared exactly between
+    /// adjacent faces, so the welded mesh is watertight.
+    pub fn tessellate(&self) -> CoreResult<TriangleMesh> {
+        let mut triangles = Vec::new();
+        let mut scale: f64 = 0.0;
+        for mf in &self.mesh_faces {
+            for ring in &mf.rings {
+                for p in &ring.points {
+                    scale = scale.max(p.coords.norm());
+                }
+            }
+        }
+        let weld_eps = 1e-9 * (1.0 + scale);
+        for mf in &self.mesh_faces {
+            triangles.extend(triangulate_mesh_face(mf, weld_eps)?);
+        }
+        Ok(TriangleMesh::from_triangles(&triangles).weld(weld_eps))
+    }
+}
+
+/// Material of A or B.
+///
+/// # Errors
+/// [`CoreError::NotImplemented`] for coincident or tangent face contacts
+/// (transversal MVP) and for face surfaces without a parameter chart yet;
+/// [`CoreError::Degenerate`] if a region cannot be classified robustly.
+pub fn unite(
+    a: &AnalyticSolid,
+    b: &AnalyticSolid,
+    tol: &ToleranceContext,
+) -> CoreResult<BooleanOutput> {
+    boolean(BooleanOp::Unite, a, b, tol)
+}
+
+/// Material of A and not B. See [`unite`] for errors.
+pub fn subtract(
+    a: &AnalyticSolid,
+    b: &AnalyticSolid,
+    tol: &ToleranceContext,
+) -> CoreResult<BooleanOutput> {
+    boolean(BooleanOp::Subtract, a, b, tol)
+}
+
+/// Material of A and B. See [`unite`] for errors.
+pub fn intersect(
+    a: &AnalyticSolid,
+    b: &AnalyticSolid,
+    tol: &ToleranceContext,
+) -> CoreResult<BooleanOutput> {
+    boolean(BooleanOp::Intersect, a, b, tol)
+}
+
+// ---------------------------------------------------------------------
+// Parameter charts
+// ---------------------------------------------------------------------
+
+/// Invertible parameterization of the supported analytic surfaces.
+#[derive(Debug, Clone)]
+enum Chart {
+    Plane {
+        origin: Point3,
+        e_u: Vector3,
+        e_v: Vector3,
+        normal: Vector3,
+    },
+    Cylinder {
+        origin: Point3,
+        axis: Vector3,
+        e_u: Vector3,
+        e_v: Vector3,
+        radius: f64,
+    },
+}
+
+impl Chart {
+    fn new(surface: &Surface3) -> CoreResult<Self> {
+        match surface {
+            Surface3::Plane { origin, normal } => {
+                let (e_u, e_v) = plane_basis(normal);
+                Ok(Chart::Plane {
+                    origin: *origin,
+                    e_u,
+                    e_v,
+                    normal: *normal,
+                })
+            }
+            Surface3::Cylinder {
+                origin,
+                axis,
+                radius,
+            } => {
+                let (e_u, e_v) = plane_basis(axis);
+                Ok(Chart::Cylinder {
+                    origin: *origin,
+                    axis: *axis,
+                    e_u,
+                    e_v,
+                    radius: *radius,
+                })
+            }
+            other => Err(CoreError::NotImplemented {
+                feature: match other {
+                    Surface3::Cone { .. } => "boolean parameter chart for cones",
+                    Surface3::Sphere { .. } => "boolean parameter chart for spheres",
+                    Surface3::Torus { .. } => "boolean parameter chart for tori",
+                    _ => unreachable!(),
+                },
+            }),
+        }
+    }
+
+    /// Parameters of a point assumed to lie on the surface. For cylinders
+    /// the angle is unwrapped to land within π of `hint`'s angle.
+    fn param(&self, p: &Point3, hint: Option<(f64, f64)>) -> (f64, f64) {
+        match self {
+            Chart::Plane {
+                origin, e_u, e_v, ..
+            } => {
+                let d = p - origin;
+                (d.dot(e_u), d.dot(e_v))
+            }
+            Chart::Cylinder {
+                origin,
+                axis,
+                e_u,
+                e_v,
+                ..
+            } => {
+                let d = p - origin;
+                let mut u = d.dot(e_v).atan2(d.dot(e_u));
+                if let Some((hu, _)) = hint {
+                    while u - hu > std::f64::consts::PI {
+                        u -= TWO_PI;
+                    }
+                    while hu - u > std::f64::consts::PI {
+                        u += TWO_PI;
+                    }
+                }
+                (u, d.dot(axis))
+            }
+        }
+    }
+
+    /// Unit surface normal at parameters `(u, v)`.
+    fn normal(&self, u: f64) -> Vector3 {
+        match self {
+            Chart::Plane { normal, .. } => *normal,
+            Chart::Cylinder { e_u, e_v, .. } => e_u * u.cos() + e_v * u.sin(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// Discretization
+// ---------------------------------------------------------------------
+
+/// A sampled edge or imprint curve: an ordered 3D polyline.
+#[derive(Debug, Clone)]
+struct SampledCurve {
+    points: Vec<Point3>,
+    closed: bool,
+}
+
+fn sample_edge(edge: &SolidEdge) -> SampledCurve {
+    let n = match edge.curve {
+        Curve3::Line { .. } => LINE_SAMPLES,
+        _ => {
+            let span = (edge.t1 - edge.t0).abs() / TWO_PI;
+            ((SAMPLES_PER_CIRCLE as f64 * span).ceil() as usize).max(8)
+        }
+    };
+    let count = if edge.closed { n } else { n + 1 };
+    let points = (0..count)
+        .map(|i| {
+            let t = edge.t0 + (edge.t1 - edge.t0) * i as f64 / n as f64;
+            edge.curve.point(t)
+        })
+        .collect();
+    SampledCurve {
+        points,
+        closed: edge.closed,
+    }
+}
+
+/// Per-face discretized boundary in parameter space, kept alongside its 3D
+/// points; loop polylines close implicitly (last point connects to first).
+#[derive(Debug, Clone)]
+struct FaceRegionPoly {
+    chart: Chart,
+    /// One closed polyline per loop: (uv, 3D point).
+    loops: Vec<Vec<((f64, f64), Point3)>>,
+}
+
+impl FaceRegionPoly {
+    /// Even-odd point containment over all loops.
+    fn contains(&self, uv: (f64, f64)) -> bool {
+        let mut inside = false;
+        for lp in &self.loops {
+            let n = lp.len();
+            for i in 0..n {
+                let (a, _) = lp[i];
+                let (b, _) = lp[(i + 1) % n];
+                if crosses_upward(a, b, uv) {
+                    inside = !inside;
+                }
+            }
+        }
+        inside
+    }
+
+    /// Bring an angle-like `u` into this polygon's neighborhood by shifting
+    /// whole periods (no-op for planes).
+    fn localize(&self, uv: (f64, f64)) -> (f64, f64) {
+        if !matches!(self.chart, Chart::Cylinder { .. }) {
+            return uv;
+        }
+        let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+        for lp in &self.loops {
+            for ((u, _), _) in lp {
+                lo = lo.min(*u);
+                hi = hi.max(*u);
+            }
+        }
+        let center = 0.5 * (lo + hi);
+        let mut u = uv.0;
+        while u - center > std::f64::consts::PI {
+            u -= TWO_PI;
+        }
+        while center - u > std::f64::consts::PI {
+            u += TWO_PI;
+        }
+        (u, uv.1)
+    }
+}
+
+/// Does segment `a -> b` cross the upward ray from `p` (even-odd rule)?
+fn crosses_upward(a: (f64, f64), b: (f64, f64), p: (f64, f64)) -> bool {
+    let (ax, ay) = a;
+    let (bx, by) = b;
+    let (px, py) = p;
+    if (ay > py) == (by > py) {
+        return false;
+    }
+    let x_at = ax + (py - ay) / (by - ay) * (bx - ax);
+    x_at > px
+}
+
+/// Map a 3D polyline into a face's parameter space with angle unwrapping.
+fn map_polyline(chart: &Chart, points: &[Point3]) -> Vec<(f64, f64)> {
+    let mut out: Vec<(f64, f64)> = Vec::with_capacity(points.len());
+    for p in points {
+        let hint = out.last().copied();
+        out.push(chart.param(p, hint));
+    }
+    out
+}
+
+// ---------------------------------------------------------------------
+// Pipeline data
+// ---------------------------------------------------------------------
+
+/// Which solid an entity belongs to.
+type SolidTag = usize; // 0 = A, 1 = B
+
+/// A curve in the global split network: an original edge of one solid or
+/// an imprint shared by one face of each solid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum CurveSource {
+    Edge { solid: SolidTag, edge: usize },
+    Imprint { index: usize },
+}
+
+/// An imprint: one transversal intersection curve piece clipped to both
+/// host face regions.
+#[derive(Debug)]
+struct Imprint {
+    face_a: usize,
+    face_b: usize,
+    sampled: SampledCurve,
+}
+
+/// A maximal un-split piece of a source curve: the atomic arrangement edge
+/// and future topology edge (its provenance lives in the pipeline's
+/// by-source index).
+#[derive(Debug, Clone)]
+struct Atom {
+    points: Vec<Point3>,
+    /// Ring atom: closed polyline (points[0] is the seam; the polyline does
+    /// not repeat it at the end).
+    closed: bool,
+}
+
+fn quantize(p: &Point3, snap: f64) -> (i64, i64, i64) {
+    (
+        (p.x / snap).round() as i64,
+        (p.y / snap).round() as i64,
+        (p.z / snap).round() as i64,
+    )
+}
+
+// ---------------------------------------------------------------------
+// The pipeline
+// ---------------------------------------------------------------------
+
+struct Pipeline<'a> {
+    solids: [&'a AnalyticSolid; 2],
+    tol: ToleranceContext,
+    snap: f64,
+    /// Sampled original edges, per solid.
+    edge_samples: [Vec<SampledCurve>; 2],
+    /// Discretized face regions, per solid.
+    face_polys: [Vec<FaceRegionPoly>; 2],
+    imprints: Vec<Imprint>,
+    /// Split points per curve source, as 3D points.
+    splits: HashMap<CurveSource, Vec<Point3>>,
+}
+
+/// Boolean pipeline entry point.
+fn boolean(
+    op: BooleanOp,
+    a: &AnalyticSolid,
+    b: &AnalyticSolid,
+    tol: &ToleranceContext,
+) -> CoreResult<BooleanOutput> {
+    let mut pipe = Pipeline::new(a, b, tol)?;
+    pipe.find_imprints()?;
+    pipe.collect_splits();
+    let (atoms, atoms_by_source) = pipe.build_atoms();
+    pipe.reconstruct(op, atoms, atoms_by_source)
+}
+
+impl<'a> Pipeline<'a> {
+    fn new(a: &'a AnalyticSolid, b: &'a AnalyticSolid, tol: &ToleranceContext) -> CoreResult<Self> {
+        let solids = [a, b];
+        let edge_samples = [
+            a.edges.iter().map(sample_edge).collect::<Vec<_>>(),
+            b.edges.iter().map(sample_edge).collect::<Vec<_>>(),
+        ];
+        // Geometry scale for snapping, from all sampled points.
+        let mut scale: f64 = 1.0;
+        for samples in &edge_samples {
+            for s in samples {
+                for p in &s.points {
+                    scale = scale.max(p.coords.norm());
+                }
+            }
+        }
+        let snap = 1e-9 * scale;
+
+        let mut face_polys: [Vec<FaceRegionPoly>; 2] = [Vec::new(), Vec::new()];
+        for s in 0..2 {
+            for face in &solids[s].faces {
+                let chart = Chart::new(&face.surface)?;
+                let mut loops = Vec::new();
+                for lp in &face.loops {
+                    let mut pts3: Vec<Point3> = Vec::new();
+                    for de in lp {
+                        let sampled = &edge_samples[s][de.edge];
+                        append_directed(&mut pts3, sampled, de.forward);
+                    }
+                    let uv = map_polyline(&chart, &pts3);
+                    loops.push(uv.into_iter().zip(pts3).collect());
+                }
+                face_polys[s].push(FaceRegionPoly { chart, loops });
+            }
+        }
+        Ok(Self {
+            solids,
+            tol: *tol,
+            snap,
+            edge_samples,
+            face_polys,
+            imprints: Vec::new(),
+            splits: HashMap::new(),
+        })
+    }
+
+    /// Phases 1-2: clash detection and SSI, producing clipped imprints.
+    fn find_imprints(&mut self) -> CoreResult<()> {
+        let boxes: [Vec<(Point3, Point3)>; 2] = [self.face_boxes(0), self.face_boxes(1)];
+        for (fa, box_a) in boxes[0].iter().enumerate() {
+            for (fb, box_b) in boxes[1].iter().enumerate() {
+                if !boxes_overlap(box_a, box_b) {
+                    continue;
+                }
+                let sa = &self.solids[0].faces[fa].surface;
+                let sb = &self.solids[1].faces[fb].surface;
+                match ssi_intersect(sa, sb, &self.tol)? {
+                    SurfaceIntersection::Empty => {}
+                    SurfaceIntersection::Coincident => {
+                        return Err(CoreError::NotImplemented {
+                            feature: "boolean operations on coincident faces \
+                                      (transversal MVP)",
+                        });
+                    }
+                    SurfaceIntersection::TangentPoint(_) => {
+                        return Err(CoreError::NotImplemented {
+                            feature: "boolean operations with tangent face contact \
+                                      (transversal MVP)",
+                        });
+                    }
+                    SurfaceIntersection::Curves(curves) => {
+                        for ic in curves {
+                            if ic.kind == IntersectionKind::Tangential {
+                                return Err(CoreError::NotImplemented {
+                                    feature: "boolean operations with tangential \
+                                              intersection curves (transversal MVP)",
+                                });
+                            }
+                            self.clip_imprint(&ic.curve, fa, fb, box_a, box_b);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn face_boxes(&self, s: SolidTag) -> Vec<(Point3, Point3)> {
+        self.face_polys[s]
+            .iter()
+            .map(|fp| {
+                let mut lo = Point3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY);
+                let mut hi = Point3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+                for lp in &fp.loops {
+                    for (_, p) in lp {
+                        lo = Point3::new(lo.x.min(p.x), lo.y.min(p.y), lo.z.min(p.z));
+                        hi = Point3::new(hi.x.max(p.x), hi.y.max(p.y), hi.z.max(p.z));
+                    }
+                }
+                // Dilate: boundary samples underestimate curved interiors,
+                // and touching contacts must still clash so they reach SSI
+                // (which rejects them as tangent, not silently misses them).
+                let d = (hi - lo).norm() * 0.05 + self.tol.linear + self.snap;
+                (lo - Vector3::new(d, d, d), hi + Vector3::new(d, d, d))
+            })
+            .collect()
+    }
+
+    /// Clip one SSI curve to both face regions; store surviving pieces as
+    /// imprints.
+    fn clip_imprint(
+        &mut self,
+        curve: &Curve3,
+        fa: usize,
+        fb: usize,
+        box_a: &(Point3, Point3),
+        box_b: &(Point3, Point3),
+    ) {
+        // Parameter window: full period for closed conics, bbox slab clip
+        // for lines.
+        let (t_lo, t_hi, closed_curve) = match curve {
+            Curve3::Line { origin, dir } => {
+                let joint = (
+                    Point3::new(
+                        box_a.0.x.max(box_b.0.x),
+                        box_a.0.y.max(box_b.0.y),
+                        box_a.0.z.max(box_b.0.z),
+                    ),
+                    Point3::new(
+                        box_a.1.x.min(box_b.1.x),
+                        box_a.1.y.min(box_b.1.y),
+                        box_a.1.z.min(box_b.1.z),
+                    ),
+                );
+                match clip_line_to_box(origin, dir, &joint) {
+                    Some(range) => (range.0, range.1, false),
+                    None => return,
+                }
+            }
+            _ => (0.0, TWO_PI, true),
+        };
+        let n = if closed_curve {
+            SAMPLES_PER_CIRCLE
+        } else {
+            IMPRINT_LINE_SAMPLES
+        };
+        let count = if closed_curve { n } else { n + 1 };
+        let ts: Vec<f64> = (0..count)
+            .map(|i| t_lo + (t_hi - t_lo) * i as f64 / n as f64)
+            .collect();
+        let inside = |t: f64| -> bool {
+            let p = curve.point(t);
+            let pa = self.face_polys[0][fa].localize(self.face_polys[0][fa].chart.param(&p, None));
+            let pb = self.face_polys[1][fb].localize(self.face_polys[1][fb].chart.param(&p, None));
+            self.face_polys[0][fa].contains(pa) && self.face_polys[1][fb].contains(pb)
+        };
+        let flags: Vec<bool> = ts.iter().map(|&t| inside(t)).collect();
+
+        if closed_curve && flags.iter().all(|&f| f) {
+            // Entire ring inside both regions.
+            self.imprints.push(Imprint {
+                face_a: fa,
+                face_b: fb,
+                sampled: SampledCurve {
+                    points: ts.iter().map(|&t| curve.point(t)).collect(),
+                    closed: true,
+                },
+            });
+            return;
+        }
+
+        // Extract maximal inside runs; refine both ends by bisection.
+        let total = ts.len();
+        let step = |i: usize| (i + 1) % total;
+        let run_allowed = |i: usize| flags[i];
+        let mut visited = vec![false; total];
+        for start in 0..total {
+            if !run_allowed(start) || visited[start] {
+                continue;
+            }
+            // Walk back to the run's first sample (for closed curves the
+            // run may wrap).
+            let mut first = start;
+            loop {
+                let prev = (first + total - 1) % total;
+                if (closed_curve || first > 0) && run_allowed(prev) && prev != start {
+                    first = prev;
+                    if first == start {
+                        break;
+                    }
+                    continue;
+                }
+                break;
+            }
+            // Collect the run.
+            let mut run = vec![first];
+            visited[first] = true;
+            let mut i = first;
+            loop {
+                let next = step(i);
+                if !closed_curve && next == 0 {
+                    break;
+                }
+                if run_allowed(next) && !visited[next] {
+                    visited[next] = true;
+                    run.push(next);
+                    i = next;
+                } else {
+                    break;
+                }
+            }
+            let mut pts: Vec<Point3> = Vec::with_capacity(run.len() + 2);
+            // Refine entry point (before the run's first sample).
+            let first_idx = run[0];
+            let prev_idx = (first_idx + total - 1) % total;
+            if (closed_curve || first_idx > 0) && !flags[prev_idx] {
+                let mut t_out = ts[prev_idx];
+                let t_in = ts[first_idx];
+                if closed_curve && t_out > t_in {
+                    t_out -= TWO_PI;
+                }
+                pts.push(curve.point(refine_crossing(&inside, t_out, t_in)));
+            }
+            pts.extend(run.iter().map(|&i| curve.point(ts[i])));
+            // Refine exit point (after the run's last sample).
+            let last_idx = *run.last().expect("non-empty run");
+            let next_idx = step(last_idx);
+            if (closed_curve || last_idx + 1 < total) && !flags[next_idx] {
+                let mut t_out = ts[next_idx];
+                let t_in = ts[last_idx];
+                if closed_curve && t_out < t_in {
+                    t_out += TWO_PI;
+                }
+                pts.push(curve.point(refine_crossing(&inside, t_out, t_in)));
+            }
+            if pts.len() >= 2 && (pts[0] - pts[pts.len() - 1]).norm() > self.snap {
+                self.imprints.push(Imprint {
+                    face_a: fa,
+                    face_b: fb,
+                    sampled: SampledCurve {
+                        points: pts,
+                        closed: false,
+                    },
+                });
+            }
+        }
+    }
+
+    /// Phase 3: register the global split events. Every open imprint
+    /// endpoint lies on some original edge of one of the solids and splits
+    /// it there. Closed imprints hosted on a periodic face additionally
+    /// wrap that face's parameter cover; they are cut where they cross the
+    /// face's seam meridian (splitting both the imprint and the seam edge)
+    /// so the cover polygon sees them as boundary-to-boundary chords.
+    fn collect_splits(&mut self) {
+        let mut events: Vec<(CurveSource, Point3)> = Vec::new();
+        for (ii, imp) in self.imprints.iter().enumerate() {
+            if !imp.sampled.closed {
+                for endpoint in [
+                    imp.sampled.points[0],
+                    imp.sampled.points[imp.sampled.points.len() - 1],
+                ] {
+                    for (s, f) in [(0usize, imp.face_a), (1usize, imp.face_b)] {
+                        if let Some(edge) = self.nearest_edge_of_face(&endpoint, s, f) {
+                            events.push((CurveSource::Edge { solid: s, edge }, endpoint));
+                            break;
+                        }
+                    }
+                }
+                continue;
+            }
+            for (s, f) in [(0usize, imp.face_a), (1usize, imp.face_b)] {
+                let fp = &self.face_polys[s][f];
+                if !matches!(fp.chart, Chart::Cylinder { .. }) {
+                    continue;
+                }
+                let Some(seam_point) = seam_crossing(fp, &imp.sampled.points) else {
+                    continue;
+                };
+                events.push((CurveSource::Imprint { index: ii }, seam_point));
+                if let Some(edge) = self.nearest_edge_of_face(&seam_point, s, f) {
+                    events.push((CurveSource::Edge { solid: s, edge }, seam_point));
+                }
+            }
+        }
+        for (source, p) in events {
+            self.splits.entry(source).or_default().push(p);
+        }
+    }
+
+    /// The boundary edge of face `(s, f)` nearest to `p`, if within
+    /// acceptance distance (bisection leaves imprint endpoints on the
+    /// region boundary; polyline sag bounds the residual).
+    fn nearest_edge_of_face(&self, p: &Point3, s: SolidTag, f: usize) -> Option<usize> {
+        let mut best: Option<(f64, usize)> = None;
+        for lp in &self.solids[s].faces[f].loops {
+            for de in lp {
+                let sampled = &self.edge_samples[s][de.edge];
+                let d = polyline_distance(&sampled.points, sampled.closed, p);
+                if best.is_none() || d < best.expect("checked").0 {
+                    best = Some((d, de.edge));
+                }
+            }
+        }
+        let (d, e) = best?;
+        let accept = self.tol.linear.max(self.snap * 10.0).max(1e-5);
+        (d <= accept).then_some(e)
+    }
+
+    /// Phase 3b: split all source curves at their registered split points,
+    /// producing the atomic arrangement/topology edges, grouped by source
+    /// in polyline order.
+    fn build_atoms(&self) -> (Vec<Atom>, HashMap<CurveSource, Vec<usize>>) {
+        let mut atoms: Vec<Atom> = Vec::new();
+        let mut by_source: HashMap<CurveSource, Vec<usize>> = HashMap::new();
+        let push_all = |atoms: &mut Vec<Atom>,
+                        by_source: &mut HashMap<CurveSource, Vec<usize>>,
+                        pieces: Vec<Atom>,
+                        source: CurveSource| {
+            let ids: Vec<usize> = (atoms.len()..atoms.len() + pieces.len()).collect();
+            atoms.extend(pieces);
+            by_source.insert(source, ids);
+        };
+        for s in 0..2 {
+            for (e, sampled) in self.edge_samples[s].iter().enumerate() {
+                let source = CurveSource::Edge { solid: s, edge: e };
+                let splits = self.splits.get(&source).cloned().unwrap_or_default();
+                push_all(
+                    &mut atoms,
+                    &mut by_source,
+                    split_sampled(sampled, &splits, self.snap),
+                    source,
+                );
+            }
+        }
+        for (i, imp) in self.imprints.iter().enumerate() {
+            let source = CurveSource::Imprint { index: i };
+            let splits = self.splits.get(&source).cloned().unwrap_or_default();
+            push_all(
+                &mut atoms,
+                &mut by_source,
+                split_sampled(&imp.sampled, &splits, self.snap),
+                source,
+            );
+        }
+        (atoms, by_source)
+    }
+
+    /// Phases 4-5: per-face region splitting, classification, and topology
+    /// reconstruction.
+    fn reconstruct(
+        &self,
+        op: BooleanOp,
+        atoms: Vec<Atom>,
+        atoms_by_source: HashMap<CurveSource, Vec<usize>>,
+    ) -> CoreResult<BooleanOutput> {
+        let mut kept: Vec<KeptRegion> = Vec::new();
+        for s in 0..2 {
+            let other = 1 - s;
+            for f in 0..self.solids[s].faces.len() {
+                let face = &self.solids[s].faces[f];
+                let face_poly = &self.face_polys[s][f];
+
+                // Initial region: the face's own loops, atom by atom.
+                let mut cycles = Vec::new();
+                for lp in &face.loops {
+                    let mut darts: DartChain = Vec::new();
+                    for de in lp {
+                        let source = CurveSource::Edge {
+                            solid: s,
+                            edge: de.edge,
+                        };
+                        let ids = &atoms_by_source[&source];
+                        if de.forward {
+                            darts.extend(ids.iter().map(|&ai| (ai, true)));
+                        } else {
+                            darts.extend(ids.iter().rev().map(|&ai| (ai, false)));
+                        }
+                    }
+                    cycles.push(embed_cycle(face_poly, &atoms, darts));
+                }
+                let mut regions = vec![Region { cycles }];
+
+                // Imprint atoms hosted on this face, merged into chains.
+                let mut imprint_ids: Vec<usize> = Vec::new();
+                for (i, imp) in self.imprints.iter().enumerate() {
+                    let hosted = (s == 0 && imp.face_a == f) || (s == 1 && imp.face_b == f);
+                    if hosted {
+                        imprint_ids
+                            .extend(atoms_by_source[&CurveSource::Imprint { index: i }].iter());
+                    }
+                }
+                for chain in merge_imprint_chains(&atoms, &imprint_ids, self.snap) {
+                    apply_chain(face_poly, &atoms, &mut regions, chain, self.snap)?;
+                }
+
+                for region in regions {
+                    let sample =
+                        region_interior_point(&face_poly.chart, &region).ok_or_else(|| {
+                            CoreError::Degenerate {
+                                context: "boolean::classify",
+                                reason: "could not find an interior sample point for a face \
+                                     region"
+                                    .into(),
+                            }
+                        })?;
+                    let inside_other = self.contains_point(other, &sample)?;
+                    let (keep, reverse) = keep_table(op, s, inside_other);
+                    if keep {
+                        kept.push(KeptRegion {
+                            solid: s,
+                            face: f,
+                            region,
+                            reverse,
+                        });
+                    }
+                }
+            }
+        }
+
+        build_output(self, op, &atoms, kept)
+    }
+
+    /// Ray-parity containment of a point in one of the input solids.
+    fn contains_point(&self, s: SolidTag, p: &Point3) -> CoreResult<bool> {
+        'dirs: for raw in RAY_DIRECTIONS {
+            let dir = Vector3::new(raw[0], raw[1], raw[2]).normalize();
+            let mut hits = 0usize;
+            for (f, face) in self.solids[s].faces.iter().enumerate() {
+                let fp = &self.face_polys[s][f];
+                for t in ray_surface_hits(&face.surface, p, &dir) {
+                    let ambiguous = self.snap * 10.0;
+                    if t < -ambiguous {
+                        continue; // behind the ray: irrelevant
+                    }
+                    if t <= ambiguous {
+                        // Would mean the sample point lies on this surface;
+                        // only ambiguous if it is actually on the face.
+                        let uv = fp.localize(fp.chart.param(p, None));
+                        if fp.contains(uv) {
+                            continue 'dirs;
+                        }
+                        continue;
+                    }
+                    let hit = p + dir * t;
+                    // Grazing incidence: retry with another direction.
+                    let n = fp.chart.normal(fp.chart.param(&hit, None).0);
+                    if n.dot(&dir).abs() < 1e-6 {
+                        continue 'dirs;
+                    }
+                    let uv = fp.localize(fp.chart.param(&hit, None));
+                    if !fp.contains(uv) {
+                        continue;
+                    }
+                    // Near a region boundary: retry.
+                    if self.near_face_boundary(s, f, &hit) {
+                        continue 'dirs;
+                    }
+                    hits += 1;
+                }
+            }
+            return Ok(hits % 2 == 1);
+        }
+        Err(CoreError::Degenerate {
+            context: "boolean::ray_classify",
+            reason: format!("all classification rays from {p:?} hit degenerate cases"),
+        })
+    }
+
+    fn near_face_boundary(&self, s: SolidTag, f: usize, p: &Point3) -> bool {
+        for lp in &self.solids[s].faces[f].loops {
+            for de in lp {
+                let sampled = &self.edge_samples[s][de.edge];
+                if polyline_distance(&sampled.points, sampled.closed, p) < self.tol.linear * 10.0 {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
+/// (keep?, reverse orientation?) for a region of `solid` that is
+/// `inside_other` the other body.
+fn keep_table(op: BooleanOp, solid: SolidTag, inside_other: bool) -> (bool, bool) {
+    match (op, solid, inside_other) {
+        (BooleanOp::Unite, _, inside) => (!inside, false),
+        (BooleanOp::Subtract, 0, inside) => (!inside, false),
+        (BooleanOp::Subtract, 1, inside) => (inside, true),
+        (BooleanOp::Intersect, _, inside) => (inside, false),
+        _ => unreachable!(),
+    }
+}
+
+// ---------------------------------------------------------------------
+// Geometry helpers
+// ---------------------------------------------------------------------
+
+fn append_directed(out: &mut Vec<Point3>, sampled: &SampledCurve, forward: bool) {
+    // Loops concatenate edge polylines; each edge contributes all its
+    // samples except the final endpoint (the next edge starts there). For
+    // closed (ring) edges the sample list already omits the repeated seam.
+    if forward {
+        if sampled.closed {
+            out.extend_from_slice(&sampled.points);
+        } else {
+            out.extend_from_slice(&sampled.points[..sampled.points.len() - 1]);
+        }
+    } else if sampled.closed {
+        out.push(sampled.points[0]);
+        out.extend(sampled.points[1..].iter().rev());
+    } else {
+        out.extend(sampled.points[1..].iter().rev());
+    }
+}
+
+fn boxes_overlap(a: &(Point3, Point3), b: &(Point3, Point3)) -> bool {
+    a.0.x <= b.1.x
+        && b.0.x <= a.1.x
+        && a.0.y <= b.1.y
+        && b.0.y <= a.1.y
+        && a.0.z <= b.1.z
+        && b.0.z <= a.1.z
+}
+
+/// Clip the line `origin + t·dir` to an axis-aligned box (slab method).
+fn clip_line_to_box(origin: &Point3, dir: &Vector3, bx: &(Point3, Point3)) -> Option<(f64, f64)> {
+    let (mut t0, mut t1) = (f64::NEG_INFINITY, f64::INFINITY);
+    for k in 0..3 {
+        let (o, d, lo, hi) = (origin[k], dir[k], bx.0[k], bx.1[k]);
+        if d.abs() < 1e-15 {
+            if o < lo || o > hi {
+                return None;
+            }
+            continue;
+        }
+        let (mut a, mut b) = ((lo - o) / d, (hi - o) / d);
+        if a > b {
+            std::mem::swap(&mut a, &mut b);
+        }
+        t0 = t0.max(a);
+        t1 = t1.min(b);
+    }
+    (t0 < t1 && t0.is_finite() && t1.is_finite()).then_some((t0, t1))
+}
+
+/// Bisection: `t_out` fails the predicate, `t_in` passes; return the
+/// crossing parameter.
+fn refine_crossing(inside: &dyn Fn(f64) -> bool, mut t_out: f64, mut t_in: f64) -> f64 {
+    for _ in 0..CLIP_REFINE_ITERATIONS {
+        let mid = 0.5 * (t_out + t_in);
+        if inside(mid) {
+            t_in = mid;
+        } else {
+            t_out = mid;
+        }
+    }
+    0.5 * (t_out + t_in)
+}
+
+/// Distance from `p` to a polyline (closed if `closed`).
+fn polyline_distance(points: &[Point3], closed: bool, p: &Point3) -> f64 {
+    let n = points.len();
+    let segs = if closed { n } else { n - 1 };
+    let mut best = f64::INFINITY;
+    for i in 0..segs {
+        let a = points[i];
+        let b = points[(i + 1) % n];
+        let ab = b - a;
+        let len2 = ab.norm_squared();
+        let t = if len2 > 0.0 {
+            ((p - a).dot(&ab) / len2).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        best = best.min((p - (a + ab * t)).norm());
+    }
+    best
+}
+
+/// Split a sampled curve at the given 3D points, producing atoms. Split
+/// points are inserted into the polyline at their nearest segment.
+fn split_sampled(sampled: &SampledCurve, splits: &[Point3], snap: f64) -> Vec<Atom> {
+    // Position each split point on the polyline: (segment index, fraction).
+    let n = sampled.points.len();
+    let segs = if sampled.closed { n } else { n - 1 };
+    let mut located: Vec<(usize, f64, Point3)> = Vec::new();
+    'next_split: for sp in splits {
+        let mut best = (f64::INFINITY, 0usize, 0.0f64);
+        for i in 0..segs {
+            let a = sampled.points[i];
+            let b = sampled.points[(i + 1) % n];
+            let ab = b - a;
+            let len2 = ab.norm_squared();
+            let t = if len2 > 0.0 {
+                ((sp - a).dot(&ab) / len2).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let d = (sp - (a + ab * t)).norm();
+            if d < best.0 {
+                best = (d, i, t);
+            }
+        }
+        // Merge duplicates (both host faces report the same endpoint).
+        for (i, t, _) in &located {
+            if *i == best.1
+                && (t - best.2).abs() * (sampled.points[(*i + 1) % n] - sampled.points[*i]).norm()
+                    < snap * 10.0
+            {
+                continue 'next_split;
+            }
+        }
+        located.push((best.1, best.2, *sp));
+    }
+    if located.is_empty() {
+        return vec![Atom {
+            points: sampled.points.clone(),
+            closed: sampled.closed,
+        }];
+    }
+    located.sort_by(|a, b| (a.0, a.1).partial_cmp(&(b.0, b.1)).expect("finite"));
+
+    // Build the augmented point list with split-point markers.
+    let mut aug: Vec<(Point3, bool)> = Vec::new();
+    let mut li = 0;
+    for i in 0..n {
+        aug.push((sampled.points[i], false));
+        while li < located.len() && located[li].0 == i {
+            let (_, t, sp) = located[li];
+            if t <= 1e-9 {
+                // Coincides with the segment start sample.
+                let last = aug.last_mut().expect("just pushed");
+                last.0 = sp;
+                last.1 = true;
+            } else {
+                aug.push((sp, true));
+            }
+            li += 1;
+        }
+    }
+    if !sampled.closed {
+        // Ensure endpoints are markers so open curves split cleanly.
+        aug.first_mut().expect("non-empty").1 = true;
+        aug.last_mut().expect("non-empty").1 = true;
+    }
+
+    // Cut at markers.
+    let m = aug.len();
+    let marker_positions: Vec<usize> = aug
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, mk))| *mk)
+        .map(|(i, _)| i)
+        .collect();
+    let mut atoms = Vec::new();
+    if sampled.closed {
+        let k = marker_positions.len();
+        for w in 0..k {
+            let start = marker_positions[w];
+            let end = marker_positions[(w + 1) % k];
+            let mut pts = Vec::new();
+            let mut i = start;
+            loop {
+                pts.push(aug[i].0);
+                if i == end && !pts.is_empty() && pts.len() > 1 {
+                    break;
+                }
+                i = (i + 1) % m;
+                if i == start {
+                    // Single marker on a ring: the whole ring is one open
+                    // atom from the marker back to itself.
+                    pts.push(aug[start].0);
+                    break;
+                }
+            }
+            atoms.push(Atom {
+                points: pts,
+                closed: false,
+            });
+            if k == 1 {
+                break;
+            }
+        }
+    } else {
+        for w in marker_positions.windows(2) {
+            let pts: Vec<Point3> = aug[w[0]..=w[1]].iter().map(|(p, _)| *p).collect();
+            if pts.len() >= 2 {
+                atoms.push(Atom {
+                    points: pts,
+                    closed: false,
+                });
+            }
+        }
+    }
+    atoms
+        .into_iter()
+        .filter(|a| a.closed || polyline_length(&a.points) > snap)
+        .collect()
+}
+
+fn polyline_length(points: &[Point3]) -> f64 {
+    points.windows(2).map(|w| (w[1] - w[0]).norm()).sum()
+}
+
+/// Where a closed 3D polyline on a periodic face crosses the face's seam
+/// meridian (the minimum-u side of its cover window), if it wraps the
+/// period. Linear interpolation between the bracketing samples.
+fn seam_crossing(face_poly: &FaceRegionPoly, points: &[Point3]) -> Option<Point3> {
+    let uv = map_polyline(&face_poly.chart, points);
+    // Closing segment: unwrap the first point relative to the last.
+    let close_u = {
+        let mut u = uv[0].0;
+        let last = uv[uv.len() - 1].0;
+        while u - last > std::f64::consts::PI {
+            u -= TWO_PI;
+        }
+        while last - u > std::f64::consts::PI {
+            u += TWO_PI;
+        }
+        u
+    };
+    let winding = close_u - uv[0].0;
+    if winding.abs() < 1.0 {
+        return None; // does not wrap the period
+    }
+    // Seam level: the face cover's minimum u, brought into the polyline's
+    // unwrapped range.
+    let mut seam_u = f64::INFINITY;
+    for lp in &face_poly.loops {
+        for ((u, _), _) in lp {
+            seam_u = seam_u.min(*u);
+        }
+    }
+    let (u_min, u_max) = uv
+        .iter()
+        .map(|(u, _)| *u)
+        .chain([close_u])
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), u| {
+            (lo.min(u), hi.max(u))
+        });
+    let mut level = seam_u;
+    while level <= u_min {
+        level += TWO_PI;
+    }
+    while level > u_max {
+        level -= TWO_PI;
+    }
+    if level <= u_min {
+        return None;
+    }
+    let n = uv.len();
+    for i in 0..n {
+        let (u0, _) = uv[i];
+        let u1 = if i + 1 < n { uv[i + 1].0 } else { close_u };
+        if (u0 - level) * (u1 - level) <= 0.0 && (u1 - u0).abs() > 1e-15 {
+            let t = (level - u0) / (u1 - u0);
+            let p0 = points[i];
+            let p1 = points[(i + 1) % n];
+            return Some(p0 + (p1 - p0) * t);
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------
+// Arrangement: region tracing in parameter space
+// ---------------------------------------------------------------------
+
+/// One traced region of a face: the outer cycle plus hole cycles, as
+/// sequences of directed atoms with their param-space polylines.
+#[derive(Debug, Clone)]
+struct Region {
+    /// cycles[0] is the outer boundary (positive area); the rest are holes.
+    cycles: Vec<Cycle>,
+}
+
+#[derive(Debug, Clone)]
+struct Cycle {
+    /// (atom index, forward?) in traversal order.
+    darts: Vec<(usize, bool)>,
+    /// Concatenated param-space polyline (closed; last connects to first),
+    /// paired with the 3D points.
+    poly: Vec<((f64, f64), Point3)>,
+    area: f64,
+    /// Index into `poly` of each dart's first point (the cycle vertices).
+    dart_offsets: Vec<usize>,
+}
+
+struct KeptRegion {
+    solid: SolidTag,
+    face: usize,
+    region: Region,
+    reverse: bool,
+}
+
+/// A sequence of directed atoms (the walk order of a cycle or chain).
+type DartChain = Vec<(usize, bool)>;
+
+/// A polyline vertex in a face's parameter cover: `(uv, 3D point)`.
+type CoverPoint = ((f64, f64), Point3);
+
+/// Directed 3D endpoints of an atom traversal.
+fn dart_endpoints(atom: &Atom, forward: bool) -> (Point3, Point3) {
+    let first = atom.points[0];
+    let last = if atom.closed {
+        first
+    } else {
+        atom.points[atom.points.len() - 1]
+    };
+    if forward {
+        (first, last)
+    } else {
+        (last, first)
+    }
+}
+
+/// Embed a walk of darts into the face's parameter cover: continuous angle
+/// unwrapping along the walk, ring atoms rotated to start where the walk
+/// stands, and the finished polyline shifted whole periods so every cycle
+/// of a face shares one cover window.
+fn embed_walk(
+    face_poly: &FaceRegionPoly,
+    atoms: &[Atom],
+    darts: &[(usize, bool)],
+    keep_final: bool,
+) -> (Vec<CoverPoint>, Vec<usize>) {
+    let mut poly: Vec<((f64, f64), Point3)> = Vec::new();
+    let mut offsets = Vec::with_capacity(darts.len());
+    let mut walk_pos: Option<Point3> = None;
+    let mut last_uv: Option<(f64, f64)> = None;
+    for (k, &(ai, forward)) in darts.iter().enumerate() {
+        let atom = &atoms[ai];
+        let mut pts: Vec<Point3> = if forward {
+            atom.points.clone()
+        } else {
+            atom.points.iter().rev().copied().collect()
+        };
+        if atom.closed {
+            if let Some(prev) = walk_pos {
+                let rot = pts
+                    .iter()
+                    .enumerate()
+                    .min_by(|a, b| (a.1 - prev).norm().total_cmp(&(b.1 - prev).norm()))
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                pts.rotate_left(rot);
+            }
+        }
+        offsets.push(poly.len());
+        let last_dart = k + 1 == darts.len();
+        let take = if atom.closed || (last_dart && keep_final) {
+            pts.len()
+        } else {
+            pts.len() - 1
+        };
+        for p in &pts[..take] {
+            let raw = face_poly.chart.param(p, last_uv);
+            let uv = if last_uv.is_none() {
+                face_poly.localize(raw)
+            } else {
+                raw
+            };
+            poly.push((uv, *p));
+            last_uv = Some(uv);
+        }
+        walk_pos = Some(if atom.closed {
+            pts[0]
+        } else {
+            pts[pts.len() - 1]
+        });
+    }
+    // Align the whole polyline into the face's cover window so cycles,
+    // holes, and probes of one face are mutually comparable.
+    if let Chart::Cylinder { .. } = face_poly.chart {
+        if !poly.is_empty() {
+            let mean = poly.iter().map(|((u, _), _)| u).sum::<f64>() / poly.len() as f64;
+            let target = face_poly.localize((mean, 0.0)).0;
+            let shift = target - mean;
+            if shift.abs() > 1e-9 {
+                for ((u, _), _) in poly.iter_mut() {
+                    *u += shift;
+                }
+            }
+        }
+    }
+    (poly, offsets)
+}
+
+fn shoelace(poly: &[((f64, f64), Point3)]) -> f64 {
+    0.5 * poly
+        .iter()
+        .enumerate()
+        .map(|(i, ((x0, y0), _))| {
+            let ((x1, y1), _) = poly[(i + 1) % poly.len()];
+            x0 * y1 - x1 * y0
+        })
+        .sum::<f64>()
+}
+
+fn embed_cycle(face_poly: &FaceRegionPoly, atoms: &[Atom], darts: DartChain) -> Cycle {
+    let (poly, dart_offsets) = embed_walk(face_poly, atoms, &darts, false);
+    let area = shoelace(&poly);
+    Cycle {
+        darts,
+        poly,
+        area,
+        dart_offsets,
+    }
+}
+
+fn reverse_chain(darts: &[(usize, bool)]) -> DartChain {
+    darts.iter().rev().map(|&(a, f)| (a, !f)).collect()
+}
+
+/// Merge a face's imprint atoms into maximal chains through their shared
+/// (interior) endpoints. Closed atoms become single-dart chains.
+fn merge_imprint_chains(atoms: &[Atom], ids: &[usize], snap: f64) -> Vec<DartChain> {
+    use std::collections::HashSet;
+    let mut chains: Vec<DartChain> = ids
+        .iter()
+        .filter(|&&ai| atoms[ai].closed)
+        .map(|&ai| vec![(ai, true)])
+        .collect();
+    let open: Vec<usize> = ids
+        .iter()
+        .copied()
+        .filter(|&ai| !atoms[ai].closed)
+        .collect();
+    let key = |p: &Point3| quantize(p, snap * 4.0);
+    let mut adjacency: HashMap<(i64, i64, i64), Vec<(usize, bool)>> = HashMap::new();
+    for &ai in &open {
+        adjacency
+            .entry(key(&atoms[ai].points[0]))
+            .or_default()
+            .push((ai, true));
+        adjacency
+            .entry(key(&atoms[ai].points[atoms[ai].points.len() - 1]))
+            .or_default()
+            .push((ai, false));
+    }
+    let mut used: HashSet<usize> = HashSet::new();
+    for &seed in &open {
+        if used.contains(&seed) {
+            continue;
+        }
+        used.insert(seed);
+        let mut chain: std::collections::VecDeque<(usize, bool)> = [(seed, true)].into();
+        loop {
+            let &(a, fwd) = chain.back().expect("non-empty");
+            let (_, end) = dart_endpoints(&atoms[a], fwd);
+            let Some(cands) = adjacency.get(&key(&end)) else {
+                break;
+            };
+            match cands.iter().find(|(c, _)| !used.contains(c)) {
+                Some(&(c, at_start)) => {
+                    used.insert(c);
+                    chain.push_back((c, at_start));
+                }
+                None => break,
+            }
+        }
+        loop {
+            let &(a, fwd) = chain.front().expect("non-empty");
+            let (start, _) = dart_endpoints(&atoms[a], fwd);
+            let Some(cands) = adjacency.get(&key(&start)) else {
+                break;
+            };
+            match cands.iter().find(|(c, _)| !used.contains(c)) {
+                Some(&(c, at_start)) => {
+                    used.insert(c);
+                    // The predecessor must END at our chain start: forward
+                    // if the junction is its endpoint, reversed if its start.
+                    chain.push_front((c, !at_start));
+                }
+                None => break,
+            }
+        }
+        chains.push(chain.into());
+    }
+    chains
+}
+
+/// Match an embedded chain's endpoints to two distinct vertices of a
+/// cycle, allowing a whole-period shift of the chain (seam chords match
+/// the two cover copies of one 3D point).
+fn match_chain_to_cycle(
+    cycle: &Cycle,
+    chain_poly: &[((f64, f64), Point3)],
+    period: Option<f64>,
+) -> Option<(usize, usize)> {
+    let (mut lo, mut hi) = (
+        (f64::INFINITY, f64::INFINITY),
+        (f64::NEG_INFINITY, f64::NEG_INFINITY),
+    );
+    for ((u, v), _) in &cycle.poly {
+        lo = (lo.0.min(*u), lo.1.min(*v));
+        hi = (hi.0.max(*u), hi.1.max(*v));
+    }
+    let eps = ((hi.0 - lo.0) + (hi.1 - lo.1)).max(1e-12) * 1e-5;
+    let s_uv = chain_poly[0].0;
+    let e_uv = chain_poly[chain_poly.len() - 1].0;
+    let shifts: Vec<f64> = match period {
+        Some(p) => vec![-p, 0.0, p],
+        None => vec![0.0],
+    };
+    let nearest = |uv: (f64, f64)| -> (usize, f64) {
+        cycle
+            .dart_offsets
+            .iter()
+            .enumerate()
+            .map(|(k, &off)| {
+                let v = cycle.poly[off].0;
+                (k, ((v.0 - uv.0).powi(2) + (v.1 - uv.1).powi(2)).sqrt())
+            })
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .expect("cycle has darts")
+    };
+    let mut best: Option<(f64, usize, usize)> = None;
+    for &sh in &shifts {
+        let (i, di) = nearest((s_uv.0 + sh, s_uv.1));
+        let (j, dj) = nearest((e_uv.0 + sh, e_uv.1));
+        if di <= eps && dj <= eps && i != j {
+            let score = di + dj;
+            if best.is_none() || score < best.expect("checked").0 {
+                best = Some((score, i, j));
+            }
+        }
+    }
+    best.map(|(_, i, j)| (i, j))
+}
+
+fn cyclic_slice(darts: &[(usize, bool)], from: usize, to: usize) -> DartChain {
+    if from < to {
+        darts[from..to].to_vec()
+    } else {
+        darts[from..].iter().chain(&darts[..to]).copied().collect()
+    }
+}
+
+/// Even-odd containment of a probe (already in the face cover) in a region.
+fn region_contains(region: &Region, p: (f64, f64)) -> bool {
+    let mut inside = false;
+    for cy in &region.cycles {
+        let n = cy.poly.len();
+        for i in 0..n {
+            let (a, _) = cy.poly[i];
+            let (b, _) = cy.poly[(i + 1) % n];
+            if crosses_upward(a, b, p) {
+                inside = !inside;
+            }
+        }
+    }
+    inside
+}
+
+/// Apply one imprint chain to the current region set: split a region's
+/// outer cycle when the chain is a boundary-to-boundary chord, or insert a
+/// hole + disk when it closes on itself in the interior.
+fn apply_chain(
+    face_poly: &FaceRegionPoly,
+    atoms: &[Atom],
+    regions: &mut Vec<Region>,
+    chain: DartChain,
+    snap: f64,
+) -> CoreResult<()> {
+    let (chain_poly, _) = embed_walk(face_poly, atoms, &chain, true);
+    let period = matches!(face_poly.chart, Chart::Cylinder { .. }).then_some(TWO_PI);
+
+    for ri in 0..regions.len() {
+        for ci in 0..regions[ri].cycles.len() {
+            let Some((vi, vj)) = match_chain_to_cycle(&regions[ri].cycles[ci], &chain_poly, period)
+            else {
+                continue;
+            };
+            if ci != 0 {
+                return Err(CoreError::NotImplemented {
+                    feature: "boolean imprints chording a hole boundary (transversal MVP)",
+                });
+            }
+            // The chain runs vertex vi -> vertex vj of the outer cycle.
+            let outer = regions[ri].cycles[0].clone();
+            let holes: Vec<Cycle> = regions[ri].cycles[1..].to_vec();
+            let mut darts_one = chain.clone();
+            darts_one.extend(cyclic_slice(&outer.darts, vj, vi));
+            let mut darts_two = reverse_chain(&chain);
+            darts_two.extend(cyclic_slice(&outer.darts, vi, vj));
+            let cycle_one = embed_cycle(face_poly, atoms, darts_one);
+            let cycle_two = embed_cycle(face_poly, atoms, darts_two);
+            let mut region_one = Region {
+                cycles: vec![cycle_one],
+            };
+            let mut region_two = Region {
+                cycles: vec![cycle_two],
+            };
+            for hole in holes {
+                let probe = hole.poly[0].0;
+                if point_in_cycle(&region_one.cycles[0], probe) {
+                    region_one.cycles.push(hole);
+                } else {
+                    region_two.cycles.push(hole);
+                }
+            }
+            regions[ri] = region_one;
+            regions.push(region_two);
+            return Ok(());
+        }
+    }
+
+    // No boundary match: the chain must close on itself (an interior ring).
+    let start = chain_poly[0].1;
+    let end = chain_poly[chain_poly.len() - 1].1;
+    if (start - end).norm() > snap * 100.0 {
+        return Err(CoreError::Degenerate {
+            context: "boolean::imprint",
+            reason: "an imprint chain ends in a face interior without closing \
+                     or reaching the face boundary"
+                .into(),
+        });
+    }
+    let ring = embed_cycle(face_poly, atoms, chain);
+    let probe = ring.poly[0].0;
+    let host = regions
+        .iter()
+        .position(|r| region_contains(r, probe))
+        .ok_or_else(|| CoreError::Degenerate {
+            context: "boolean::imprint",
+            reason: "an interior imprint ring lies in no region of its host face".into(),
+        })?;
+    let (disk, hole) = if ring.area >= 0.0 {
+        let hole = embed_cycle(face_poly, atoms, reverse_chain(&ring.darts));
+        (ring, hole)
+    } else {
+        let disk = embed_cycle(face_poly, atoms, reverse_chain(&ring.darts));
+        (disk, ring)
+    };
+    regions[host].cycles.push(hole);
+    regions.push(Region { cycles: vec![disk] });
+    Ok(())
+}
+
+fn point_in_cycle(cycle: &Cycle, p: (f64, f64)) -> bool {
+    let n = cycle.poly.len();
+    let mut inside = false;
+    for i in 0..n {
+        let (a, _) = cycle.poly[i];
+        let (b, _) = cycle.poly[(i + 1) % n];
+        if crosses_upward(a, b, p) {
+            inside = !inside;
+        }
+    }
+    inside
+}
+
+/// A robust interior point of a region, in 3D.
+fn region_interior_point(chart: &Chart, region: &Region) -> Option<Point3> {
+    let outer = &region.cycles[0];
+    let n = outer.poly.len();
+    let inside_region = |p: (f64, f64)| -> bool {
+        let mut inside = false;
+        for cy in &region.cycles {
+            let m = cy.poly.len();
+            for i in 0..m {
+                let (a, _) = cy.poly[i];
+                let (b, _) = cy.poly[(i + 1) % m];
+                if crosses_upward(a, b, p) {
+                    inside = !inside;
+                }
+            }
+        }
+        inside
+    };
+    // Param-space extent for offset scaling.
+    let (mut lo, mut hi) = (
+        (f64::INFINITY, f64::INFINITY),
+        (f64::NEG_INFINITY, f64::NEG_INFINITY),
+    );
+    for (uv, _) in &outer.poly {
+        lo = (lo.0.min(uv.0), lo.1.min(uv.1));
+        hi = (hi.0.max(uv.0), hi.1.max(uv.1));
+    }
+    let extent = ((hi.0 - lo.0).abs() + (hi.1 - lo.1).abs()).max(1e-12);
+    for scale in [1e-3, 1e-2, 5e-2] {
+        let off = extent * scale;
+        for i in 0..n {
+            let (a, _) = outer.poly[i];
+            let (b, _) = outer.poly[(i + 1) % n];
+            let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+            let len = (dx * dx + dy * dy).sqrt();
+            if len < extent * 1e-9 {
+                continue;
+            }
+            // Left normal of a CCW boundary points into the region.
+            let (nx, ny) = (-dy / len, dx / len);
+            let mid = ((a.0 + b.0) * 0.5 + nx * off, (a.1 + b.1) * 0.5 + ny * off);
+            if inside_region(mid) {
+                return Some(chart_point(chart, mid));
+            }
+        }
+    }
+    None
+}
+
+fn chart_point(chart: &Chart, uv: (f64, f64)) -> Point3 {
+    match chart {
+        Chart::Plane {
+            origin, e_u, e_v, ..
+        } => origin + e_u * uv.0 + e_v * uv.1,
+        Chart::Cylinder {
+            origin,
+            axis,
+            e_u,
+            e_v,
+            radius,
+        } => {
+            let radial = e_u * uv.0.cos() + e_v * uv.0.sin();
+            origin + radial * *radius + axis * uv.1
+        }
+    }
+}
+
+/// Analytic ray-surface intersection parameters (unbounded surface).
+fn ray_surface_hits(surface: &Surface3, p: &Point3, dir: &Vector3) -> Vec<f64> {
+    match surface {
+        Surface3::Plane { origin, normal } => {
+            let denom = normal.dot(dir);
+            if denom.abs() < 1e-12 {
+                return Vec::new();
+            }
+            vec![normal.dot(&(origin - p)) / denom]
+        }
+        Surface3::Cylinder {
+            origin,
+            axis,
+            radius,
+        } => {
+            // |(p + t d - o) perp axis|² = r².
+            let oc = p - origin;
+            let d_perp = dir - axis * dir.dot(axis);
+            let o_perp = oc - axis * oc.dot(axis);
+            let a = d_perp.norm_squared();
+            let b = 2.0 * o_perp.dot(&d_perp);
+            let c = o_perp.norm_squared() - radius * radius;
+            if a < 1e-15 {
+                return Vec::new();
+            }
+            let disc = b * b - 4.0 * a * c;
+            if disc <= 0.0 {
+                return Vec::new();
+            }
+            let sq = disc.sqrt();
+            vec![(-b - sq) / (2.0 * a), (-b + sq) / (2.0 * a)]
+        }
+        _ => Vec::new(),
+    }
+}
+
+// ---------------------------------------------------------------------
+// Output assembly
+// ---------------------------------------------------------------------
+
+/// Per-face tessellation payload.
+struct MeshFace {
+    chart: Chart,
+    /// rings[0] outer, rest holes; param + 3D per vertex, in the *original*
+    /// (pre-reversal) face orientation.
+    rings: Vec<MeshRing>,
+    /// Outward normal sign relative to the chart normal.
+    normal_sign: f64,
+}
+
+struct MeshRing {
+    uv: Vec<(f64, f64)>,
+    points: Vec<Point3>,
+}
+
+fn build_output(
+    pipe: &Pipeline<'_>,
+    _op: BooleanOp,
+    atoms: &[Atom],
+    kept: Vec<KeptRegion>,
+) -> CoreResult<BooleanOutput> {
+    let snap = pipe.snap;
+    let mut store = TopologyStore::new();
+    let body = store.create_body(BodyType::Solid);
+
+    // Shell partition: union-find over kept regions via shared atoms.
+    let mut parent: Vec<usize> = (0..kept.len()).collect();
+    fn find(parent: &mut Vec<usize>, i: usize) -> usize {
+        if parent[i] != i {
+            let r = find(parent, parent[i]);
+            parent[i] = r;
+        }
+        parent[i]
+    }
+    let mut atom_user: HashMap<usize, usize> = HashMap::new();
+    for (ri, kr) in kept.iter().enumerate() {
+        for cy in &kr.region.cycles {
+            for &(ai, _) in &cy.darts {
+                if let Some(&other) = atom_user.get(&ai) {
+                    let (a, b) = (find(&mut parent, ri), find(&mut parent, other));
+                    if a != b {
+                        parent[a] = b;
+                    }
+                } else {
+                    atom_user.insert(ai, ri);
+                }
+            }
+        }
+    }
+    let mut shells: HashMap<usize, EntityId<crate::topology::Shell>> = HashMap::new();
+
+    // Vertices and edges, deduplicated by quantized 3D position / atom id.
+    let mut vertex_of: HashMap<(i64, i64, i64), EntityId<crate::topology::Vertex>> = HashMap::new();
+    let mut edge_of_atom: HashMap<usize, EntityId<crate::topology::Edge>> = HashMap::new();
+
+    let mut mesh_faces = Vec::new();
+    let mut face_count = 0usize;
+
+    for (ri, kr) in kept.iter().enumerate() {
+        let root = find(&mut parent, ri);
+        let shell = *shells
+            .entry(root)
+            .or_insert_with(|| store.create_shell(body, true, ShellOrientation::Outward));
+        let face_data = &pipe.solids[kr.solid].faces[kr.face];
+        let outward_along_surface = face_data.outward_along_normal != kr.reverse;
+        let face_id = store.create_face(
+            shell,
+            if outward_along_surface {
+                FaceSense::Positive
+            } else {
+                FaceSense::Negative
+            },
+        );
+        face_count += 1;
+
+        for (ci, cycle) in kr.region.cycles.iter().enumerate() {
+            let loop_type = if ci == 0 {
+                LoopType::Outer
+            } else {
+                LoopType::Inner
+            };
+            let mut entries: Vec<(EntityId<crate::topology::Edge>, FinSense)> = Vec::new();
+            let darts: Vec<(usize, bool)> = if kr.reverse {
+                cycle
+                    .darts
+                    .iter()
+                    .rev()
+                    .map(|&(a, fwd)| (a, !fwd))
+                    .collect()
+            } else {
+                cycle.darts.clone()
+            };
+            for (ai, forward) in darts {
+                let atom = &atoms[ai];
+                let edge_id = *edge_of_atom.entry(ai).or_insert_with(|| {
+                    let start_p = atom.points[0];
+                    let end_p = if atom.closed {
+                        start_p
+                    } else {
+                        atom.points[atom.points.len() - 1]
+                    };
+                    let sv = *vertex_of
+                        .entry(quantize(&start_p, snap * 4.0))
+                        .or_insert_with(|| store.create_vertex(start_p, SYSTEM_RESOLUTION));
+                    let ev = *vertex_of
+                        .entry(quantize(&end_p, snap * 4.0))
+                        .or_insert_with(|| store.create_vertex(end_p, SYSTEM_RESOLUTION));
+                    store.create_edge(sv, ev, SYSTEM_RESOLUTION)
+                });
+                entries.push((
+                    edge_id,
+                    if forward {
+                        FinSense::Forward
+                    } else {
+                        FinSense::Reversed
+                    },
+                ));
+            }
+            store.create_loop(face_id, loop_type, &entries);
+        }
+
+        // Tessellation payload.
+        let fp = &pipe.face_polys[kr.solid][kr.face];
+        let rings = kr
+            .region
+            .cycles
+            .iter()
+            .map(|cy| MeshRing {
+                uv: cy.poly.iter().map(|(uv, _)| *uv).collect(),
+                points: cy.poly.iter().map(|(_, p)| *p).collect(),
+            })
+            .collect();
+        let base_sign = if face_data.outward_along_normal {
+            1.0
+        } else {
+            -1.0
+        };
+        mesh_faces.push(MeshFace {
+            chart: fp.chart.clone(),
+            rings,
+            normal_sign: if kr.reverse { -base_sign } else { base_sign },
+        });
+    }
+
+    // Genus per shell from the Euler-Poincaré formula (S = 1 per shell).
+    let shell_ids: Vec<EntityId<crate::topology::Shell>> = shells.values().copied().collect();
+    for shell_id in &shell_ids {
+        let (v, e, f, r) = shell_counts(&store, *shell_id);
+        let chi = v as i64 - e as i64 + f as i64 - r as i64;
+        // V - E + F - R = 2(1 - H)  =>  H = 1 - chi/2.
+        if chi % 2 == 0 {
+            let h = 1 - chi / 2;
+            if h >= 0 {
+                store
+                    .shells
+                    .get_mut(*shell_id)
+                    .expect("shell just created")
+                    .genus = h as u32;
+            }
+        }
+    }
+
+    let shell_count = shells.len();
+    Ok(BooleanOutput {
+        store,
+        body,
+        mesh_faces,
+        face_count,
+        shell_count,
+    })
+}
+
+/// V/E/F/R counts of one shell (vertices and edges reached via its faces).
+fn shell_counts(
+    store: &TopologyStore,
+    shell: EntityId<crate::topology::Shell>,
+) -> (usize, usize, usize, usize) {
+    use std::collections::HashSet;
+    let mut vs: HashSet<EntityId<crate::topology::Vertex>> = HashSet::new();
+    let mut es: HashSet<EntityId<crate::topology::Edge>> = HashSet::new();
+    let faces = store.faces_of_shell(shell).to_vec();
+    let mut rings = 0usize;
+    for &f in &faces {
+        let loops = store.loops_of_face(f);
+        rings += loops.len().saturating_sub(1);
+        for lp in loops {
+            for &fin in store.fins_of_loop(lp) {
+                let fin_data = store.fin(fin).expect("live fin");
+                let edge = store.edge(fin_data.edge).expect("live edge");
+                es.insert(fin_data.edge);
+                vs.insert(edge.start_vertex);
+                vs.insert(edge.end_vertex);
+            }
+        }
+    }
+    (vs.len(), es.len(), faces.len(), rings)
+}
+
+// ---------------------------------------------------------------------
+// Tessellation (ear clipping with hole bridging)
+// ---------------------------------------------------------------------
+
+fn triangulate_mesh_face(mf: &MeshFace, weld_eps: f64) -> CoreResult<Vec<Triangle>> {
+    // Combine outer ring and holes into a single polygon via bridges.
+    let outer: Vec<usize> = (0..mf.rings[0].uv.len()).collect();
+    let mut all_uv: Vec<(f64, f64)> = mf.rings[0].uv.clone();
+    let mut all_p: Vec<Point3> = mf.rings[0].points.clone();
+    let mut polygon: Vec<usize> = outer;
+
+    // Sort holes by max-u vertex, descending, and bridge each into the
+    // polygon (Eberly's method, simplified with nearest-visible search).
+    type HoleRing = (Vec<(f64, f64)>, Vec<Point3>);
+    let mut holes: Vec<HoleRing> = mf.rings[1..]
+        .iter()
+        .map(|r| (r.uv.clone(), r.points.clone()))
+        .collect();
+    holes.sort_by(|a, b| {
+        let ma = a.0.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max);
+        let mb = b.0.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max);
+        mb.total_cmp(&ma)
+    });
+    for (huv, hp) in holes {
+        let base = all_uv.len();
+        all_uv.extend_from_slice(&huv);
+        all_p.extend_from_slice(&hp);
+        // Hole vertex with max u.
+        let (hi_local, _) = huv
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.0.total_cmp(&b.1.0))
+            .expect("non-empty hole");
+        let h_idx = base + hi_local;
+        // Polygon vertex to bridge to: nearest by distance whose connecting
+        // segment crosses no polygon or hole boundary segment.
+        let mut candidates: Vec<usize> = (0..polygon.len()).collect();
+        candidates.sort_by(|&a, &b| {
+            let da = dist2(all_uv[polygon[a]], all_uv[h_idx]);
+            let db = dist2(all_uv[polygon[b]], all_uv[h_idx]);
+            da.total_cmp(&db)
+        });
+        let mut bridged = false;
+        for cand in candidates {
+            let p_idx = polygon[cand];
+            if bridge_is_clear(&all_uv, &polygon, &huv, base, all_uv[h_idx], all_uv[p_idx]) {
+                // Splice: ...p, h, h+1.., h, p...
+                let mut new_poly = Vec::with_capacity(polygon.len() + huv.len() + 2);
+                new_poly.extend_from_slice(&polygon[..=cand]);
+                let hn = huv.len();
+                for k in 0..=hn {
+                    new_poly.push(base + (hi_local + k) % hn);
+                }
+                new_poly.push(p_idx);
+                new_poly.extend_from_slice(&polygon[cand + 1..]);
+                polygon = new_poly;
+                bridged = true;
+                break;
+            }
+        }
+        if !bridged {
+            return Err(CoreError::Degenerate {
+                context: "boolean::tessellate",
+                reason: "could not bridge a hole into its outer boundary".into(),
+            });
+        }
+    }
+
+    // Ear clipping on the bridged polygon.
+    let mut idx = polygon;
+    let mut tris: Vec<[usize; 3]> = Vec::new();
+    let mut guard = 0usize;
+    while idx.len() > 3 {
+        guard += 1;
+        if guard > 100_000 {
+            return Err(CoreError::Degenerate {
+                context: "boolean::tessellate",
+                reason: "ear clipping did not terminate".into(),
+            });
+        }
+        let n = idx.len();
+        let mut clipped = false;
+        for i in 0..n {
+            let (ia, ib, ic) = (idx[(i + n - 1) % n], idx[i], idx[(i + 1) % n]);
+            let (a, b, c) = (all_uv[ia], all_uv[ib], all_uv[ic]);
+            let cross = (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0);
+            if cross <= 0.0 {
+                continue; // reflex or degenerate corner
+            }
+            // No other polygon vertex strictly inside the ear.
+            let mut ok = true;
+            for &other in &idx {
+                if other == ia || other == ib || other == ic {
+                    continue;
+                }
+                if point_in_triangle(all_uv[other], a, b, c) {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok {
+                tris.push([ia, ib, ic]);
+                idx.remove(i);
+                clipped = true;
+                break;
+            }
+        }
+        if !clipped {
+            // Fallback: clip the least-reflex corner to guarantee progress
+            // on nearly-degenerate polygons.
+            let n = idx.len();
+            let mut best = (f64::NEG_INFINITY, 0usize);
+            for i in 0..n {
+                let (a, b, c) = (
+                    all_uv[idx[(i + n - 1) % n]],
+                    all_uv[idx[i]],
+                    all_uv[idx[(i + 1) % n]],
+                );
+                let cross = (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0);
+                if cross > best.0 {
+                    best = (cross, i);
+                }
+            }
+            let i = best.1;
+            let n = idx.len();
+            tris.push([idx[(i + n - 1) % n], idx[i], idx[(i + 1) % n]]);
+            idx.remove(i);
+        }
+    }
+    if idx.len() == 3 {
+        tris.push([idx[0], idx[1], idx[2]]);
+    }
+
+    // Emit 3D triangles; flip winding when the outward normal opposes the
+    // chart normal (param-space CCW maps to the chart normal side).
+    let mut out = Vec::with_capacity(tris.len());
+    for t in tris {
+        let (mut i0, i1, mut i2) = (t[0], t[1], t[2]);
+        if mf.normal_sign < 0.0 {
+            std::mem::swap(&mut i0, &mut i2);
+        }
+        let ps = [all_p[i0], all_p[i1], all_p[i2]];
+        let normals = [
+            mf.chart.normal(all_uv[i0].0) * mf.normal_sign,
+            mf.chart.normal(all_uv[i1].0) * mf.normal_sign,
+            mf.chart.normal(all_uv[i2].0) * mf.normal_sign,
+        ];
+        // Keep zero-area slivers (collinear boundary chains need them to
+        // pair their chord edges) but drop triangles with a zero-length
+        // edge: those come from duplicated bridge vertices, would weld
+        // into degenerate indices, and their two remaining edges cancel
+        // each other, so dropping them preserves edge pairing.
+        let zero_length = (ps[1] - ps[0]).norm() <= weld_eps
+            || (ps[2] - ps[1]).norm() <= weld_eps
+            || (ps[0] - ps[2]).norm() <= weld_eps;
+        if !zero_length {
+            out.push(Triangle {
+                positions: ps,
+                normals,
+            });
+        }
+    }
+    Ok(out)
+}
+
+fn dist2(a: (f64, f64), b: (f64, f64)) -> f64 {
+    let (dx, dy) = (a.0 - b.0, a.1 - b.1);
+    dx * dx + dy * dy
+}
+
+fn point_in_triangle(p: (f64, f64), a: (f64, f64), b: (f64, f64), c: (f64, f64)) -> bool {
+    let sign = |p1: (f64, f64), p2: (f64, f64), p3: (f64, f64)| {
+        (p1.0 - p3.0) * (p2.1 - p3.1) - (p2.0 - p3.0) * (p1.1 - p3.1)
+    };
+    let d1 = sign(p, a, b);
+    let d2 = sign(p, b, c);
+    let d3 = sign(p, c, a);
+    let has_neg = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
+    let has_pos = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
+    !(has_neg && has_pos)
+}
+
+/// Does the candidate bridge segment cross any polygon or hole boundary
+/// segment (excluding segments sharing an endpoint with it)?
+fn bridge_is_clear(
+    all_uv: &[(f64, f64)],
+    polygon: &[usize],
+    hole_uv: &[(f64, f64)],
+    hole_base: usize,
+    from: (f64, f64),
+    to: (f64, f64),
+) -> bool {
+    let n = polygon.len();
+    for i in 0..n {
+        let a = all_uv[polygon[i]];
+        let b = all_uv[polygon[(i + 1) % n]];
+        if segments_cross(from, to, a, b) {
+            return false;
+        }
+    }
+    let hn = hole_uv.len();
+    for i in 0..hn {
+        let a = all_uv[hole_base + i];
+        let b = all_uv[hole_base + (i + 1) % hn];
+        if segments_cross(from, to, a, b) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Strict proper crossing test (shared endpoints do not count).
+fn segments_cross(p1: (f64, f64), p2: (f64, f64), q1: (f64, f64), q2: (f64, f64)) -> bool {
+    let eps = 1e-14;
+    if dist2(p1, q1) < eps || dist2(p1, q2) < eps || dist2(p2, q1) < eps || dist2(p2, q2) < eps {
+        return false;
+    }
+    let d = |a: (f64, f64), b: (f64, f64), c: (f64, f64)| {
+        (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0)
+    };
+    let d1 = d(q1, q2, p1);
+    let d2 = d(q1, q2, p2);
+    let d3 = d(p1, p2, q1);
+    let d4 = d(p1, p2, q2);
+    ((d1 > 0.0 && d2 < 0.0) || (d1 < 0.0 && d2 > 0.0))
+        && ((d3 > 0.0 && d4 < 0.0) || (d3 < 0.0 && d4 > 0.0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tol() -> ToleranceContext {
+        ToleranceContext::default()
+    }
+
+    fn assert_valid(out: &BooleanOutput, context: &str) {
+        let failures = out.check();
+        assert!(
+            failures.is_empty(),
+            "{context}: check() reported {} failures: {:#?}",
+            failures.len(),
+            failures
+        );
+        let mesh = out.tessellate().expect("tessellation succeeds");
+        assert!(
+            mesh.is_closed_manifold(),
+            "{context}: tessellation is not a closed manifold"
+        );
+    }
+
+    #[test]
+    fn block_construction_is_valid_input() {
+        let block = AnalyticSolid::block(Point3::origin(), Point3::new(2.0, 3.0, 1.0)).unwrap();
+        assert_eq!(block.faces.len(), 6);
+        assert_eq!(block.edges.len(), 12);
+    }
+
+    #[test]
+    fn cylinder_construction_is_valid_input() {
+        let cyl = AnalyticSolid::cylinder(Point3::origin(), Vector3::z(), 1.0, 2.0).unwrap();
+        assert_eq!(cyl.faces.len(), 3);
+        assert_eq!(cyl.edges.len(), 3);
+    }
+
+    #[test]
+    fn subtract_block_minus_cylinder_makes_through_hole() {
+        // Cylinder pierces the block completely: the result is the block
+        // with a cylindrical hole — 6 block faces (top and bottom gaining
+        // a circular inner loop) plus the trimmed cylinder wall.
+        let block = AnalyticSolid::block(Point3::origin(), Point3::new(4.0, 4.0, 2.0)).unwrap();
+        let tool =
+            AnalyticSolid::cylinder(Point3::new(2.0, 2.0, -1.0), Vector3::z(), 1.0, 4.0).unwrap();
+        let out = subtract(&block, &tool, &tol()).unwrap();
+        assert_eq!(out.face_count(), 7, "6 block faces + 1 cylinder band");
+        assert_eq!(out.shell_count(), 1);
+        assert_valid(&out, "block minus cylinder");
+        // Through-hole: genus 1.
+        let counts = out.store.euler_counts(out.body);
+        assert_eq!(counts.genus, 1, "through hole must give genus 1");
+    }
+
+    #[test]
+    fn unite_overlapping_blocks_face_count() {
+        // Corner overlap: each block keeps 3 untouched faces and 3
+        // L-shaped trimmed faces — 12 faces total.
+        let a = AnalyticSolid::block(Point3::origin(), Point3::new(2.0, 2.0, 2.0)).unwrap();
+        let b =
+            AnalyticSolid::block(Point3::new(1.0, 1.0, 1.0), Point3::new(3.0, 3.0, 3.0)).unwrap();
+        let out = unite(&a, &b, &tol()).unwrap();
+        assert_eq!(out.face_count(), 12);
+        assert_eq!(out.shell_count(), 1);
+        assert_valid(&out, "union of overlapping blocks");
+        let counts = out.store.euler_counts(out.body);
+        assert_eq!(counts.genus, 0);
+    }
+
+    #[test]
+    fn intersect_overlapping_blocks_is_overlap_box() {
+        let a = AnalyticSolid::block(Point3::origin(), Point3::new(2.0, 2.0, 2.0)).unwrap();
+        let b =
+            AnalyticSolid::block(Point3::new(1.0, 1.0, 1.0), Point3::new(3.0, 3.0, 3.0)).unwrap();
+        let out = intersect(&a, &b, &tol()).unwrap();
+        assert_eq!(out.face_count(), 6, "intersection of blocks is a block");
+        assert_valid(&out, "intersection of overlapping blocks");
+        let mesh = out.tessellate().unwrap();
+        let bb = mesh.bounding_box().expect("non-empty mesh");
+        for (got, want) in [
+            (bb.min.x, 1.0),
+            (bb.min.y, 1.0),
+            (bb.min.z, 1.0),
+            (bb.max.x, 2.0),
+            (bb.max.y, 2.0),
+            (bb.max.z, 2.0),
+        ] {
+            assert!(
+                (got - want).abs() < 1e-6,
+                "intersection extent {got} != {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn unite_disjoint_solids_keeps_two_shells() {
+        let a = AnalyticSolid::block(Point3::origin(), Point3::new(1.0, 1.0, 1.0)).unwrap();
+        let b =
+            AnalyticSolid::block(Point3::new(5.0, 5.0, 5.0), Point3::new(6.0, 6.0, 6.0)).unwrap();
+        let out = unite(&a, &b, &tol()).unwrap();
+        assert_eq!(out.face_count(), 12);
+        assert_eq!(out.shell_count(), 2);
+        assert_valid(&out, "union of disjoint blocks");
+    }
+
+    #[test]
+    fn intersect_disjoint_solids_is_empty() {
+        let a = AnalyticSolid::block(Point3::origin(), Point3::new(1.0, 1.0, 1.0)).unwrap();
+        let b =
+            AnalyticSolid::block(Point3::new(5.0, 5.0, 5.0), Point3::new(6.0, 6.0, 6.0)).unwrap();
+        let out = intersect(&a, &b, &tol()).unwrap();
+        assert_eq!(out.face_count(), 0);
+        assert_eq!(out.shell_count(), 0);
+    }
+
+    #[test]
+    fn subtract_embedded_cylinder_makes_internal_void() {
+        // Tool entirely inside the block: no face crossings at all; the
+        // subtract keeps the whole reversed tool boundary as a void shell.
+        let block = AnalyticSolid::block(Point3::origin(), Point3::new(4.0, 4.0, 4.0)).unwrap();
+        let tool =
+            AnalyticSolid::cylinder(Point3::new(2.0, 2.0, 1.0), Vector3::z(), 1.0, 2.0).unwrap();
+        let out = subtract(&block, &tool, &tol()).unwrap();
+        assert_eq!(out.face_count(), 9, "6 block faces + 3 reversed tool faces");
+        assert_eq!(out.shell_count(), 2, "outer shell + void shell");
+        assert_valid(&out, "block with internal void");
+    }
+
+    #[test]
+    fn coincident_faces_are_not_implemented() {
+        // Blocks sharing the x = 2 plane: coincident faces.
+        let a = AnalyticSolid::block(Point3::origin(), Point3::new(2.0, 2.0, 2.0)).unwrap();
+        let b =
+            AnalyticSolid::block(Point3::new(2.0, 0.0, 0.0), Point3::new(4.0, 2.0, 2.0)).unwrap();
+        let err = unite(&a, &b, &tol()).unwrap_err();
+        assert!(
+            matches!(err, CoreError::NotImplemented { .. }),
+            "expected NotImplemented for coincident faces, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("coincident"),
+            "unhelpful error: {err}"
+        );
+    }
+
+    #[test]
+    fn tangent_contact_is_not_implemented() {
+        // Cylinder wall tangent to the block face plane x = 2.
+        let block = AnalyticSolid::block(Point3::origin(), Point3::new(2.0, 2.0, 2.0)).unwrap();
+        let tool =
+            AnalyticSolid::cylinder(Point3::new(3.0, 1.0, -1.0), Vector3::z(), 1.0, 4.0).unwrap();
+        let err = subtract(&block, &tool, &tol()).unwrap_err();
+        assert!(
+            matches!(err, CoreError::NotImplemented { .. }),
+            "expected NotImplemented for tangent contact, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("tangent"),
+            "unhelpful error: {err}"
+        );
+    }
+}
