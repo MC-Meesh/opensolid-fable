@@ -2284,18 +2284,43 @@ fn shell_counts(
 /// samples alone, so chords can stray by up to the radius), letting
 /// callers judge the mesh instead of trusting it blindly.
 fn triangulate_mesh_face(mf: &MeshFace, weld_eps: f64) -> CoreResult<(Vec<Triangle>, f64)> {
+    // Ring polylines are concatenated dart chains, so chain joins (and the
+    // ring closure) carry consecutive duplicate vertices. A duplicate is
+    // uv-coincident with its neighbor but has its own index, so the ear
+    // test — which skips coincident points by index only — sees it as a
+    // blocking vertex on every ear at that corner, starving ear clipping
+    // into the degenerate-corner fallback. Drop them up front.
+    let dedupe = |uv: &[(f64, f64)], points: &[Point3]| -> (Vec<(f64, f64)>, Vec<Point3>) {
+        let extent = uv
+            .iter()
+            .map(|p| p.0.abs().max(p.1.abs()))
+            .fold(0.0, f64::max);
+        let eps2 = (1e-12 * (1.0 + extent)).powi(2);
+        let mut out_uv: Vec<(f64, f64)> = Vec::with_capacity(uv.len());
+        let mut out_p: Vec<Point3> = Vec::with_capacity(points.len());
+        for (q, p) in uv.iter().zip(points) {
+            if out_uv.last().is_none_or(|last| dist2(*last, *q) > eps2) {
+                out_uv.push(*q);
+                out_p.push(*p);
+            }
+        }
+        while out_uv.len() > 1 && dist2(out_uv[0], *out_uv.last().expect("non-empty")) <= eps2 {
+            out_uv.pop();
+            out_p.pop();
+        }
+        (out_uv, out_p)
+    };
+
     // Combine outer ring and holes into a single polygon via bridges.
-    let outer: Vec<usize> = (0..mf.rings[0].uv.len()).collect();
-    let mut all_uv: Vec<(f64, f64)> = mf.rings[0].uv.clone();
-    let mut all_p: Vec<Point3> = mf.rings[0].points.clone();
-    let mut polygon: Vec<usize> = outer;
+    let (mut all_uv, mut all_p) = dedupe(&mf.rings[0].uv, &mf.rings[0].points);
+    let mut polygon: Vec<usize> = (0..all_uv.len()).collect();
 
     // Sort holes by max-u vertex, descending, and bridge each into the
     // polygon (Eberly's method, simplified with nearest-visible search).
     type HoleRing = (Vec<(f64, f64)>, Vec<Point3>);
     let mut holes: Vec<HoleRing> = mf.rings[1..]
         .iter()
-        .map(|r| (r.uv.clone(), r.points.clone()))
+        .map(|r| dedupe(&r.uv, &r.points))
         .collect();
     holes.sort_by(|a, b| {
         let ma = a.0.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max);
@@ -2412,9 +2437,57 @@ fn triangulate_mesh_face(mf: &MeshFace, weld_eps: f64) -> CoreResult<(Vec<Triang
         tris.push([idx[0], idx[1], idx[2]]);
     }
 
+    let planar = matches!(mf.chart, Chart::Plane { .. });
+
+    // Curved charts: ear clipping covers the parameter region exactly, but
+    // a wide face (e.g. the full-wrap band left by a through-hole
+    // subtract) gets triangles whose u-span is far coarser than the
+    // boundary sampling, so their flat 3D chords cut deep inside the
+    // surface. Refine by bisecting any triangle edge whose u-span exceeds
+    // the boundary pitch, evaluating the midpoint on the analytic surface.
+    // The split decision depends only on the edge and midpoints are shared
+    // through an edge-keyed map, so neighbors always split identically
+    // (no cracks); boundary polyline edges are already at pitch and are
+    // never split, so welding with adjacent faces is preserved.
+    if !planar {
+        // 1.5× the boundary pitch: edges at the sampling pitch (the shared
+        // boundary polylines themselves) must never split — the adjacent
+        // face doesn't refine its copy, and a one-sided split is a
+        // T-junction (non-manifold weld). Chords under 1.5 pitch deviate
+        // from the surface by < r·(1 − cos(0.75·2π/96)) ≈ 1e-3·r, in line
+        // with the boundary sampling itself.
+        let max_du = 1.5 * TWO_PI / SAMPLES_PER_CIRCLE as f64;
+        let mut midpoint: HashMap<(usize, usize), usize> = HashMap::new();
+        let mut queue: std::collections::VecDeque<[usize; 3]> = tris.drain(..).collect();
+        while let Some(t) = queue.pop_front() {
+            let span = |i: usize, j: usize| (all_uv[t[i]].0 - all_uv[t[j]].0).abs();
+            let spans = [span(0, 1), span(1, 2), span(2, 0)];
+            let (k, widest) = spans
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .expect("three edges");
+            if *widest <= max_du {
+                tris.push(t);
+                continue;
+            }
+            let (i, j, o) = (t[k], t[(k + 1) % 3], t[(k + 2) % 3]);
+            let m = *midpoint.entry((i.min(j), i.max(j))).or_insert_with(|| {
+                let mid_uv = (
+                    0.5 * (all_uv[i].0 + all_uv[j].0),
+                    0.5 * (all_uv[i].1 + all_uv[j].1),
+                );
+                all_uv.push(mid_uv);
+                all_p.push(chart_point(&mf.chart, mid_uv));
+                all_uv.len() - 1
+            });
+            queue.push_back([i, m, o]);
+            queue.push_back([m, j, o]);
+        }
+    }
+
     // Emit 3D triangles; flip winding when the outward normal opposes the
     // chart normal (param-space CCW maps to the chart normal side).
-    let planar = matches!(mf.chart, Chart::Plane { .. });
     let mut deviation: f64 = 0.0;
     let mut out = Vec::with_capacity(tris.len());
     for t in tris {

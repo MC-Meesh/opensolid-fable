@@ -645,11 +645,10 @@ mod tests {
 
     #[test]
     fn block_minus_cylinder_is_closed_and_accurate() {
-        // The exact pipeline succeeds topologically here, but its trimmed
-        // full-wrap cylinder band tessellates as wide ear-clip chords that
-        // cut far inside the true surface, failing the quality gate. The
-        // hybrid path must divert to the F-Rep fallback and still deliver
-        // a watertight, volume-accurate result — booleans never fail.
+        // The trimmed full-wrap cylinder band now refines its ear-clip
+        // chords onto the true surface (of-ipt.4), so the exact pipeline
+        // passes the quality gate — no F-Rep diversion — and the mesh must
+        // be watertight and volume-accurate.
         let mut store = TopologyStore::new();
         let mut geo = GeometryStore::new();
         let block = primitives::block(&mut store, &mut geo, 4.0, 4.0, 2.0).unwrap();
@@ -662,8 +661,8 @@ mod tests {
         )
         .unwrap();
         assert!(
-            matches!(out.path, HybridPath::Frep { .. }),
-            "coarse exact tessellation must divert to the F-Rep fallback"
+            matches!(out.path, HybridPath::Brep(_)),
+            "accurate exact tessellation must keep the B-Rep fast path"
         );
         assert!(out.mesh.is_closed_manifold());
         assert_volume(
