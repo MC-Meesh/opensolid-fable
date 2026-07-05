@@ -866,13 +866,15 @@ mod tests {
     }
 
     #[test]
-    fn volume_gate_catches_ipt4_silent_wrongness() {
-        // of-ipt.4: the exact subtract on the canonical through-hole
-        // config returns Ok with a closed-manifold mesh whose geometry is
-        // wrong (bottom-face hole never cut; removed volume off ~12×).
-        // The volume cross-check must flag it independently of the
-        // chordal-deviation gate: the F-Rep estimate lands near the true
-        // volume, far from the mesh's.
+    fn volume_gate_passes_ipt4_config_after_tessellation_fix() {
+        // of-ipt.4: the canonical through-hole config used to tessellate
+        // to a closed-manifold mesh with silently wrong geometry (removed
+        // volume off ~12×), and this test asserted the volume gate caught
+        // it. The tessellation fix makes the exact result correct, so the
+        // gate must now agree with it: brep volume, F-Rep estimate, and
+        // the analytic value all match within the default divergence.
+        // (Gate trip wiring is covered by
+        // discarded_exact_result_diverts_to_fallback_with_diagnostic.)
         let mut store = TopologyStore::new();
         let mut geo = GeometryStore::new();
         let block = primitives::block(&mut store, &mut geo, 4.0, 4.0, 2.0).unwrap();
@@ -881,7 +883,7 @@ mod tests {
         let (mesh, _) = out.tessellate_measured().unwrap();
         assert!(
             mesh.is_closed_manifold(),
-            "of-ipt.4 mesh is combinatorially fine"
+            "of-ipt.4 mesh must stay combinatorially closed"
         );
         let brep_volume = volume(&mesh);
 
@@ -895,11 +897,15 @@ mod tests {
             (estimated - exact).abs() / exact < 0.05,
             "estimate {estimated} should be near the true volume {exact}"
         );
+        assert!(
+            (brep_volume - exact).abs() / exact < 0.05,
+            "brep volume {brep_volume} should be near the true volume {exact}"
+        );
         let divergence = (brep_volume - estimated).abs() / brep_volume.max(estimated);
         assert!(
-            divergence > ValidationOptions::default().max_volume_divergence,
-            "divergence {divergence} must exceed the default gate \
-             (brep {brep_volume} vs estimate {estimated})"
+            divergence <= ValidationOptions::default().max_volume_divergence,
+            "fixed exact result must survive the default gate, \
+             divergence {divergence} (brep {brep_volume} vs estimate {estimated})"
         );
     }
 
