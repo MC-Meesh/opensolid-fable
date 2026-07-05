@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import init, { WasmShape } from '../pkg/opensolid_wasm.js';
 import ScriptEditor from './components/ScriptEditor.jsx';
 import Viewport3D from './components/Viewport3D.jsx';
 import Toolbar from './components/Toolbar.jsx';
 import StatusBar from './components/StatusBar.jsx';
+import ScenePanel from './components/ScenePanel.jsx';
 import SceneTree from './components/SceneTree.jsx';
 import SketchCanvas from './components/SketchCanvas.jsx';
 import { DEFAULT_SCRIPT } from './lib/defaultScript.js';
@@ -11,6 +12,13 @@ import { freeNodes, nodeLabel, runTracedScript, serializeTree } from './lib/scen
 import { buildBinaryStl } from './lib/stl.js';
 import { pickCandidates, pickNodeAt } from './lib/picking.js';
 import { applyTranslate, applyRotate, applyScale, pathTo, nodeAt } from './lib/transformEdit.js';
+import {
+  addShape,
+  deleteShape,
+  listNodes,
+  parseScript,
+  updateNumericArg,
+} from './lib/shapeGraph.js';
 
 let wasmInit = null;
 function ensureWasm() {
@@ -19,6 +27,7 @@ function ensureWasm() {
 }
 
 const DEFAULT_RESOLUTION = 64;
+const EDIT_DEBOUNCE_MS = 400;
 
 function meshShape(shape, resolution) {
   const data = shape.mesh(resolution);
@@ -50,7 +59,14 @@ export default function App() {
   const [sketchPlane, setSketchPlane] = useState('XY');
   const profileRef = useRef(null);
 
+  // Bidirectional sync: the shape operation graph parsed from the script.
+  // GUI mutations (palette, parameter edits) rewrite individual statements
+  // and push the new script text into the editor, preserving all hand-written
+  // code. The graph is re-derived after every change from either side.
+  const [graph, setGraph] = useState(() => parseScript(DEFAULT_SCRIPT));
+
   const scriptRef = useRef(DEFAULT_SCRIPT);
+  const graphRef = useRef(graph);
   const resolutionRef = useRef(DEFAULT_RESOLUTION);
   const shapeRef = useRef(null);
   const tracedRef = useRef(null);
@@ -58,6 +74,7 @@ export default function App() {
   const meshKeyRef = useRef(0);
   const editorRef = useRef(null);
   const selectedPathRef = useRef(null);
+  const editTimerRef = useRef(null);
 
   const clearSelection = useCallback(() => {
     setSelectedNode(null);
@@ -149,6 +166,73 @@ export default function App() {
     }
   }, [remesh, clearSelection]);
 
+  const commitGraph = useCallback(() => {
+    const next = parseScript(scriptRef.current);
+    graphRef.current = next;
+    setGraph(next);
+  }, []);
+
+  // Script -> GUI: re-parse and re-evaluate, debounced behind keystrokes.
+  const handleScriptChange = useCallback(
+    (source) => {
+      if (source === scriptRef.current) return;
+      scriptRef.current = source;
+      clearTimeout(editTimerRef.current);
+      editTimerRef.current = setTimeout(() => {
+        commitGraph();
+        evaluateScript();
+      }, EDIT_DEBOUNCE_MS);
+    },
+    [commitGraph, evaluateScript]
+  );
+
+  const runNow = useCallback(() => {
+    clearTimeout(editTimerRef.current);
+    commitGraph();
+    evaluateScript();
+  }, [commitGraph, evaluateScript]);
+
+  useEffect(() => () => clearTimeout(editTimerRef.current), []);
+
+  // GUI -> Script: apply a shapeGraph mutation, push the rewritten script
+  // into the editor, and refresh graph + shape immediately.
+  const applyMutation = useCallback(
+    (result) => {
+      if (result.error) {
+        setError(result.error);
+        return false;
+      }
+      scriptRef.current = result.source;
+      editorRef.current?.setDoc(result.source);
+      commitGraph();
+      evaluateScript();
+      return true;
+    },
+    [commitGraph, evaluateScript]
+  );
+
+  const handleAddShape = useCallback(
+    (ctor, args) => {
+      const result = addShape(graphRef.current, ctor, args);
+      applyMutation(result);
+    },
+    [applyMutation]
+  );
+
+  const handleDeleteShape = useCallback(
+    (name) => {
+      applyMutation(deleteShape(graphRef.current, name));
+    },
+    [applyMutation]
+  );
+
+  const handleUpdateArg = useCallback(
+    (nodeId, linkIndex, argIndex, value) => {
+      applyMutation(updateNumericArg(graphRef.current, nodeId, linkIndex, argIndex, value));
+    },
+    [applyMutation]
+  );
+
   const selectNode = useCallback(
     (node) => {
       const root = tracedRef.current?.root;
@@ -213,9 +297,10 @@ export default function App() {
       const script = serializeTree(newRoot);
       scriptRef.current = script;
       editorRef.current?.setDoc(script);
+      commitGraph();
       evaluateScript();
     },
-    [selectedNode, evaluateScript]
+    [selectedNode, commitGraph, evaluateScript]
   );
 
   const downloadStl = useCallback(() => {
@@ -281,27 +366,34 @@ export default function App() {
     remesh();
   }, [remesh]);
 
-  const handleScriptChange = useCallback((source) => {
-    scriptRef.current = source;
-  }, []);
-
   const handleProfileChange = useCallback((profile) => {
     profileRef.current = profile;
   }, []);
+
+  const graphNodes = useMemo(() => listNodes(graph), [graph]);
 
   return (
     <div className="app">
       <div className="left">
         <header>
           <h1>OpenSolid Playground</h1>
-          <p>Write a script that returns a Shape, then Run (Ctrl/Cmd+Enter).</p>
+          <p>Edit the script or the scene — both stay in sync.</p>
         </header>
+        <ScenePanel
+          nodes={graphNodes}
+          selected={null}
+          onSelect={() => {}}
+          onAddShape={handleAddShape}
+          onDeleteShape={handleDeleteShape}
+          onUpdateArg={handleUpdateArg}
+          disabled={!wasmReady}
+        />
         <SceneTree root={tree} selectedId={selectedNode?.id} onSelect={selectNode} />
         <ScriptEditor
           ref={editorRef}
           initialDoc={DEFAULT_SCRIPT}
           onChange={handleScriptChange}
-          onRun={evaluateScript}
+          onRun={runNow}
         />
         {error && <pre className="error">{error}</pre>}
         <Toolbar
@@ -310,7 +402,7 @@ export default function App() {
           onResolutionCommit={handleResolutionCommit}
           wireframe={wireframe}
           onWireframeChange={setWireframe}
-          onRun={evaluateScript}
+          onRun={runNow}
           onDownloadStl={downloadStl}
           disabled={!wasmReady}
         />
