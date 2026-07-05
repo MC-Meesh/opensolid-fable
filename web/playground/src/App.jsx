@@ -5,6 +5,7 @@ import Viewport3D from './components/Viewport3D.jsx';
 import Toolbar from './components/Toolbar.jsx';
 import StatusBar from './components/StatusBar.jsx';
 import SceneTree from './components/SceneTree.jsx';
+import SketchCanvas from './components/SketchCanvas.jsx';
 import { DEFAULT_SCRIPT } from './lib/defaultScript.js';
 import { freeNodes, nodeLabel, runTracedScript } from './lib/sceneTree.js';
 import { buildBinaryStl } from './lib/stl.js';
@@ -27,6 +28,9 @@ export default function App() {
   const [stats, setStats] = useState(null); // { triangles, vertices, resolution, elapsedMs }
   const [tree, setTree] = useState(null); // root node of the construction tree
   const [selected, setSelected] = useState(null); // isolated tree node, or null
+  const [sketchOpen, setSketchOpen] = useState(false);
+  const [sketchPlane, setSketchPlane] = useState('XY');
+  const profileRef = useRef(null); // latest sketch profile (for extrude, of-4eh.6)
 
   const scriptRef = useRef(DEFAULT_SCRIPT); // live editor contents
   const resolutionRef = useRef(DEFAULT_RESOLUTION); // committed slider value
@@ -162,6 +166,10 @@ export default function App() {
     scriptRef.current = source;
   }, []);
 
+  const handleProfileChange = useCallback((profile) => {
+    profileRef.current = profile;
+  }, []);
+
   return (
     <div className="app">
       <div className="left">
@@ -188,7 +196,11 @@ export default function App() {
         />
       </div>
       <div className="right">
-        <Viewport3D mesh={mesh} wireframe={wireframe} />
+        <Viewport3D
+          mesh={mesh}
+          wireframe={wireframe}
+          sketchPlane={sketchOpen ? sketchPlane : null}
+        />
         {selected && (
           <div className="isolate-banner">
             <span>
@@ -199,7 +211,19 @@ export default function App() {
             </button>
           </div>
         )}
-        {stats && <StatusBar stats={stats} />}
+        <SketchCanvas
+          open={sketchOpen}
+          plane={sketchPlane}
+          onPlaneChange={setSketchPlane}
+          onProfileChange={handleProfileChange}
+        />
+        <button
+          className={`secondary sketch-toggle${sketchOpen ? ' active' : ''}`}
+          onClick={() => setSketchOpen((v) => !v)}
+        >
+          {sketchOpen ? 'Exit sketch' : 'Sketch'}
+        </button>
+        {stats && !sketchOpen && <StatusBar stats={stats} />}
         {!wasmReady && <div className="loading">Loading WASM…</div>}
       </div>
     </div>

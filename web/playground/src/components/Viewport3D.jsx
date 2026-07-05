@@ -12,14 +12,23 @@ function frameCamera({ camera, controls }, { center, radius }) {
   controls.target.copy(target);
 }
 
+/** Orientation and tint for each selectable sketch plane. */
+const SKETCH_PLANES = {
+  XY: { rotation: [0, 0, 0], color: 0x4f9cf9 }, // normal +Z
+  XZ: { rotation: [-Math.PI / 2, 0, 0], color: 0x5fdf8a }, // normal +Y
+  YZ: { rotation: [0, Math.PI / 2, 0], color: 0xef6f6f }, // normal +X
+};
+
 /**
  * three.js canvas with orbit controls.
  *
  * `mesh` carries flat buffers ({ positions, normals, indices }) plus an
  * optional `frame` ({ center, radius }) that recenters the camera, and a
  * monotonically increasing `key` so identical-looking remeshes still apply.
+ * `sketchPlane` ('XY' | 'XZ' | 'YZ' | null) shows a translucent plane
+ * indicating the active sketch plane's orientation.
  */
-export default function Viewport3D({ mesh, wireframe }) {
+export default function Viewport3D({ mesh, wireframe, sketchPlane }) {
   const containerRef = useRef(null);
   const sceneRef = useRef(null);
 
@@ -106,6 +115,44 @@ export default function Viewport3D({ mesh, wireframe }) {
     const ctx = sceneRef.current;
     if (ctx) ctx.material.wireframe = wireframe;
   }, [wireframe]);
+
+  useEffect(() => {
+    const ctx = sceneRef.current;
+    if (!ctx || !sketchPlane) return undefined;
+    const spec = SKETCH_PLANES[sketchPlane];
+    if (!spec) return undefined;
+
+    const scene = ctx.meshObject.parent;
+    const group = new THREE.Group();
+    group.rotation.set(...spec.rotation);
+
+    const fillGeometry = new THREE.PlaneGeometry(10, 10);
+    const fillMaterial = new THREE.MeshBasicMaterial({
+      color: spec.color,
+      transparent: true,
+      opacity: 0.12,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+    });
+    group.add(new THREE.Mesh(fillGeometry, fillMaterial));
+
+    const edgeGeometry = new THREE.EdgesGeometry(fillGeometry);
+    const edgeMaterial = new THREE.LineBasicMaterial({
+      color: spec.color,
+      transparent: true,
+      opacity: 0.6,
+    });
+    group.add(new THREE.LineSegments(edgeGeometry, edgeMaterial));
+
+    scene.add(group);
+    return () => {
+      scene.remove(group);
+      fillGeometry.dispose();
+      fillMaterial.dispose();
+      edgeGeometry.dispose();
+      edgeMaterial.dispose();
+    };
+  }, [sketchPlane]);
 
   return <div className="viewport" ref={containerRef} />;
 }

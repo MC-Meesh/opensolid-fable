@@ -185,3 +185,151 @@ button.secondary {
   font-size: 14px;
   pointer-events: none;
 }
+
+/* ---- 2D sketch overlay ---- */
+.sketch-toggle {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  z-index: 3;
+}
+.sketch-toggle.active { border-color: var(--accent); color: var(--accent); }
+.sketch-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+}
+.sketch-overlay.hidden { display: none; }
+.sketch-svg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  background: color-mix(in srgb, var(--bg) 72%, transparent);
+  touch-action: none;
+}
+.sketch-svg.tool-select { cursor: default; }
+.sketch-svg.tool-pan { cursor: grab; }
+.sketch-svg.tool-line,
+.sketch-svg.tool-rect,
+.sketch-svg.tool-circle,
+.sketch-svg.tool-arc { cursor: crosshair; }
+.sketch-svg .grid-minor { stroke: #222831; stroke-width: 1; }
+.sketch-svg .grid-major { stroke: #2d3542; stroke-width: 1; }
+.sketch-svg .axis-u { stroke: #7a4a4a; stroke-width: 1.2; }
+.sketch-svg .axis-v { stroke: #4a6e4a; stroke-width: 1.2; }
+.sketch-svg .axis-label {
+  fill: var(--muted);
+  font-size: 11px;
+  user-select: none;
+}
+.sketch-svg .entity {
+  stroke: #d7dde6;
+  stroke-width: 1.8;
+  fill: none;
+  cursor: pointer;
+}
+.sketch-svg .entity.selected { stroke: var(--accent); stroke-width: 2.4; }
+.sketch-svg .point {
+  fill: #aab6c6;
+  stroke: #14171c;
+  stroke-width: 1;
+  cursor: pointer;
+}
+.sketch-svg .point.selected { fill: var(--accent); }
+.sketch-svg .draft {
+  stroke: var(--accent);
+  stroke-width: 1.4;
+  stroke-dasharray: 5 4;
+  fill: none;
+  pointer-events: none;
+}
+.sketch-svg .draft.faint { opacity: 0.35; }
+.sketch-svg .snap-indicator {
+  stroke: #ffd66b;
+  stroke-width: 1.5;
+  pointer-events: none;
+}
+.sketch-svg .glyph {
+  fill: #ffd66b;
+  stroke: none;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  user-select: none;
+}
+.sketch-svg circle.glyph { fill: none; stroke: #ffd66b; stroke-width: 1.2; }
+.sketch-svg .glyph.selected { fill: var(--accent); }
+.sketch-svg circle.glyph.selected { stroke: var(--accent); }
+.sketch-toolbar {
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  right: 110px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  align-items: center;
+  padding: 6px 10px;
+  background: color-mix(in srgb, var(--panel) 92%, transparent);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 12px;
+}
+.sketch-toolbar .group {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.sketch-toolbar .group-label { color: var(--muted); margin-right: 2px; }
+.sketch-toolbar label {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--text);
+}
+.tool-btn {
+  background: transparent;
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 4px 9px;
+  font-size: 12px;
+  font-weight: 500;
+}
+.tool-btn.active {
+  background: var(--accent);
+  color: #0b1220;
+  border-color: var(--accent);
+}
+.tool-btn:disabled { opacity: 0.4; }
+.dim-input {
+  width: 64px;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 4px 6px;
+  font-size: 12px;
+}
+.sketch-status {
+  position: absolute;
+  bottom: 10px;
+  left: 10px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  max-width: calc(100% - 20px);
+}
+.profile-chip {
+  padding: 4px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--panel) 92%, transparent);
+  color: var(--muted);
+}
+.profile-chip.ok { color: #7ce38b; border-color: #2e5136; }
+.sketch-message { color: #ffd66b; }
+.sketch-hint { color: var(--muted); }
