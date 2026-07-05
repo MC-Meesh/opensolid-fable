@@ -14,9 +14,11 @@
 //! and [`revolve`] planar profiles into solids), the geometry store
 //! ([`GeometryStore`] backing [`Edge::curve`]/[`Face::surface`]), and
 //! primitive solids ([`primitives`]: block, cylinder, sphere, torus with
-//! full topology + geometry), and tessellation ([`tessellate`]: analytic
-//! faces to [`opensolid_core::TriangleMesh`]). Tolerant modeling lands
-//! here next.
+//! full topology + geometry), body placement ([`transform`]:
+//! [`translate_body`]), booleans over store-backed bodies ([`boolean`]:
+//! unite/subtract/intersect producing geometry-bound results), and
+//! tessellation ([`tessellate`]: analytic faces to
+//! [`opensolid_core::TriangleMesh`]). Tolerant modeling lands here next.
 //!
 //! This crate follows the OpenSolid error handling policy documented at the
 //! [`opensolid_core`] crate level: fallible public APIs (e.g. the [`Curve3`]
@@ -36,8 +38,9 @@ pub mod surface;
 pub mod sweep;
 pub mod tessellate;
 pub mod topology;
+pub mod transform;
 
-pub use boolean::{AnalyticFace, AnalyticSolid, BooleanOp, BooleanOutput, SolidEdge};
+pub use boolean::{BooleanOp, BooleanOutput};
 pub use check::{CheckFailure, EntityRef, MAX_ALLOWED_TOLERANCE};
 pub use curve::{Curve3, CurveEval};
 pub use euler::{EulerCounts, EulerError};
@@ -55,3 +58,4 @@ pub use topology::{
     Body, BodyType, Curve, Edge, Face, FaceSense, Fin, FinSense, Loop, LoopType, SYSTEM_RESOLUTION,
     Shell, ShellOrientation, TopologyStore, Vertex,
 };
+pub use transform::translate_body;

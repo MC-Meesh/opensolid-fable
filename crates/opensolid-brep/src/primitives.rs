@@ -61,11 +61,8 @@ fn positive_dim(name: &'static str, value: f64) -> CoreResult<f64> {
     Ok(value)
 }
 
-/// Create an edge with attached curve geometry and exact parameter range.
-///
-/// Unlike [`TopologyStore::create_edge`], handles closed edges
-/// (`start == end`): the edge registers on the shared vertex once, not
-/// twice.
+/// Create an edge with attached curve geometry and exact parameter range
+/// ([`TopologyStore::create_edge_with_curve`] at system resolution).
 fn make_edge(
     store: &mut TopologyStore,
     start: EntityId<Vertex>,
@@ -74,30 +71,7 @@ fn make_edge(
     t_start: f64,
     t_end: f64,
 ) -> EntityId<Edge> {
-    let edge = store.edges.insert(Edge {
-        curve: Some(curve),
-        start_vertex: start,
-        end_vertex: end,
-        t_start,
-        t_end,
-        tolerance: SYSTEM_RESOLUTION,
-        fins: Vec::new(),
-    });
-    store
-        .vertices
-        .get_mut(start)
-        .expect("make_edge: stale start Vertex id")
-        .edges
-        .push(edge);
-    if end != start {
-        store
-            .vertices
-            .get_mut(end)
-            .expect("make_edge: stale end Vertex id")
-            .edges
-            .push(edge);
-    }
-    edge
+    store.create_edge_with_curve(start, end, SYSTEM_RESOLUTION, curve, t_start, t_end)
 }
 
 /// Axis-aligned rectangular block centered at the origin, with extents

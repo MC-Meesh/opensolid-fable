@@ -2,9 +2,12 @@
 //! (`spec/04-booleans.md` at the spec/12 "minimum viable" level).
 //!
 //! [`unite`], [`subtract`], and [`intersect`] combine two transversal
-//! [`AnalyticSolid`]s — closed outward-oriented shells whose faces carry
-//! analytic surfaces ([`Surface3`], planes and cylinders for now) and whose
-//! edges carry exact [`Curve3`] geometry — through the spec pipeline:
+//! solid bodies living in one [`TopologyStore`]/[`GeometryStore`] pair —
+//! closed outward-oriented shells whose faces bind analytic surfaces
+//! ([`Surface3`], planes and cylinders for now) and whose edges bind exact
+//! [`Curve3`] geometry, exactly what [`crate::primitives`] and
+//! [`crate::transform::translate_body`] produce — through the spec
+//! pipeline:
 //!
 //! 1. **Clash**: dilated face bounding boxes (from sampled boundaries) are
 //!    indexed in a [`Bvh`] per solid and candidate face pairs come from a
@@ -34,13 +37,20 @@
 //! than planes and cylinders are likewise `NotImplemented` for now (the
 //! parameter charts and ray intersections below extend naturally).
 //!
-//! Like [`crate::sweep`], the result keeps its defining geometry beside the
-//! topology store because the store's geometry slots (`Edge::curve`,
-//! `Face::surface`) are still placeholders; binding real geometry to the
-//! topology is a later issue.
+//! The result body binds real geometry through its own stores
+//! ([`BooleanOutput::store`] + [`BooleanOutput::geo`]): every face carries
+//! the [`Surface3`] of its host input face (regions split from one face
+//! share one surface id), and every edge carries its source [`Curve3`] —
+//! an original input edge's curve or the exact SSI intersection curve —
+//! with the parameter range recovered by closest-point projection
+//! ([`CurveProject`]). Vertices sit on sampled polylines, so edge and
+//! vertex tolerances record the actual curve-endpoint-to-vertex residual
+//! (tolerant modeling, `spec/08-tolerances.md`).
 
 use crate::check::CheckFailure;
 use crate::curve::{Curve3, CurveEval, TWO_PI, plane_basis};
+use crate::geometry::GeometryStore;
+use crate::project::CurveProject;
 use crate::ssi::{IntersectionKind, SurfaceIntersection, intersect as ssi_intersect};
 use crate::surface::Surface3;
 use crate::topology::{
@@ -88,23 +98,23 @@ pub enum BooleanOp {
 
 /// A directed use of a solid's edge in a face loop.
 #[derive(Debug, Clone, Copy)]
-pub struct DirectedEdge {
+struct DirectedEdge {
     /// Index into [`AnalyticSolid`]'s edge list.
-    pub edge: usize,
+    edge: usize,
     /// Traversal direction relative to the edge's parameterization.
-    pub forward: bool,
+    forward: bool,
 }
 
 /// An exact edge of an [`AnalyticSolid`]: a [`Curve3`] restricted to
 /// `[t0, t1]`. A closed edge (full circle) has `t1 - t0` equal to the
 /// period and identical endpoints.
 #[derive(Debug, Clone)]
-pub struct SolidEdge {
-    pub curve: Curve3,
-    pub t0: f64,
-    pub t1: f64,
+struct SolidEdge {
+    curve: Curve3,
+    t0: f64,
+    t1: f64,
     /// Whether the edge is a closed ring (start point = end point).
-    pub closed: bool,
+    closed: bool,
 }
 
 /// A face of an [`AnalyticSolid`]: an analytic surface trimmed by loops of
@@ -112,170 +122,129 @@ pub struct SolidEdge {
 /// counterclockwise (outer) / clockwise (holes) as seen from the face's
 /// outward side.
 #[derive(Debug, Clone)]
-pub struct AnalyticFace {
-    pub surface: Surface3,
+struct AnalyticFace {
+    surface: Surface3,
     /// Whether the face's outward normal equals the surface normal.
-    pub outward_along_normal: bool,
-    pub loops: Vec<Vec<DirectedEdge>>,
+    outward_along_normal: bool,
+    loops: Vec<Vec<DirectedEdge>>,
 }
 
-/// A closed, outward-oriented solid with exact analytic geometry: the
-/// input (and conceptual output) representation of the boolean pipeline.
+/// The pipeline's working view of one input body: a closed,
+/// outward-oriented solid with exact analytic geometry, extracted from a
+/// store-backed body by [`extract_solid`].
 #[derive(Debug, Clone)]
-pub struct AnalyticSolid {
-    pub edges: Vec<SolidEdge>,
-    pub faces: Vec<AnalyticFace>,
+struct AnalyticSolid {
+    edges: Vec<SolidEdge>,
+    faces: Vec<AnalyticFace>,
 }
 
-impl AnalyticSolid {
-    /// Axis-aligned block spanning `min` to `max`.
-    ///
-    /// # Errors
-    /// [`CoreError::InvalidArgument`] if any extent is not strictly
-    /// positive and finite.
-    pub fn block(min: Point3, max: Point3) -> CoreResult<Self> {
-        let d = max - min;
-        if !(d.x > 0.0 && d.y > 0.0 && d.z > 0.0 && d.iter().all(|c| c.is_finite())) {
-            return Err(CoreError::InvalidArgument {
-                argument: "max",
-                reason: format!("block extents must be positive and finite, got {d:?}"),
-            });
-        }
-        // Corner index bit k set = max along axis k (x=1, y=2, z=4).
-        let corner = |mask: usize| {
-            Point3::new(
-                if mask & 1 != 0 { max.x } else { min.x },
-                if mask & 2 != 0 { max.y } else { min.y },
-                if mask & 4 != 0 { max.z } else { min.z },
-            )
-        };
-        let mut edges = Vec::new();
-        let mut edge_between = HashMap::new();
-        let mut edge_index = |edges: &mut Vec<SolidEdge>, a: usize, b: usize| {
-            let key = (a.min(b), a.max(b));
-            *edge_between.entry(key).or_insert_with(|| {
-                let (pa, pb) = (corner(key.0), corner(key.1));
-                let curve = Curve3::line(pa, pb - pa).expect("distinct corners");
-                let len = (pb - pa).norm();
-                edges.push(SolidEdge {
-                    curve,
-                    t0: 0.0,
-                    t1: len,
-                    closed: false,
-                });
-                edges.len() - 1
-            })
-        };
-        // Each face: (fixed axis bit, at max?, corner cycle CCW from outside).
-        let face_cycles: [(Vector3, [usize; 4]); 6] = [
-            (-Vector3::x(), [0, 4, 6, 2]), // x = min
-            (Vector3::x(), [1, 3, 7, 5]),  // x = max
-            (-Vector3::y(), [0, 1, 5, 4]), // y = min
-            (Vector3::y(), [2, 6, 7, 3]),  // y = max
-            (-Vector3::z(), [0, 2, 3, 1]), // z = min
-            (Vector3::z(), [4, 5, 7, 6]),  // z = max
-        ];
-        let mut faces = Vec::new();
-        for (normal, cycle) in face_cycles {
-            let origin = corner(cycle[0]);
-            let surface = Surface3::plane(origin, normal).expect("unit normal");
-            let mut boundary = Vec::new();
-            for i in 0..4 {
-                let (a, b) = (cycle[i], cycle[(i + 1) % 4]);
-                let idx = edge_index(&mut edges, a, b);
-                boundary.push(DirectedEdge {
-                    edge: idx,
-                    forward: a < b,
-                });
+/// Flatten a store-backed body into the pipeline's [`AnalyticSolid`] view:
+/// dereference every face's [`Surface3`] and every edge's [`Curve3`]
+/// through `geo`, and turn loop fins into indexed directed edges.
+///
+/// `argument` names the body in error messages (`"a"` or `"b"`).
+///
+/// # Errors
+/// [`CoreError::InvalidArgument`] if the body id is stale, the body is not
+/// a [`BodyType::Solid`], or any face/edge lacks bound geometry.
+fn extract_solid(
+    store: &TopologyStore,
+    geo: &GeometryStore,
+    body: EntityId<Body>,
+    argument: &'static str,
+) -> CoreResult<AnalyticSolid> {
+    let invalid = |reason: String| CoreError::InvalidArgument { argument, reason };
+    let body_data = store
+        .body(body)
+        .ok_or_else(|| invalid(format!("stale body id {body:?}")))?;
+    if body_data.body_type != BodyType::Solid {
+        return Err(invalid(format!(
+            "boolean inputs must be solid bodies, got {:?}",
+            body_data.body_type
+        )));
+    }
+
+    let mut edges: Vec<SolidEdge> = Vec::new();
+    let mut edge_index: HashMap<EntityId<crate::topology::Edge>, usize> = HashMap::new();
+    let mut faces = Vec::new();
+    for &shell_id in store.shells_of_body(body) {
+        let shell = store.shell(shell_id).expect("live shell");
+        for &face_id in store.faces_of_shell(shell_id) {
+            let face = store.face(face_id).expect("live face");
+            let surface_id = face
+                .surface
+                .ok_or_else(|| invalid(format!("{face_id:?} has no bound surface")))?;
+            let surface = geo
+                .surface(surface_id)
+                .ok_or_else(|| invalid(format!("{face_id:?} references a dead surface id")))?
+                .clone();
+            // Face normal = surface normal XOR sense; outward = face normal
+            // XOR shell orientation.
+            let outward_along_normal = (face.sense == FaceSense::Positive)
+                == (shell.orientation == ShellOrientation::Outward);
+            let mut loops = Vec::new();
+            for loop_id in store.loops_of_face(face_id) {
+                let mut directed = Vec::new();
+                for &fin_id in store.fins_of_loop(loop_id) {
+                    let fin = store.fin(fin_id).expect("live fin");
+                    let edge_id = fin.edge;
+                    let index = match edge_index.get(&edge_id) {
+                        Some(&i) => i,
+                        None => {
+                            let edge = store.edge(edge_id).expect("live edge");
+                            let curve_id = edge.curve.ok_or_else(|| {
+                                invalid(format!("{edge_id:?} has no bound curve"))
+                            })?;
+                            let curve = geo
+                                .curve(curve_id)
+                                .ok_or_else(|| {
+                                    invalid(format!("{edge_id:?} references a dead curve id"))
+                                })?
+                                .clone();
+                            edges.push(SolidEdge {
+                                curve,
+                                t0: edge.t_start,
+                                t1: edge.t_end,
+                                closed: edge.start_vertex == edge.end_vertex,
+                            });
+                            edge_index.insert(edge_id, edges.len() - 1);
+                            edges.len() - 1
+                        }
+                    };
+                    directed.push(DirectedEdge {
+                        edge: index,
+                        forward: fin.sense == FinSense::Forward,
+                    });
+                }
+                if directed.is_empty() {
+                    return Err(invalid(format!(
+                        "{face_id:?} has a degenerate loop; booleans need fin-bounded loops"
+                    )));
+                }
+                loops.push(directed);
+            }
+            if loops.is_empty() {
+                return Err(invalid(format!("{face_id:?} has no loops")));
             }
             faces.push(AnalyticFace {
                 surface,
-                outward_along_normal: true,
-                loops: vec![boundary],
+                outward_along_normal,
+                loops,
             });
         }
-        Ok(Self { edges, faces })
     }
-
-    /// Capped right circular cylinder: radius `radius` about the axis from
-    /// `base` along `axis`, of the given `height`.
-    ///
-    /// # Errors
-    /// [`CoreError::InvalidArgument`] / [`CoreError::Degenerate`] for
-    /// non-positive radius or height, or a degenerate axis.
-    pub fn cylinder(base: Point3, axis: Vector3, radius: f64, height: f64) -> CoreResult<Self> {
-        if height <= 0.0 || !height.is_finite() {
-            return Err(CoreError::InvalidArgument {
-                argument: "height",
-                reason: format!("must be positive and finite, got {height}"),
-            });
-        }
-        let side = Surface3::cylinder(base, axis, radius)?;
-        let Surface3::Cylinder { axis: unit, .. } = &side else {
-            unreachable!("cylinder constructor returns Cylinder")
-        };
-        let unit = *unit;
-        let top_center = base + unit * height;
-        let bottom_circle = Curve3::circle(base, unit, radius)?;
-        let top_circle = Curve3::circle(top_center, unit, radius)?;
-        // Seam meridian at angle 0 (plane_basis of the axis), shared frame
-        // between the circles and the cylinder surface.
-        let (e_u, _) = plane_basis(&unit);
-        let seam_bottom = base + e_u * radius;
-        let seam = Curve3::line(seam_bottom, unit)?;
-        let edges = vec![
-            SolidEdge {
-                curve: bottom_circle,
-                t0: 0.0,
-                t1: TWO_PI,
-                closed: true,
-            },
-            SolidEdge {
-                curve: top_circle,
-                t0: 0.0,
-                t1: TWO_PI,
-                closed: true,
-            },
-            SolidEdge {
-                curve: seam,
-                t0: 0.0,
-                t1: height,
-                closed: false,
-            },
-        ];
-        let de = |edge: usize, forward: bool| DirectedEdge { edge, forward };
-        // Side face: parameter rectangle [0, 2π] x [0, h] traversed CCW
-        // (outward normal is radial): bottom circle forward, seam up at
-        // u = 2π, top circle backward, seam down at u = 0. The seam edge is
-        // used twice with opposite senses (self-mated).
-        let side_face = AnalyticFace {
-            surface: side,
-            outward_along_normal: true,
-            loops: vec![vec![de(0, true), de(2, true), de(1, false), de(2, false)]],
-        };
-        let top_face = AnalyticFace {
-            surface: Surface3::plane(top_center, unit)?,
-            outward_along_normal: true,
-            loops: vec![vec![de(1, true)]],
-        };
-        let bottom_face = AnalyticFace {
-            surface: Surface3::plane(base, -unit)?,
-            outward_along_normal: true,
-            loops: vec![vec![de(0, false)]],
-        };
-        Ok(Self {
-            edges,
-            faces: vec![side_face, top_face, bottom_face],
-        })
-    }
+    Ok(AnalyticSolid { edges, faces })
 }
 
-/// The result of a boolean operation: reconstructed topology plus the
-/// per-face data needed to tessellate (the store's geometry slots are
-/// still placeholders).
+/// The result of a boolean operation: reconstructed topology binding real
+/// geometry through its own [`GeometryStore`], plus the per-face data
+/// needed to tessellate.
 pub struct BooleanOutput {
-    /// The reconstructed topology graph.
+    /// The reconstructed topology graph. Every face binds a [`Surface3`]
+    /// and every edge a [`Curve3`] in [`BooleanOutput::geo`].
     pub store: TopologyStore,
+    /// The geometry referenced by [`BooleanOutput::store`].
+    pub geo: GeometryStore,
     /// The result body inside [`BooleanOutput::store`].
     pub body: EntityId<Body>,
     /// Tessellation payload: one entry per kept face region.
@@ -332,36 +301,46 @@ impl BooleanOutput {
     }
 }
 
-/// Material of A or B.
+/// Material of A or B. Both bodies live in the shared `store`/`geo` pair
+/// (e.g. built by [`crate::primitives`]); the result is returned in its
+/// own stores ([`BooleanOutput`]).
 ///
 /// # Errors
+/// [`CoreError::InvalidArgument`] if either body is stale, not a solid, or
+/// has faces/edges without bound geometry;
 /// [`CoreError::NotImplemented`] for coincident or tangent face contacts
 /// (transversal MVP) and for face surfaces without a parameter chart yet;
 /// [`CoreError::Degenerate`] if a region cannot be classified robustly.
 pub fn unite(
-    a: &AnalyticSolid,
-    b: &AnalyticSolid,
+    store: &TopologyStore,
+    geo: &GeometryStore,
+    a: EntityId<Body>,
+    b: EntityId<Body>,
     tol: &ToleranceContext,
 ) -> CoreResult<BooleanOutput> {
-    boolean(BooleanOp::Unite, a, b, tol)
+    boolean(BooleanOp::Unite, store, geo, a, b, tol)
 }
 
 /// Material of A and not B. See [`unite`] for errors.
 pub fn subtract(
-    a: &AnalyticSolid,
-    b: &AnalyticSolid,
+    store: &TopologyStore,
+    geo: &GeometryStore,
+    a: EntityId<Body>,
+    b: EntityId<Body>,
     tol: &ToleranceContext,
 ) -> CoreResult<BooleanOutput> {
-    boolean(BooleanOp::Subtract, a, b, tol)
+    boolean(BooleanOp::Subtract, store, geo, a, b, tol)
 }
 
 /// Material of A and B. See [`unite`] for errors.
 pub fn intersect(
-    a: &AnalyticSolid,
-    b: &AnalyticSolid,
+    store: &TopologyStore,
+    geo: &GeometryStore,
+    a: EntityId<Body>,
+    b: EntityId<Body>,
     tol: &ToleranceContext,
 ) -> CoreResult<BooleanOutput> {
-    boolean(BooleanOp::Intersect, a, b, tol)
+    boolean(BooleanOp::Intersect, store, geo, a, b, tol)
 }
 
 // ---------------------------------------------------------------------
@@ -590,6 +569,8 @@ enum CurveSource {
 struct Imprint {
     face_a: usize,
     face_b: usize,
+    /// The exact SSI curve the samples came from (bound to result edges).
+    curve: Curve3,
     sampled: SampledCurve,
 }
 
@@ -632,11 +613,15 @@ struct Pipeline<'a> {
 /// Boolean pipeline entry point.
 fn boolean(
     op: BooleanOp,
-    a: &AnalyticSolid,
-    b: &AnalyticSolid,
+    store: &TopologyStore,
+    geo: &GeometryStore,
+    a: EntityId<Body>,
+    b: EntityId<Body>,
     tol: &ToleranceContext,
 ) -> CoreResult<BooleanOutput> {
-    let mut pipe = Pipeline::new(a, b, tol)?;
+    let solid_a = extract_solid(store, geo, a, "a")?;
+    let solid_b = extract_solid(store, geo, b, "b")?;
+    let mut pipe = Pipeline::new(&solid_a, &solid_b, tol)?;
     pipe.find_imprints()?;
     pipe.collect_splits();
     let (atoms, atoms_by_source) = pipe.build_atoms();
@@ -794,6 +779,7 @@ impl<'a> Pipeline<'a> {
             self.imprints.push(Imprint {
                 face_a: fa,
                 face_b: fb,
+                curve: curve.clone(),
                 sampled: SampledCurve {
                     points: ts.iter().map(|&t| curve.point(t)).collect(),
                     closed: true,
@@ -870,6 +856,7 @@ impl<'a> Pipeline<'a> {
                 self.imprints.push(Imprint {
                     face_a: fa,
                     face_b: fb,
+                    curve: curve.clone(),
                     sampled: SampledCurve {
                         points: pts,
                         closed: false,
@@ -1051,7 +1038,20 @@ impl<'a> Pipeline<'a> {
             }
         }
 
-        build_output(self, op, &atoms, kept)
+        // Invert the by-source index: which source curve produced each atom
+        // (build_output binds that curve's geometry to the atom's edge).
+        let mut atom_source: Vec<Option<CurveSource>> = vec![None; atoms.len()];
+        for (&source, ids) in &atoms_by_source {
+            for &ai in ids {
+                atom_source[ai] = Some(source);
+            }
+        }
+        let atom_source: Vec<CurveSource> = atom_source
+            .into_iter()
+            .map(|s| s.expect("every atom comes from exactly one source"))
+            .collect();
+
+        build_output(self, op, &atoms, &atom_source, kept)
     }
 
     /// Ray-parity containment of a point in one of the input solids.
@@ -1898,14 +1898,24 @@ struct MeshRing {
     points: Vec<Point3>,
 }
 
+/// The exact source curve an atom was sampled from.
+fn source_curve<'p>(pipe: &'p Pipeline<'_>, source: CurveSource) -> &'p Curve3 {
+    match source {
+        CurveSource::Edge { solid, edge } => &pipe.solids[solid].edges[edge].curve,
+        CurveSource::Imprint { index } => &pipe.imprints[index].curve,
+    }
+}
+
 fn build_output(
     pipe: &Pipeline<'_>,
     _op: BooleanOp,
     atoms: &[Atom],
+    atom_source: &[CurveSource],
     kept: Vec<KeptRegion>,
 ) -> CoreResult<BooleanOutput> {
     let snap = pipe.snap;
     let mut store = TopologyStore::new();
+    let mut geo = GeometryStore::new();
     let body = store.create_body(BodyType::Solid);
 
     // Shell partition: union-find over kept regions via shared atoms.
@@ -1935,8 +1945,12 @@ fn build_output(
     let mut shells: HashMap<usize, EntityId<crate::topology::Shell>> = HashMap::new();
 
     // Vertices and edges, deduplicated by quantized 3D position / atom id.
+    // Geometry is shared: one output surface id per host face (all regions
+    // split from it), one output curve id per source curve.
     let mut vertex_of: HashMap<(i64, i64, i64), EntityId<crate::topology::Vertex>> = HashMap::new();
     let mut edge_of_atom: HashMap<usize, EntityId<crate::topology::Edge>> = HashMap::new();
+    let mut surface_of_host: HashMap<(SolidTag, usize), EntityId<Surface3>> = HashMap::new();
+    let mut curve_of_source: HashMap<CurveSource, EntityId<Curve3>> = HashMap::new();
 
     let mut mesh_faces = Vec::new();
     let mut face_count = 0usize;
@@ -1956,6 +1970,10 @@ fn build_output(
                 FaceSense::Negative
             },
         );
+        let surface_id = *surface_of_host
+            .entry((kr.solid, kr.face))
+            .or_insert_with(|| geo.add_surface(face_data.surface.clone()));
+        store.faces.get_mut(face_id).expect("just created").surface = Some(surface_id);
         face_count += 1;
 
         for (ci, cycle) in kr.region.cycles.iter().enumerate() {
@@ -1977,21 +1995,66 @@ fn build_output(
             };
             for (ai, forward) in darts {
                 let atom = &atoms[ai];
-                let edge_id = *edge_of_atom.entry(ai).or_insert_with(|| {
-                    let start_p = atom.points[0];
-                    let end_p = if atom.closed {
-                        start_p
-                    } else {
-                        atom.points[atom.points.len() - 1]
-                    };
-                    let sv = *vertex_of
-                        .entry(quantize(&start_p, snap * 4.0))
-                        .or_insert_with(|| store.create_vertex(start_p, SYSTEM_RESOLUTION));
-                    let ev = *vertex_of
-                        .entry(quantize(&end_p, snap * 4.0))
-                        .or_insert_with(|| store.create_vertex(end_p, SYSTEM_RESOLUTION));
-                    store.create_edge(sv, ev, SYSTEM_RESOLUTION)
-                });
+                let edge_id = match edge_of_atom.get(&ai) {
+                    Some(&edge_id) => edge_id,
+                    None => {
+                        let start_p = atom.points[0];
+                        let end_p = if atom.closed {
+                            start_p
+                        } else {
+                            atom.points[atom.points.len() - 1]
+                        };
+                        let sv = *vertex_of
+                            .entry(quantize(&start_p, snap * 4.0))
+                            .or_insert_with(|| store.create_vertex(start_p, SYSTEM_RESOLUTION));
+                        let ev = *vertex_of
+                            .entry(quantize(&end_p, snap * 4.0))
+                            .or_insert_with(|| store.create_vertex(end_p, SYSTEM_RESOLUTION));
+
+                        // Bind the atom's source curve with the parameter
+                        // range recovered by exact closest-point projection.
+                        // Atom polylines run in increasing curve parameter,
+                        // so a wrapped range on a periodic curve unwraps
+                        // forward by one period.
+                        let source = atom_source[ai];
+                        let curve = source_curve(pipe, source);
+                        let curve_id = *curve_of_source
+                            .entry(source)
+                            .or_insert_with(|| geo.add_curve(curve.clone()));
+                        let t_first = curve.project_point(&start_p).t;
+                        let (t_start, t_end) = if atom.closed {
+                            let period = curve
+                                .period()
+                                .expect("closed atoms come from periodic curves");
+                            (t_first, t_first + period)
+                        } else {
+                            let mut t_last = curve.project_point(&end_p).t;
+                            if let Some(period) = curve.period() {
+                                if t_last <= t_first {
+                                    t_last += period;
+                                }
+                            }
+                            (t_first, t_last)
+                        };
+
+                        // Tolerant modeling: vertices come from sampled
+                        // polylines (imprint refinement, seam interpolation),
+                        // so record the true curve-endpoint-to-vertex gap.
+                        let d_start =
+                            (curve.point(t_start) - store.vertex(sv).expect("live").point).norm();
+                        let d_end =
+                            (curve.point(t_end) - store.vertex(ev).expect("live").point).norm();
+                        let tolerance = SYSTEM_RESOLUTION.max(d_start).max(d_end);
+                        let edge_id = store
+                            .create_edge_with_curve(sv, ev, tolerance, curve_id, t_start, t_end);
+                        for (v, d) in [(sv, d_start), (ev, d_end)] {
+                            let vertex = store.vertices.get_mut(v).expect("live");
+                            vertex.tolerance = vertex.tolerance.max(d);
+                        }
+                        edge_of_atom.insert(ai, edge_id);
+                        edge_id
+                    }
+                };
                 entries.push((
                     edge_id,
                     if forward {
@@ -2048,6 +2111,7 @@ fn build_output(
     let shell_count = shells.len();
     Ok(BooleanOutput {
         store,
+        geo,
         body,
         mesh_faces,
         face_count,
@@ -2312,9 +2376,43 @@ fn segments_cross(p1: (f64, f64), p2: (f64, f64), q1: (f64, f64), q2: (f64, f64)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::check::MAX_ALLOWED_TOLERANCE;
+    use crate::primitives;
+    use crate::transform::translate_body;
 
     fn tol() -> ToleranceContext {
         ToleranceContext::default()
+    }
+
+    fn stores() -> (TopologyStore, GeometryStore) {
+        (TopologyStore::new(), GeometryStore::new())
+    }
+
+    /// Origin-centered block moved to `center`.
+    fn block_at(
+        store: &mut TopologyStore,
+        geo: &mut GeometryStore,
+        sizes: (f64, f64, f64),
+        center: (f64, f64, f64),
+    ) -> EntityId<Body> {
+        let body = primitives::block(store, geo, sizes.0, sizes.1, sizes.2).expect("valid block");
+        translate_body(store, geo, body, Vector3::new(center.0, center.1, center.2))
+            .expect("finite offset");
+        body
+    }
+
+    /// Origin-centered +Z cylinder moved to `center`.
+    fn cylinder_at(
+        store: &mut TopologyStore,
+        geo: &mut GeometryStore,
+        radius: f64,
+        height: f64,
+        center: (f64, f64, f64),
+    ) -> EntityId<Body> {
+        let body = primitives::cylinder(store, geo, radius, height).expect("valid cylinder");
+        translate_body(store, geo, body, Vector3::new(center.0, center.1, center.2))
+            .expect("finite offset");
+        body
     }
 
     fn assert_valid(out: &BooleanOutput, context: &str) {
@@ -2332,18 +2430,55 @@ mod tests {
         );
     }
 
-    #[test]
-    fn block_construction_is_valid_input() {
-        let block = AnalyticSolid::block(Point3::origin(), Point3::new(2.0, 3.0, 1.0)).unwrap();
-        assert_eq!(block.faces.len(), 6);
-        assert_eq!(block.edges.len(), 12);
-    }
-
-    #[test]
-    fn cylinder_construction_is_valid_input() {
-        let cyl = AnalyticSolid::cylinder(Point3::origin(), Vector3::z(), 1.0, 2.0).unwrap();
-        assert_eq!(cyl.faces.len(), 3);
-        assert_eq!(cyl.edges.len(), 3);
+    /// Every face binds a live surface and every edge a live curve whose
+    /// endpoints interpolate the edge's vertices within the recorded
+    /// tolerances.
+    fn assert_geometry_bound(out: &BooleanOutput, context: &str) {
+        for face in out.store.faces_of_body(out.body) {
+            let surface_id = out
+                .store
+                .face(face)
+                .unwrap()
+                .surface
+                .unwrap_or_else(|| panic!("{context}: {face:?} has no bound surface"));
+            assert!(
+                out.geo.surface(surface_id).is_some(),
+                "{context}: {face:?} references a dead surface id"
+            );
+            for edge_id in out.store.edges_of_face(face) {
+                let edge = out.store.edge(edge_id).unwrap();
+                let curve_id = edge
+                    .curve
+                    .unwrap_or_else(|| panic!("{context}: {edge_id:?} has no bound curve"));
+                let curve = out
+                    .geo
+                    .curve(curve_id)
+                    .unwrap_or_else(|| panic!("{context}: {edge_id:?} dead curve id"));
+                assert!(
+                    edge.t_end > edge.t_start,
+                    "{context}: {edge_id:?} has empty parameter range"
+                );
+                assert!(
+                    edge.tolerance <= MAX_ALLOWED_TOLERANCE,
+                    "{context}: {edge_id:?} tolerance {} above limit",
+                    edge.tolerance
+                );
+                for (t, v) in [
+                    (edge.t_start, edge.start_vertex),
+                    (edge.t_end, edge.end_vertex),
+                ] {
+                    let vertex = out.store.vertex(v).unwrap();
+                    let gap = (curve.point(t) - vertex.point).norm();
+                    assert!(
+                        gap <= edge.tolerance.max(vertex.tolerance) + 1e-12,
+                        "{context}: {edge_id:?} endpoint off vertex by {gap:.2e} \
+                         (edge tol {:.2e}, vertex tol {:.2e})",
+                        edge.tolerance,
+                        vertex.tolerance
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -2351,13 +2486,14 @@ mod tests {
         // Cylinder pierces the block completely: the result is the block
         // with a cylindrical hole — 6 block faces (top and bottom gaining
         // a circular inner loop) plus the trimmed cylinder wall.
-        let block = AnalyticSolid::block(Point3::origin(), Point3::new(4.0, 4.0, 2.0)).unwrap();
-        let tool =
-            AnalyticSolid::cylinder(Point3::new(2.0, 2.0, -1.0), Vector3::z(), 1.0, 4.0).unwrap();
-        let out = subtract(&block, &tool, &tol()).unwrap();
+        let (mut store, mut geo) = stores();
+        let block = block_at(&mut store, &mut geo, (4.0, 4.0, 2.0), (2.0, 2.0, 1.0));
+        let tool = cylinder_at(&mut store, &mut geo, 1.0, 4.0, (2.0, 2.0, 1.0));
+        let out = subtract(&store, &geo, block, tool, &tol()).unwrap();
         assert_eq!(out.face_count(), 7, "6 block faces + 1 cylinder band");
         assert_eq!(out.shell_count(), 1);
         assert_valid(&out, "block minus cylinder");
+        assert_geometry_bound(&out, "block minus cylinder");
         // Through-hole: genus 1.
         let counts = out.store.euler_counts(out.body);
         assert_eq!(counts.genus, 1, "through hole must give genus 1");
@@ -2367,25 +2503,27 @@ mod tests {
     fn unite_overlapping_blocks_face_count() {
         // Corner overlap: each block keeps 3 untouched faces and 3
         // L-shaped trimmed faces — 12 faces total.
-        let a = AnalyticSolid::block(Point3::origin(), Point3::new(2.0, 2.0, 2.0)).unwrap();
-        let b =
-            AnalyticSolid::block(Point3::new(1.0, 1.0, 1.0), Point3::new(3.0, 3.0, 3.0)).unwrap();
-        let out = unite(&a, &b, &tol()).unwrap();
+        let (mut store, mut geo) = stores();
+        let a = block_at(&mut store, &mut geo, (2.0, 2.0, 2.0), (1.0, 1.0, 1.0));
+        let b = block_at(&mut store, &mut geo, (2.0, 2.0, 2.0), (2.0, 2.0, 2.0));
+        let out = unite(&store, &geo, a, b, &tol()).unwrap();
         assert_eq!(out.face_count(), 12);
         assert_eq!(out.shell_count(), 1);
         assert_valid(&out, "union of overlapping blocks");
+        assert_geometry_bound(&out, "union of overlapping blocks");
         let counts = out.store.euler_counts(out.body);
         assert_eq!(counts.genus, 0);
     }
 
     #[test]
     fn intersect_overlapping_blocks_is_overlap_box() {
-        let a = AnalyticSolid::block(Point3::origin(), Point3::new(2.0, 2.0, 2.0)).unwrap();
-        let b =
-            AnalyticSolid::block(Point3::new(1.0, 1.0, 1.0), Point3::new(3.0, 3.0, 3.0)).unwrap();
-        let out = intersect(&a, &b, &tol()).unwrap();
+        let (mut store, mut geo) = stores();
+        let a = block_at(&mut store, &mut geo, (2.0, 2.0, 2.0), (1.0, 1.0, 1.0));
+        let b = block_at(&mut store, &mut geo, (2.0, 2.0, 2.0), (2.0, 2.0, 2.0));
+        let out = intersect(&store, &geo, a, b, &tol()).unwrap();
         assert_eq!(out.face_count(), 6, "intersection of blocks is a block");
         assert_valid(&out, "intersection of overlapping blocks");
+        assert_geometry_bound(&out, "intersection of overlapping blocks");
         let mesh = out.tessellate().unwrap();
         let bb = mesh.bounding_box().expect("non-empty mesh");
         for (got, want) in [
@@ -2405,21 +2543,22 @@ mod tests {
 
     #[test]
     fn unite_disjoint_solids_keeps_two_shells() {
-        let a = AnalyticSolid::block(Point3::origin(), Point3::new(1.0, 1.0, 1.0)).unwrap();
-        let b =
-            AnalyticSolid::block(Point3::new(5.0, 5.0, 5.0), Point3::new(6.0, 6.0, 6.0)).unwrap();
-        let out = unite(&a, &b, &tol()).unwrap();
+        let (mut store, mut geo) = stores();
+        let a = block_at(&mut store, &mut geo, (1.0, 1.0, 1.0), (0.0, 0.0, 0.0));
+        let b = block_at(&mut store, &mut geo, (1.0, 1.0, 1.0), (5.0, 5.0, 5.0));
+        let out = unite(&store, &geo, a, b, &tol()).unwrap();
         assert_eq!(out.face_count(), 12);
         assert_eq!(out.shell_count(), 2);
         assert_valid(&out, "union of disjoint blocks");
+        assert_geometry_bound(&out, "union of disjoint blocks");
     }
 
     #[test]
     fn intersect_disjoint_solids_is_empty() {
-        let a = AnalyticSolid::block(Point3::origin(), Point3::new(1.0, 1.0, 1.0)).unwrap();
-        let b =
-            AnalyticSolid::block(Point3::new(5.0, 5.0, 5.0), Point3::new(6.0, 6.0, 6.0)).unwrap();
-        let out = intersect(&a, &b, &tol()).unwrap();
+        let (mut store, mut geo) = stores();
+        let a = block_at(&mut store, &mut geo, (1.0, 1.0, 1.0), (0.0, 0.0, 0.0));
+        let b = block_at(&mut store, &mut geo, (1.0, 1.0, 1.0), (5.0, 5.0, 5.0));
+        let out = intersect(&store, &geo, a, b, &tol()).unwrap();
         assert_eq!(out.face_count(), 0);
         assert_eq!(out.shell_count(), 0);
     }
@@ -2428,22 +2567,87 @@ mod tests {
     fn subtract_embedded_cylinder_makes_internal_void() {
         // Tool entirely inside the block: no face crossings at all; the
         // subtract keeps the whole reversed tool boundary as a void shell.
-        let block = AnalyticSolid::block(Point3::origin(), Point3::new(4.0, 4.0, 4.0)).unwrap();
-        let tool =
-            AnalyticSolid::cylinder(Point3::new(2.0, 2.0, 1.0), Vector3::z(), 1.0, 2.0).unwrap();
-        let out = subtract(&block, &tool, &tol()).unwrap();
+        let (mut store, mut geo) = stores();
+        let block = block_at(&mut store, &mut geo, (4.0, 4.0, 4.0), (0.0, 0.0, 0.0));
+        let tool = cylinder_at(&mut store, &mut geo, 1.0, 2.0, (0.0, 0.0, 0.0));
+        let out = subtract(&store, &geo, block, tool, &tol()).unwrap();
         assert_eq!(out.face_count(), 9, "6 block faces + 3 reversed tool faces");
         assert_eq!(out.shell_count(), 2, "outer shell + void shell");
         assert_valid(&out, "block with internal void");
+        assert_geometry_bound(&out, "block with internal void");
+    }
+
+    #[test]
+    fn output_binds_host_surfaces_and_source_curves() {
+        // Through-hole case: the band face must carry the tool's cylinder
+        // surface, and the hole rims must be circles of the tool's radius.
+        let (mut store, mut geo) = stores();
+        let block = block_at(&mut store, &mut geo, (4.0, 4.0, 2.0), (0.0, 0.0, 0.0));
+        let tool = cylinder_at(&mut store, &mut geo, 1.0, 4.0, (0.0, 0.0, 0.0));
+        let out = subtract(&store, &geo, block, tool, &tol()).unwrap();
+
+        let faces = out.store.faces_of_body(out.body);
+        let cylinder_faces: Vec<_> = faces
+            .iter()
+            .filter(|&&f| {
+                let id = out.store.face(f).unwrap().surface.unwrap();
+                matches!(out.geo.surface(id).unwrap(), Surface3::Cylinder { .. })
+            })
+            .copied()
+            .collect();
+        assert_eq!(cylinder_faces.len(), 1, "exactly one cylindrical band");
+
+        let mut rim_circles = 0;
+        for edge_id in out.store.edges_of_face(cylinder_faces[0]) {
+            let edge = out.store.edge(edge_id).unwrap();
+            if let Curve3::Circle { radius, .. } = out.geo.curve(edge.curve.unwrap()).unwrap() {
+                assert!((radius - 1.0).abs() < 1e-9, "rim radius must be the tool's");
+                rim_circles += 1;
+            }
+        }
+        assert!(rim_circles >= 2, "band must be rimmed by circular edges");
+    }
+
+    #[test]
+    fn bodies_without_bound_geometry_are_rejected() {
+        let (mut store, mut geo) = stores();
+        let a = block_at(&mut store, &mut geo, (2.0, 2.0, 2.0), (0.0, 0.0, 0.0));
+        let b = block_at(&mut store, &mut geo, (2.0, 2.0, 2.0), (1.0, 1.0, 1.0));
+        // Strip one face's surface binding: extraction must refuse.
+        let face = store.faces_of_body(b)[0];
+        store.faces.get_mut(face).unwrap().surface = None;
+        let err = unite(&store, &geo, a, b, &tol()).unwrap_err();
+        assert!(
+            matches!(err, CoreError::InvalidArgument { argument: "b", .. }),
+            "expected InvalidArgument for unbound geometry, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("surface"),
+            "unhelpful error: {err}"
+        );
+    }
+
+    #[test]
+    fn sphere_inputs_hit_the_chart_gap() {
+        // Spheres extract fine but have no boolean parameter chart yet.
+        let (mut store, mut geo) = stores();
+        let a = block_at(&mut store, &mut geo, (2.0, 2.0, 2.0), (0.0, 0.0, 0.0));
+        let b = primitives::sphere(&mut store, &mut geo, 1.0).expect("valid sphere");
+        let err = unite(&store, &geo, a, b, &tol()).unwrap_err();
+        assert!(
+            matches!(err, CoreError::NotImplemented { .. }),
+            "expected NotImplemented for sphere charts, got {err:?}"
+        );
+        assert!(err.to_string().contains("sphere"), "unhelpful error: {err}");
     }
 
     #[test]
     fn coincident_faces_are_not_implemented() {
-        // Blocks sharing the x = 2 plane: coincident faces.
-        let a = AnalyticSolid::block(Point3::origin(), Point3::new(2.0, 2.0, 2.0)).unwrap();
-        let b =
-            AnalyticSolid::block(Point3::new(2.0, 0.0, 0.0), Point3::new(4.0, 2.0, 2.0)).unwrap();
-        let err = unite(&a, &b, &tol()).unwrap_err();
+        // Blocks sharing the x = 1 plane: coincident faces.
+        let (mut store, mut geo) = stores();
+        let a = block_at(&mut store, &mut geo, (2.0, 2.0, 2.0), (0.0, 0.0, 0.0));
+        let b = block_at(&mut store, &mut geo, (2.0, 2.0, 2.0), (2.0, 0.0, 0.0));
+        let err = unite(&store, &geo, a, b, &tol()).unwrap_err();
         assert!(
             matches!(err, CoreError::NotImplemented { .. }),
             "expected NotImplemented for coincident faces, got {err:?}"
@@ -2456,11 +2660,11 @@ mod tests {
 
     #[test]
     fn tangent_contact_is_not_implemented() {
-        // Cylinder wall tangent to the block face plane x = 2.
-        let block = AnalyticSolid::block(Point3::origin(), Point3::new(2.0, 2.0, 2.0)).unwrap();
-        let tool =
-            AnalyticSolid::cylinder(Point3::new(3.0, 1.0, -1.0), Vector3::z(), 1.0, 4.0).unwrap();
-        let err = subtract(&block, &tool, &tol()).unwrap_err();
+        // Cylinder wall tangent to the block face plane x = 1.
+        let (mut store, mut geo) = stores();
+        let block = block_at(&mut store, &mut geo, (2.0, 2.0, 2.0), (0.0, 0.0, 0.0));
+        let tool = cylinder_at(&mut store, &mut geo, 1.0, 4.0, (2.0, 0.0, 0.0));
+        let err = subtract(&store, &geo, block, tool, &tol()).unwrap_err();
         assert!(
             matches!(err, CoreError::NotImplemented { .. }),
             "expected NotImplemented for tangent contact, got {err:?}"

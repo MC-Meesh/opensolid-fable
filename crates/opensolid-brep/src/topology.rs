@@ -349,6 +349,46 @@ impl TopologyStore {
         edge
     }
 
+    /// Create an edge carrying curve geometry with an exact parameter
+    /// range, registered on its vertices. Unlike
+    /// [`TopologyStore::create_edge`], handles closed edges
+    /// (`start_vertex == end_vertex`): the edge registers on the shared
+    /// vertex once, not twice.
+    ///
+    /// Panics if either vertex id is stale.
+    pub fn create_edge_with_curve(
+        &mut self,
+        start_vertex: EntityId<Vertex>,
+        end_vertex: EntityId<Vertex>,
+        tolerance: f64,
+        curve: EntityId<Curve3>,
+        t_start: f64,
+        t_end: f64,
+    ) -> EntityId<Edge> {
+        let edge = self.edges.insert(Edge {
+            curve: Some(curve),
+            start_vertex,
+            end_vertex,
+            t_start,
+            t_end,
+            tolerance,
+            fins: Vec::new(),
+        });
+        self.vertices
+            .get_mut(start_vertex)
+            .expect("create_edge_with_curve: stale start Vertex id")
+            .edges
+            .push(edge);
+        if end_vertex != start_vertex {
+            self.vertices
+                .get_mut(end_vertex)
+                .expect("create_edge_with_curve: stale end Vertex id")
+                .edges
+                .push(edge);
+        }
+        edge
+    }
+
     /// Create a loop on `face` from an ordered sequence of directed edges.
     ///
     /// One fin is created per `(edge, sense)` entry. Fins are linked in a
