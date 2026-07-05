@@ -463,6 +463,17 @@ impl Chart {
             Chart::Cylinder { e_u, e_v, .. } => e_u * u.cos() + e_v * u.sin(),
         }
     }
+
+    /// Model-space length of one unit of `u`: the radius for cylinder
+    /// charts (where `u` is an angle in radians) and 1 for planes. Scaling
+    /// `u` by this puts both parameter axes in model units (arc length),
+    /// so uv distances are meaningful.
+    fn u_scale(&self) -> f64 {
+        match self {
+            Chart::Plane { .. } => 1.0,
+            Chart::Cylinder { radius, .. } => *radius,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -1819,11 +1830,15 @@ fn merge_imprint_chains(atoms: &[Atom], ids: &[usize], snap: f64) -> Vec<DartCha
 
 /// Match an embedded chain's endpoints to two distinct vertices of a
 /// cycle, allowing a whole-period shift of the chain (seam chords match
-/// the two cover copies of one 3D point).
+/// the two cover copies of one 3D point). Distances and the acceptance
+/// band use the arc-length metric — `u` scaled by `u_scale` — because on
+/// cylinder charts `u` is radians while `v` is model units, and a mixed
+/// euclidean metric mis-ranks candidate vertices at extreme aspect ratios.
 fn match_chain_to_cycle(
     cycle: &Cycle,
     chain_poly: &[((f64, f64), Point3)],
     period: Option<f64>,
+    u_scale: f64,
 ) -> Option<(usize, usize)> {
     let (mut lo, mut hi) = (
         (f64::INFINITY, f64::INFINITY),
@@ -1833,7 +1848,7 @@ fn match_chain_to_cycle(
         lo = (lo.0.min(*u), lo.1.min(*v));
         hi = (hi.0.max(*u), hi.1.max(*v));
     }
-    let eps = ((hi.0 - lo.0) + (hi.1 - lo.1)).max(1e-12) * 1e-5;
+    let eps = ((hi.0 - lo.0) * u_scale + (hi.1 - lo.1)).max(1e-12) * 1e-5;
     let s_uv = chain_poly[0].0;
     let e_uv = chain_poly[chain_poly.len() - 1].0;
     let shifts: Vec<f64> = match period {
@@ -1847,7 +1862,8 @@ fn match_chain_to_cycle(
             .enumerate()
             .map(|(k, &off)| {
                 let v = cycle.poly[off].0;
-                (k, ((v.0 - uv.0).powi(2) + (v.1 - uv.1).powi(2)).sqrt())
+                let d = (((v.0 - uv.0) * u_scale).powi(2) + (v.1 - uv.1).powi(2)).sqrt();
+                (k, d)
             })
             .min_by(|a, b| a.1.total_cmp(&b.1))
             .expect("cycle has darts")
@@ -1872,6 +1888,31 @@ fn cyclic_slice(darts: &[(usize, bool)], from: usize, to: usize) -> DartChain {
     } else {
         darts[from..].iter().chain(&darts[..to]).copied().collect()
     }
+}
+
+/// Shift an angle-like probe by whole periods so its `u` lies within half
+/// a period of `poly`'s `u`-midrange (no-op without a period). Each cycle
+/// of a face is mean-aligned into the cover window independently, so two
+/// cycles hugging opposite cover edges can sit a whole period apart even
+/// though they overlap on the surface.
+fn localize_to_window(poly: &[CoverPoint], p: (f64, f64), period: Option<f64>) -> (f64, f64) {
+    let Some(per) = period else {
+        return p;
+    };
+    let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+    for ((u, _), _) in poly {
+        lo = lo.min(*u);
+        hi = hi.max(*u);
+    }
+    let center = 0.5 * (lo + hi);
+    let mut u = p.0;
+    while u - center > 0.5 * per {
+        u -= per;
+    }
+    while center - u > 0.5 * per {
+        u += per;
+    }
+    (u, p.1)
 }
 
 /// Even-odd containment of a probe (already in the face cover) in a region.
@@ -1903,9 +1944,11 @@ fn apply_chain(
     let (chain_poly, _) = embed_walk(face_poly, atoms, &chain, true);
     let period = matches!(face_poly.chart, Chart::Cylinder { .. }).then_some(TWO_PI);
 
+    let u_scale = face_poly.chart.u_scale();
     for ri in 0..regions.len() {
         for ci in 0..regions[ri].cycles.len() {
-            let Some((vi, vj)) = match_chain_to_cycle(&regions[ri].cycles[ci], &chain_poly, period)
+            let Some((vi, vj)) =
+                match_chain_to_cycle(&regions[ri].cycles[ci], &chain_poly, period, u_scale)
             else {
                 continue;
             };
@@ -1929,9 +1972,25 @@ fn apply_chain(
             let mut region_two = Region {
                 cycles: vec![cycle_two],
             };
-            for hole in holes {
+            for mut hole in holes {
                 let probe = hole.poly[0].0;
-                if point_in_cycle(&region_one.cycles[0], probe) {
+                let one = localize_to_window(&region_one.cycles[0].poly, probe, period);
+                let in_one = point_in_cycle(&region_one.cycles[0], one);
+                let localized = if in_one {
+                    one
+                } else {
+                    localize_to_window(&region_two.cycles[0].poly, probe, period)
+                };
+                // Keep the hole in its host's cover window so later
+                // even-odd tests and tessellation see the outer cycle and
+                // its holes as one polygon set.
+                let shift = localized.0 - probe.0;
+                if shift != 0.0 {
+                    for ((u, _), _) in hole.poly.iter_mut() {
+                        *u += shift;
+                    }
+                }
+                if in_one {
                     region_one.cycles.push(hole);
                 } else {
                     region_two.cycles.push(hole);
@@ -1958,18 +2017,26 @@ fn apply_chain(
     let probe = ring.poly[0].0;
     let host = regions
         .iter()
-        .position(|r| region_contains(r, probe))
+        .position(|r| region_contains(r, localize_to_window(&r.cycles[0].poly, probe, period)))
         .ok_or_else(|| CoreError::Degenerate {
             context: "boolean::imprint",
             reason: "an interior imprint ring lies in no region of its host face".into(),
         })?;
-    let (disk, hole) = if ring.area >= 0.0 {
+    let shift = localize_to_window(&regions[host].cycles[0].poly, probe, period).0 - probe.0;
+    let (disk, mut hole) = if ring.area >= 0.0 {
         let hole = embed_cycle(face_poly, atoms, reverse_chain(&ring.darts));
         (ring, hole)
     } else {
         let disk = embed_cycle(face_poly, atoms, reverse_chain(&ring.darts));
         (disk, ring)
     };
+    // The hole joins the host's cycle set: move it into the host's cover
+    // window (the disk keeps its own window as a standalone region).
+    if shift != 0.0 {
+        for ((u, _), _) in hole.poly.iter_mut() {
+            *u += shift;
+        }
+    }
     regions[host].cycles.push(hole);
     regions.push(Region { cycles: vec![disk] });
     Ok(())
@@ -2015,20 +2082,30 @@ fn region_interior_point(chart: &Chart, region: &Region) -> Option<Point3> {
         lo = (lo.0.min(uv.0), lo.1.min(uv.1));
         hi = (hi.0.max(uv.0), hi.1.max(uv.1));
     }
-    let extent = ((hi.0 - lo.0).abs() + (hi.1 - lo.1).abs()).max(1e-12);
-    for scale in [1e-3, 1e-2, 5e-2] {
-        let off = extent * scale;
+    // Work in coordinates normalized by the region's own per-axis extents:
+    // on cylinder charts `u` is radians while `v` is model units, so an
+    // isotropic offset scaled by the summed extents cannot adapt to sliver
+    // regions that are thin along only one axis.
+    let du = (hi.0 - lo.0).max(1e-12);
+    let dv = (hi.1 - lo.1).max(1e-12);
+    // Coarse offsets first (bolder samples classify more robustly); the
+    // sub-1e-3 tail reaches regions that are thin even diagonally.
+    for scale in [5e-2, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6, 1e-7] {
         for i in 0..n {
             let (a, _) = outer.poly[i];
             let (b, _) = outer.poly[(i + 1) % n];
-            let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+            let (dx, dy) = ((b.0 - a.0) / du, (b.1 - a.1) / dv);
             let len = (dx * dx + dy * dy).sqrt();
-            if len < extent * 1e-9 {
+            if len < 1e-9 {
                 continue;
             }
-            // Left normal of a CCW boundary points into the region.
+            // Left normal of a CCW boundary points into the region
+            // (orientation survives the positive per-axis scaling).
             let (nx, ny) = (-dy / len, dx / len);
-            let mid = ((a.0 + b.0) * 0.5 + nx * off, (a.1 + b.1) * 0.5 + ny * off);
+            let mid = (
+                (a.0 + b.0) * 0.5 + nx * scale * du,
+                (a.1 + b.1) * 0.5 + ny * scale * dv,
+            );
             if inside_region(mid) {
                 return Some(chart_point(chart, mid));
             }
@@ -3239,6 +3316,132 @@ mod tests {
             (p - expected).norm() < 1e-9,
             "seam vertex off the exact curve by {:.3e}",
             (p - expected).norm()
+        );
+    }
+
+    #[test]
+    fn match_chain_uses_arc_length_metric_on_cylinder_charts() {
+        // r = 1000: 0.005 rad of u is 5 model units of arc, while vertex B
+        // sits only 0.008 units away along v. A uv-euclidean metric
+        // mis-ranks A (0.005 "closer" than 0.008); the arc-length metric
+        // must pick B (of-9n8).
+        let p = Point3::new(0.0, 0.0, 0.0);
+        let verts = [
+            (0.0, 0.0),      // A: 5 units of arc from the chain start
+            (0.005, 0.008),  // B: 0.008 units from the chain start
+            (0.005, 1000.0), // C
+            (0.0, 1000.0),   // D: nearest to the chain end
+        ];
+        let poly: Vec<CoverPoint> = verts.iter().map(|&uv| (uv, p)).collect();
+        let cycle = Cycle {
+            darts: vec![(0, true); 4],
+            area: shoelace(&poly),
+            dart_offsets: vec![0, 1, 2, 3],
+            poly,
+        };
+        let chain = [((0.005, 0.0), p), ((0.0, 999.995), p)];
+        let got = match_chain_to_cycle(&cycle, &chain, None, 1000.0);
+        assert_eq!(got, Some((1, 3)), "arc-length metric must prefer B over A");
+    }
+
+    #[test]
+    fn interior_point_found_in_grazing_sliver_band() {
+        // A full-period band between two sinusoids 1e-4 units apart (the
+        // uv shape of a grazing tilted cut on an r = 500 wall). Isotropic
+        // probe offsets scaled by the summed extents (≈ 2π + 2) overshoot
+        // the band from every segment; per-axis offsets must not (of-9n8).
+        let chart = Chart::Cylinder {
+            origin: Point3::new(0.0, 0.0, 0.0),
+            axis: Vector3::new(0.0, 0.0, 1.0),
+            e_u: Vector3::new(1.0, 0.0, 0.0),
+            e_v: Vector3::new(0.0, 1.0, 0.0),
+            radius: 500.0,
+        };
+        let h = 1e-4;
+        let n = 96;
+        let mut poly: Vec<CoverPoint> = Vec::new();
+        for i in 0..=n {
+            let u = TWO_PI * f64::from(i) / f64::from(n);
+            let uv = (u, u.sin());
+            poly.push((uv, chart_point(&chart, uv)));
+        }
+        for i in (0..=n).rev() {
+            let u = TWO_PI * f64::from(i) / f64::from(n);
+            let uv = (u, u.sin() + h);
+            poly.push((uv, chart_point(&chart, uv)));
+        }
+        let cycle = Cycle {
+            darts: vec![(0, true)],
+            area: shoelace(&poly),
+            dart_offsets: vec![0],
+            poly,
+        };
+        assert!(cycle.area > 0.0, "band winds CCW");
+        let region = Region {
+            cycles: vec![cycle],
+        };
+        let p = region_interior_point(&chart, &region)
+            .expect("sliver band must yield an interior sample");
+        let radial = (p.x * p.x + p.y * p.y).sqrt();
+        assert!(
+            (radial - 500.0).abs() < 1e-9,
+            "sample must lie on the chart surface, radial = {radial}"
+        );
+    }
+
+    #[test]
+    fn hole_probe_localizes_across_the_cover_edge() {
+        // Cycles of one face are mean-aligned independently, so a hole
+        // and its host can land a whole period apart when they hug
+        // opposite edges of the cover window (of-9n8).
+        let p = Point3::new(0.0, 0.0, 0.0);
+        let square = [(2.6, 0.0), (3.6, 0.0), (3.6, 1.0), (2.6, 1.0)];
+        let poly: Vec<CoverPoint> = square.iter().map(|&uv| (uv, p)).collect();
+        let cycle = Cycle {
+            darts: vec![(0, true); 4],
+            area: shoelace(&poly),
+            dart_offsets: vec![0, 1, 2, 3],
+            poly,
+        };
+        let probe = (3.1 - TWO_PI, 0.5);
+        assert!(
+            !point_in_cycle(&cycle, probe),
+            "raw probe sits outside the host's cover window"
+        );
+        let local = localize_to_window(&cycle.poly, probe, Some(TWO_PI));
+        assert!((local.0 - 3.1).abs() < 1e-12);
+        assert_eq!(local.1, 0.5);
+        assert!(point_in_cycle(&cycle, local));
+        // Planar charts: no period, no shift.
+        assert_eq!(localize_to_window(&cycle.poly, probe, None), probe);
+    }
+
+    #[test]
+    fn subtract_grazing_cut_keeps_thin_band_on_tall_cylinder() {
+        // of-9n8 stress: h = 2000, r = 500 cylinder; the block's bottom
+        // plane grazes 1e-3 above the bottom cap, so the kept wall band
+        // is a full-period sliver — 2π (radians) × 1e-3 (units) in uv.
+        let (mut store, mut geo) = stores();
+        let cyl = cylinder_at(&mut store, &mut geo, 500.0, 2000.0, (0.0, 0.0, 0.0));
+        let band = 1e-3;
+        let block = block_at(
+            &mut store,
+            &mut geo,
+            (2400.0, 2400.0, 2001.0),
+            (0.0, 0.0, -1000.0 + band + 1000.5),
+        );
+        let out = subtract(&store, &geo, cyl, block, &tol()).unwrap();
+        assert_eq!(out.face_count(), 3, "bottom cap + wall band + new top cap");
+        assert_eq!(out.shell_count(), 1);
+        assert_valid(&out, "grazing cut on tall cylinder");
+        assert_geometry_bound(&out, "grazing cut on tall cylinder");
+        let mesh = out.tessellate().unwrap();
+        let bb = mesh.bounding_box().expect("non-empty mesh");
+        assert!((bb.min.z + 1000.0).abs() < 1e-6, "bottom cap preserved");
+        assert!(
+            (bb.max.z + 1000.0 - band).abs() < 1e-6,
+            "sliver top sits at the graze plane, got {}",
+            bb.max.z
         );
     }
 
