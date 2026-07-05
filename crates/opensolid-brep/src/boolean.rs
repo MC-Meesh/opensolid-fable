@@ -2327,10 +2327,11 @@ fn triangulate_mesh_face(mf: &MeshFace, weld_eps: f64) -> CoreResult<(Vec<Triang
         let mb = b.0.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max);
         mb.total_cmp(&ma)
     });
-    for (huv, hp) in holes {
+    for hi in 0..holes.len() {
+        let (huv, hp) = &holes[hi];
         let base = all_uv.len();
-        all_uv.extend_from_slice(&huv);
-        all_p.extend_from_slice(&hp);
+        all_uv.extend_from_slice(huv);
+        all_p.extend_from_slice(hp);
         // Hole vertex with max u.
         let (hi_local, _) = huv
             .iter()
@@ -2338,6 +2339,12 @@ fn triangulate_mesh_face(mf: &MeshFace, weld_eps: f64) -> CoreResult<(Vec<Triang
             .max_by(|a, b| a.1.0.total_cmp(&b.1.0))
             .expect("non-empty hole");
         let h_idx = base + hi_local;
+        // Rings the bridge must not cross: this hole plus every hole not
+        // yet spliced (spliced holes are already polygon segments). A
+        // bridge that merely avoids the current hole can still cut
+        // through a later one, and splicing that hole would then
+        // self-intersect the polygon.
+        let unspliced: Vec<&[(f64, f64)]> = holes[hi..].iter().map(|h| h.0.as_slice()).collect();
         // Polygon vertex to bridge to: nearest by distance whose connecting
         // segment crosses no polygon or hole boundary segment.
         let mut candidates: Vec<usize> = (0..polygon.len()).collect();
@@ -2349,7 +2356,7 @@ fn triangulate_mesh_face(mf: &MeshFace, weld_eps: f64) -> CoreResult<(Vec<Triang
         let mut bridged = false;
         for cand in candidates {
             let p_idx = polygon[cand];
-            if bridge_is_clear(&all_uv, &polygon, &huv, base, all_uv[h_idx], all_uv[p_idx]) {
+            if bridge_is_clear(&all_uv, &polygon, &unspliced, all_uv[h_idx], all_uv[p_idx]) {
                 // Splice: ...p, h, h+1.., h, p...
                 let mut new_poly = Vec::with_capacity(polygon.len() + huv.len() + 2);
                 new_poly.extend_from_slice(&polygon[..=cand]);
@@ -2547,13 +2554,15 @@ fn point_in_triangle(p: (f64, f64), a: (f64, f64), b: (f64, f64), c: (f64, f64))
     !(has_neg && has_pos)
 }
 
-/// Does the candidate bridge segment cross any polygon or hole boundary
-/// segment (excluding segments sharing an endpoint with it)?
+/// Does the candidate bridge segment cross any polygon segment or any
+/// segment of the given hole rings (excluding segments sharing an
+/// endpoint with it)? `hole_rings` must contain every hole not yet
+/// spliced into the polygon, current hole included — already-spliced
+/// holes are covered by the polygon segments.
 fn bridge_is_clear(
     all_uv: &[(f64, f64)],
     polygon: &[usize],
-    hole_uv: &[(f64, f64)],
-    hole_base: usize,
+    hole_rings: &[&[(f64, f64)]],
     from: (f64, f64),
     to: (f64, f64),
 ) -> bool {
@@ -2565,12 +2574,12 @@ fn bridge_is_clear(
             return false;
         }
     }
-    let hn = hole_uv.len();
-    for i in 0..hn {
-        let a = all_uv[hole_base + i];
-        let b = all_uv[hole_base + (i + 1) % hn];
-        if segments_cross(from, to, a, b) {
-            return false;
+    for ring in hole_rings {
+        let hn = ring.len();
+        for i in 0..hn {
+            if segments_cross(from, to, ring[i], ring[(i + 1) % hn]) {
+                return false;
+            }
         }
     }
     true
@@ -3063,5 +3072,55 @@ mod tests {
         assert_geometry_bound(&out, "large block minus r=25 cylinder");
         let counts = out.store.euler_counts(out.body);
         assert_eq!(counts.genus, 1, "through hole must give genus 1");
+    }
+
+    #[test]
+    fn hole_bridge_avoids_unspliced_holes() {
+        // of-299: the rightmost hole's nearest outer vertex lies on the
+        // far side of the second (not yet spliced) hole. A bridge that is
+        // only validated against the outer polygon and the current hole
+        // cuts straight through the second hole, and splicing that hole
+        // afterwards self-intersects the polygon, emitting overlapping
+        // triangles.
+        let ring = |uv: &[(f64, f64)]| MeshRing {
+            uv: uv.to_vec(),
+            points: uv.iter().map(|&(u, v)| Point3::new(u, v, 0.0)).collect(),
+        };
+        // Outer 10x2 rectangle (CCW).
+        let outer = ring(&[(0.0, 0.0), (10.0, 0.0), (10.0, 2.0), (0.0, 2.0)]);
+        // Rightmost hole: flat diamond around (2.5, 0.9), CW, edge slope
+        // 0.2. Its max-u vertex (2.9, 0.9) is nearest to outer corner
+        // (0, 0), and that bridge (slope 0.31) clears the flat diamond
+        // itself but cuts straight through the second hole.
+        let hole_a = ring(&[(2.9, 0.9), (2.5, 0.82), (2.1, 0.9), (2.5, 0.98)]);
+        // Second hole: 0.7 square straddling the (2.9,0.9)-(0,0) segment, CW.
+        let hole_b = ring(&[(0.45, 0.05), (0.45, 0.75), (1.15, 0.75), (1.15, 0.05)]);
+        let mf = MeshFace {
+            chart: Chart::Plane {
+                origin: Point3::new(0.0, 0.0, 0.0),
+                e_u: Vector3::new(1.0, 0.0, 0.0),
+                e_v: Vector3::new(0.0, 1.0, 0.0),
+                normal: Vector3::new(0.0, 0.0, 1.0),
+            },
+            rings: vec![outer, hole_a, hole_b],
+            normal_sign: 1.0,
+        };
+        let (tris, dev) = triangulate_mesh_face(&mf, 1e-9).expect("face triangulates");
+        assert_eq!(dev, 0.0, "planar face has no chordal deviation");
+        // Covered area must equal outer minus both holes; overlapping or
+        // inverted triangles from a self-intersecting splice break this.
+        let area: f64 = tris
+            .iter()
+            .map(|t| {
+                let ab = t.positions[1] - t.positions[0];
+                let ac = t.positions[2] - t.positions[0];
+                ab.cross(&ac).norm() * 0.5
+            })
+            .sum();
+        let expected = 20.0 - 0.064 - 0.49;
+        assert!(
+            (area - expected).abs() < 1e-9,
+            "triangulated area {area} != expected {expected}"
+        );
     }
 }
