@@ -90,6 +90,16 @@ export function entityPointIds(entity) {
   }
 }
 
+/** Translate a set of points rigidly by (dx, dy). */
+export function translatePoints(sketch, ids, dx, dy) {
+  for (const pid of ids) {
+    const p = sketch.points[pid];
+    if (!p) continue;
+    p.x += dx;
+    p.y += dy;
+  }
+}
+
 /** Ids (entity/point) a constraint references. */
 export function constraintRefs(constraint) {
   switch (constraint.type) {

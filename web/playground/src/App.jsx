@@ -462,6 +462,8 @@ export default function App() {
       if (tag === 'INPUT' || tag === 'TEXTAREA') return;
       const cm = event.target.closest('.cm-editor');
       if (cm) return;
+      // Sketch mode owns the keyboard (tools, dimensions, undo, Esc).
+      if (sketchOpen) return;
 
       if (event.key === 't' || event.key === 'T') {
         setGizmoMode('translate');
@@ -476,7 +478,7 @@ export default function App() {
     }
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [clearSelection, sweep, cancelSweep]);
+  }, [clearSelection, sweep, cancelSweep, sketchOpen]);
 
   const handleResolutionChange = useCallback((value) => {
     resolutionRef.current = value;
@@ -590,6 +592,7 @@ export default function App() {
           onPlaneChange={setSketchPlane}
           onProfileChange={handleProfileChange}
           onSweep={handleSweepStart}
+          onExit={() => setSketchOpen(false)}
         />
         <button
           className={`secondary sketch-toggle${sketchOpen ? ' active' : ''}`}

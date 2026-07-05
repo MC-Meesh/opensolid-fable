@@ -13,6 +13,7 @@ import {
   deletePoint,
   entityPointIds,
   entityRadius,
+  translatePoints,
   validateConstraint,
 } from './model.js';
 
@@ -107,6 +108,17 @@ describe('sketch model', () => {
     const a = addPoint(s, 0, 0);
     deletePoint(s, a);
     expect(Object.keys(s.points)).toHaveLength(0);
+  });
+
+  it('translatePoints moves listed points rigidly and skips unknown ids', () => {
+    const s = createSketch();
+    const a = addPoint(s, 0, 0);
+    const b = addPoint(s, 1, 2);
+    const c = addPoint(s, 5, 5);
+    translatePoints(s, [a, b, 'missing'], 10, -3);
+    expect(s.points[a]).toMatchObject({ x: 10, y: -3 });
+    expect(s.points[b]).toMatchObject({ x: 11, y: -1 });
+    expect(s.points[c]).toMatchObject({ x: 5, y: 5 });
   });
 
   it('deleteConstraint removes only the constraint', () => {
