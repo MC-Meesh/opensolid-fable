@@ -12,3 +12,8 @@ crate-type = ["cdylib", "rlib"]
 opensolid-core = { path = "../opensolid-core" }
 opensolid-frep = { path = "../opensolid-frep" }
 wasm-bindgen = "0.2"
+
+[dev-dependencies]
+# Native-only acceptance tests: the hybrid kernel result must feed the
+# playground mesh path (of-ipt.3). Not part of the wasm32 artifact.
+opensolid-kernel = { path = "../opensolid-kernel" }
