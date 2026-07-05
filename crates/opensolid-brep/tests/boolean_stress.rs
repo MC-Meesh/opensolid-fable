@@ -28,6 +28,13 @@
 //!   non-manifold (one edge shared by four triangles) despite clean
 //!   check() and correct hexahedron topology.
 //!
+//! Re-verified after the of-k3u seam-refinement fix (of-ipt.12,
+//! 2026-07-05): all 15 ignored cases still fail. 15° tilt is still a
+//! silent no-op; 30°/45° now accept the imprint but fail check()
+//! (OpenEdgeInClosedShell) like of-ipt.6; the 25° skew case no longer
+//! errors — it builds correct topology (genus 1, clean check) but
+//! tessellates non-manifold. of-ipt.4/6/8/9 and of-ny6 are unchanged.
+//!
 //! Invariants asserted throughout:
 //! - `BooleanOutput::check()` reports no failures,
 //! - `BooleanOutput::tessellate()` yields a closed manifold mesh,
@@ -378,19 +385,22 @@ fn rotated_tool_through_hole_5_deg() {
 }
 
 #[test]
-#[ignore = "of-ipt.5: ≥15° tilt drops all imprints — subtract silently returns A unchanged"]
+#[ignore = "of-ipt.5: 15° tilt drops all imprints — subtract silently returns A unchanged \
+            (unchanged by of-k3u)"]
 fn rotated_tool_through_hole_15_deg() {
     rotated_tool_through_hole(15.0);
 }
 
 #[test]
-#[ignore = "of-ipt.5: ≥15° tilt drops all imprints — subtract silently returns A unchanged"]
+#[ignore = "of-ipt.5: post-of-k3u the 30° imprint is accepted (7 faces) but the output fails \
+            check() (OpenEdgeInClosedShell) and tessellates non-manifold, like of-ipt.6"]
 fn rotated_tool_through_hole_30_deg() {
     rotated_tool_through_hole(30.0);
 }
 
 #[test]
-#[ignore = "of-ipt.5: ≥15° tilt drops all imprints — subtract silently returns A unchanged"]
+#[ignore = "of-ipt.5: post-of-k3u the 45° imprint is accepted (7 faces) but the output fails \
+            check() (OpenEdgeInClosedShell) and tessellates non-manifold, like of-ipt.6"]
 fn rotated_tool_through_hole_45_deg() {
     rotated_tool_through_hole(45.0);
 }
@@ -398,7 +408,8 @@ fn rotated_tool_through_hole_45_deg() {
 /// Same tilted-tool subtraction but tilted toward a block diagonal, so no
 /// imprint aligns with any coordinate plane.
 #[test]
-#[ignore = "of-ipt.7: Degenerate 'interior imprint ring lies in no region of its host face'"]
+#[ignore = "of-ipt.7: post-of-k3u subtract succeeds with correct topology (genus 1, check \
+            clean) but the tessellation is not a closed manifold"]
 fn rotated_tool_through_hole_skew_axis() {
     let context = "block minus cylinder tilted 25° toward XY diagonal";
     let mut scene = Scene::new();
