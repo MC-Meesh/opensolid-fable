@@ -13,8 +13,16 @@
 //! - **Referential integrity / orphans**: every containment reference
 //!   (body → shell → face → loop → fin → edge → vertex) resolves to a live
 //!   entity; children point back at their parents; fins are registered on
-//!   their edges and edges on their endpoint vertices; no empty shells,
-//!   loop-less faces, or fin-less non-vertex loops.
+//!   their edges and edges on their endpoint vertices; every entry in a
+//!   vertex's edge list resolves and actually ends at that vertex; no empty
+//!   shells, loop-less faces, or fin-less non-vertex loops. A
+//!   [`BodyType::Solid`](crate::BodyType::Solid) body must own at least one
+//!   shell — an "empty solid" is explicitly illegal, not vacuously valid.
+//! - **Loop bookkeeping**: a face's outer loop is not flagged
+//!   [`LoopType::Inner`](crate::LoopType::Inner), no `inner_loops` entry is
+//!   flagged [`LoopType::Outer`](crate::LoopType::Outer), and no loop is
+//!   listed twice on one face (a duplicate would double-count the `R` term
+//!   of the Euler–Poincaré formula).
 //! - **Loop connectivity**: `next`/`prev` links agree with each loop's fin
 //!   order, and each fin's end vertex is the next fin's start vertex.
 //! - **Closure and manifoldness**: every edge of a shell that must be
@@ -23,7 +31,10 @@
 //!   fins; no edge anywhere has more than two. The producer-supplied
 //!   `is_closed` flag is not trusted: a solid shell flagged open fails
 //!   outright, and a flagged-open shell whose every edge is two-fin is
-//!   reported as inconsistent regardless of body type.
+//!   reported as inconsistent regardless of body type. Shells of one body
+//!   must also be disjoint: an edge or vertex used by two different shells
+//!   is non-manifold between them and reported directly, not left for the
+//!   Euler formula to notice.
 //! - **Orientation consistency**: the two fins of a manifold edge traverse
 //!   it in opposite directions. This is the topological form of "adjacent
 //!   faces are consistently oriented"; [`FaceSense`](crate::FaceSense)
@@ -32,12 +43,15 @@
 //!   [`SYSTEM_RESOLUTION`], and at most [`MAX_ALLOWED_TOLERANCE`]; vertex
 //!   points are finite.
 //! - **Euler–Poincaré formula** `V - E + F - R = 2(S - H)`: checked only
-//!   when every other check passed *and* all shells are closed — the formula
-//!   applies to closed surfaces, and on a structurally broken graph the
-//!   counts are meaningless noise. For solid bodies this bypass is never
-//!   silent: a solid with a non-closed shell has already failed the closure
-//!   checks above, so the formula is only ever skipped on a body that
-//!   reports at least one other failure.
+//!   when no *structural* failure was found *and* all shells are closed —
+//!   the formula applies to closed surfaces, and on a structurally broken
+//!   graph the counts are meaningless noise. Non-structural failures
+//!   (tolerance sanity, non-finite points — see
+//!   [`CheckFailure::is_structural`]) do **not** suppress it: a body with
+//!   one loose tolerance *and* a wrong genus reports both. For solid bodies
+//!   the bypass is never silent: a solid with a non-closed shell has
+//!   already failed the closure checks above, so the formula is only ever
+//!   skipped on a body that reports at least one other failure.
 //!
 //! Geometric checks from the spec (edge-on-surface, vertex-on-edge,
 //! self-intersection) are deferred until faces and edges carry real
@@ -45,8 +59,8 @@
 
 use crate::euler::EulerCounts;
 use crate::topology::{
-    Body, BodyType, Edge, Face, Fin, FinSense, Loop, SYSTEM_RESOLUTION, Shell, TopologyStore,
-    Vertex,
+    Body, BodyType, Edge, Face, Fin, FinSense, Loop, LoopType, SYSTEM_RESOLUTION, Shell,
+    TopologyStore, Vertex,
 };
 use opensolid_core::EntityId;
 use thiserror::Error;
@@ -90,6 +104,13 @@ pub enum CheckFailure {
     #[error("shell {0:?} has no faces")]
     EmptyShell(EntityId<Shell>),
 
+    /// A [`BodyType::Solid`](crate::BodyType::Solid) body with no shells.
+    /// Every other check on such a body passes vacuously (and the Euler
+    /// formula degenerates to `0 = 0`), so the emptiness itself must fail:
+    /// a solid is a bounded volume and needs at least one bounding shell.
+    #[error("solid body {0:?} has no shells")]
+    SolidWithoutShells(EntityId<Body>),
+
     /// A face with no outer loop.
     #[error("face {0:?} has no outer loop")]
     FaceWithoutOuterLoop(EntityId<Face>),
@@ -101,6 +122,29 @@ pub enum CheckFailure {
     /// A loop with both fins and a degenerate-loop vertex.
     #[error("loop {0:?} has both fins and a degenerate-loop vertex")]
     VertexLoopWithFins(EntityId<Loop>),
+
+    /// A face's outer loop flagged [`LoopType::Inner`](crate::LoopType::Inner).
+    #[error("face {face:?} outer loop {loop_id:?} is flagged LoopType::Inner")]
+    OuterLoopFlaggedInner {
+        face: EntityId<Face>,
+        loop_id: EntityId<Loop>,
+    },
+
+    /// An `inner_loops` entry flagged [`LoopType::Outer`](crate::LoopType::Outer).
+    #[error("face {face:?} inner loop {loop_id:?} is flagged LoopType::Outer")]
+    InnerLoopFlaggedOuter {
+        face: EntityId<Face>,
+        loop_id: EntityId<Loop>,
+    },
+
+    /// The same loop listed more than once on one face (as both outer and
+    /// inner, or twice among the inner loops). Double-counts the `R` term
+    /// of the Euler–Poincaré formula.
+    #[error("face {face:?} lists loop {loop_id:?} more than once")]
+    DuplicateLoopOnFace {
+        face: EntityId<Face>,
+        loop_id: EntityId<Loop>,
+    },
 
     /// A fin whose `next`/`prev` links disagree with its loop's fin order.
     #[error("fin {fin:?} next/prev links disagree with loop {loop_id:?} order")]
@@ -137,6 +181,14 @@ pub enum CheckFailure {
         vertex: EntityId<Vertex>,
     },
 
+    /// A vertex whose edge list contains an edge that does not end at it
+    /// (mirror of [`ForeignFinOnEdge`](CheckFailure::ForeignFinOnEdge)).
+    #[error("vertex {vertex:?} lists edge {edge:?} which does not end at it")]
+    ForeignEdgeOnVertex {
+        vertex: EntityId<Vertex>,
+        edge: EntityId<Edge>,
+    },
+
     /// A single-fin (boundary) edge inside a shell that must be closed —
     /// one flagged `is_closed`, or any shell of a
     /// [`BodyType::Solid`](crate::BodyType::Solid) body.
@@ -163,6 +215,24 @@ pub enum CheckFailure {
     /// An edge with more than two fins.
     #[error("edge {edge:?} is non-manifold ({fins} fins)")]
     NonManifoldEdge { edge: EntityId<Edge>, fins: usize },
+
+    /// An edge used by two different shells of the same body: the shells
+    /// touch along it, which is non-manifold between shells.
+    #[error("edge {edge:?} is shared by shells {shell_a:?} and {shell_b:?}")]
+    EdgeSharedBetweenShells {
+        edge: EntityId<Edge>,
+        shell_a: EntityId<Shell>,
+        shell_b: EntityId<Shell>,
+    },
+
+    /// A vertex used by two different shells of the same body: the shells
+    /// touch at it, which is non-manifold between shells.
+    #[error("vertex {vertex:?} is shared by shells {shell_a:?} and {shell_b:?}")]
+    VertexSharedBetweenShells {
+        vertex: EntityId<Vertex>,
+        shell_a: EntityId<Shell>,
+        shell_b: EntityId<Shell>,
+    },
 
     /// A two-fin edge whose fins are not mated to each other.
     #[error("edge {edge:?}: its two fins are not mated to each other")]
@@ -219,6 +289,23 @@ pub enum CheckFailure {
     NonFinitePoint(EntityId<Vertex>),
 }
 
+impl CheckFailure {
+    /// Whether this failure means the topology *graph* itself is suspect.
+    ///
+    /// Structural failures make the Euler–Poincaré counts meaningless, so
+    /// [`TopologyStore::check`] skips the formula when any is present.
+    /// Non-structural failures (bad tolerances, non-finite points) leave the
+    /// connectivity intact and do not suppress it.
+    pub fn is_structural(&self) -> bool {
+        !matches!(
+            self,
+            CheckFailure::InvalidTolerance { .. }
+                | CheckFailure::ToleranceExceeded { .. }
+                | CheckFailure::NonFinitePoint(_)
+        )
+    }
+}
+
 /// Push `id` if not already present (order-preserving dedup; entity counts
 /// per body are small enough that linear scans match the rest of the crate).
 fn push_unique<T>(list: &mut Vec<EntityId<T>>, id: EntityId<T>) {
@@ -241,10 +328,18 @@ impl TopologyStore {
             return vec![CheckFailure::StaleBody(body)];
         };
 
+        if b.body_type == BodyType::Solid && b.shells.is_empty() {
+            failures.push(CheckFailure::SolidWithoutShells(body));
+        }
+
         // Entities reachable from the body, deduplicated, for the
         // edge/vertex-level passes below.
         let mut edges: Vec<EntityId<Edge>> = Vec::new();
         let mut vertices: Vec<EntityId<Vertex>> = Vec::new();
+        // First shell seen using each edge/vertex, to catch a second shell
+        // touching it (non-manifold between shells).
+        let mut edge_owner: Vec<(EntityId<Edge>, EntityId<Shell>)> = Vec::new();
+        let mut vertex_owner: Vec<(EntityId<Vertex>, EntityId<Shell>)> = Vec::new();
 
         for &shell_id in &b.shells {
             let Some(shell) = self.shells.get(shell_id) else {
@@ -265,13 +360,14 @@ impl TopologyStore {
             }
 
             let mut shell_edges: Vec<EntityId<Edge>> = Vec::new();
+            let mut shell_vertices: Vec<EntityId<Vertex>> = Vec::new();
             for &face_id in &shell.faces {
                 self.check_face(
                     shell_id,
                     face_id,
                     &mut failures,
                     &mut shell_edges,
-                    &mut vertices,
+                    &mut shell_vertices,
                 );
             }
 
@@ -305,8 +401,39 @@ impl TopologyStore {
             {
                 failures.push(CheckFailure::ShellFlaggedOpenButClosed(shell_id));
             }
+            // Shells of one body must be disjoint: a second shell using an
+            // edge or vertex already claimed by another shell touches it,
+            // which is non-manifold between shells.
+            for &edge_id in &shell_edges {
+                if let Some(edge) = self.edges.get(edge_id) {
+                    push_unique(&mut shell_vertices, edge.start_vertex);
+                    push_unique(&mut shell_vertices, edge.end_vertex);
+                }
+                match edge_owner.iter().find(|&&(e, _)| e == edge_id) {
+                    Some(&(_, owner)) => failures.push(CheckFailure::EdgeSharedBetweenShells {
+                        edge: edge_id,
+                        shell_a: owner,
+                        shell_b: shell_id,
+                    }),
+                    None => edge_owner.push((edge_id, shell_id)),
+                }
+            }
+            for &vertex_id in &shell_vertices {
+                match vertex_owner.iter().find(|&&(v, _)| v == vertex_id) {
+                    Some(&(_, owner)) => failures.push(CheckFailure::VertexSharedBetweenShells {
+                        vertex: vertex_id,
+                        shell_a: owner,
+                        shell_b: shell_id,
+                    }),
+                    None => vertex_owner.push((vertex_id, shell_id)),
+                }
+            }
+
             for edge_id in shell_edges {
                 push_unique(&mut edges, edge_id);
+            }
+            for vertex_id in shell_vertices {
+                push_unique(&mut vertices, vertex_id);
             }
         }
 
@@ -323,19 +450,40 @@ impl TopologyStore {
                     EntityRef::Vertex(vertex_id),
                     vertex.tolerance,
                 );
+                // Mirror of EdgeMissingFromVertex: every entry in the
+                // vertex's edge list must resolve and end at the vertex.
+                for &edge_id in &vertex.edges {
+                    match self.edges.get(edge_id) {
+                        None => failures.push(CheckFailure::StaleReference {
+                            from: EntityRef::Vertex(vertex_id),
+                            to: EntityRef::Edge(edge_id),
+                        }),
+                        Some(edge)
+                            if edge.start_vertex != vertex_id && edge.end_vertex != vertex_id =>
+                        {
+                            failures.push(CheckFailure::ForeignEdgeOnVertex {
+                                vertex: vertex_id,
+                                edge: edge_id,
+                            });
+                        }
+                        Some(_) => {}
+                    }
+                }
             }
         }
 
         // The Euler–Poincaré formula only applies to closed surfaces, and
         // on a broken graph the counts are meaningless — so it is checked
-        // last, only when everything else passed and all shells are closed.
-        // Skipping it is never silent for solids: a solid with a non-closed
-        // shell already failed the closure checks above.
+        // last, only when no structural failure was found and all shells
+        // are closed. Non-structural failures (tolerances, non-finite
+        // points) leave the graph intact and must not mask a genus/closure
+        // defect. Skipping it is never silent for solids: a solid with a
+        // non-closed shell already failed the closure checks above.
         let all_closed = b
             .shells
             .iter()
             .all(|&s| self.shells.get(s).is_some_and(|shell| shell.is_closed));
-        if failures.is_empty() && all_closed {
+        if !failures.iter().any(CheckFailure::is_structural) && all_closed {
             let counts = self.euler_counts(body);
             if !counts.euler_poincare_holds() {
                 failures.push(CheckFailure::EulerViolation { body, counts });
@@ -345,9 +493,9 @@ impl TopologyStore {
         failures
     }
 
-    /// Face-level checks: back-pointers, loop presence, loop connectivity,
-    /// fin links and mates. Collects reachable edges and degenerate-loop
-    /// vertices.
+    /// Face-level checks: back-pointers, loop presence and bookkeeping
+    /// (loop-type flags, duplicates), loop connectivity, fin links and
+    /// mates. Collects reachable edges and degenerate-loop vertices.
     fn check_face(
         &self,
         shell_id: EntityId<Shell>,
@@ -373,11 +521,24 @@ impl TopologyStore {
             failures.push(CheckFailure::FaceWithoutOuterLoop(face_id));
         }
 
-        for loop_id in face
+        let mut seen_loops: Vec<EntityId<Loop>> = Vec::new();
+        for (is_outer, loop_id) in face
             .outer_loop
             .into_iter()
-            .chain(face.inner_loops.iter().copied())
+            .map(|l| (true, l))
+            .chain(face.inner_loops.iter().map(|&l| (false, l)))
         {
+            // A loop listed twice would double-count the Euler R term (and
+            // double-report every defect inside it), so it is reported once
+            // and not walked again.
+            if seen_loops.contains(&loop_id) {
+                failures.push(CheckFailure::DuplicateLoopOnFace {
+                    face: face_id,
+                    loop_id,
+                });
+                continue;
+            }
+            seen_loops.push(loop_id);
             let Some(lp) = self.loops.get(loop_id) else {
                 failures.push(CheckFailure::StaleReference {
                     from: EntityRef::Face(face_id),
@@ -385,6 +546,18 @@ impl TopologyStore {
                 });
                 continue;
             };
+            if is_outer && lp.loop_type == LoopType::Inner {
+                failures.push(CheckFailure::OuterLoopFlaggedInner {
+                    face: face_id,
+                    loop_id,
+                });
+            }
+            if !is_outer && lp.loop_type == LoopType::Outer {
+                failures.push(CheckFailure::InnerLoopFlaggedOuter {
+                    face: face_id,
+                    loop_id,
+                });
+            }
             if lp.face != face_id {
                 failures.push(CheckFailure::BackPointerMismatch {
                     child: EntityRef::Loop(loop_id),
@@ -1074,5 +1247,239 @@ mod tests {
             edge: edge_a,
             fins: 3
         }));
+    }
+
+    #[test]
+    fn outer_loop_flagged_inner_detected() {
+        let (mut store, body, shell, _edges) = build_triangle_sheet(BodyType::Sheet, false);
+        let face = store.faces_of_shell(shell)[0];
+        let loop_id = store.face(face).unwrap().outer_loop.unwrap();
+        store.loops.get_mut(loop_id).unwrap().loop_type = LoopType::Inner;
+
+        assert_eq!(
+            store.check(body),
+            vec![CheckFailure::OuterLoopFlaggedInner { face, loop_id }]
+        );
+    }
+
+    #[test]
+    fn inner_loop_flagged_outer_detected() {
+        let (mut store, body, shell, edges) = build_triangle_sheet(BodyType::Sheet, false);
+        let face = store.faces_of_shell(shell)[0];
+        // A degenerate vertex loop at an existing vertex, mis-flagged Outer,
+        // listed among the inner loops.
+        let v = store.edges.get(edges[0]).unwrap().start_vertex;
+        let loop_id = store.loops.insert(Loop {
+            face,
+            fins: Vec::new(),
+            loop_type: LoopType::Outer,
+            vertex: Some(v),
+        });
+        store.faces.get_mut(face).unwrap().inner_loops.push(loop_id);
+
+        assert_eq!(
+            store.check(body),
+            vec![CheckFailure::InnerLoopFlaggedOuter { face, loop_id }]
+        );
+    }
+
+    #[test]
+    fn duplicate_loop_on_face_detected() {
+        // The same loop as both the outer loop and an inner loop: reported
+        // once, and the duplicate walk (with its double-reported defects and
+        // double-counted Euler R) is skipped.
+        let (mut store, body, shell) = build_cube();
+        let face = store.faces_of_shell(shell)[0];
+        let loop_id = store.face(face).unwrap().outer_loop.unwrap();
+        store.faces.get_mut(face).unwrap().inner_loops.push(loop_id);
+
+        assert_eq!(
+            store.check(body),
+            vec![CheckFailure::DuplicateLoopOnFace { face, loop_id }]
+        );
+    }
+
+    #[test]
+    fn solid_without_shells_detected() {
+        let mut store = TopologyStore::new();
+        let solid = store.create_body(BodyType::Solid);
+        assert_eq!(
+            store.check(solid),
+            vec![CheckFailure::SolidWithoutShells(solid)]
+        );
+
+        // Only solids claim a bounding shell; an empty General body is fine.
+        let general = store.create_body(BodyType::General);
+        assert_eq!(store.check(general), Vec::new());
+    }
+
+    #[test]
+    fn foreign_edge_on_vertex_detected() {
+        let (mut store, body, _shell) = build_cube();
+        let (edge, e) = store.edges.iter().next().unwrap();
+        let (v0, v1) = (e.start_vertex, e.end_vertex);
+        // An edge that touches neither endpoint of `edge`.
+        let foreign = store
+            .edges
+            .iter()
+            .find(|(_, f)| {
+                f.start_vertex != v0
+                    && f.start_vertex != v1
+                    && f.end_vertex != v0
+                    && f.end_vertex != v1
+            })
+            .map(|(id, _)| id)
+            .expect("cube has a disjoint edge");
+        store.vertices.get_mut(v0).unwrap().edges.push(foreign);
+
+        let failures = store.check(body);
+        assert!(
+            failures.contains(&CheckFailure::ForeignEdgeOnVertex {
+                vertex: v0,
+                edge: foreign
+            }),
+            "expected ForeignEdgeOnVertex in {failures:?}"
+        );
+        // `edge` itself is still registered both ways: no mirror failure.
+        assert!(!failures.contains(&CheckFailure::EdgeMissingFromVertex { edge, vertex: v0 }));
+    }
+
+    #[test]
+    fn stale_edge_in_vertex_list_detected() {
+        let (mut store, body, _shell) = build_cube();
+        let (edge, e) = store.edges.iter().next().unwrap();
+        let (v0, v1) = (e.start_vertex, e.end_vertex);
+        // create_edge registers itself on both vertices; removing the edge
+        // leaves both lists holding a stale id.
+        let doomed = store.create_edge(v0, v1, SYSTEM_RESOLUTION);
+        store.edges.remove(doomed);
+
+        let failures = store.check(body);
+        for vertex in [v0, v1] {
+            assert!(
+                failures.contains(&CheckFailure::StaleReference {
+                    from: EntityRef::Vertex(vertex),
+                    to: EntityRef::Edge(doomed),
+                }),
+                "expected stale-edge report on {vertex:?} in {failures:?}"
+            );
+        }
+        let _ = edge;
+    }
+
+    #[test]
+    fn tolerance_failure_does_not_mask_euler_violation() {
+        // A loose tolerance is not a structural failure: the genus
+        // corruption must still be reported alongside it.
+        let (mut store, body, shell) = build_cube();
+        store.shells.get_mut(shell).unwrap().genus = 1;
+        let (bad_edge, _) = store.edges.iter().next().unwrap();
+        store.edges.get_mut(bad_edge).unwrap().tolerance = 0.02;
+
+        let failures = store.check(body);
+        assert!(failures.contains(&CheckFailure::ToleranceExceeded {
+            entity: EntityRef::Edge(bad_edge),
+            tolerance: 0.02,
+            limit: MAX_ALLOWED_TOLERANCE,
+        }));
+        assert!(
+            failures
+                .iter()
+                .any(|f| matches!(f, CheckFailure::EulerViolation { body: b, .. } if *b == body)),
+            "expected EulerViolation alongside the tolerance failure: {failures:?}"
+        );
+        assert_eq!(failures.len(), 2);
+    }
+
+    #[test]
+    fn structural_failure_still_suppresses_euler() {
+        // Genus corruption plus a structural defect (a dropped fin): the
+        // counts are meaningless, so only the structural failures report.
+        let (mut store, body, shell) = build_cube();
+        store.shells.get_mut(shell).unwrap().genus = 1;
+        let (edge, _) = store.edges.iter().next().unwrap();
+        store.edges.get_mut(edge).unwrap().fins.pop();
+
+        let failures = store.check(body);
+        assert!(
+            !failures
+                .iter()
+                .any(|f| matches!(f, CheckFailure::EulerViolation { .. })),
+            "Euler must stay suppressed on a broken graph: {failures:?}"
+        );
+    }
+
+    #[test]
+    fn shared_vertex_between_shells_detected() {
+        // Two shells of one body touching at a single vertex: directly
+        // reported, not left for the Euler formula.
+        let (mut store, body, shell_a) = build_cube();
+        store.bodies.get_mut(body).unwrap().body_type = BodyType::General;
+        let (edge, _) = store.edges.iter().next().unwrap();
+        let shared = store.edges.get(edge).unwrap().start_vertex;
+
+        let shell_b = store.create_shell(body, false, ShellOrientation::Outward);
+        let face = store.create_face(shell_b, FaceSense::Positive);
+        let w1 = store.create_vertex(p(5.0, 0.0, 0.0), SYSTEM_RESOLUTION);
+        let w2 = store.create_vertex(p(5.0, 5.0, 0.0), SYSTEM_RESOLUTION);
+        let tri = [
+            store.create_edge(shared, w1, SYSTEM_RESOLUTION),
+            store.create_edge(w1, w2, SYSTEM_RESOLUTION),
+            store.create_edge(w2, shared, SYSTEM_RESOLUTION),
+        ];
+        store.create_loop(face, LoopType::Outer, &tri.map(|e| (e, FinSense::Forward)));
+
+        assert_eq!(
+            store.check(body),
+            vec![CheckFailure::VertexSharedBetweenShells {
+                vertex: shared,
+                shell_a,
+                shell_b,
+            }]
+        );
+    }
+
+    #[test]
+    fn shared_edge_between_shells_detected() {
+        // A second shell reusing a cube edge: the shared edge, its two
+        // shared endpoints, and the resulting third fin all report.
+        let (mut store, body, shell_a) = build_cube();
+        store.bodies.get_mut(body).unwrap().body_type = BodyType::General;
+        let (edge, e) = store.edges.iter().next().unwrap();
+        let (v0, v1) = (e.start_vertex, e.end_vertex);
+
+        let shell_b = store.create_shell(body, false, ShellOrientation::Outward);
+        let face = store.create_face(shell_b, FaceSense::Positive);
+        let w = store.create_vertex(p(5.0, 5.0, 5.0), SYSTEM_RESOLUTION);
+        let e1w = store.create_edge(v1, w, SYSTEM_RESOLUTION);
+        let ew0 = store.create_edge(w, v0, SYSTEM_RESOLUTION);
+        store.create_loop(
+            face,
+            LoopType::Outer,
+            &[
+                (edge, FinSense::Forward),
+                (e1w, FinSense::Forward),
+                (ew0, FinSense::Forward),
+            ],
+        );
+
+        let failures = store.check(body);
+        assert!(failures.contains(&CheckFailure::EdgeSharedBetweenShells {
+            edge,
+            shell_a,
+            shell_b,
+        }));
+        for vertex in [v0, v1] {
+            assert!(
+                failures.contains(&CheckFailure::VertexSharedBetweenShells {
+                    vertex,
+                    shell_a,
+                    shell_b,
+                }),
+                "expected shared-vertex report for {vertex:?} in {failures:?}"
+            );
+        }
+        assert!(failures.contains(&CheckFailure::NonManifoldEdge { edge, fins: 3 }));
+        assert_eq!(failures.len(), 4);
     }
 }
