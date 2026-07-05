@@ -7,10 +7,9 @@
 //! edges carry exact [`Curve3`] geometry — through the spec pipeline:
 //!
 //! 1. **Clash**: dilated face bounding boxes (from sampled boundaries) are
-//!    tested pairwise for overlap to find candidate face pairs. (The BVH
-//!    from of-pb7.1 lives in `opensolid-kernel`, downstream of this crate;
-//!    the pairwise test is O(faces²) with tiny constants at MVP face
-//!    counts. Hooking the BVH up is future work.)
+//!    indexed in a [`Bvh`] per solid and candidate face pairs come from a
+//!    simultaneous box-overlap descent of both trees
+//!    ([`Bvh::overlap_pairs`], the of-pb7.1 index).
 //! 2. **SSI**: each candidate pair is intersected analytically
 //!    ([`crate::ssi::intersect`]); the resulting curves are clipped to the
 //!    trimmed regions of *both* faces and become imprint curves.
@@ -49,10 +48,11 @@ use crate::topology::{
     TopologyStore,
 };
 use opensolid_core::EntityId;
+use opensolid_core::bvh::Bvh;
 use opensolid_core::error::{CoreError, CoreResult};
 use opensolid_core::mesh::{Triangle, TriangleMesh};
 use opensolid_core::tolerance::ToleranceContext;
-use opensolid_core::types::{Point3, Vector3};
+use opensolid_core::types::{BoundingBox3, Point3, Vector3};
 use std::collections::HashMap;
 
 /// Samples for a full circular edge or imprint curve.
@@ -691,38 +691,45 @@ impl<'a> Pipeline<'a> {
 
     /// Phases 1-2: clash detection and SSI, producing clipped imprints.
     fn find_imprints(&mut self) -> CoreResult<()> {
-        let boxes: [Vec<(Point3, Point3)>; 2] = [self.face_boxes(0), self.face_boxes(1)];
-        for (fa, box_a) in boxes[0].iter().enumerate() {
-            for (fb, box_b) in boxes[1].iter().enumerate() {
-                if !boxes_overlap(box_a, box_b) {
-                    continue;
+        let boxes: [Vec<BoundingBox3>; 2] = [self.face_boxes(0), self.face_boxes(1)];
+        // Broad phase: one BVH per solid, candidate pairs from a dual-tree
+        // box-overlap descent. Sorted so imprints are found in the same
+        // (face A, face B) order the old pairwise scan produced.
+        let bvhs: [Bvh<usize>; 2] =
+            [0, 1].map(|s| Bvh::build(boxes[s].iter().enumerate().map(|(f, &b)| (b, f)).collect()));
+        let mut pairs: Vec<(usize, usize)> = bvhs[0]
+            .overlap_pairs(&bvhs[1])
+            .into_iter()
+            .map(|(&fa, &fb)| (fa, fb))
+            .collect();
+        pairs.sort_unstable();
+        for (fa, fb) in pairs {
+            let (box_a, box_b) = (&boxes[0][fa], &boxes[1][fb]);
+            let sa = &self.solids[0].faces[fa].surface;
+            let sb = &self.solids[1].faces[fb].surface;
+            match ssi_intersect(sa, sb, &self.tol)? {
+                SurfaceIntersection::Empty => {}
+                SurfaceIntersection::Coincident => {
+                    return Err(CoreError::NotImplemented {
+                        feature: "boolean operations on coincident faces \
+                                  (transversal MVP)",
+                    });
                 }
-                let sa = &self.solids[0].faces[fa].surface;
-                let sb = &self.solids[1].faces[fb].surface;
-                match ssi_intersect(sa, sb, &self.tol)? {
-                    SurfaceIntersection::Empty => {}
-                    SurfaceIntersection::Coincident => {
-                        return Err(CoreError::NotImplemented {
-                            feature: "boolean operations on coincident faces \
-                                      (transversal MVP)",
-                        });
-                    }
-                    SurfaceIntersection::TangentPoint(_) => {
-                        return Err(CoreError::NotImplemented {
-                            feature: "boolean operations with tangent face contact \
-                                      (transversal MVP)",
-                        });
-                    }
-                    SurfaceIntersection::Curves(curves) => {
-                        for ic in curves {
-                            if ic.kind == IntersectionKind::Tangential {
-                                return Err(CoreError::NotImplemented {
-                                    feature: "boolean operations with tangential \
-                                              intersection curves (transversal MVP)",
-                                });
-                            }
-                            self.clip_imprint(&ic.curve, fa, fb, box_a, box_b);
+                SurfaceIntersection::TangentPoint(_) => {
+                    return Err(CoreError::NotImplemented {
+                        feature: "boolean operations with tangent face contact \
+                                  (transversal MVP)",
+                    });
+                }
+                SurfaceIntersection::Curves(curves) => {
+                    for ic in curves {
+                        if ic.kind == IntersectionKind::Tangential {
+                            return Err(CoreError::NotImplemented {
+                                feature: "boolean operations with tangential \
+                                          intersection curves (transversal MVP)",
+                            });
                         }
+                        self.clip_imprint(&ic.curve, fa, fb, box_a, box_b);
                     }
                 }
             }
@@ -730,23 +737,15 @@ impl<'a> Pipeline<'a> {
         Ok(())
     }
 
-    fn face_boxes(&self, s: SolidTag) -> Vec<(Point3, Point3)> {
+    fn face_boxes(&self, s: SolidTag) -> Vec<BoundingBox3> {
         self.face_polys[s]
             .iter()
             .map(|fp| {
-                let mut lo = Point3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY);
-                let mut hi = Point3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
-                for lp in &fp.loops {
-                    for (_, p) in lp {
-                        lo = Point3::new(lo.x.min(p.x), lo.y.min(p.y), lo.z.min(p.z));
-                        hi = Point3::new(hi.x.max(p.x), hi.y.max(p.y), hi.z.max(p.z));
-                    }
-                }
+                let bounds = BoundingBox3::from_points(fp.loops.iter().flatten().map(|&(_, p)| p));
                 // Dilate: boundary samples underestimate curved interiors,
                 // and touching contacts must still clash so they reach SSI
                 // (which rejects them as tangent, not silently misses them).
-                let d = (hi - lo).norm() * 0.05 + self.tol.linear + self.snap;
-                (lo - Vector3::new(d, d, d), hi + Vector3::new(d, d, d))
+                bounds.dilate(bounds.extents().norm() * 0.05 + self.tol.linear + self.snap)
             })
             .collect()
     }
@@ -758,25 +757,14 @@ impl<'a> Pipeline<'a> {
         curve: &Curve3,
         fa: usize,
         fb: usize,
-        box_a: &(Point3, Point3),
-        box_b: &(Point3, Point3),
+        box_a: &BoundingBox3,
+        box_b: &BoundingBox3,
     ) {
         // Parameter window: full period for closed conics, bbox slab clip
         // for lines.
         let (t_lo, t_hi, closed_curve) = match curve {
             Curve3::Line { origin, dir } => {
-                let joint = (
-                    Point3::new(
-                        box_a.0.x.max(box_b.0.x),
-                        box_a.0.y.max(box_b.0.y),
-                        box_a.0.z.max(box_b.0.z),
-                    ),
-                    Point3::new(
-                        box_a.1.x.min(box_b.1.x),
-                        box_a.1.y.min(box_b.1.y),
-                        box_a.1.z.min(box_b.1.z),
-                    ),
-                );
+                let joint = box_a.intersection(box_b);
                 match clip_line_to_box(origin, dir, &joint) {
                     Some(range) => (range.0, range.1, false),
                     None => return,
@@ -1159,20 +1147,11 @@ fn append_directed(out: &mut Vec<Point3>, sampled: &SampledCurve, forward: bool)
     }
 }
 
-fn boxes_overlap(a: &(Point3, Point3), b: &(Point3, Point3)) -> bool {
-    a.0.x <= b.1.x
-        && b.0.x <= a.1.x
-        && a.0.y <= b.1.y
-        && b.0.y <= a.1.y
-        && a.0.z <= b.1.z
-        && b.0.z <= a.1.z
-}
-
 /// Clip the line `origin + t·dir` to an axis-aligned box (slab method).
-fn clip_line_to_box(origin: &Point3, dir: &Vector3, bx: &(Point3, Point3)) -> Option<(f64, f64)> {
+fn clip_line_to_box(origin: &Point3, dir: &Vector3, bx: &BoundingBox3) -> Option<(f64, f64)> {
     let (mut t0, mut t1) = (f64::NEG_INFINITY, f64::INFINITY);
     for k in 0..3 {
-        let (o, d, lo, hi) = (origin[k], dir[k], bx.0[k], bx.1[k]);
+        let (o, d, lo, hi) = (origin[k], dir[k], bx.min[k], bx.max[k]);
         if d.abs() < 1e-15 {
             if o < lo || o > hi {
                 return None;

@@ -11,8 +11,8 @@
 //! centroids do not separate (e.g. many identical boxes), so building
 //! always terminates and never produces an empty child.
 
-use opensolid_core::mesh::TriangleMesh;
-use opensolid_core::types::{BoundingBox3, Point3, Ray3};
+use crate::mesh::TriangleMesh;
+use crate::types::{BoundingBox3, Point3, Ray3};
 
 /// Items per leaf below which splitting stops.
 const LEAF_SIZE: usize = 4;
@@ -393,7 +393,7 @@ fn sah_split<Id>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use opensolid_core::types::Vector3;
+    use crate::types::Vector3;
 
     /// Deterministic LCG so test data is reproducible without a rand dep.
     struct Lcg(u64);

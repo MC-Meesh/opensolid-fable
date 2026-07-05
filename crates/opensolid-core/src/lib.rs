@@ -19,6 +19,7 @@
 //!   on an empty mesh) use `Option` rather than an error.
 
 pub mod arena;
+pub mod bvh;
 pub mod error;
 pub mod interval;
 pub mod mesh;
@@ -26,6 +27,7 @@ pub mod tolerance;
 pub mod types;
 
 pub use arena::{Arena, ArenaSnapshot, EntityId};
+pub use bvh::Bvh;
 pub use error::{CoreError, CoreResult};
 pub use interval::Interval;
 pub use mesh::{Triangle, TriangleMesh};
