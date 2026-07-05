@@ -302,15 +302,14 @@ impl BooleanOutput {
     /// hybrid boolean falls back to F-Rep meshing when it is not).
     pub fn tessellate_measured(&self) -> CoreResult<(TriangleMesh, f64)> {
         let mut triangles = Vec::new();
-        let mut scale: f64 = 0.0;
-        for mf in &self.mesh_faces {
-            for ring in &mf.rings {
-                for p in &ring.points {
-                    scale = scale.max(p.coords.norm());
-                }
-            }
-        }
-        let weld_eps = 1e-9 * (1.0 + scale);
+        // Weld epsilon from the mesh's feature extent (see `geometric_snap`
+        // — must not grow with distance from the origin).
+        let weld_eps = geometric_snap(
+            self.mesh_faces
+                .iter()
+                .flat_map(|mf| mf.rings.iter())
+                .flat_map(|ring| ring.points.iter().copied()),
+        );
         let mut deviation: f64 = 0.0;
         for mf in &self.mesh_faces {
             let (tris, dev) = triangulate_mesh_face(mf, weld_eps)?;
@@ -608,6 +607,40 @@ struct Atom {
     closed: bool,
 }
 
+/// Snap length for a point cloud: 1e-9 of the cloud's bounding-box
+/// extent — the feature size — floored at ~100 ULPs of the largest
+/// coordinate magnitude.
+///
+/// The snap must key off feature size, not point magnitude `|p|`: a part
+/// has to weld and classify the same at (1e6, 0, 0) as at the origin, and
+/// a magnitude-derived snap inflates every tolerance band with distance
+/// from the origin until interior probes read as on-surface and
+/// classification fails (of-260). The ULP floor exists because distances
+/// below the f64 spacing of the coordinates themselves cannot be
+/// resolved, so a tighter snap would fail to merge points that differ
+/// only by rounding noise.
+fn geometric_snap<I: IntoIterator<Item = Point3>>(points: I) -> f64 {
+    let mut lo = [f64::INFINITY; 3];
+    let mut hi = [f64::NEG_INFINITY; 3];
+    for p in points {
+        for k in 0..3 {
+            lo[k] = lo[k].min(p[k]);
+            hi[k] = hi[k].max(p[k]);
+        }
+    }
+    let mut extent: f64 = 0.0;
+    let mut magnitude: f64 = 0.0;
+    for k in 0..3 {
+        if hi[k] >= lo[k] {
+            extent = extent.max(hi[k] - lo[k]);
+            magnitude = magnitude.max(lo[k].abs()).max(hi[k].abs());
+        }
+    }
+    (1e-9 * extent)
+        .max(100.0 * f64::EPSILON * magnitude)
+        .max(f64::MIN_POSITIVE)
+}
+
 fn quantize(p: &Point3, snap: f64) -> (i64, i64, i64) {
     (
         (p.x / snap).round() as i64,
@@ -658,16 +691,14 @@ impl<'a> Pipeline<'a> {
             a.edges.iter().map(sample_edge).collect::<Vec<_>>(),
             b.edges.iter().map(sample_edge).collect::<Vec<_>>(),
         ];
-        // Geometry scale for snapping, from all sampled points.
-        let mut scale: f64 = 1.0;
-        for samples in &edge_samples {
-            for s in samples {
-                for p in &s.points {
-                    scale = scale.max(p.coords.norm());
-                }
-            }
-        }
-        let snap = 1e-9 * scale;
+        // Snap length from the joint feature extent of both solids (see
+        // `geometric_snap` — must not grow with distance from the origin).
+        let snap = geometric_snap(
+            edge_samples
+                .iter()
+                .flatten()
+                .flat_map(|s| s.points.iter().copied()),
+        );
 
         let mut face_polys: [Vec<FaceRegionPoly>; 2] = [Vec::new(), Vec::new()];
         for s in 0..2 {
@@ -2691,6 +2722,66 @@ mod tests {
         assert_eq!(out.shell_count(), 2, "outer shell + void shell");
         assert_valid(&out, "block with internal void");
         assert_geometry_bound(&out, "block with internal void");
+    }
+
+    #[test]
+    fn geometric_snap_uses_extent_not_origin_distance() {
+        let cloud = |off: f64| [Point3::new(off, 0.0, 0.0), Point3::new(off + 2.0, 1.0, 0.5)];
+        // Near the origin: 1e-9 of the 2.0 bounding-box extent.
+        let near = geometric_snap(cloud(0.0));
+        assert!((near - 2e-9).abs() < 1e-18, "near snap {near:e}");
+        // Translating the cloud must not change the snap while the ULP
+        // floor is below the extent term.
+        assert_eq!(geometric_snap(cloud(1e3)), near);
+        // Far enough out the floor engages: 100 ULPs of the largest
+        // coordinate, so welding never drops below f64 resolution.
+        let far = geometric_snap(cloud(1e9));
+        assert_eq!(far, 100.0 * f64::EPSILON * (1e9 + 2.0));
+        // Degenerate clouds still give a positive, finite snap.
+        assert!(geometric_snap([]) > 0.0);
+        assert!(geometric_snap([Point3::origin()]) > 0.0);
+    }
+
+    /// of-260: snap bands must derive from feature extent, not distance
+    /// from the origin. Micro-scale blocks that boolean cleanly at the
+    /// origin must boolean identically when translated far from it (the
+    /// old magnitude-derived snap failed from x = 1e3 on).
+    #[test]
+    fn subtract_small_blocks_far_from_origin() {
+        let s = 1e-3;
+        for off in [0.0, 1e2, 1e3, 1e4, 1e6] {
+            let ctx = format!("1e-3 blocks at x = {off:e}");
+            let (mut store, mut geo) = stores();
+            let a = block_at(&mut store, &mut geo, (s, s, s), (off, 0.0, 0.0));
+            let b = block_at(
+                &mut store,
+                &mut geo,
+                (s, s, s),
+                (off + s / 2.0, s / 2.0, s / 2.0),
+            );
+            let out = subtract(&store, &geo, a, b, &tol())
+                .unwrap_or_else(|e| panic!("{ctx}: subtract failed: {e:?}"));
+            assert_eq!(out.face_count(), 9, "{ctx}: face count");
+            assert_eq!(out.shell_count(), 1, "{ctx}: shell count");
+            assert_valid(&out, &ctx);
+            assert_geometry_bound(&out, &ctx);
+        }
+    }
+
+    /// of-260, curved case: a through-hole subtract must survive the
+    /// whole assembly sitting far from the origin.
+    #[test]
+    fn subtract_through_hole_far_from_origin() {
+        let off = 1e3;
+        let (mut store, mut geo) = stores();
+        let block = block_at(&mut store, &mut geo, (4.0, 4.0, 2.0), (off, 0.0, 0.0));
+        let tool = cylinder_at(&mut store, &mut geo, 1.0, 4.0, (off, 0.0, 0.0));
+        let out = subtract(&store, &geo, block, tool, &tol()).unwrap();
+        assert_eq!(out.face_count(), 7, "6 block faces + 1 cylinder band");
+        assert_valid(&out, "far block minus cylinder");
+        assert_geometry_bound(&out, "far block minus cylinder");
+        let counts = out.store.euler_counts(out.body);
+        assert_eq!(counts.genus, 1, "through hole must give genus 1");
     }
 
     #[test]
