@@ -14,7 +14,86 @@ pub mod bounded;
 
 use bounded::{BoundedShape, flatten_mesh};
 use opensolid_core::types::{Point3, Vector3};
+use opensolid_frep::Profile2D;
 use wasm_bindgen::prelude::*;
+
+/// Closed 2D profile builder for [`WasmShape::extrude`] and
+/// [`WasmShape::revolve`]: start at a point, chain `lineTo`/`arcTo`, then
+/// `close()`. Arcs use the DXF bulge convention: `bulge = tan(sweep / 4)`,
+/// positive sweeping counter-clockwise (`1` is a CCW semicircle).
+#[wasm_bindgen]
+pub struct WasmProfile2D {
+    points: Vec<[f64; 2]>,
+    /// Bulge of the segment leaving `points[i]`; `len == points.len() - 1`
+    /// until `close()` completes the loop.
+    bulges: Vec<f64>,
+    closed: bool,
+}
+
+#[wasm_bindgen]
+impl WasmProfile2D {
+    /// Start a profile at `(x, y)`.
+    #[wasm_bindgen(constructor)]
+    pub fn new(x: f64, y: f64) -> WasmProfile2D {
+        WasmProfile2D {
+            points: vec![[x, y]],
+            bulges: Vec::new(),
+            closed: false,
+        }
+    }
+
+    /// Straight segment from the current point to `(x, y)`. Ignored after
+    /// `close()`.
+    #[wasm_bindgen(js_name = lineTo)]
+    pub fn line_to(&mut self, x: f64, y: f64) {
+        self.arc_to(x, y, 0.0);
+    }
+
+    /// Circular arc from the current point to `(x, y)` with the given
+    /// bulge (`tan(sweep / 4)`, positive = counter-clockwise; `0` is a
+    /// straight line). Ignored after `close()`.
+    #[wasm_bindgen(js_name = arcTo)]
+    pub fn arc_to(&mut self, x: f64, y: f64, bulge: f64) {
+        if !self.closed {
+            self.points.push([x, y]);
+            self.bulges.push(bulge);
+        }
+    }
+
+    /// Close the loop with a straight segment back to the start point (a
+    /// no-op segment if the profile already ends there). Further segments
+    /// are ignored.
+    pub fn close(&mut self) {
+        self.closed = true;
+    }
+}
+
+impl WasmProfile2D {
+    /// Assemble the validated frep profile. Fails if the profile is not
+    /// closed or violates [`Profile2D::new`]'s constraints.
+    fn build(&self) -> Result<Profile2D, String> {
+        if !self.closed {
+            return Err("profile must be closed before sweeping (call close())".into());
+        }
+        let mut verts = self.points.clone();
+        let mut bulges = self.bulges.clone();
+        // Drop an explicit return to the start point; otherwise the
+        // implicit closing segment is a straight line (bulge 0).
+        let n = verts.len();
+        if n >= 2 {
+            let first = verts[0];
+            let last = verts[n - 1];
+            if (last[0] - first[0]).hypot(last[1] - first[1]) < 1e-9 {
+                verts.pop();
+            } else {
+                bulges.push(0.0);
+            }
+        } else {
+            bulges.push(0.0);
+        }
+        Profile2D::new(verts, bulges).map_err(|e| e.to_string())
+    }
+}
 
 /// Mesh buffers for JS consumption: xyz-interleaved positions and normals
 /// (`Float32Array`), and flat triangle indices (`Uint32Array`), three per
@@ -72,9 +151,62 @@ impl WasmShape {
         ))
     }
 
+    /// The closed profile swept along +Y over `y ∈ [0, height]`; profile
+    /// `(x, y)` coordinates map to world `(x, z)`.
+    pub fn extrude(profile: &WasmProfile2D, height: f64) -> Result<WasmShape, String> {
+        let p = profile.build()?;
+        BoundedShape::extrude(p, height)
+            .map(WasmShape)
+            .map_err(|e| e.to_string())
+    }
+
+    /// The closed profile revolved around the Y axis through
+    /// `angle_degrees` (in `(0, 360]`), sweeping from the +X half-plane
+    /// towards +Z. Profile `(x, y)` maps to `(radius, y)`, so the profile
+    /// must lie in `x >= 0`.
+    pub fn revolve(profile: &WasmProfile2D, angle_degrees: f64) -> Result<WasmShape, String> {
+        let p = profile.build()?;
+        BoundedShape::revolve(p, angle_degrees.to_radians())
+            .map(WasmShape)
+            .map_err(|e| e.to_string())
+    }
+
     /// This shape moved by `(x, y, z)`.
     pub fn translate(&self, x: f64, y: f64, z: f64) -> WasmShape {
         WasmShape(self.0.translate(Vector3::new(x, y, z)))
+    }
+
+    /// This shape rotated about the origin by `angle` radians around the
+    /// axis `(ax, ay, az)` (any non-zero length). A zero or non-finite
+    /// axis or angle is the identity rotation.
+    pub fn rotate(&self, ax: f64, ay: f64, az: f64, angle: f64) -> WasmShape {
+        let axis = Vector3::new(ax, ay, az);
+        let axis_angle = if axis.norm().is_normal() && angle.is_finite() {
+            axis.normalize() * angle
+        } else {
+            Vector3::zeros()
+        };
+        WasmShape(self.0.rotate(axis_angle))
+    }
+
+    /// This shape scaled per-axis about the origin (each factor `> 0`).
+    /// Booleans and meshing stay correct, but the field is no longer an
+    /// exact distance, so smooth-blend radii applied afterwards are
+    /// distorted; prefer `uniformScale` when the factors are equal.
+    pub fn scale(&self, sx: f64, sy: f64, sz: f64) -> Result<WasmShape, String> {
+        self.0
+            .scale(Vector3::new(sx, sy, sz))
+            .map(WasmShape)
+            .map_err(|e| e.to_string())
+    }
+
+    /// This shape scaled uniformly about the origin (`factor > 0`).
+    #[wasm_bindgen(js_name = uniformScale)]
+    pub fn uniform_scale(&self, factor: f64) -> Result<WasmShape, String> {
+        self.0
+            .uniform_scale(factor)
+            .map(WasmShape)
+            .map_err(|e| e.to_string())
     }
 
     /// Boolean union with `other`.
@@ -178,5 +310,135 @@ mod tests {
     fn bounds_reports_translated_box() {
         let b = WasmShape::sphere(1.0).translate(2.0, 0.0, 0.0).bounds();
         assert_eq!(b, vec![1.0, -1.0, -1.0, 3.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn rotate_and_scale_mesh_via_wasm_api() {
+        let s = WasmShape::box3(1.0, 0.4, 0.6)
+            .rotate(0.0, 0.0, 1.0, std::f64::consts::FRAC_PI_2)
+            .scale(1.5, 1.0, 2.0)
+            .expect("valid factors")
+            .translate(0.2, -0.1, 0.3);
+        assert_valid(&s.mesh(32, None));
+
+        // Quarter turn about z swaps the box's x/y bounds (then scaled).
+        let b = WasmShape::box3(2.0, 1.0, 0.5)
+            .rotate(0.0, 0.0, 1.0, std::f64::consts::FRAC_PI_2)
+            .bounds();
+        assert!((b[3] - 1.0).abs() < 1e-12 && (b[4] - 2.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn uniform_scale_via_wasm_api() {
+        let b = WasmShape::sphere(1.0)
+            .uniform_scale(2.5)
+            .expect("valid factor")
+            .bounds();
+        assert_eq!(b, vec![-2.5, -2.5, -2.5, 2.5, 2.5, 2.5]);
+        assert!(WasmShape::sphere(1.0).uniform_scale(-1.0).is_err());
+        assert!(WasmShape::sphere(1.0).scale(1.0, 0.0, 1.0).is_err());
+    }
+
+    #[test]
+    fn zero_axis_rotation_is_identity() {
+        let b = WasmShape::box3(2.0, 1.0, 0.5)
+            .rotate(0.0, 0.0, 0.0, 1.0)
+            .bounds();
+        assert_eq!(b, vec![-2.0, -1.0, -0.5, 2.0, 1.0, 0.5]);
+        let b = WasmShape::box3(2.0, 1.0, 0.5)
+            .rotate(0.0, 0.0, 1.0, f64::NAN)
+            .bounds();
+        assert_eq!(b, vec![-2.0, -1.0, -0.5, 2.0, 1.0, 0.5]);
+    }
+
+    fn closed_square() -> WasmProfile2D {
+        let mut p = WasmProfile2D::new(0.0, 0.0);
+        p.line_to(1.0, 0.0);
+        p.line_to(1.0, 1.0);
+        p.line_to(0.0, 1.0);
+        p.close();
+        p
+    }
+
+    #[test]
+    fn extrude_square_via_wasm_api() {
+        let shape = WasmShape::extrude(&closed_square(), 2.0).expect("valid extrude");
+        assert_eq!(shape.bounds(), vec![0.0, 0.0, 0.0, 1.0, 2.0, 1.0]);
+        assert_valid(&shape.mesh(32, None));
+    }
+
+    #[test]
+    fn extrude_profile_with_arcs_via_wasm_api() {
+        // Rounded slot: two straight edges joined by semicircular caps.
+        let mut p = WasmProfile2D::new(-0.5, -0.25);
+        p.line_to(0.5, -0.25);
+        p.arc_to(0.5, 0.25, 1.0);
+        p.line_to(-0.5, 0.25);
+        p.arc_to(-0.5, -0.25, 1.0); // explicit arc back to the start
+        p.close();
+        let shape = WasmShape::extrude(&p, 0.5).expect("valid extrude");
+        let b = shape.bounds();
+        // Semicircular caps extend the x reach by their radius 0.25.
+        assert!((b[0] + 0.75).abs() < 1e-9 && (b[3] - 0.75).abs() < 1e-9);
+        assert_valid(&shape.mesh(32, None));
+    }
+
+    #[test]
+    fn revolve_full_and_partial_via_wasm_api() {
+        let mut p = WasmProfile2D::new(0.5, 0.0);
+        p.line_to(1.0, 0.0);
+        p.line_to(1.0, 0.4);
+        p.line_to(0.5, 0.4);
+        p.close();
+        let full = WasmShape::revolve(&p, 360.0).expect("valid revolve");
+        assert_eq!(full.bounds(), vec![-1.0, 0.0, -1.0, 1.0, 0.4, 1.0]);
+        assert_valid(&full.mesh(32, None));
+
+        let partial = WasmShape::revolve(&p, 135.0).expect("valid revolve");
+        assert_valid(&partial.mesh(32, None));
+    }
+
+    #[test]
+    fn profile_errors_surface_as_strings() {
+        // Unclosed profile.
+        let mut open = WasmProfile2D::new(0.0, 0.0);
+        open.line_to(1.0, 0.0);
+        open.line_to(1.0, 1.0);
+        let err = match WasmShape::extrude(&open, 1.0) {
+            Ok(_) => panic!("must require close()"),
+            Err(e) => e,
+        };
+        assert!(err.contains("close"), "got: {err}");
+
+        // Too few segments.
+        let mut tiny = WasmProfile2D::new(0.0, 0.0);
+        tiny.close();
+        assert!(WasmShape::extrude(&tiny, 1.0).is_err());
+
+        // Bad height / angle / negative-x revolve profile.
+        assert!(WasmShape::extrude(&closed_square(), 0.0).is_err());
+        assert!(WasmShape::revolve(&closed_square(), 0.0).is_err());
+        assert!(WasmShape::revolve(&closed_square(), 400.0).is_err());
+        let mut neg = WasmProfile2D::new(-1.0, 0.0);
+        neg.line_to(1.0, 0.0);
+        neg.line_to(1.0, 1.0);
+        neg.close();
+        assert!(WasmShape::revolve(&neg, 360.0).is_err());
+    }
+
+    #[test]
+    fn segments_after_close_are_ignored() {
+        let mut p = closed_square();
+        p.line_to(5.0, 5.0);
+        p.arc_to(9.0, 9.0, 1.0);
+        let shape = WasmShape::extrude(&p, 1.0).expect("valid extrude");
+        assert_eq!(shape.bounds(), vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn swept_shapes_compose_with_csg() {
+        let plate = WasmShape::extrude(&closed_square(), 0.3).expect("valid extrude");
+        let hole = WasmShape::cylinder(0.2, 1.0).translate(0.5, 0.15, 0.5);
+        assert_valid(&plate.subtract(&hole).mesh(40, None));
     }
 }

@@ -5,11 +5,12 @@
 //! fully exercised by native `cargo test`; the `lib.rs` wasm layer is a thin
 //! delegating wrapper.
 
+use opensolid_core::error::CoreResult;
 use opensolid_core::mesh::TriangleMesh;
-use opensolid_core::types::{BoundingBox3, Point3, Vector3};
+use opensolid_core::types::{BoundingBox3, Point3, Transform3, Vector3};
 use opensolid_frep::mesh::{MeshOptions, mesh_sdf_indexed};
 use opensolid_frep::primitives::{Box3, Capsule, Cylinder, RoundedBox, Sphere, Torus};
-use opensolid_frep::{SdfTransformExt, Shape};
+use opensolid_frep::{Extrude, Profile2D, Revolve, SdfTransformExt, Shape};
 
 /// A runtime-composable shape that carries a conservative axis-aligned
 /// bounding box of its surface, so meshing can auto-derive grid bounds.
@@ -123,11 +124,108 @@ impl BoundedShape {
         }
     }
 
+    /// The profile swept along +Y over `y ∈ [0, height]`; profile `(u, v)`
+    /// maps to world `(x, z)`.
+    ///
+    /// # Errors
+    /// Propagates [`Extrude::new`] validation (`height > 0` and finite).
+    pub fn extrude(profile: Profile2D, height: f64) -> CoreResult<Self> {
+        let (min, max) = profile.bounds();
+        let bounds = BoundingBox3::new(
+            Point3::new(min[0], 0.0, min[1]),
+            Point3::new(max[0], height, max[1]),
+        );
+        Ok(Self {
+            shape: Shape::new(Extrude::new(profile, height)?),
+            bounds,
+        })
+    }
+
+    /// The profile revolved around the Y axis through `angle` radians,
+    /// sweeping from the +X half-plane towards +Z; profile `(u, v)` maps to
+    /// `(radius, y)`. The tracked box is the full-turn box (conservative
+    /// for partial sweeps).
+    ///
+    /// # Errors
+    /// Propagates [`Revolve::new`] validation (`angle` in `(0, 2π]`,
+    /// profile in `u >= 0`).
+    pub fn revolve(profile: Profile2D, angle: f64) -> CoreResult<Self> {
+        let (min, max) = profile.bounds();
+        let reach = max[0].max(0.0);
+        let bounds = BoundingBox3::new(
+            Point3::new(-reach, min[1], -reach),
+            Point3::new(reach, max[1], reach),
+        );
+        Ok(Self {
+            shape: Shape::new(Revolve::new(profile, angle)?),
+            bounds,
+        })
+    }
+
     pub fn translate(&self, offset: Vector3) -> Self {
         Self {
             shape: Shape::new(self.shape.clone().translated(offset)),
             bounds: BoundingBox3::new(self.bounds.min + offset, self.bounds.max + offset),
         }
+    }
+
+    /// Rotated about the origin. `axis_angle`'s direction is the rotation
+    /// axis and its norm the angle in radians. The tracked box is the AABB
+    /// of the rotated corners (conservative).
+    pub fn rotate(&self, axis_angle: Vector3) -> Self {
+        let rot = Transform3::rotation(axis_angle);
+        let b = &self.bounds;
+        let corners = (0..8).map(|i| {
+            rot * Point3::new(
+                if i & 1 == 0 { b.min.x } else { b.max.x },
+                if i & 2 == 0 { b.min.y } else { b.max.y },
+                if i & 4 == 0 { b.min.z } else { b.max.z },
+            )
+        });
+        Self {
+            shape: Shape::new(self.shape.clone().rotated(axis_angle)),
+            bounds: BoundingBox3::from_points(corners),
+        }
+    }
+
+    /// Scaled per-axis about the origin (each factor `> 0`). Sign-exact
+    /// but not metric-exact — see [`opensolid_frep::AnisotropicScale`].
+    ///
+    /// # Errors
+    /// Propagates factor validation (positive and finite).
+    pub fn scale(&self, factors: Vector3) -> CoreResult<Self> {
+        let shape = Shape::new(self.shape.clone().scaled_anisotropic(factors)?);
+        Ok(Self {
+            shape,
+            bounds: BoundingBox3::new(
+                Point3::new(
+                    self.bounds.min.x * factors.x,
+                    self.bounds.min.y * factors.y,
+                    self.bounds.min.z * factors.z,
+                ),
+                Point3::new(
+                    self.bounds.max.x * factors.x,
+                    self.bounds.max.y * factors.y,
+                    self.bounds.max.z * factors.z,
+                ),
+            ),
+        })
+    }
+
+    /// Scaled uniformly about the origin (`factor > 0`); stays an exact
+    /// distance field.
+    ///
+    /// # Errors
+    /// Propagates factor validation (positive and finite).
+    pub fn uniform_scale(&self, factor: f64) -> CoreResult<Self> {
+        let shape = Shape::new(self.shape.clone().scaled(factor)?);
+        Ok(Self {
+            shape,
+            bounds: BoundingBox3::new(
+                Point3::from(self.bounds.min.coords * factor),
+                Point3::from(self.bounds.max.coords * factor),
+            ),
+        })
     }
 
     pub fn union(&self, other: &Self) -> Self {
@@ -401,5 +499,142 @@ mod tests {
         assert!(flat.positions.is_empty());
         assert!(flat.normals.is_empty());
         assert!(flat.indices.is_empty());
+    }
+
+    #[test]
+    fn rotate_quarter_turn_swaps_bounds_axes() {
+        // Box reaching x = ±2 rotated 90° about z reaches y = ±2.
+        use std::f64::consts::FRAC_PI_2;
+        let s = BoundedShape::box3(2.0, 1.0, 0.5).rotate(Vector3::new(0.0, 0.0, FRAC_PI_2));
+        assert!((s.bounds.max - Point3::new(1.0, 2.0, 0.5)).norm() < 1e-12);
+        assert!((s.bounds.min - Point3::new(-1.0, -2.0, -0.5)).norm() < 1e-12);
+        assert!(s.shape.eval(&Point3::new(0.0, 2.0, 0.0)).abs() < 1e-12);
+        assert_meshes_cleanly(&s);
+    }
+
+    #[test]
+    fn rotate_oblique_bounds_still_contain_surface() {
+        let s = BoundedShape::box3(1.0, 0.5, 0.75)
+            .rotate(Vector3::new(0.4, -0.8, 0.3))
+            .translate(Vector3::new(0.5, -0.25, 1.0));
+        assert_meshes_cleanly(&s);
+    }
+
+    #[test]
+    fn uniform_scale_scales_bounds_and_surface() {
+        let s = BoundedShape::sphere(1.0)
+            .translate(Vector3::new(1.0, 0.0, 0.0))
+            .uniform_scale(2.0)
+            .expect("valid factor");
+        assert_eq!(s.bounds.min, Point3::new(0.0, -2.0, -2.0));
+        assert_eq!(s.bounds.max, Point3::new(4.0, 2.0, 2.0));
+        assert!(s.shape.eval(&Point3::new(4.0, 0.0, 0.0)).abs() < 1e-12);
+        assert_meshes_cleanly(&s);
+    }
+
+    #[test]
+    fn anisotropic_scale_bounds_and_sign() {
+        let s = BoundedShape::sphere(1.0)
+            .scale(Vector3::new(2.0, 1.0, 0.5))
+            .expect("valid factors");
+        assert_eq!(s.bounds.min, Point3::new(-2.0, -1.0, -0.5));
+        assert_eq!(s.bounds.max, Point3::new(2.0, 1.0, 0.5));
+        assert!(s.shape.eval(&Point3::new(2.0, 0.0, 0.0)).abs() < 1e-12);
+        assert!(s.shape.eval(&Point3::new(0.0, 0.0, 0.6)) > 0.0);
+        let mesh = s.mesh(RES, None);
+        assert!(!mesh.is_empty());
+        assert!(mesh.is_closed_manifold());
+    }
+
+    #[test]
+    fn scale_rejects_bad_factors() {
+        let s = BoundedShape::sphere(1.0);
+        assert!(s.scale(Vector3::new(0.0, 1.0, 1.0)).is_err());
+        assert!(s.scale(Vector3::new(1.0, -1.0, 1.0)).is_err());
+        assert!(s.uniform_scale(0.0).is_err());
+        assert!(s.uniform_scale(f64::NAN).is_err());
+    }
+
+    fn l_profile() -> Profile2D {
+        Profile2D::new(
+            vec![
+                [0.0, 0.0],
+                [1.0, 0.0],
+                [1.0, 0.4],
+                [0.4, 0.4],
+                [0.4, 1.0],
+                [0.0, 1.0],
+            ],
+            vec![0.0; 6],
+        )
+        .expect("valid L profile")
+    }
+
+    #[test]
+    fn extrude_tracks_bounds_and_meshes() {
+        let s = BoundedShape::extrude(l_profile(), 0.8).expect("valid extrude");
+        assert_eq!(s.bounds.min, Point3::new(0.0, 0.0, 0.0));
+        assert_eq!(s.bounds.max, Point3::new(1.0, 0.8, 1.0));
+        // Surface touches the tracked box faces.
+        assert!(s.shape.eval(&Point3::new(0.5, 0.8, 0.2)).abs() < 1e-12);
+        assert!(s.shape.eval(&Point3::new(1.0, 0.4, 0.2)).abs() < 1e-12);
+        assert_meshes_cleanly(&s);
+    }
+
+    #[test]
+    fn revolve_tracks_bounds_and_meshes() {
+        let profile = Profile2D::new(
+            vec![[0.3, -0.2], [0.8, -0.2], [0.8, 0.2], [0.3, 0.2]],
+            vec![0.0; 4],
+        )
+        .expect("valid profile");
+        let s =
+            BoundedShape::revolve(profile.clone(), std::f64::consts::TAU).expect("valid revolve");
+        assert_eq!(s.bounds.min, Point3::new(-0.8, -0.2, -0.8));
+        assert_eq!(s.bounds.max, Point3::new(0.8, 0.2, 0.8));
+        assert!(s.shape.eval(&Point3::new(0.0, 0.0, 0.8)).abs() < 1e-12);
+        assert_meshes_cleanly(&s);
+
+        // Partial sweep: still contained in the (conservative) full box.
+        let partial = BoundedShape::revolve(profile, 2.0).expect("valid revolve");
+        assert_meshes_cleanly(&partial);
+    }
+
+    #[test]
+    fn extrude_and_revolve_reject_bad_input() {
+        assert!(BoundedShape::extrude(l_profile(), 0.0).is_err());
+        assert!(BoundedShape::extrude(l_profile(), -1.0).is_err());
+        assert!(BoundedShape::revolve(l_profile(), 0.0).is_err());
+        assert!(BoundedShape::revolve(l_profile(), 7.0).is_err());
+        // Profile crossing to negative u cannot be revolved.
+        let crossing = Profile2D::new(
+            vec![[-0.5, 0.0], [0.5, 0.0], [0.5, 1.0], [-0.5, 1.0]],
+            vec![0.0; 4],
+        )
+        .expect("valid profile");
+        assert!(BoundedShape::revolve(crossing, std::f64::consts::TAU).is_err());
+    }
+
+    #[test]
+    fn swept_solids_compose_with_csg_and_transforms() {
+        // A rotated, scaled extrusion subtracted from a revolve: the whole
+        // pipeline stays composable and meshable.
+        let ring = BoundedShape::revolve(
+            Profile2D::new(
+                vec![[0.5, -0.15], [0.9, -0.15], [0.9, 0.15], [0.5, 0.15]],
+                vec![0.0; 4],
+            )
+            .expect("valid profile"),
+            std::f64::consts::TAU,
+        )
+        .expect("valid revolve");
+        let bar = BoundedShape::extrude(l_profile(), 0.5)
+            .expect("valid extrude")
+            .rotate(Vector3::new(0.0, 0.3, 0.0))
+            .translate(Vector3::new(-0.5, -0.25, -0.5));
+        let part = ring.subtract(&bar);
+        let mesh = part.mesh(RES, None);
+        assert!(!mesh.is_empty());
+        assert!(mesh.is_closed_manifold());
     }
 }

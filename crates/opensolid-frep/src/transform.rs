@@ -56,13 +56,13 @@ impl<S: Sdf> Sdf for Transformed<S> {
 /// Uniform scaling multiplies every Euclidean distance by the same factor,
 /// so rescaling the inner value keeps the field an exact distance.
 ///
-/// Non-uniform scale is deliberately excluded: it stretches space by a
-/// direction-dependent amount (spheres become ellipsoids), so no single
-/// correction factor can restore the inner value to a distance — `|∇f|`
-/// drifts away from 1 and everything that relies on the metric property
-/// (blend radii, meshing step bounds, offsets) silently breaks. An
-/// approximate anisotropic scale would need its own re-normalizing
-/// operator, not this wrapper.
+/// Non-uniform scale is deliberately excluded from this wrapper: it
+/// stretches space by a direction-dependent amount (spheres become
+/// ellipsoids), so no single correction factor can restore the inner value
+/// to a distance — `|∇f|` drifts away from 1 and everything that relies on
+/// the metric property (blend radii, meshing step bounds, offsets)
+/// silently breaks. The dedicated [`AnisotropicScale`] operator provides
+/// the re-normalized conservative bound instead.
 pub struct UniformScale<S> {
     pub sdf: S,
     factor: f64,
@@ -104,6 +104,77 @@ impl<S: Sdf> Sdf for UniformScale<S> {
     }
 }
 
+/// An SDF scaled per-axis about the origin by positive `factors`:
+/// `eval(p) = min(factors) * inner(p ⊘ factors)`.
+///
+/// Unlike [`UniformScale`] the result is **not** an exact distance — no
+/// anisotropic rescaling of an SDF can be (see the [`UniformScale`] docs).
+/// Multiplying by the *smallest* factor keeps the field a conservative
+/// bound: the sign (and therefore the surface) is exact, the Lipschitz
+/// constant stays ≤ 1 (so the default `eval_interval` reasoning remains
+/// valid), and magnitudes underestimate the true distance by at most the
+/// max/min factor ratio. Metric-sensitive operators applied on top
+/// (offset, shell, blend radii) will be distorted accordingly.
+pub struct AnisotropicScale<S> {
+    pub sdf: S,
+    factors: Vector3,
+    min_factor: f64,
+}
+
+impl<S> AnisotropicScale<S> {
+    /// # Errors
+    /// [`CoreError::InvalidArgument`] if any factor is not positive and
+    /// finite.
+    pub fn new(sdf: S, factors: Vector3) -> CoreResult<Self> {
+        if factors.iter().any(|f| *f <= 0.0 || !f.is_finite()) {
+            return Err(CoreError::InvalidArgument {
+                argument: "factors",
+                reason: format!(
+                    "must be positive and finite, got ({}, {}, {})",
+                    factors.x, factors.y, factors.z
+                ),
+            });
+        }
+        Ok(Self {
+            sdf,
+            factors,
+            min_factor: factors.x.min(factors.y).min(factors.z),
+        })
+    }
+
+    fn to_inner(&self, p: &Point3) -> Point3 {
+        Point3::new(
+            p.x / self.factors.x,
+            p.y / self.factors.y,
+            p.z / self.factors.z,
+        )
+    }
+}
+
+impl<S: Sdf> Sdf for AnisotropicScale<S> {
+    fn eval(&self, p: &Point3) -> f64 {
+        self.sdf.eval(&self.to_inner(p)) * self.min_factor
+    }
+
+    fn grad(&self, p: &Point3) -> Vector3 {
+        // ∇(k · g(A p)) = k · Aᵀ ∇g(A p) with A = diag(1 / factors).
+        let g = self.sdf.grad(&self.to_inner(p));
+        Vector3::new(
+            g.x / self.factors.x,
+            g.y / self.factors.y,
+            g.z / self.factors.z,
+        ) * self.min_factor
+    }
+
+    fn eval_interval(&self, b: &BoundingBox3) -> Interval {
+        // Exact given the inner bound: map the box into the inner frame
+        // (positive factors preserve per-axis order) and rescale.
+        let inner = BoundingBox3::new(self.to_inner(&b.min), self.to_inner(&b.max));
+        let i = self.sdf.eval_interval(&inner);
+        Interval::new(i.lo * self.min_factor, i.hi * self.min_factor)
+    }
+}
+
 /// Chainable constructors for the transform wrappers. Each call wraps the
 /// receiver, so transforms apply to the shape in the order they are chained:
 /// `sdf.rotated(r).translated(t)` rotates first, then translates.
@@ -130,6 +201,16 @@ pub trait SdfTransformExt: Sdf + Sized {
     /// [`CoreError::InvalidArgument`] if `factor` is not positive and finite.
     fn scaled(self, factor: f64) -> CoreResult<UniformScale<Self>> {
         UniformScale::new(self, factor)
+    }
+
+    /// Scale per-axis about the origin (each factor `> 0`). Sign-exact but
+    /// not metric-exact — see [`AnisotropicScale`].
+    ///
+    /// # Errors
+    /// [`CoreError::InvalidArgument`] if any factor is not positive and
+    /// finite.
+    fn scaled_anisotropic(self, factors: Vector3) -> CoreResult<AnisotropicScale<Self>> {
+        AnisotropicScale::new(self, factors)
     }
 }
 
@@ -376,6 +457,99 @@ mod tests {
             let g = s.grad(&p);
             let expected = p.coords.normalize();
             assert!((g - expected).norm() < 1e-14, "at {p:?}: got {g:?}");
+        }
+    }
+
+    #[test]
+    fn anisotropic_scale_surface_and_sign() {
+        // Unit sphere scaled (2, 1, 0.5): ellipsoid with semi-axes 2/1/0.5.
+        let e = unit_sphere()
+            .scaled_anisotropic(Vector3::new(2.0, 1.0, 0.5))
+            .expect("valid factors");
+        for (p, expect_zero) in [
+            (Point3::new(2.0, 0.0, 0.0), true),
+            (Point3::new(0.0, 1.0, 0.0), true),
+            (Point3::new(0.0, 0.0, 0.5), true),
+            (Point3::new(0.0, 0.0, 0.0), false),
+        ] {
+            let d = e.eval(&p);
+            if expect_zero {
+                assert!(d.abs() < 1e-12, "at {p:?}: {d}");
+            } else {
+                assert!(d < 0.0, "at {p:?}: {d}");
+            }
+        }
+        assert!(e.eval(&Point3::new(2.1, 0.0, 0.0)) > 0.0);
+        assert!(e.eval(&Point3::new(0.0, 0.0, 0.6)) > 0.0);
+        assert!(e.eval(&Point3::new(1.9, 0.0, 0.0)) < 0.0);
+    }
+
+    #[test]
+    fn anisotropic_scale_underestimates_but_never_exceeds_distance() {
+        // Along +x the true distance from (4, 0, 0) to the ellipsoid
+        // (semi-axis 2) is 2; the conservative field reports
+        // min_factor * inner = 0.5 * 1 = 0.5 ≤ 2. It must stay positive
+        // outside and Lipschitz ≤ 1 (checked via interval containment).
+        let e = unit_sphere()
+            .scaled_anisotropic(Vector3::new(2.0, 1.0, 0.5))
+            .expect("valid factors");
+        let d = e.eval(&Point3::new(4.0, 0.0, 0.0));
+        assert!(d > 0.0 && d <= 2.0 + 1e-12, "got {d}");
+        assert!((d - 0.5).abs() < 1e-12);
+        crate::test_util::assert_interval_containment(&e, 33);
+    }
+
+    #[test]
+    fn anisotropic_scale_grad_forwards_and_rescales() {
+        // With the flat probe (see above) a finite-difference fallback
+        // would return zero, so a non-zero result proves forwarding:
+        // grad = min_factor * diag(1/f) * inner_grad(p ⊘ f).
+        let s = GradProbe
+            .scaled_anisotropic(Vector3::new(2.0, 1.0, 0.5))
+            .expect("valid factors");
+        let p = Point3::new(4.0, -2.0, 1.0);
+        let g = s.grad(&p);
+        let expected = Vector3::new(4.0 / 2.0 / 2.0, -2.0 / 1.0 / 1.0, 1.0 / 0.5 / 0.5) * 0.5;
+        assert!((g - expected).norm() < 1e-14, "got {g:?}");
+    }
+
+    #[test]
+    fn anisotropic_uniform_factors_match_uniform_scale() {
+        let a = unit_sphere()
+            .scaled_anisotropic(Vector3::new(1.7, 1.7, 1.7))
+            .expect("valid factors");
+        let u = unit_sphere().scaled(1.7).expect("valid scale");
+        for p in [
+            Point3::origin(),
+            Point3::new(1.7, 0.0, 0.0),
+            Point3::new(-0.4, 2.2, 0.9),
+        ] {
+            assert!((a.eval(&p) - u.eval(&p)).abs() < 1e-12, "at {p:?}");
+        }
+    }
+
+    #[test]
+    fn anisotropic_scale_rejects_bad_factors() {
+        for bad in [
+            Vector3::new(0.0, 1.0, 1.0),
+            Vector3::new(1.0, -2.0, 1.0),
+            Vector3::new(1.0, 1.0, f64::NAN),
+            Vector3::new(f64::INFINITY, 1.0, 1.0),
+        ] {
+            let err = match AnisotropicScale::new(unit_sphere(), bad) {
+                Ok(_) => panic!("factors {bad:?}: expected rejection"),
+                Err(e) => e,
+            };
+            assert!(
+                matches!(
+                    err,
+                    CoreError::InvalidArgument {
+                        argument: "factors",
+                        ..
+                    }
+                ),
+                "factors {bad:?}: got {err}"
+            );
         }
     }
 
