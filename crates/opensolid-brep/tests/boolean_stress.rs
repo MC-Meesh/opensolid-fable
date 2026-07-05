@@ -40,6 +40,11 @@
 //! through-hole cases (all scales), the near-tangent wall case, and the
 //! block−cylinder round trip are un-ignored and pass.
 //!
+//! of-ipt.7 FIXED (2026-07-05): the 25° skew case tessellates closed-
+//! manifold after the of-ipt.4 curved-chart refinement and the of-299
+//! hole-bridge validation landed; volume matches the transversal
+//! prediction. Un-ignored.
+//!
 //! Invariants asserted throughout:
 //! - `BooleanOutput::check()` reports no failures,
 //! - `BooleanOutput::tessellate()` yields a closed manifold mesh,
@@ -413,8 +418,6 @@ fn rotated_tool_through_hole_45_deg() {
 /// Same tilted-tool subtraction but tilted toward a block diagonal, so no
 /// imprint aligns with any coordinate plane.
 #[test]
-#[ignore = "of-ipt.7: post-of-k3u subtract succeeds with correct topology (genus 1, check \
-            clean) but the tessellation is not a closed manifold"]
 fn rotated_tool_through_hole_skew_axis() {
     let context = "block minus cylinder tilted 25° toward XY diagonal";
     let mut scene = Scene::new();
