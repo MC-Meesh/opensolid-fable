@@ -27,9 +27,26 @@
 //! pair of valid inputs — including the degenerate contacts the exact
 //! pipeline rejects. This is the "booleans never fail" escape hatch of the
 //! hybrid architecture.
+//!
+//! # Runtime result validation
+//!
+//! The exact pipeline can return `Ok` with *wrong* geometry (of-ipt.4:
+//! removed volume off 12×; of-ipt.5: silent no-op) — failures the
+//! mesh-quality gate alone cannot see, because the bad mesh is still
+//! closed, manifold, and chord-faithful to the (wrong) analytic faces. So
+//! a successful exact result additionally passes a validation gate
+//! ([`ValidationOptions`], on by default) before it is kept: the result
+//! body must pass the full topology checker ([`BooleanOutput::check`]),
+//! and its enclosed volume ([`mass_properties`]) must agree with a coarse
+//! F-Rep grid estimate of the same boolean. A result that fails either
+//! test is discarded and the operation diverts to the F-Rep fallback,
+//! recording why in [`HybridBoolean::diagnostic`]. Set
+//! [`HybridOptions::validation`] to `None` to benchmark the pure B-Rep
+//! path without the cross-check cost.
 
 use crate::builder::Part;
 use crate::convert::{MeshSdf, SdfToBrepOptions, sdf_to_brep};
+use crate::massprops::mass_properties;
 use crate::mesh::{MeshOptions, TriangleMesh, mesh_sdf_indexed};
 use opensolid_brep::boolean::{
     intersect as brep_intersect, subtract as brep_subtract, unite as brep_unite,
@@ -40,7 +57,8 @@ use opensolid_brep::{
 use opensolid_core::EntityId;
 use opensolid_core::error::{CoreError, CoreResult};
 use opensolid_core::tolerance::ToleranceContext;
-use opensolid_core::types::{BoundingBox3, Vector3};
+use opensolid_core::types::{BoundingBox3, Point3, Vector3};
+use opensolid_frep::primitives::Sdf;
 use opensolid_frep::shape::Shape;
 
 pub use opensolid_brep::BooleanOp;
@@ -132,6 +150,11 @@ pub struct HybridOptions {
     /// fallback's dual-contouring mesh. Also sets the exact path's
     /// mesh-quality bar: one grid cell of chordal deviation.
     pub resolution: usize,
+    /// Runtime validation of a successful exact result (see the
+    /// [module docs](self)). `None` disables the gate — the exact path
+    /// then answers only to the mesh-quality bar, with no operand
+    /// tessellation or grid-evaluation overhead (pure-B-Rep benchmarking).
+    pub validation: Option<ValidationOptions>,
 }
 
 impl Default for HybridOptions {
@@ -139,8 +162,58 @@ impl Default for HybridOptions {
         Self {
             tol: ToleranceContext::default(),
             resolution: 64,
+            validation: Some(ValidationOptions::default()),
         }
     }
+}
+
+/// Options for the exact-result validation gate (see the
+/// [module docs](self)).
+#[derive(Debug, Clone, Copy)]
+pub struct ValidationOptions {
+    /// Grid resolution (cells across the longest bounds axis) for the
+    /// F-Rep volume estimate. Coarser than the fallback's meshing
+    /// resolution: the estimate only has to expose gross volume errors,
+    /// not reproduce the surface.
+    pub resolution: usize,
+    /// Maximum allowed relative divergence between the exact result's
+    /// enclosed volume and the F-Rep estimate:
+    /// `|v_brep − v_est| ≤ max_volume_divergence · max(v_brep, v_est)`.
+    /// Must cover the estimate's own error (grid discretization plus
+    /// operand tessellation), or correct exact results get discarded.
+    pub max_volume_divergence: f64,
+}
+
+impl Default for ValidationOptions {
+    fn default() -> Self {
+        Self {
+            resolution: 32,
+            max_volume_divergence: 0.05,
+        }
+    }
+}
+
+/// Why the validation gate discarded a successful exact B-Rep result and
+/// diverted to the F-Rep fallback. Carried on
+/// [`HybridBoolean::diagnostic`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum ValidationDiagnostic {
+    /// The result body failed the full topology checker
+    /// ([`BooleanOutput::check`]); `failures` is the number of check
+    /// failures reported.
+    CheckFailed { failures: usize },
+    /// The result's enclosed volume disagreed with the F-Rep grid estimate
+    /// of the same boolean by more than
+    /// [`ValidationOptions::max_volume_divergence`].
+    VolumeDivergence {
+        /// Volume enclosed by the exact result's tessellation.
+        brep_volume: f64,
+        /// Coarse F-Rep grid estimate of the true boolean's volume.
+        estimated_volume: f64,
+    },
+    /// The result mesh was closed and manifold but enclosed no measurable
+    /// volume (e.g. a zero-thickness pillow).
+    UnmeasurableVolume,
 }
 
 /// Which pipeline produced the result, with that pipeline's
@@ -175,6 +248,12 @@ pub struct HybridBoolean {
     pub mesh: TriangleMesh,
     /// The pipeline that produced it.
     pub path: HybridPath,
+    /// Set when the exact pipeline returned `Ok` but the validation gate
+    /// discarded its result as wrong ([`ValidationDiagnostic`]); the
+    /// F-Rep fallback result held here replaced it. `None` on the exact
+    /// path, and on fallbacks taken for any other reason (mixed
+    /// representations, exact-pipeline error, mesh-quality shortfall).
+    pub diagnostic: Option<ValidationDiagnostic>,
 }
 
 impl HybridBoolean {
@@ -255,16 +334,12 @@ pub fn boolean(
     b: &HybridBody,
     opts: &HybridOptions,
 ) -> CoreResult<HybridBoolean> {
-    if opts.resolution < MIN_RESOLUTION {
-        return Err(CoreError::InvalidArgument {
-            argument: "resolution",
-            reason: format!(
-                "must be at least {MIN_RESOLUTION} grid cells per axis, got {}",
-                opts.resolution
-            ),
-        });
+    check_resolution("resolution", opts.resolution)?;
+    if let Some(v) = &opts.validation {
+        check_resolution("validation.resolution", v.resolution)?;
     }
 
+    let mut diagnostic = None;
     if let (
         HybridBody::Brep {
             store: sa,
@@ -296,14 +371,119 @@ pub fn boolean(
             && let Some(bounds) = mesh.bounding_box()
             && deviation <= cell_size(&bounds, opts.resolution)
         {
-            return Ok(HybridBoolean {
-                mesh,
-                path: HybridPath::Brep(Box::new(out)),
-            });
+            match opts
+                .validation
+                .as_ref()
+                .and_then(|v| validate_exact(&out, &mesh, op, a, b, v))
+            {
+                None => {
+                    return Ok(HybridBoolean {
+                        mesh,
+                        path: HybridPath::Brep(Box::new(out)),
+                        diagnostic: None,
+                    });
+                }
+                // Validation caught a silently-wrong exact result: discard
+                // it and let the fallback rebuild from the operands.
+                Some(d) => diagnostic = Some(d),
+            }
         }
     }
 
-    frep_fallback(op, a, b, opts)
+    let mut result = frep_fallback(op, a, b, opts)?;
+    result.diagnostic = diagnostic;
+    Ok(result)
+}
+
+fn check_resolution(argument: &'static str, resolution: usize) -> CoreResult<()> {
+    if resolution < MIN_RESOLUTION {
+        return Err(CoreError::InvalidArgument {
+            argument,
+            reason: format!(
+                "must be at least {MIN_RESOLUTION} grid cells per axis, got {resolution}"
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// The validation gate: decide whether a successful exact result that
+/// already passed the mesh-quality bar is *geometrically* trustworthy.
+/// `None` keeps the exact result; `Some` discards it with the reason.
+///
+/// Operand-conversion failures here (a B-Rep operand that won't
+/// tessellate) keep the exact result rather than discarding it: the
+/// fallback would fail on the same conversion, so an unverifiable exact
+/// result is strictly better than a guaranteed error.
+fn validate_exact(
+    out: &BooleanOutput,
+    mesh: &TriangleMesh,
+    op: BooleanOp,
+    a: &HybridBody,
+    b: &HybridBody,
+    v: &ValidationOptions,
+) -> Option<ValidationDiagnostic> {
+    let failures = out.check();
+    if !failures.is_empty() {
+        return Some(ValidationDiagnostic::CheckFailed {
+            failures: failures.len(),
+        });
+    }
+    let brep_volume = match mass_properties(mesh) {
+        Ok(mp) => mp.volume,
+        // The mesh is already known closed and manifold, so the only
+        // failure left is an enclosed volume of zero.
+        Err(_) => return Some(ValidationDiagnostic::UnmeasurableVolume),
+    };
+    let Ok((shape, bounds)) = combined_field(op, a, b) else {
+        return None;
+    };
+    let estimated_volume = grid_volume(&shape, &bounds, v.resolution);
+    let scale = brep_volume.max(estimated_volume);
+    if (brep_volume - estimated_volume).abs() > v.max_volume_divergence * scale {
+        return Some(ValidationDiagnostic::VolumeDivergence {
+            brep_volume,
+            estimated_volume,
+        });
+    }
+    None
+}
+
+/// Coarse volume of the region where `shape` is negative: field samples at
+/// the centers of cubic cells tiling `bounds` (padded by one cell so
+/// boundary-straddling cells are covered), each converted to an occupancy
+/// fraction `clamp(0.5 − d/h, 0, 1)`. For a locally planar boundary the
+/// occupancy model is exact up to interface orientation, so the estimate's
+/// error stays a small fraction of (surface area × cell size) — far
+/// tighter than binary inside/outside counting at the same resolution.
+fn grid_volume(shape: &Shape, bounds: &BoundingBox3, resolution: usize) -> f64 {
+    if bounds.is_empty() {
+        return 0.0;
+    }
+    let e = bounds.extents();
+    let h = e.x.max(e.y).max(e.z) / resolution as f64;
+    if h <= 0.0 || !h.is_finite() {
+        return 0.0;
+    }
+    let cells = |extent: f64| (extent / h).ceil() as usize + 2;
+    let (nx, ny, nz) = (cells(e.x), cells(e.y), cells(e.z));
+    let origin = bounds.min - Vector3::repeat(h);
+    let cell_volume = h * h * h;
+    let mut volume = 0.0;
+    for i in 0..nx {
+        for j in 0..ny {
+            for k in 0..nz {
+                let p = Point3::new(
+                    origin.x + (i as f64 + 0.5) * h,
+                    origin.y + (j as f64 + 0.5) * h,
+                    origin.z + (k as f64 + 0.5) * h,
+                );
+                let occupancy = (0.5 - shape.eval(&p) / h).clamp(0.0, 1.0);
+                volume += occupancy * cell_volume;
+            }
+        }
+    }
+    volume
 }
 
 /// The robustness path: every operand becomes a signed distance field, the
@@ -314,19 +494,13 @@ fn frep_fallback(
     b: &HybridBody,
     opts: &HybridOptions,
 ) -> CoreResult<HybridBoolean> {
-    let (fa, ba) = field_of(a)?;
-    let (fb, bb) = field_of(b)?;
-    let (shape, bounds) = match op {
-        BooleanOp::Unite => (fa.union(fb), ba.union(&bb)),
-        // A - B and A ∩ B are both subsets of A; B only carves.
-        BooleanOp::Subtract => (fa.subtract(fb), ba),
-        BooleanOp::Intersect => (fa.intersect(fb), ba.intersection(&bb)),
-    };
+    let (shape, bounds) = combined_field(op, a, b)?;
     if bounds.is_empty() {
         // Disjoint intersection: provably empty result.
         return Ok(HybridBoolean {
             mesh: TriangleMesh::from_triangles(&[]),
             path: HybridPath::Frep { shape, bounds },
+            diagnostic: None,
         });
     }
     let mesh = mesh_sdf_indexed(
@@ -339,6 +513,24 @@ fn frep_fallback(
     Ok(HybridBoolean {
         mesh,
         path: HybridPath::Frep { shape, bounds },
+        diagnostic: None,
+    })
+}
+
+/// Both operands as fields, combined per `op`: the fallback's CSG field
+/// and tight (pre-padding) bounds of the result.
+fn combined_field(
+    op: BooleanOp,
+    a: &HybridBody,
+    b: &HybridBody,
+) -> CoreResult<(Shape, BoundingBox3)> {
+    let (fa, ba) = field_of(a)?;
+    let (fb, bb) = field_of(b)?;
+    Ok(match op {
+        BooleanOp::Unite => (fa.union(fb), ba.union(&bb)),
+        // A - B and A ∩ B are both subsets of A; B only carves.
+        BooleanOp::Subtract => (fa.subtract(fb), ba),
+        BooleanOp::Intersect => (fa.intersect(fb), ba.intersection(&bb)),
     })
 }
 
@@ -438,6 +630,10 @@ mod tests {
         assert!(
             matches!(out.path, HybridPath::Brep(_)),
             "transversal planar B-Rep inputs must take the exact path"
+        );
+        assert!(
+            out.diagnostic.is_none(),
+            "a kept exact result carries no validation diagnostic"
         );
         assert!(out.mesh.is_closed_manifold());
         assert_volume(
@@ -641,6 +837,148 @@ mod tests {
         let other: HybridBody = shape::sphere(1.0).unwrap().into();
         let bad = HybridOptions {
             resolution: 4,
+            ..Default::default()
+        };
+        assert!(boolean(BooleanOp::Unite, &ball, &other, &bad).is_err());
+    }
+
+    #[test]
+    fn grid_volume_estimates_known_volumes() {
+        let ball = shape::sphere(1.0).unwrap();
+        let est = grid_volume(ball.shape(), &ball.bounds(), 32);
+        let exact = (4.0 / 3.0) * PI;
+        assert!(
+            (est - exact).abs() / exact < 0.02,
+            "sphere estimate {est} not within 2% of {exact}"
+        );
+
+        let block = shape::box3(2.0, 3.0, 1.0).unwrap();
+        let est = grid_volume(block.shape(), &block.bounds(), 32);
+        assert!(
+            (est - 6.0).abs() / 6.0 < 0.02,
+            "box estimate {est} not within 2% of 6"
+        );
+    }
+
+    #[test]
+    fn grid_volume_of_empty_bounds_is_zero() {
+        let ball = shape::sphere(1.0).unwrap();
+        assert_eq!(grid_volume(ball.shape(), &BoundingBox3::EMPTY, 32), 0.0);
+    }
+
+    #[test]
+    fn volume_gate_catches_ipt4_silent_wrongness() {
+        // of-ipt.4: the exact subtract on the canonical through-hole
+        // config returns Ok with a closed-manifold mesh whose geometry is
+        // wrong (bottom-face hole never cut; removed volume off ~12×).
+        // The volume cross-check must flag it independently of the
+        // chordal-deviation gate: the F-Rep estimate lands near the true
+        // volume, far from the mesh's.
+        let mut store = TopologyStore::new();
+        let mut geo = GeometryStore::new();
+        let block = primitives::block(&mut store, &mut geo, 4.0, 4.0, 2.0).unwrap();
+        let tool = primitives::cylinder(&mut store, &mut geo, 1.0, 4.0).unwrap();
+        let out = brep_subtract(&store, &geo, block, tool, &opts().tol).unwrap();
+        let (mesh, _) = out.tessellate_measured().unwrap();
+        assert!(
+            mesh.is_closed_manifold(),
+            "of-ipt.4 mesh is combinatorially fine"
+        );
+        let brep_volume = volume(&mesh);
+
+        let a = HybridBody::brep(&store, &geo, block);
+        let b = HybridBody::brep(&store, &geo, tool);
+        let (shape, bounds) = combined_field(BooleanOp::Subtract, &a, &b).unwrap();
+        let estimated = grid_volume(&shape, &bounds, ValidationOptions::default().resolution);
+
+        let exact = 4.0 * 4.0 * 2.0 - 2.0 * PI;
+        assert!(
+            (estimated - exact).abs() / exact < 0.05,
+            "estimate {estimated} should be near the true volume {exact}"
+        );
+        let divergence = (brep_volume - estimated).abs() / brep_volume.max(estimated);
+        assert!(
+            divergence > ValidationOptions::default().max_volume_divergence,
+            "divergence {divergence} must exceed the default gate \
+             (brep {brep_volume} vs estimate {estimated})"
+        );
+    }
+
+    #[test]
+    fn discarded_exact_result_diverts_to_fallback_with_diagnostic() {
+        // Wiring: with an impossibly strict divergence tolerance even a
+        // correct exact result is discarded — the fallback must engage,
+        // record the diagnostic, and still produce the right volume.
+        let mut store = TopologyStore::new();
+        let mut geo = GeometryStore::new();
+        let block = primitives::block(&mut store, &mut geo, 4.0, 4.0, 2.0).unwrap();
+        let tool = primitives::block(&mut store, &mut geo, 2.0, 2.0, 4.0).unwrap();
+        let strict = HybridOptions {
+            validation: Some(ValidationOptions {
+                max_volume_divergence: 0.0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let out = boolean(
+            BooleanOp::Subtract,
+            &HybridBody::brep(&store, &geo, block),
+            &HybridBody::brep(&store, &geo, tool),
+            &strict,
+        )
+        .unwrap();
+        assert!(
+            matches!(out.path, HybridPath::Frep { .. }),
+            "a discarded exact result must divert to the F-Rep fallback"
+        );
+        assert!(
+            matches!(
+                out.diagnostic,
+                Some(ValidationDiagnostic::VolumeDivergence { .. })
+            ),
+            "the discard reason must be recorded, got {:?}",
+            out.diagnostic
+        );
+        assert!(out.mesh.is_closed_manifold());
+        assert_volume(
+            &out.mesh,
+            4.0 * 4.0 * 2.0 - 2.0 * 2.0 * 2.0,
+            "fallback after validation discard",
+        );
+    }
+
+    #[test]
+    fn disabled_validation_keeps_exact_path() {
+        // Pure-B-Rep benchmarking mode: no check(), no cross-check, the
+        // mesh-quality bar alone decides.
+        let mut store = TopologyStore::new();
+        let mut geo = GeometryStore::new();
+        let block = primitives::block(&mut store, &mut geo, 4.0, 4.0, 2.0).unwrap();
+        let tool = primitives::block(&mut store, &mut geo, 2.0, 2.0, 4.0).unwrap();
+        let bench = HybridOptions {
+            validation: None,
+            ..Default::default()
+        };
+        let out = boolean(
+            BooleanOp::Subtract,
+            &HybridBody::brep(&store, &geo, block),
+            &HybridBody::brep(&store, &geo, tool),
+            &bench,
+        )
+        .unwrap();
+        assert!(matches!(out.path, HybridPath::Brep(_)));
+        assert!(out.diagnostic.is_none());
+    }
+
+    #[test]
+    fn coarse_validation_resolution_is_rejected() {
+        let ball: HybridBody = shape::sphere(1.0).unwrap().into();
+        let other: HybridBody = shape::sphere(1.0).unwrap().into();
+        let bad = HybridOptions {
+            validation: Some(ValidationOptions {
+                resolution: 4,
+                ..Default::default()
+            }),
             ..Default::default()
         };
         assert!(boolean(BooleanOp::Unite, &ball, &other, &bad).is_err());
