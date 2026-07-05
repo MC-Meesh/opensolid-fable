@@ -5,7 +5,9 @@
   "type": "module",
   "scripts": {
     "wasm": "wasm-pack build ../../crates/opensolid-wasm --target web --no-typescript --out-dir ../../web/playground/pkg",
+    "predev": "node scripts/check-pkg.mjs --warn",
     "dev": "vite",
+    "prebuild": "node scripts/check-pkg.mjs",
     "build": "vite build",
     "preview": "vite preview",
     "test": "vitest run"
@@ -22,6 +24,7 @@
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^4.3.4",
+    "jsdom": "^29.1.1",
     "vite": "^6.0.7",
     "vitest": "^2.1.8"
   }

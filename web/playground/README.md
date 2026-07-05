@@ -32,6 +32,26 @@ npm run wasm    # builds crates/opensolid-wasm into pkg/ (rerun after Rust chang
 npm run dev     # Vite dev server at http://localhost:5173
 ```
 
+`npm run wasm` is a required setup step: `pkg/` is generated build output
+(written into the playground tree, not symlinked) and is not checked in.
+`npm run dev` warns loudly if it's missing (and `npm run build` refuses to
+run); the app itself shows an error screen with these instructions instead
+of loading. If you generate `pkg/` while the dev server is already running,
+restart the dev server.
+
+### WASM init lifecycle
+
+WASM initialization is single-flight and owned by `src/wasm/loader.js`
+(surfaced to React through `src/wasm/WasmContext.jsx`). It has three states:
+**loading** (overlay), **ready**, or **failed** — failure shows a
+full-viewport error screen with the reason (failing URL, HTTP status when
+one exists), the `npm run wasm` fix, and a Retry button. Init that hangs
+times out after 10 s with a diagnostic; there is never an infinite spinner.
+
+The main panels (3D viewport, sketch canvas, script editor) are each wrapped
+in a React error boundary, so a crash in one degrades to an inline error
+card with a reset button instead of blanking the app.
+
 Production build (outputs a static site to `web/playground/dist/`):
 
 ```sh

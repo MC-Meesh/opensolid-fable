@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import init, { WasmProfile2D, WasmShape } from '../pkg/opensolid_wasm.js';
+import { useWasm } from './wasm/WasmContext.jsx';
+import ErrorBoundary from './components/ErrorBoundary.jsx';
+import WasmErrorScreen from './components/WasmErrorScreen.jsx';
 import ScriptEditor from './components/ScriptEditor.jsx';
 import Viewport3D from './components/Viewport3D.jsx';
 import Toolbar from './components/Toolbar.jsx';
@@ -24,12 +26,6 @@ import {
 } from './lib/shapeGraph.js';
 import { buildSweepShape, opsBounds, profileToOps, sweepTreeNode } from './lib/sweep.js';
 
-let wasmInit = null;
-function ensureWasm() {
-  wasmInit ??= init();
-  return wasmInit;
-}
-
 const DEFAULT_RESOLUTION = 64;
 const EDIT_DEBOUNCE_MS = 400;
 
@@ -48,7 +44,9 @@ function shapePivot(shape) {
 }
 
 export default function App() {
-  const [wasmReady, setWasmReady] = useState(false);
+  // The WASM lifecycle lives in one store (src/wasm/loader.js, surfaced via
+  // WasmContext) — App only reads status and the bound API classes.
+  const { status: wasmStatus, error: wasmError, api: wasm, ready: wasmReady, retry: retryWasm } = useWasm();
   const [error, setError] = useState(null);
   const [resolution, setResolution] = useState(DEFAULT_RESOLUTION);
   const [wireframe, setWireframe] = useState(false);
@@ -82,6 +80,8 @@ export default function App() {
   const editorRef = useRef(null);
   const selectedPathRef = useRef(null);
   const editTimerRef = useRef(null);
+  const wasmRef = useRef(null);
+  wasmRef.current = wasm;
 
   const clearSelection = useCallback(() => {
     setSelectedNode(null);
@@ -140,10 +140,12 @@ export default function App() {
   }, []);
 
   const evaluateScript = useCallback(() => {
+    const api = wasmRef.current;
+    if (!api) return;
     setError(null);
     let traced;
     try {
-      traced = runTracedScript(scriptRef.current, WasmShape, WasmProfile2D);
+      traced = runTracedScript(scriptRef.current, api.WasmShape, api.WasmProfile2D);
     } catch (err) {
       setError(String(err?.stack || err));
       return;
@@ -415,13 +417,13 @@ export default function App() {
 
   // Live preview: remesh the pending sweep whenever its parameters change.
   useEffect(() => {
-    if (!sweep || !wasmReady) {
+    if (!sweep || !wasm) {
       setPreviewMesh(null);
       return;
     }
     let shape = null;
     try {
-      shape = buildSweepShape(WasmShape, WasmProfile2D, sweep);
+      shape = buildSweepShape(wasm.WasmShape, wasm.WasmProfile2D, sweep);
       setPreviewMesh(meshShape(shape, resolutionRef.current));
       setSweepError(null);
     } catch (err) {
@@ -430,7 +432,7 @@ export default function App() {
     } finally {
       shape?.free?.();
     }
-  }, [sweep, wasmReady]);
+  }, [sweep, wasm]);
 
   const handleSketchToggle = useCallback(() => {
     setSweep(null);
@@ -438,23 +440,13 @@ export default function App() {
     setSketchOpen((v) => !v);
   }, []);
 
+  // First successful WASM init runs the default script once.
   const bootedRef = useRef(false);
   useEffect(() => {
-    let cancelled = false;
-    ensureWasm()
-      .then(() => {
-        if (cancelled || bootedRef.current) return;
-        bootedRef.current = true;
-        setWasmReady(true);
-        evaluateScript();
-      })
-      .catch((err) => {
-        if (!cancelled) setError(`Failed to load WASM module: ${String(err)}`);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [evaluateScript]);
+    if (!wasmReady || bootedRef.current) return;
+    bootedRef.current = true;
+    evaluateScript();
+  }, [wasmReady, evaluateScript]);
 
   useEffect(() => {
     function onKeyDown(event) {
@@ -512,12 +504,14 @@ export default function App() {
           disabled={!wasmReady}
         />
         <SceneTree root={tree} selectedId={selectedNode?.id} onSelect={selectNode} />
-        <ScriptEditor
-          ref={editorRef}
-          initialDoc={DEFAULT_SCRIPT}
-          onChange={handleScriptChange}
-          onRun={runNow}
-        />
+        <ErrorBoundary name="Script editor">
+          <ScriptEditor
+            ref={editorRef}
+            initialDoc={DEFAULT_SCRIPT}
+            onChange={handleScriptChange}
+            onRun={runNow}
+          />
+        </ErrorBoundary>
         {error && <pre className="error">{error}</pre>}
         <Toolbar
           resolution={resolution}
@@ -531,17 +525,19 @@ export default function App() {
         />
       </div>
       <div className="right">
-        <Viewport3D
-          mesh={mesh}
-          wireframe={wireframe}
-          sketchPlane={sketchOpen ? sketchPlane : null}
-          gizmoMode={gizmoMode}
-          selectedMesh={selectedMesh}
-          selectedPivot={selectedPivot}
-          previewMesh={previewMesh}
-          onPick={handlePick}
-          onTransform={handleTransform}
-        />
+        <ErrorBoundary name="3D viewport">
+          <Viewport3D
+            mesh={mesh}
+            wireframe={wireframe}
+            sketchPlane={sketchOpen ? sketchPlane : null}
+            gizmoMode={gizmoMode}
+            selectedMesh={selectedMesh}
+            selectedPivot={selectedPivot}
+            previewMesh={previewMesh}
+            onPick={handlePick}
+            onTransform={handleTransform}
+          />
+        </ErrorBoundary>
         <SweepPanel
           sweep={sweep}
           error={sweepError}
@@ -586,14 +582,16 @@ export default function App() {
             onChangeOp={handleChangeOp}
           />
         )}
-        <SketchCanvas
-          open={sketchOpen}
-          plane={sketchPlane}
-          onPlaneChange={setSketchPlane}
-          onProfileChange={handleProfileChange}
-          onSweep={handleSweepStart}
-          onExit={() => setSketchOpen(false)}
-        />
+        <ErrorBoundary name="Sketch canvas">
+          <SketchCanvas
+            open={sketchOpen}
+            plane={sketchPlane}
+            onPlaneChange={setSketchPlane}
+            onProfileChange={handleProfileChange}
+            onSweep={handleSweepStart}
+            onExit={() => setSketchOpen(false)}
+          />
+        </ErrorBoundary>
         <button
           className={`secondary sketch-toggle${sketchOpen ? ' active' : ''}`}
           onClick={handleSketchToggle}
@@ -601,7 +599,12 @@ export default function App() {
           {sketchOpen ? 'Exit sketch' : 'Sketch'}
         </button>
         {stats && !sketchOpen && <StatusBar stats={stats} />}
-        {!wasmReady && <div className="loading">Loading WASM…</div>}
+        {(wasmStatus === 'idle' || wasmStatus === 'loading') && (
+          <div className="loading">Loading WASM…</div>
+        )}
+        {wasmStatus === 'failed' && (
+          <WasmErrorScreen error={wasmError} onRetry={retryWasm} />
+        )}
       </div>
     </div>
   );
