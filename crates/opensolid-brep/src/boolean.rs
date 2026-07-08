@@ -74,6 +74,27 @@ const IMPRINT_LINE_SAMPLES: usize = 64;
 /// Bisection iterations when refining an imprint's exit point through a
 /// face boundary.
 const CLIP_REFINE_ITERATIONS: usize = 50;
+/// Acceptance band for matching an imprint endpoint (or seam crossing) to
+/// the original edge it splits, as a multiple of the feature-derived
+/// [`geometric_snap`]. Endpoints are placed on the region-boundary
+/// polyline by bisection, so genuine residuals measure below `1e-7 * snap`;
+/// this band clears rounding noise while staying ~7 orders under the
+/// inter-edge gap (O(feature size) ≈ `1e8 * snap`), so it never grabs the
+/// wrong edge. Scaling off `snap` (not an absolute floor) is what keeps
+/// this correct at any model scale (of-lxk).
+const EDGE_MATCH_SNAP: f64 = 10.0;
+/// Half-width of the "near a region boundary" band that rejects
+/// ray-classification hits whose parity could flip under polyline
+/// discretization, as a fraction of the local face extent
+/// (`Pipeline::face_extents`). Sized to the polyline sagitta —
+/// `r * (1 - cos(π / SAMPLES_PER_CIRCLE)) ≈ 5.4e-4 * r` — so a hit within a
+/// chord's worth of a curved boundary is retried, while genuine interior
+/// hits (nearest ≈ `3e-3 * face_extent`) are not. Keying off the face
+/// extent (not `snap`, whose ULP floor inflates with distance from the
+/// origin) keeps the band a fixed fraction of the feature at any scale and
+/// position; an absolute band instead swallows whole small faces and
+/// misses grazing hits on large ones (of-lxk, of-260).
+const BOUNDARY_BAND_FRAC: f64 = 5e-4;
 /// Fixed ray directions for point classification; each is retried in turn
 /// when a cast grazes a surface or hits near a face boundary.
 const RAY_DIRECTIONS: [[f64; 3]; 6] = [
@@ -753,6 +774,10 @@ struct Pipeline<'a> {
     edge_samples: [Vec<SampledCurve>; 2],
     /// Discretized face regions, per solid.
     face_polys: [Vec<FaceRegionPoly>; 2],
+    /// Local feature length of each face (boundary bounding-box diagonal),
+    /// per solid. Magnitude-independent, so classification bands stay a
+    /// fixed fraction of the face at any position and scale (of-lxk).
+    face_extents: [Vec<f64>; 2],
     imprints: Vec<Imprint>,
     /// Split points per curve source, as 3D points.
     splits: HashMap<CurveSource, Vec<Point3>>,
@@ -809,12 +834,22 @@ impl<'a> Pipeline<'a> {
                 face_polys[s].push(FaceRegionPoly { chart, loops });
             }
         }
+        let face_extents: [Vec<f64>; 2] = [0, 1].map(|s| {
+            face_polys[s]
+                .iter()
+                .map(|fp| {
+                    let bb = BoundingBox3::from_points(fp.loops.iter().flatten().map(|&(_, p)| p));
+                    bb.extents().norm()
+                })
+                .collect()
+        });
         Ok(Self {
             solids,
             tol: *tol,
             snap,
             edge_samples,
             face_polys,
+            face_extents,
             imprints: Vec::new(),
             splits: HashMap::new(),
         })
@@ -1085,8 +1120,7 @@ impl<'a> Pipeline<'a> {
             }
         }
         let (d, e) = best?;
-        let accept = self.tol.linear.max(self.snap * 10.0).max(1e-5);
-        (d <= accept).then_some(e)
+        (d <= self.snap * EDGE_MATCH_SNAP).then_some(e)
     }
 
     /// Phase 3b: split all source curves at their registered split points,
@@ -1263,10 +1297,11 @@ impl<'a> Pipeline<'a> {
     }
 
     fn near_face_boundary(&self, s: SolidTag, f: usize, p: &Point3) -> bool {
+        let band = self.face_extents[s][f] * BOUNDARY_BAND_FRAC;
         for lp in &self.solids[s].faces[f].loops {
             for de in lp {
                 let sampled = &self.edge_samples[s][de.edge];
-                if polyline_distance(&sampled.points, sampled.closed, p) < self.tol.linear * 10.0 {
+                if polyline_distance(&sampled.points, sampled.closed, p) < band {
                     return true;
                 }
             }
@@ -2956,6 +2991,44 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn through_hole_classification_is_scale_invariant() {
+        // The same through-hole subtract must produce the same topology at
+        // every scale: the classification/imprint bands are relative to
+        // feature size (edge snap, face extent), not absolute floors. Before
+        // of-lxk the absolute `1e-5` edge-accept floor and `tol.linear * 10`
+        // boundary band swallowed sub-1e-4 features and produced a
+        // `Degenerate` ray-classify at k = 1e-5.
+        for k in [1.0, 1e-1, 1e-2, 1e-3, 1e-4, 1e-5] {
+            let (mut store, mut geo) = stores();
+            let block = block_at(
+                &mut store,
+                &mut geo,
+                (4.0 * k, 4.0 * k, 2.0 * k),
+                (0.0, 0.0, 0.0),
+            );
+            let tool = cylinder_at(&mut store, &mut geo, 1.0 * k, 4.0 * k, (0.0, 0.0, 0.0));
+            let out = subtract(&store, &geo, block, tool, &tol())
+                .unwrap_or_else(|e| panic!("k={k:e}: subtract failed: {e:?}"));
+            assert_eq!(
+                out.face_count(),
+                7,
+                "k={k:e}: 6 block faces + 1 cylinder band"
+            );
+            assert_eq!(out.shell_count(), 1, "k={k:e}: single shell");
+            assert_eq!(
+                out.store.euler_counts(out.body).genus,
+                1,
+                "k={k:e}: through hole must give genus 1"
+            );
+            assert!(
+                out.check().is_empty(),
+                "k={k:e}: topology check failures: {:?}",
+                out.check()
+            );
         }
     }
 
