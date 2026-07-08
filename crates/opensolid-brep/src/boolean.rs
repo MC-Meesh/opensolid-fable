@@ -3304,6 +3304,43 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "temp debug"]
+    fn dbg_band_rings() {
+        let (mut store, mut geo) = stores();
+        let slab = block_at(&mut store, &mut geo, (4.0, 4.0, 2.0), (0.0, 0.0, 0.0));
+        let tool = cylinder_at(&mut store, &mut geo, 1.0, 4.0, (0.0, 0.0, 0.0));
+        let out = subtract(&store, &geo, slab, tool, &tol()).unwrap();
+        for (fi, mf) in out.mesh_faces.iter().enumerate() {
+            let curved = matches!(mf.chart, Chart::Cylinder { .. });
+            eprintln!(
+                "face {fi} curved={curved} normal_sign={} rings={}",
+                mf.normal_sign,
+                mf.rings.len()
+            );
+            if !curved {
+                continue;
+            }
+            for (ri, r) in mf.rings.iter().enumerate() {
+                let us: Vec<f64> = r.uv.iter().map(|p| p.0).collect();
+                let vs: Vec<f64> = r.uv.iter().map(|p| p.1).collect();
+                let umin = us.iter().cloned().fold(f64::INFINITY, f64::min);
+                let umax = us.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                let vmin = vs.iter().cloned().fold(f64::INFINITY, f64::min);
+                let vmax = vs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                eprintln!(
+                    "  ring {ri}: {} pts  u[{umin:.4},{umax:.4}] v[{vmin:.4},{vmax:.4}]",
+                    r.uv.len()
+                );
+                for (i, p) in r.uv.iter().enumerate() {
+                    if i < 3 || (i >= 93 && i <= 102) || i >= r.uv.len() - 3 {
+                        eprintln!("    [{i}] ({:.4},{:.4})", p.0, p.1);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn geometric_snap_uses_extent_not_origin_distance() {
         let cloud = |off: f64| [Point3::new(off, 0.0, 0.0), Point3::new(off + 2.0, 1.0, 0.5)];
         // Near the origin: 1e-9 of the 2.0 bounding-box extent.
