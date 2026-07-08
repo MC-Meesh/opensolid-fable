@@ -4,7 +4,6 @@
 //! round-trip stability. These exercise only the public kernel API — they
 //! are the "kernel MVP is actually done" gate.
 
-use std::collections::HashMap;
 use std::f64::consts::PI;
 
 use opensolid_kernel::brep::boolean::{subtract as brep_subtract, unite as brep_unite};
@@ -36,35 +35,19 @@ fn assert_volume_within(mesh: &TriangleMesh, exact: f64, rel_tol: f64, context: 
     );
 }
 
-/// Volume of a body via the divergence theorem on its tessellation.
+/// Volume of a body via mass properties on its tessellation.
 ///
-/// Faceted bodies recovered by `sdf_to_brep` tessellate with sliver
-/// triangles that share edges more than twice (of-tess-slivers), so the
-/// strict manifold gate in `mass_properties` rejects them; the signed
-/// volume integral only needs a closed, consistently oriented boundary,
-/// which is asserted here directly (every directed edge balanced by its
-/// reverse).
+/// Faceted bodies recovered by `sdf_to_brep` now ear-clip into a closed,
+/// consistently oriented manifold (of-6sq), so the strict manifold gate in
+/// `mass_properties` accepts them directly.
 fn body_volume(store: &TopologyStore, geo: &GeometryStore, body: EntityId<Body>) -> f64 {
     let mesh = tessellate_body(store, geo, body, &TessellationOptions::default())
         .expect("body tessellates");
-    let mut edge_balance: HashMap<(usize, usize), i64> = HashMap::new();
-    for tri in &mesh.indices {
-        for k in 0..3 {
-            let (a, b) = (tri[k], tri[(k + 1) % 3]);
-            *edge_balance.entry((a.min(b), a.max(b))).or_default() += if a < b { 1 } else { -1 };
-        }
-    }
     assert!(
-        edge_balance.values().all(|&count| count == 0),
-        "tessellation is not a closed oriented boundary"
+        mesh.is_closed_manifold(),
+        "recovered faceted body must tessellate to a closed manifold"
     );
-    mesh.indices
-        .iter()
-        .map(|tri| {
-            let [a, b, c] = tri.map(|i| mesh.positions[i].coords);
-            a.dot(&b.cross(&c)) / 6.0
-        })
-        .sum()
+    volume(&mesh)
 }
 
 /// Acceptance (1a): an implicit sphere minus an exact B-Rep block covering
@@ -242,14 +225,11 @@ fn brep_sdf_round_trip_preserves_volume_one_cycle() {
 /// Acceptance (3b): two full cycles — the second re-imaging must not
 /// compound the error.
 ///
-/// BLOCKED (of-6sq): `tessellate_body` on a faceted `sdf_to_brep` body
-/// ear-clips its planar region boundaries into sliver triangles whose
-/// edges are shared by more than two triangles, so `MeshSdf::from_body`
-/// rejects every recovered body and the second B-Rep → SDF conversion is
-/// impossible through the public API. Un-ignore once of-6sq lands.
+/// The second cycle re-images an already-faceted body: `tessellate_body`
+/// ear-clips its planar region boundaries into a closed manifold (of-6sq),
+/// so `MeshSdf::from_body` accepts it and the second B-Rep → SDF conversion
+/// runs through the public API.
 #[test]
-#[ignore = "blocked by of-6sq: faceted-body tessellation is non-manifold, \
-            so the second B-Rep -> SDF conversion is rejected"]
 fn brep_sdf_round_trip_preserves_volume_across_two_cycles() {
     let analytic = PI * 2.0; // cylinder: radius 1, height 2
     let mut store0 = TopologyStore::new();
