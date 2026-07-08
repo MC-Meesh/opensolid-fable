@@ -43,11 +43,12 @@
 //! ```
 
 use crate::check::CheckFailure;
-use crate::curve::{Curve3, CurveEval, TWO_PI};
+use crate::curve::{Curve3, CurveEval, TWO_PI, plane_basis};
 use crate::topology::{
     Body, BodyType, Edge, Face, FaceSense, FinSense, Loop, LoopType, SYSTEM_RESOLUTION,
     ShellOrientation, TopologyStore, Vertex,
 };
+use crate::triangulate::ear_clip;
 use opensolid_core::EntityId;
 use opensolid_core::error::{CoreError, CoreResult};
 use opensolid_core::mesh::TriangleMesh;
@@ -877,24 +878,43 @@ fn debug_check(store: &TopologyStore, body: EntityId<Body>) {
 fn extrude_mesh(profile: &Profile, direction: Vector3, resolution: usize) -> TriangleMesh {
     let ring = profile.sample_closed_polyline(resolution);
     let m = ring.len();
-    let centroid = polyline_centroid(&ring);
 
     let mut mesh = TriangleMesh::new();
     mesh.positions.extend(ring.iter().copied());
     mesh.positions.extend(ring.iter().map(|&p| p + direction));
-    let bottom_center = mesh.positions.len();
-    mesh.positions.push(centroid);
-    let top_center = mesh.positions.len();
-    mesh.positions.push(centroid + direction);
 
     for k in 0..m {
         let k1 = (k + 1) % m;
         // Side wall quad, wound outward for a counterclockwise profile.
         mesh.indices.push([k, k1, m + k1]);
         mesh.indices.push([k, m + k1, m + k]);
-        // Caps: centroid fans, bottom facing against the extrusion.
-        mesh.indices.push([bottom_center, k1, k]);
-        mesh.indices.push([top_center, m + k, m + k1]);
+    }
+
+    // Caps: ear-clip the profile polygon so concave outlines (U/S/C) tile
+    // without overlap. A centroid fan silently produced overlapping,
+    // mixed-winding cap triangles for any non-star profile (of-6dw). Both
+    // caps are parallel to the profile plane, so their outward normals are
+    // ±profile.normal; the extrusion runs toward +direction, so the top
+    // cap faces sign(profile.normal·direction)·profile.normal.
+    let (e_u, e_v) = plane_basis(&profile.normal);
+    let origin = ring[0];
+    let ring_uv: Vec<(f64, f64)> = ring
+        .iter()
+        .map(|p| {
+            let d = p - origin;
+            (d.dot(&e_u), d.dot(&e_v))
+        })
+        .collect();
+    // ear_clip winds triangles counterclockwise about profile.normal.
+    let top_along_normal = profile.normal.dot(&direction) > 0.0;
+    for [a, b, c] in ear_clip(&ring_uv) {
+        if top_along_normal {
+            mesh.indices.push([m + a, m + b, m + c]); // top faces +normal
+            mesh.indices.push([a, c, b]); // bottom faces −normal
+        } else {
+            mesh.indices.push([m + a, m + c, m + b]); // top faces −normal
+            mesh.indices.push([a, b, c]); // bottom faces +normal
+        }
     }
     mesh
 }
@@ -1149,6 +1169,36 @@ mod tests {
         checked_counts(&block);
         // Positive signed volume == outward orientation.
         assert_volume(&block.tessellate(8).unwrap(), 6.0, 1e-9);
+    }
+
+    #[test]
+    fn concave_profile_caps_tile_without_overlap() {
+        // U-profile: a centroid fan spills across the notch and covers it
+        // with overlapping, mixed-winding cap triangles (of-6dw). Signed
+        // volume still cancels correctly and every edge is still used
+        // twice, so is_closed_manifold and the volume check both pass —
+        // total_area is what exposes the overlap: it inflates when the
+        // caps double back over the notch.
+        let u = polygon(&[
+            (0.0, 0.0),
+            (3.0, 0.0),
+            (3.0, 3.0),
+            (2.0, 3.0),
+            (2.0, 1.0),
+            (1.0, 1.0),
+            (1.0, 3.0),
+            (0.0, 3.0),
+        ]);
+        let mesh = extrude(&u, Vector3::z()).unwrap().tessellate(16).unwrap();
+        // Base area 7, height 1.
+        assert_volume(&mesh, 7.0, 1e-9);
+        // Two caps (2·7) plus side walls (perimeter 16 × height 1).
+        let expected_area = 2.0 * 7.0 + 16.0;
+        assert!(
+            (mesh.total_area() - expected_area).abs() < 1e-9,
+            "cap triangles overlap: total area {} != {expected_area}",
+            mesh.total_area()
+        );
     }
 
     #[test]

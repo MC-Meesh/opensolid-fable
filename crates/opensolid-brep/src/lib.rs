@@ -39,6 +39,7 @@ pub mod sweep;
 pub mod tessellate;
 pub mod topology;
 pub mod transform;
+pub mod triangulate;
 
 pub use boolean::{BooleanOp, BooleanOutput};
 pub use check::{CheckFailure, EntityRef, MAX_ALLOWED_TOLERANCE};

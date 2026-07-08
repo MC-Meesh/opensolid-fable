@@ -5,7 +5,7 @@
 //!
 //! - **Planar faces**: the outer loop is sampled into a polygon (lines as
 //!   single segments, circles/ellipses at the angular step) and
-//!   fan-triangulated from its first vertex.
+//!   ear-clip triangulated (correct for concave outlines).
 //! - **Quadric faces** (cylinder, cone, sphere, torus): sampled on a
 //!   parameter grid. Periodic directions wrap by index, so seams close
 //!   exactly; parameterization singularities (sphere poles, cone apex)
@@ -26,10 +26,10 @@
 //!
 //! # MVP limitations (later hardening passes)
 //!
-//! - Planar faces are triangulated by a **fan**, which is only correct for
-//!   convex outer loops; faces with inner loops (holes) are rejected with
+//! - Planar faces are **ear-clip** triangulated (correct for concave outer
+//!   loops), but faces with inner loops (holes) are still rejected with
 //!   [`CoreError::NotImplemented`]. Full constrained Delaunay triangulation
-//!   is a later pass.
+//!   (hole bridging, as in [`crate::boolean`]) is a later pass.
 //! - Quadric faces are assumed to cover their surface's **full angular
 //!   range** (the full `u` period, and the full `v` domain/period for
 //!   spheres and tori), as the primitive and sweep constructors produce.
@@ -38,7 +38,7 @@
 //!   chord tolerance, edge-length bounds, and adaptive refinement are
 //!   deferred.
 
-use crate::curve::{Curve3, CurveEval};
+use crate::curve::{Curve3, CurveEval, plane_basis};
 use crate::geometry::GeometryStore;
 use crate::project::SurfaceProject;
 use crate::surface::{Surface3, SurfaceEval};
@@ -189,8 +189,8 @@ fn tessellate_face_into(
     }
 }
 
-/// Fan-triangulate a planar face's outer loop polygon. Correct for convex
-/// loops only (module docs); the fan apex is the polygon's first vertex.
+/// Ear-clip triangulate a planar face's outer loop polygon. Correct for
+/// concave outlines, unlike the old first-vertex fan (of-6dw).
 fn fan_planar_face(
     store: &TopologyStore,
     geo: &GeometryStore,
@@ -224,10 +224,23 @@ fn fan_planar_face(
         mesh.positions.push(*point);
         mesh.normals.push(normal);
     }
-    // The loop runs counterclockwise about the outward normal, so the fan
-    // inherits outward winding.
-    for k in 1..polygon.len() - 1 {
-        mesh.indices.push([base, base + k, base + k + 1]);
+    // Ear-clip the loop polygon so concave faces (U/S/C outlines) tile
+    // without overlap; a first-vertex fan was silently wrong for any loop
+    // not star-shaped from that vertex (of-6dw). Project onto a plane
+    // basis with e_u × e_v = normal so ear_clip's counterclockwise
+    // triples come out wound about +normal — the outward winding, since
+    // the loop runs counterclockwise about the outward normal.
+    let (e_u, e_v) = plane_basis(&normal);
+    let origin = polygon[0];
+    let uv: Vec<(f64, f64)> = polygon
+        .iter()
+        .map(|p| {
+            let d = p - origin;
+            (d.dot(&e_u), d.dot(&e_v))
+        })
+        .collect();
+    for [a, b, c] in crate::triangulate::ear_clip(&uv) {
+        mesh.indices.push([base + a, base + b, base + c]);
     }
     Ok(())
 }
@@ -586,6 +599,76 @@ mod tests {
             fine < coarse / 4.0,
             "quadratic convergence expected: coarse err {coarse}, fine err {fine}"
         );
+    }
+
+    #[test]
+    fn concave_planar_face_tiles_without_overlap() {
+        use crate::topology::{
+            BodyType, FaceSense, FinSense, LoopType, SYSTEM_RESOLUTION, ShellOrientation,
+        };
+        // A concave U outline in the z=0 plane (of-6dw): the old
+        // first-vertex fan spilled across the notch and emitted
+        // overlapping, mixed-winding triangles that inflate the area. Ear
+        // clipping tiles the polygon exactly.
+        let outline = [
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(3.0, 0.0, 0.0),
+            Point3::new(3.0, 3.0, 0.0),
+            Point3::new(2.0, 3.0, 0.0),
+            Point3::new(2.0, 1.0, 0.0),
+            Point3::new(1.0, 1.0, 0.0),
+            Point3::new(1.0, 3.0, 0.0),
+            Point3::new(0.0, 3.0, 0.0),
+        ];
+        let n = outline.len();
+
+        let mut store = TopologyStore::new();
+        let mut geo = GeometryStore::new();
+        let body = store.create_body(BodyType::Solid);
+        let shell = store.create_shell(body, true, ShellOrientation::Outward);
+        let verts: Vec<_> = outline
+            .iter()
+            .map(|&p| store.create_vertex(p, SYSTEM_RESOLUTION))
+            .collect();
+        let plane = Surface3::plane(outline[0], Vector3::z()).expect("valid plane");
+        let face = store.create_face(shell, FaceSense::Positive);
+        store.faces.get_mut(face).expect("just created").surface = Some(geo.add_surface(plane));
+        let loop_edges: Vec<_> = (0..n)
+            .map(|i| {
+                let (a, b) = (outline[i], outline[(i + 1) % n]);
+                let curve = geo.add_curve(Curve3::line(a, b - a).expect("valid line"));
+                let edge = store.create_edge_with_curve(
+                    verts[i],
+                    verts[(i + 1) % n],
+                    SYSTEM_RESOLUTION,
+                    curve,
+                    0.0,
+                    (b - a).norm(),
+                );
+                (edge, FinSense::Forward)
+            })
+            .collect();
+        store.create_loop(face, LoopType::Outer, &loop_edges);
+
+        let mesh = tessellate_face(&store, &geo, face, &TessellationOptions::default())
+            .expect("tessellation succeeds");
+        assert_eq!(
+            mesh.triangle_count(),
+            n - 2,
+            "n-2 triangles tile the polygon"
+        );
+        // Exact area of the U outline (shoelace = 7).
+        assert!(
+            (mesh.total_area() - 7.0).abs() < 1e-9,
+            "cap triangles overlap: area {} != 7",
+            mesh.total_area()
+        );
+        // Every triangle winds counterclockwise about +z (outward).
+        for tri in &mesh.indices {
+            let [a, b, c] = tri.map(|i| mesh.positions[i]);
+            let facing = (b - a).cross(&(c - a));
+            assert!(facing.z > 0.0, "triangle winds inward: {facing:?}");
+        }
     }
 
     #[test]
