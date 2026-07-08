@@ -45,6 +45,12 @@
 //! hole-bridge validation landed; volume matches the transversal
 //! prediction. Un-ignored.
 //!
+//! of-ipt.8 FIXED (2026-07-08): the quarter-notch (cylinder centered on a
+//! vertical block edge) now removes 0.2511 vs the analytic 0.2513 (rel_err
+//! 3e-5, was 0.1971 / 7e-3). Same of-ipt.4 curved-chart full-wrap
+//! refinement (57af8a6): before it the notch's swept band tessellated the
+//! wrong geometry and undercounted the removed volume. Un-ignored.
+//!
 //! Invariants asserted throughout:
 //! - `BooleanOutput::check()` reports no failures,
 //! - `BooleanOutput::tessellate()` yields a closed manifold mesh,
@@ -736,7 +742,6 @@ fn thin_sliver_walls() {
 /// vertical block edge, so the edge is strictly inside the tool and the
 /// subtraction carves a quarter-round notch spanning two side faces.
 #[test]
-#[ignore = "of-ipt.8: quarter-notch removes 0.197 instead of 0.251 despite valid topology"]
 fn tool_swallows_vertical_edge() {
     let context = "quarter-notch: cylinder centered on the (2,2,z) edge";
     let radius = 0.4;
