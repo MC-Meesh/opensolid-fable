@@ -51,6 +51,13 @@
 //! refinement (57af8a6): before it the notch's swept band tessellated the
 //! wrong geometry and undercounted the removed volume. Un-ignored.
 //!
+//! of-ipt.9 FIXED (2026-07-08): the block∪block corner-overlap round trip
+//! (tessellate → MeshSdf → volume) passes — the accumulated planar and
+//! curved-chart triangulation robustness (of-ipt.4 refinement, of-6dw
+//! planar ear-clipping) no longer emits the sliver triangles MeshSdf::new
+//! rejected. `round_trip_union_of_blocks` un-ignored; `round_trip_block_
+//! minus_cylinder` was already passing.
+//!
 //! Invariants asserted throughout:
 //! - `BooleanOutput::check()` reports no failures,
 //! - `BooleanOutput::tessellate()` yields a closed manifold mesh,
@@ -872,7 +879,6 @@ fn round_trip_block_minus_cylinder() {
 }
 
 #[test]
-#[ignore = "of-ipt.9: tessellate() emits sliver triangles that MeshSdf::new rejects"]
 fn round_trip_union_of_blocks() {
     let mut scene = Scene::new();
     let a = scene.block([0.0, 0.0, 0.0], [2.0, 2.0, 2.0]);
