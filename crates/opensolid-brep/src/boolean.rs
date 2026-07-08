@@ -1177,7 +1177,16 @@ impl<'a> Pipeline<'a> {
                 let face = &self.solids[s].faces[f];
                 let face_poly = &self.face_polys[s][f];
 
-                // Initial region: the face's own loops, atom by atom.
+                // Initial region: the face's own loops, atom by atom. The
+                // stored loops wind CCW as seen from the face's outward side;
+                // when that side opposes the surface normal (the chart normal),
+                // that is CW in the chart, so the whole region machinery —
+                // shoelace area sign, `region_interior_point`'s inward left
+                // normal, `apply_chain`'s ring/hole split — would invert.
+                // Reverse the traversal here so every traced cycle is
+                // CCW-in-chart; `build_output` undoes it to restore the loop's
+                // outward-CCW winding for the result topology.
+                let flip = !face.outward_along_normal;
                 let mut cycles = Vec::new();
                 for lp in &face.loops {
                     let mut darts: DartChain = Vec::new();
@@ -1192,6 +1201,9 @@ impl<'a> Pipeline<'a> {
                         } else {
                             darts.extend(ids.iter().rev().map(|&ai| (ai, false)));
                         }
+                    }
+                    if flip {
+                        darts = reverse_chain(&darts);
                     }
                     cycles.push(embed_cycle(face_poly, &atoms, darts));
                 }
@@ -2307,7 +2319,15 @@ fn build_output(
                 LoopType::Inner
             };
             let mut entries: Vec<(EntityId<crate::topology::Edge>, FinSense)> = Vec::new();
-            let darts: Vec<(usize, bool)> = if kr.reverse {
+            // `reconstruct` traced cycles CCW-in-chart, reversing the walk for
+            // faces whose outward side opposes the surface normal. Undo that
+            // extra reversal here (XOR with the flip) so the emitted loop winds
+            // CCW as seen from the output face's outward side. `kr.reverse`
+            // additionally flips the winding when this region's face is
+            // oriented opposite its source (e.g. the tool in a subtract).
+            // (XOR with the flip `!outward_along_normal`; `a != !b == a == b`.)
+            let output_reverse = kr.reverse == face_data.outward_along_normal;
+            let darts: Vec<(usize, bool)> = if output_reverse {
                 cycle
                     .darts
                     .iter()
@@ -2992,6 +3012,126 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Re-encode a block's faces with inward-pointing surface normals: flip
+    /// each planar surface's normal and flip the face's `FaceSense` to
+    /// compensate. The declared outward direction, loop winding, and
+    /// represented point-set are all unchanged, so the body is still a valid
+    /// `check()`-clean solid of the same region — but every face now reports
+    /// `outward_along_normal == false` in the pipeline, so its loop winds CW
+    /// in the surface chart. This is the legitimate encoding an importer with
+    /// inward normals produces; it exercises the region-tracing path the
+    /// pipeline used to assume away (of-alr). Blocks only — all six faces are
+    /// planes, the one surface kind whose normal can simply be negated (a
+    /// `Surface3::Cylinder` normal is intrinsically radially outward).
+    fn flip_block_face_encoding(
+        store: &mut TopologyStore,
+        geo: &mut GeometryStore,
+        body: EntityId<Body>,
+    ) {
+        for face_id in store.faces_of_body(body) {
+            let surface_id = store.face(face_id).unwrap().surface.expect("bound surface");
+            let flipped = match geo.surface(surface_id).expect("live surface") {
+                Surface3::Plane { origin, normal } => Surface3::Plane {
+                    origin: *origin,
+                    normal: -*normal,
+                },
+                other => panic!("flip_block_face_encoding expects planar faces, got {other:?}"),
+            };
+            let new_id = geo.add_surface(flipped);
+            let face = store.faces.get_mut(face_id).expect("live face");
+            face.surface = Some(new_id);
+            face.sense = match face.sense {
+                FaceSense::Positive => FaceSense::Negative,
+                FaceSense::Negative => FaceSense::Positive,
+            };
+        }
+    }
+
+    #[test]
+    fn unite_inward_normal_blocks_matches_normal_orientation() {
+        // of-alr: a face whose declared outward opposes its surface normal
+        // (outward_along_normal == false) is legal topology, but its outer
+        // loop then winds CW in the surface chart. The region machinery
+        // assumed CCW-in-chart, so region_interior_point's inward left normal
+        // pointed OUT and every probe on a convex region failed — a spurious
+        // CoreError::Degenerate. Two inward-normal blocks (same region as the
+        // all-Positive originals) must unite identically.
+        let (mut store, mut geo) = stores();
+        let a = block_at(&mut store, &mut geo, (2.0, 2.0, 2.0), (0.0, 0.0, 0.0));
+        let b = block_at(&mut store, &mut geo, (2.0, 2.0, 2.0), (1.0, 1.0, 1.0));
+        flip_block_face_encoding(&mut store, &mut geo, a);
+        flip_block_face_encoding(&mut store, &mut geo, b);
+        // The re-encoding preserves the region — the inputs stay valid solids.
+        assert!(
+            store.check(a).is_empty(),
+            "inward-normal A: {:?}",
+            store.check(a)
+        );
+        assert!(
+            store.check(b).is_empty(),
+            "inward-normal B: {:?}",
+            store.check(b)
+        );
+
+        let out = unite(&store, &geo, a, b, &tol()).expect("unite of inward-normal blocks");
+        assert_valid(&out, "unite inward-normal blocks");
+        assert_geometry_bound(&out, "unite inward-normal blocks");
+
+        // Identical shape to the all-Positive union of the same two blocks.
+        let (mut store2, mut geo2) = stores();
+        let a2 = block_at(&mut store2, &mut geo2, (2.0, 2.0, 2.0), (0.0, 0.0, 0.0));
+        let b2 = block_at(&mut store2, &mut geo2, (2.0, 2.0, 2.0), (1.0, 1.0, 1.0));
+        let out2 = unite(&store2, &geo2, a2, b2, &tol()).expect("unite of normal blocks");
+        assert_eq!(
+            out.face_count(),
+            out2.face_count(),
+            "inward-normal union must match the normal union's face count"
+        );
+        assert_eq!(out.shell_count(), out2.shell_count());
+    }
+
+    #[test]
+    fn subtract_inward_normal_blocks_matches_normal_orientation() {
+        // of-alr, reverse × flip path: in a subtract the tool's kept faces
+        // carry reverse == true. Combined with outward_along_normal == false
+        // this is the corner apply_chain's ring/hole split and the output
+        // winding both have to get right. Notch a block with an overlapping
+        // block, both inward-normal encoded; the result must match the
+        // all-Positive subtract exactly (a valid, closed, manifold notch).
+        let (mut store, mut geo) = stores();
+        let target = block_at(&mut store, &mut geo, (4.0, 4.0, 4.0), (0.0, 0.0, 0.0));
+        let tool = block_at(&mut store, &mut geo, (2.0, 2.0, 2.0), (2.0, 2.0, 2.0));
+        flip_block_face_encoding(&mut store, &mut geo, target);
+        flip_block_face_encoding(&mut store, &mut geo, tool);
+        assert!(
+            store.check(target).is_empty(),
+            "target: {:?}",
+            store.check(target)
+        );
+        assert!(
+            store.check(tool).is_empty(),
+            "tool: {:?}",
+            store.check(tool)
+        );
+
+        let out =
+            subtract(&store, &geo, target, tool, &tol()).expect("subtract of inward-normal blocks");
+        assert_valid(&out, "subtract inward-normal blocks");
+        assert_geometry_bound(&out, "subtract inward-normal blocks");
+
+        let (mut store2, mut geo2) = stores();
+        let target2 = block_at(&mut store2, &mut geo2, (4.0, 4.0, 4.0), (0.0, 0.0, 0.0));
+        let tool2 = block_at(&mut store2, &mut geo2, (2.0, 2.0, 2.0), (2.0, 2.0, 2.0));
+        let out2 =
+            subtract(&store2, &geo2, target2, tool2, &tol()).expect("subtract of normal blocks");
+        assert_eq!(
+            out.face_count(),
+            out2.face_count(),
+            "inward-normal subtract must match the normal subtract's face count"
+        );
+        assert_eq!(out.shell_count(), out2.shell_count());
     }
 
     #[test]
