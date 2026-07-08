@@ -299,9 +299,15 @@ const Viewport3D = forwardRef(function Viewport3D(
 
     const transformControls = new TransformControls(camera, renderer.domElement);
     transformControls.attach(anchor);
+    // attach() sets the helper root visible=true; the gizmo the user sees is the
+    // helper (getHelper()), not the controls object — which extends Controls, not
+    // Object3D, so its own `visible` flag renders nothing. Hide the helper directly
+    // so the gizmo doesn't linger at the origin before anything is selected.
+    const transformControlsHelper = transformControls.getHelper();
+    transformControlsHelper.visible = false;
     transformControls.visible = false;
     transformControls.enabled = false;
-    scene.add(transformControls.getHelper());
+    scene.add(transformControlsHelper);
 
     transformControls.addEventListener('dragging-changed', (event) => {
       orbitControls.enabled = !event.value;
@@ -478,6 +484,7 @@ const Viewport3D = forwardRef(function Viewport3D(
       material,
       meshObject,
       transformControls,
+      transformControlsHelper,
       anchor,
       ghostMesh,
       hoverObject,
@@ -726,11 +733,13 @@ const Viewport3D = forwardRef(function Viewport3D(
       ctx.anchor.scale.set(1, 1, 1);
       ctx.anchor.visible = true;
 
+      ctx.transformControlsHelper.visible = true;
       ctx.transformControls.visible = true;
       ctx.transformControls.enabled = true;
     } else {
       ctx.ghostMesh.visible = false;
       ctx.anchor.visible = false;
+      ctx.transformControlsHelper.visible = false;
       ctx.transformControls.visible = false;
       ctx.transformControls.enabled = false;
     }
