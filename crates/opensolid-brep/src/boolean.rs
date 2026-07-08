@@ -312,15 +312,15 @@ impl BooleanOutput {
     /// Tessellate the result, also reporting the mesh's worst chordal
     /// deviation from the analytic face surfaces.
     ///
-    /// Trimmed faces are triangulated from their boundary samples alone
-    /// (ear clipping), so a wide curved face — e.g. the full-wrap cylinder
-    /// band left by a through-hole subtract — can be covered by long
-    /// parameter-space chords that cut far inside the true surface while
-    /// the mesh stays closed and manifold. The returned deviation is the
-    /// largest distance from any triangle edge's 3D midpoint to the
-    /// surface point at its parameter-space midpoint — use it to decide
-    /// whether the mesh's geometric fidelity is acceptable (the kernel's
-    /// hybrid boolean falls back to F-Rep meshing when it is not).
+    /// Planar faces are triangulated exactly by ear clipping. Curved faces
+    /// (cylinder bands) are ear-clipped for their boundary and then
+    /// retriangulated to a constrained Delaunay mesh over a lattice of
+    /// interior parameter-space points, so the flat 3D chords hug the surface
+    /// instead of cutting long secants through it (see `refine_curved_region`).
+    /// The returned deviation is the largest distance from any triangle edge's
+    /// 3D midpoint to the surface point at its parameter-space midpoint — on
+    /// the order of the boundary sampling — which the kernel's hybrid boolean
+    /// still checks before trusting the exact mesh over the F-Rep fallback.
     pub fn tessellate_measured(&self) -> CoreResult<(TriangleMesh, f64)> {
         let mut triangles = Vec::new();
         // Weld epsilon from the mesh's feature extent (see `geometric_snap`
@@ -2598,6 +2598,10 @@ fn triangulate_mesh_face(mf: &MeshFace, weld_eps: f64) -> CoreResult<(Vec<Triang
     // Combine outer ring and holes into a single polygon via bridges.
     let (mut all_uv, mut all_p) = dedupe(&mf.rings[0].uv, &mf.rings[0].points);
     let mut polygon: Vec<usize> = (0..all_uv.len()).collect();
+    // Vertex-index range of each original (unbridged) ring in `all_uv`.
+    // Ring edges are the true boundary constraints for curved-face
+    // refinement: they are never subdivided, so adjacent faces weld exactly.
+    let mut ring_ranges: Vec<(usize, usize)> = vec![(0, all_uv.len())];
 
     // Sort holes by max-u vertex, descending, and bridge each into the
     // polygon (Eberly's method, simplified with nearest-visible search).
@@ -2616,6 +2620,7 @@ fn triangulate_mesh_face(mf: &MeshFace, weld_eps: f64) -> CoreResult<(Vec<Triang
         let base = all_uv.len();
         all_uv.extend_from_slice(huv);
         all_p.extend_from_slice(hp);
+        ring_ranges.push((base, huv.len()));
         // Hole vertex with max u.
         let (hi_local, _) = huv
             .iter()
@@ -2731,50 +2736,26 @@ fn triangulate_mesh_face(mf: &MeshFace, weld_eps: f64) -> CoreResult<(Vec<Triang
     let planar = matches!(mf.chart, Chart::Plane { .. });
 
     // Curved charts: ear clipping covers the parameter region exactly, but
-    // a wide face (e.g. the full-wrap band left by a through-hole
-    // subtract) gets triangles whose u-span is far coarser than the
-    // boundary sampling, so their flat 3D chords cut deep inside the
-    // surface. Refine by bisecting any triangle edge whose u-span exceeds
-    // the boundary pitch, evaluating the midpoint on the analytic surface.
-    // The split decision depends only on the edge and midpoints are shared
-    // through an edge-keyed map, so neighbors always split identically
-    // (no cracks); boundary polyline edges are already at pitch and are
-    // never split, so welding with adjacent faces is preserved.
-    if !planar {
-        // 1.5× the boundary pitch: edges at the sampling pitch (the shared
-        // boundary polylines themselves) must never split — the adjacent
-        // face doesn't refine its copy, and a one-sided split is a
-        // T-junction (non-manifold weld). Chords under 1.5 pitch deviate
-        // from the surface by < r·(1 − cos(0.75·2π/96)) ≈ 1e-3·r, in line
-        // with the boundary sampling itself.
-        let max_du = 1.5 * TWO_PI / SAMPLES_PER_CIRCLE as f64;
-        let mut midpoint: HashMap<(usize, usize), usize> = HashMap::new();
-        let mut queue: std::collections::VecDeque<[usize; 3]> = tris.drain(..).collect();
-        while let Some(t) = queue.pop_front() {
-            let span = |i: usize, j: usize| (all_uv[t[i]].0 - all_uv[t[j]].0).abs();
-            let spans = [span(0, 1), span(1, 2), span(2, 0)];
-            let (k, widest) = spans
-                .iter()
-                .enumerate()
-                .max_by(|a, b| a.1.total_cmp(b.1))
-                .expect("three edges");
-            if *widest <= max_du {
-                tris.push(t);
-                continue;
-            }
-            let (i, j, o) = (t[k], t[(k + 1) % 3], t[(k + 2) % 3]);
-            let m = *midpoint.entry((i.min(j), i.max(j))).or_insert_with(|| {
-                let mid_uv = (
-                    0.5 * (all_uv[i].0 + all_uv[j].0),
-                    0.5 * (all_uv[i].1 + all_uv[j].1),
-                );
-                all_uv.push(mid_uv);
-                all_p.push(chart_point(&mf.chart, mid_uv));
-                all_uv.len() - 1
-            });
-            queue.push_back([i, m, o]);
-            queue.push_back([m, j, o]);
-        }
+    // a wide face (e.g. the full-wrap band left by a through-hole subtract)
+    // gets triangles whose u-span is far coarser than the boundary
+    // sampling, so their flat 3D chords cut deep inside the surface.
+    // Bisecting the ear-clip result is unsafe on trimmed faces (split
+    // midpoints land on shared boundary chords and weld non-manifold, and
+    // the split order is nondeterministic). Instead lay a clean parameter
+    // lattice of interior points strictly inside the region and retriangulate
+    // to a constrained Delaunay mesh: interior vertices are lattice-clean and
+    // never touch the boundary (so cross-face welding is untouched), boundary
+    // ring edges are constraints that are never flipped, and the whole
+    // construction is deterministic. See `refine_curved_region`.
+    if let Chart::Cylinder { radius, .. } = mf.chart {
+        refine_curved_region(
+            &mut tris,
+            &mut all_uv,
+            &mut all_p,
+            &mf.chart,
+            radius,
+            &ring_ranges,
+        );
     }
 
     // Emit 3D triangles; flip winding when the outward normal opposes the
@@ -2819,6 +2800,388 @@ fn triangulate_mesh_face(mf: &MeshFace, weld_eps: f64) -> CoreResult<(Vec<Triang
         }
     }
     Ok((out, deviation))
+}
+
+const NO_TRI: usize = usize::MAX;
+
+/// Triangle mesh with per-edge adjacency, supporting point insertion and
+/// constrained Lawson edge flips. All triangles are kept counter-clockwise
+/// in parameter space. `adj[t][k]` is the triangle across the edge
+/// `(v[k], v[(k+1)%3])`, or [`NO_TRI`] on the boundary.
+struct FlipMesh {
+    tris: Vec<[usize; 3]>,
+    adj: Vec<[usize; 3]>,
+}
+
+fn orient2d(a: (f64, f64), b: (f64, f64), c: (f64, f64)) -> f64 {
+    (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0)
+}
+
+/// True iff `d` is strictly inside the circumcircle of the CCW triangle
+/// `(a, b, c)`. Used to decide Delaunay edge flips.
+fn in_circle(a: (f64, f64), b: (f64, f64), c: (f64, f64), d: (f64, f64)) -> bool {
+    let (ax, ay) = (a.0 - d.0, a.1 - d.1);
+    let (bx, by) = (b.0 - d.0, b.1 - d.1);
+    let (cx, cy) = (c.0 - d.0, c.1 - d.1);
+    let det = (ax * ax + ay * ay) * (bx * cy - cx * by) - (bx * bx + by * by) * (ax * cy - cx * ay)
+        + (cx * cx + cy * cy) * (ax * by - bx * ay);
+    // Strict: exactly-cocircular points (e.g. lattice squares) never flip,
+    // which keeps the mesh valid and the flip loop terminating.
+    det > 0.0
+}
+
+impl FlipMesh {
+    /// Build from an existing triangulation (indices into a shared vertex
+    /// list), orienting every triangle CCW. Interior edges shared by exactly
+    /// two triangles are linked; any edge seen a third time is left as a
+    /// boundary edge on the later triangles (conservative: it is simply never
+    /// flipped).
+    fn from_tris(tris: &[[usize; 3]], verts: &[(f64, f64)]) -> Self {
+        let mut t = Vec::with_capacity(tris.len());
+        for tri in tris {
+            let mut v = *tri;
+            if orient2d(verts[v[0]], verts[v[1]], verts[v[2]]) < 0.0 {
+                v.swap(1, 2);
+            }
+            t.push(v);
+        }
+        let mut adj = vec![[NO_TRI; 3]; t.len()];
+        // key -> (tri, edge, times seen)
+        let mut edges: HashMap<(usize, usize), (usize, usize, u8)> = HashMap::new();
+        for (ti, tri) in t.iter().enumerate() {
+            for k in 0..3 {
+                let (a, b) = (tri[k], tri[(k + 1) % 3]);
+                let key = (a.min(b), a.max(b));
+                match edges.get_mut(&key) {
+                    None => {
+                        edges.insert(key, (ti, k, 1));
+                    }
+                    Some(entry) if entry.2 == 1 => {
+                        adj[ti][k] = entry.0;
+                        adj[entry.0][entry.1] = ti;
+                        entry.2 = 2;
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+        FlipMesh { tris: t, adj }
+    }
+
+    /// Edge index `k` of triangle `t` whose undirected endpoints are `{a, b}`.
+    fn edge_index(&self, t: usize, a: usize, b: usize) -> Option<usize> {
+        let tri = &self.tris[t];
+        (0..3).find(|&k| {
+            let (x, y) = (tri[k], tri[(k + 1) % 3]);
+            (x == a && y == b) || (x == b && y == a)
+        })
+    }
+
+    /// Point the neighbor `n`'s adjacency across edge `{a, b}` at `new_t`.
+    fn relink(&mut self, n: usize, a: usize, b: usize, new_t: usize) {
+        if n == NO_TRI {
+            return;
+        }
+        if let Some(k) = self.edge_index(n, a, b) {
+            self.adj[n][k] = new_t;
+        }
+    }
+
+    /// Insert vertex `np` (index into the shared list), known to lie strictly
+    /// inside triangle `t0`. Splits `t0` into three and legalizes.
+    fn insert_in_triangle(
+        &mut self,
+        t0: usize,
+        np: usize,
+        verts: &[(f64, f64)],
+        constraints: &std::collections::HashSet<(usize, usize)>,
+    ) {
+        let [a, b, c] = self.tris[t0];
+        let [na, nb, nc] = self.adj[t0]; // across (a,b),(b,c),(c,a)
+        let t1 = self.tris.len();
+        let t2 = t1 + 1;
+        self.tris[t0] = [a, b, np];
+        self.adj[t0] = [na, t1, t2];
+        self.tris.push([b, c, np]);
+        self.adj.push([nb, t2, t0]);
+        self.tris.push([c, a, np]);
+        self.adj.push([nc, t0, t1]);
+        // na still borders edge (a,b) on t0 — no relink. Move (b,c)->t1,
+        // (c,a)->t2.
+        self.relink(nb, b, c, t1);
+        self.relink(nc, c, a, t2);
+        // Legalize outward from the three new triangles.
+        let stack = vec![(t0, 0usize), (t1, 0usize), (t2, 0usize)];
+        self.legalize(stack, verts, constraints);
+    }
+
+    /// Flip edge `(t, k)` if it is a non-constraint edge that violates the
+    /// Delaunay criterion and the flip keeps both triangles valid. Returns
+    /// the four quad edges to recheck, or `None` if no flip happened.
+    fn flip_edge(
+        &mut self,
+        t: usize,
+        k: usize,
+        verts: &[(f64, f64)],
+        constraints: &std::collections::HashSet<(usize, usize)>,
+    ) -> Option<[(usize, usize); 4]> {
+        let n = self.adj[t][k];
+        if n == NO_TRI {
+            return None;
+        }
+        let u = self.tris[t][k];
+        let w = self.tris[t][(k + 1) % 3];
+        let p = self.tris[t][(k + 2) % 3];
+        if constraints.contains(&(u.min(w), u.max(w))) {
+            return None;
+        }
+        // `in_circle` needs (u, w, p) CCW. Every proper triangle is CCW; a
+        // non-positive area here is a zero-area seed sliver — leave it be.
+        if orient2d(verts[u], verts[w], verts[p]) <= 0.0 {
+            return None;
+        }
+        let q = {
+            let tri = &self.tris[n];
+            (0..3)
+                .map(|i| tri[i])
+                .find(|&x| x != u && x != w)
+                .expect("neighbor has a third vertex")
+        };
+        // (u, w, p) is CCW; flip only if q falls inside its circumcircle.
+        if !in_circle(verts[u], verts[w], verts[p], verts[q]) {
+            return None;
+        }
+        // Guard against a false positive on a non-convex quad: both new
+        // triangles must be strictly CCW.
+        if orient2d(verts[p], verts[u], verts[q]) <= 0.0
+            || orient2d(verts[p], verts[q], verts[w]) <= 0.0
+        {
+            return None;
+        }
+        // Quad p-u-q-w neighbors before the flip.
+        let a_pu = self.adj[t][(k + 2) % 3]; // across (p,u)
+        let b_wp = self.adj[t][(k + 1) % 3]; // across (w,p)
+        let jq = self.edge_index(n, u, q).expect("edge (u,q)");
+        let jw = self.edge_index(n, q, w).expect("edge (q,w)");
+        let c_uq = self.adj[n][jq];
+        let d_qw = self.adj[n][jw];
+        // Reuse slot t as [p,u,q] and slot n as [p,q,w].
+        self.tris[t] = [p, u, q];
+        self.adj[t] = [a_pu, c_uq, n];
+        self.tris[n] = [p, q, w];
+        self.adj[n] = [t, d_qw, b_wp];
+        self.relink(c_uq, u, q, t);
+        self.relink(b_wp, w, p, n);
+        // a_pu still borders (p,u) on t; d_qw still borders (q,w) on n.
+        Some([(t, 0), (t, 1), (n, 1), (n, 2)])
+    }
+
+    /// Drain a worklist of edges, flipping each illegal one and rechecking
+    /// the edges it exposes.
+    fn legalize(
+        &mut self,
+        mut stack: Vec<(usize, usize)>,
+        verts: &[(f64, f64)],
+        constraints: &std::collections::HashSet<(usize, usize)>,
+    ) {
+        let mut guard = 0usize;
+        let cap = 64 * self.tris.len() + 64;
+        while let Some((t, k)) = stack.pop() {
+            guard += 1;
+            if guard > cap {
+                break;
+            }
+            if let Some(edges) = self.flip_edge(t, k, verts, constraints) {
+                stack.extend_from_slice(&edges);
+            }
+        }
+    }
+
+    /// Flip the whole mesh toward constrained Delaunay: sweep every edge
+    /// until a full pass makes no flip. This catches long chords left by the
+    /// seed triangulation that no point insertion happened to touch.
+    fn make_delaunay(
+        &mut self,
+        verts: &[(f64, f64)],
+        constraints: &std::collections::HashSet<(usize, usize)>,
+    ) {
+        // Each sweep is O(edges); a constrained-Delaunay mesh over this many
+        // near-lattice points converges in a handful of sweeps. The cap is a
+        // safety valve — the mesh stays valid (just possibly a hair off
+        // Delaunay) if flips ever fail to settle.
+        let max_sweeps = 256;
+        for _ in 0..max_sweeps {
+            let mut flipped = false;
+            for t in 0..self.tris.len() {
+                for k in 0..3 {
+                    if self.flip_edge(t, k, verts, constraints).is_some() {
+                        flipped = true;
+                    }
+                }
+            }
+            if !flipped {
+                break;
+            }
+        }
+    }
+}
+
+/// Squared distance from point `p` to segment `ab`.
+fn point_seg_dist2(p: (f64, f64), a: (f64, f64), b: (f64, f64)) -> f64 {
+    let (abx, aby) = (b.0 - a.0, b.1 - a.1);
+    let len2 = abx * abx + aby * aby;
+    if len2 <= 0.0 {
+        return dist2(p, a);
+    }
+    let t = (((p.0 - a.0) * abx + (p.1 - a.1) * aby) / len2).clamp(0.0, 1.0);
+    dist2(p, (a.0 + t * abx, a.1 + t * aby))
+}
+
+/// Even-odd containment of `uv` in the region bounded by the given rings
+/// (index ranges into `verts`).
+fn ring_contains(uv: (f64, f64), verts: &[(f64, f64)], ring_ranges: &[(usize, usize)]) -> bool {
+    let mut inside = false;
+    for &(start, len) in ring_ranges {
+        for j in 0..len {
+            let a = verts[start + j];
+            let b = verts[start + (j + 1) % len];
+            if crosses_upward(a, b, uv) {
+                inside = !inside;
+            }
+        }
+    }
+    inside
+}
+
+/// Retriangulate a cylinder face's ear-clip result into a constrained
+/// Delaunay mesh seeded with a lattice of interior points, so every triangle
+/// edge spans at most about one sampling pitch in `u` (the curved direction).
+/// The flat 3D chords then hug the surface instead of cutting long secants
+/// through it.
+///
+/// `tris` is a valid triangulation of the region using only boundary
+/// vertices; `ring_ranges` gives each original boundary ring's index span in
+/// `all_uv`/`all_p`. Ring edges are treated as constraints and never flipped,
+/// so the boundary polylines stay bit-identical to the adjacent faces' copies
+/// (welding preserved). Interior lattice points are kept strictly inside the
+/// region and clear of the boundary, so they never weld to anything. The
+/// construction is fully deterministic. `tris` is rewritten and interior
+/// points are appended to `all_uv`/`all_p`.
+fn refine_curved_region(
+    tris: &mut Vec<[usize; 3]>,
+    all_uv: &mut Vec<(f64, f64)>,
+    all_p: &mut Vec<Point3>,
+    chart: &Chart,
+    radius: f64,
+    ring_ranges: &[(usize, usize)],
+) {
+    if tris.is_empty() || ring_ranges.is_empty() {
+        return;
+    }
+    let pitch = TWO_PI / SAMPLES_PER_CIRCLE as f64;
+
+    // Boundary constraint edges (never flipped) and bounding box.
+    let mut constraints: std::collections::HashSet<(usize, usize)> =
+        std::collections::HashSet::new();
+    let (mut u0, mut u1, mut v0, mut v1) = (
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+    );
+    for &(start, len) in ring_ranges {
+        for j in 0..len {
+            let a = start + j;
+            let b = start + (j + 1) % len;
+            constraints.insert((a.min(b), a.max(b)));
+            let (u, v) = all_uv[a];
+            u0 = u0.min(u);
+            u1 = u1.max(u);
+            v0 = v0.min(v);
+            v1 = v1.max(v);
+        }
+    }
+    if !(u1 > u0 && v1 > v0) {
+        return; // degenerate region
+    }
+
+    let mut mesh = FlipMesh::from_tris(tris, all_uv);
+
+    // Interior lattice of Steiner points, spread strictly inside the region
+    // bounding box. `u` (the curved direction) is spaced at most one sampling
+    // pitch apart so retriangulation can bound every edge's u-span; `v` maps
+    // linearly on a cylinder, so its spacing only shapes triangles and never
+    // affects fidelity — it is spaced at the same arc length, capped so thin
+    // or tall faces stay cheap. At least one interior row and column are laid
+    // whenever the region has area (so even a thin full-wrap band still gets
+    // its wide chords broken up).
+    let s = radius.abs().max(1e-12);
+    let n_cols = (((u1 - u0) / pitch).ceil() as usize).max(2) - 1;
+    let step_u = (u1 - u0) / (n_cols + 1) as f64;
+    let pitch_v = (s * pitch).max(1e-12);
+    let n_rows = (((v1 - v0) / pitch_v).ceil() as usize).clamp(2, 256) - 1;
+    let step_v = (v1 - v0) / (n_rows + 1) as f64;
+
+    // Keep interior points a quarter-cell clear of the boundary (in the
+    // arc-length metric, `u` scaled by the radius so it is isotropic in 3D):
+    // enough that they never weld to a boundary vertex and never insert on a
+    // boundary edge, while small enough that a thin band keeps its row.
+    let margin2 = {
+        let m = 0.25 * (step_u * s).min(step_v);
+        m * m
+    };
+
+    for iu in 1..=n_cols {
+        for iv in 1..=n_rows {
+            let uv = (u0 + iu as f64 * step_u, v0 + iv as f64 * step_v);
+            if !ring_contains(uv, all_uv, ring_ranges) {
+                continue;
+            }
+            // Clearance from every boundary edge, in arc-length metric.
+            let scaled = |p: (f64, f64)| (p.0 * s, p.1);
+            let ps = scaled(uv);
+            let mut clear = true;
+            'rings: for &(start, len) in ring_ranges {
+                for j in 0..len {
+                    let a = scaled(all_uv[start + j]);
+                    let b = scaled(all_uv[start + (j + 1) % len]);
+                    if point_seg_dist2(ps, a, b) < margin2 {
+                        clear = false;
+                        break 'rings;
+                    }
+                }
+            }
+            if !clear {
+                continue;
+            }
+            // Locate the containing triangle (linear scan; all slots live).
+            let np = all_uv.len();
+            let target = uv;
+            let host = (0..mesh.tris.len()).find(|&t| {
+                let [a, b, c] = mesh.tris[t];
+                point_in_triangle(target, all_uv[a], all_uv[b], all_uv[c])
+            });
+            let Some(host) = host else {
+                continue; // numerically outside; simply skip this point
+            };
+            all_uv.push(uv);
+            all_p.push(chart_point(chart, uv));
+            mesh.insert_in_triangle(host, np, all_uv, &constraints);
+        }
+    }
+
+    // Insertion legalizes only locally; sweep the whole mesh to Delaunay so
+    // any long seed chord no inserted point touched (e.g. on a thin band with
+    // a single interior row) is flipped away too.
+    mesh.make_delaunay(all_uv, &constraints);
+
+    // Read back. Insertion and flips only ever retriangulate the same point
+    // set inside the seed's boundary, so the mesh still tiles exactly the
+    // region the ear clip covered — nothing to cull. Zero-area uv slivers are
+    // kept (as before: collinear boundary chains rely on them to pair their
+    // chord edges; the emitter drops only zero-3D-length ones).
+    tris.clear();
+    tris.extend_from_slice(&mesh.tris);
 }
 
 fn dist2(a: (f64, f64), b: (f64, f64)) -> f64 {
@@ -3303,41 +3666,79 @@ mod tests {
         assert_geometry_bound(&out, "block with internal void");
     }
 
+    /// of-lcx: the through-hole cylinder band is a trimmed curved face. Its
+    /// structured tessellation must hug the surface — worst chordal deviation
+    /// on the order of the boundary sampling, not the cylinder radius — while
+    /// staying a closed manifold. (The old boundary-only ear clip cut long
+    /// secants: deviation ≈ the radius, volume ~22% high.)
     #[test]
-    #[ignore = "temp debug"]
-    fn dbg_band_rings() {
+    fn curved_band_tessellation_is_low_deviation_and_manifold() {
         let (mut store, mut geo) = stores();
         let slab = block_at(&mut store, &mut geo, (4.0, 4.0, 2.0), (0.0, 0.0, 0.0));
         let tool = cylinder_at(&mut store, &mut geo, 1.0, 4.0, (0.0, 0.0, 0.0));
         let out = subtract(&store, &geo, slab, tool, &tol()).unwrap();
-        for (fi, mf) in out.mesh_faces.iter().enumerate() {
-            let curved = matches!(mf.chart, Chart::Cylinder { .. });
-            eprintln!(
-                "face {fi} curved={curved} normal_sign={} rings={}",
-                mf.normal_sign,
-                mf.rings.len()
-            );
-            if !curved {
-                continue;
-            }
-            for (ri, r) in mf.rings.iter().enumerate() {
-                let us: Vec<f64> = r.uv.iter().map(|p| p.0).collect();
-                let vs: Vec<f64> = r.uv.iter().map(|p| p.1).collect();
-                let umin = us.iter().cloned().fold(f64::INFINITY, f64::min);
-                let umax = us.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-                let vmin = vs.iter().cloned().fold(f64::INFINITY, f64::min);
-                let vmax = vs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-                eprintln!(
-                    "  ring {ri}: {} pts  u[{umin:.4},{umax:.4}] v[{vmin:.4},{vmax:.4}]",
-                    r.uv.len()
-                );
-                for (i, p) in r.uv.iter().enumerate() {
-                    if i < 3 || (i >= 93 && i <= 102) || i >= r.uv.len() - 3 {
-                        eprintln!("    [{i}] ({:.4},{:.4})", p.0, p.1);
-                    }
-                }
-            }
-        }
+        let (mesh, dev) = out.tessellate_measured().expect("tessellation");
+        assert!(
+            mesh.is_closed_manifold(),
+            "band mesh must be closed manifold"
+        );
+        // One sampling pitch of chord on the unit cylinder deviates by
+        // r·(1 − cos(π/96)) ≈ 5.4e-4; allow generous slack, but nothing near
+        // the radius (the old ear-clip failure mode).
+        assert!(
+            dev < 5e-3,
+            "worst chordal deviation {dev:e} should be sampling-scale, not radius-scale"
+        );
+        // Interior lattice points were inserted (far more triangles than the
+        // ~2 per boundary quad an ear clip of the band alone would give).
+        assert!(
+            mesh.triangle_count() > 400,
+            "structured band should be densely triangulated, got {}",
+            mesh.triangle_count()
+        );
+    }
+
+    /// of-lcx: a thin full-wrap band (plate much thinner than the hole
+    /// radius) still spans the full 2π in u, so its wide chords must be
+    /// broken up even though the band leaves little room in v for interior
+    /// rows. The lattice guarantees at least one interior row/column.
+    #[test]
+    fn thin_curved_band_is_low_deviation_and_manifold() {
+        let (mut store, mut geo) = stores();
+        let plate = block_at(&mut store, &mut geo, (4.0, 4.0, 0.1), (0.0, 0.0, 0.0));
+        let tool = cylinder_at(&mut store, &mut geo, 1.0, 4.0, (0.0, 0.0, 0.0));
+        let out = subtract(&store, &geo, plate, tool, &tol()).unwrap();
+        let (mesh, dev) = out.tessellate_measured().expect("tessellation");
+        assert!(
+            mesh.is_closed_manifold(),
+            "thin band must be closed manifold"
+        );
+        assert!(
+            dev < 5e-3,
+            "thin-band deviation {dev:e} must stay sampling-scale, not radius-scale"
+        );
+    }
+
+    /// of-lcx: tessellation must be deterministic run-to-run (the earlier
+    /// refine-by-bisection attempt was sensitive to HashMap seed ordering).
+    #[test]
+    fn curved_tessellation_is_deterministic() {
+        let build = || {
+            let (mut store, mut geo) = stores();
+            let slab = block_at(&mut store, &mut geo, (4.0, 4.0, 2.0), (0.0, 0.0, 0.0));
+            let tool = cylinder_at(&mut store, &mut geo, 1.0, 4.0, (0.0, 0.0, 0.0));
+            let out = subtract(&store, &geo, slab, tool, &tol()).unwrap();
+            let (mesh, dev) = out.tessellate_measured().expect("tessellation");
+            (mesh.triangle_count(), dev)
+        };
+        let (n1, d1) = build();
+        let (n2, d2) = build();
+        assert_eq!(n1, n2, "triangle count must be identical across runs");
+        assert_eq!(
+            d1.to_bits(),
+            d2.to_bits(),
+            "deviation must be bit-identical"
+        );
     }
 
     #[test]
