@@ -2417,21 +2417,34 @@ fn build_output(
     }
 
     // Genus per shell from the Euler-Poincaré formula (S = 1 per shell).
+    //
+    // The genus stored here is *derived* from the reconstructed graph's own
+    // V/E/F/R counts, so the later `check()` re-derivation of the same formula
+    // holds by construction — it corroborates the counts, it does not
+    // independently validate them. What DOES carry signal is the shape of chi
+    // itself: a valid single-component closed orientable shell always has an
+    // even chi in `..=2` (chi = 2 - 2g, g >= 0). An odd chi means the shell is
+    // not closed/orientable; chi > 2 means it is not a single component. Either
+    // way the reconstruction is broken, so we reject it at build time rather
+    // than silently labelling it genus 0 and deferring the failure to a
+    // `check()` call that the caller may never make.
     let shell_ids: Vec<EntityId<crate::topology::Shell>> = shells.values().copied().collect();
     for shell_id in &shell_ids {
         let (v, e, f, r) = shell_counts(&store, *shell_id);
         let chi = v as i64 - e as i64 + f as i64 - r as i64;
-        // V - E + F - R = 2(1 - H)  =>  H = 1 - chi/2.
-        if chi % 2 == 0 {
-            let h = 1 - chi / 2;
-            if h >= 0 {
-                store
-                    .shells
-                    .get_mut(*shell_id)
-                    .expect("shell just created")
-                    .genus = h as u32;
-            }
-        }
+        let genus = shell_genus_from_euler(chi).ok_or_else(|| CoreError::Degenerate {
+            context: "boolean::build_output",
+            reason: format!(
+                "reconstructed shell has impossible Euler characteristic \
+                 chi = V-E+F-R = {v}-{e}+{f}-{r} = {chi}; a valid closed \
+                 orientable shell requires an even chi <= 2"
+            ),
+        })?;
+        store
+            .shells
+            .get_mut(*shell_id)
+            .expect("shell just created")
+            .genus = genus;
     }
 
     let shell_count = shells.len();
@@ -2443,6 +2456,22 @@ fn build_output(
         face_count,
         shell_count,
     })
+}
+
+/// Genus of a single closed orientable shell from its Euler characteristic
+/// `chi = V - E + F - R`, or `None` when `chi` is impossible for such a shell.
+///
+/// For one connected closed orientable surface `chi = 2 - 2g` with `g >= 0`,
+/// so `chi` is always even and at most 2, and `g = 1 - chi/2`. An odd `chi`
+/// (shell not closed/orientable) or `chi > 2` (more than one component fused
+/// into one shell, giving `g < 0`) has no valid genus and yields `None`.
+fn shell_genus_from_euler(chi: i64) -> Option<u32> {
+    if chi % 2 != 0 {
+        return None;
+    }
+    // V - E + F - R = 2(1 - H)  =>  H = 1 - chi/2.
+    let h = 1 - chi / 2;
+    (h >= 0).then_some(h as u32)
 }
 
 /// V/E/F/R counts of one shell (vertices and edges reached via its faces).
@@ -2811,6 +2840,26 @@ mod tests {
 
     fn tol() -> ToleranceContext {
         ToleranceContext::default()
+    }
+
+    #[test]
+    fn shell_genus_from_euler_maps_valid_characteristics() {
+        // Sphere (chi = 2) is genus 0, torus (chi = 0) is genus 1,
+        // double torus (chi = -2) is genus 2.
+        assert_eq!(shell_genus_from_euler(2), Some(0));
+        assert_eq!(shell_genus_from_euler(0), Some(1));
+        assert_eq!(shell_genus_from_euler(-2), Some(2));
+        assert_eq!(shell_genus_from_euler(-100), Some(51));
+    }
+
+    #[test]
+    fn shell_genus_from_euler_rejects_impossible_characteristics() {
+        // Odd chi cannot come from a closed orientable surface.
+        assert_eq!(shell_genus_from_euler(1), None);
+        assert_eq!(shell_genus_from_euler(-1), None);
+        assert_eq!(shell_genus_from_euler(3), None);
+        // chi > 2 implies genus < 0 (more than one component in the shell).
+        assert_eq!(shell_genus_from_euler(4), None);
     }
 
     fn stores() -> (TopologyStore, GeometryStore) {
