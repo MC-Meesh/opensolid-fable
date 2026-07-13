@@ -8,6 +8,12 @@ use thiserror::Error;
 use super::lex::{LexError, Lexer, Token};
 use super::{EntityRecord, Header, Instance, SimpleRecord, StepFile, Value};
 
+/// Maximum nesting depth of aggregates/typed parameters within a single
+/// parameter value. Real STEP files nest 2-4 levels; the cap exists so a
+/// crafted file cannot overflow the stack — both during the recursive parse
+/// and when the resulting [`Value`] tree is (recursively) dropped.
+const MAX_NESTING_DEPTH: usize = 64;
+
 /// A STEP Part 21 parse error with source location.
 #[derive(Debug, Clone, PartialEq, Error)]
 #[error("STEP parse error at line {line}, column {column}: {message}")]
@@ -58,6 +64,8 @@ struct Parser<'a> {
     /// Byte offset of the most recently `bump`ed (consumed) token — for errors
     /// that refer to the token just taken rather than the current lookahead.
     cur_at: usize,
+    /// Current aggregate/typed-parameter nesting depth inside a value.
+    depth: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -73,6 +81,7 @@ impl<'a> Parser<'a> {
             peeked,
             peeked_at,
             cur_at: 0,
+            depth: 0,
         })
     }
 
@@ -356,7 +365,7 @@ impl<'a> Parser<'a> {
             }
             Token::LParen => {
                 self.bump()?;
-                let items = self.parse_parameter_list()?;
+                let items = self.parse_nested_parameter_list()?;
                 Ok(Value::List(items))
             }
             Token::Keyword(k) => {
@@ -364,7 +373,7 @@ impl<'a> Parser<'a> {
                 let type_name = keyword_string(k);
                 self.bump()?;
                 self.expect(&Token::LParen)?;
-                let inner = self.parse_parameter_list()?;
+                let inner = self.parse_nested_parameter_list()?;
                 let value = match inner.len() {
                     1 => Box::new(inner.into_iter().next().unwrap()),
                     _ => Box::new(Value::List(inner)),
@@ -373,6 +382,21 @@ impl<'a> Parser<'a> {
             }
             other => Err(self.error(format!("expected a parameter value, found {other}"))),
         }
+    }
+
+    /// Parse a parameter list one nesting level down, enforcing
+    /// [`MAX_NESTING_DEPTH`]. The opening `(` must already be consumed.
+    fn parse_nested_parameter_list(&mut self) -> Result<Vec<Value>, StepError> {
+        self.depth += 1;
+        if self.depth > MAX_NESTING_DEPTH {
+            return Err(self.error_at(
+                self.cur_at,
+                format!("aggregate nesting too deep (limit {MAX_NESTING_DEPTH})"),
+            ));
+        }
+        let items = self.parse_parameter_list()?;
+        self.depth -= 1;
+        Ok(items)
     }
 
     /// Skip a balanced `( … )` group, consuming the opening and closing parens.
@@ -655,6 +679,58 @@ END-ISO-10303-21;
         assert_eq!(file.len(), 2);
         assert!(file.get(1).is_some());
         assert!(file.get(2).is_some());
+    }
+
+    /// Build `#1 = THING('', ((((…0.…))));` with `depth` nested parens.
+    fn nested_aggregate_src(depth: usize) -> String {
+        wrap(&format!(
+            "#1 = THING('', {}0.{});",
+            "(".repeat(depth),
+            ")".repeat(depth)
+        ))
+    }
+
+    #[test]
+    fn nesting_at_limit_parses() {
+        let file = parse(&nested_aggregate_src(MAX_NESTING_DEPTH)).unwrap();
+        // Walk down to the innermost value to confirm the shape survived.
+        let mut v = &file.get(1).unwrap().as_simple().unwrap().attributes[1];
+        for _ in 0..MAX_NESTING_DEPTH {
+            let Value::List(items) = v else {
+                panic!("expected list");
+            };
+            assert_eq!(items.len(), 1);
+            v = &items[0];
+        }
+        assert_eq!(*v, Value::Real(0.0));
+    }
+
+    #[test]
+    fn nesting_one_past_limit_errors() {
+        let err = parse(&nested_aggregate_src(MAX_NESTING_DEPTH + 1)).unwrap_err();
+        assert!(err.message.contains("nesting too deep"), "{}", err.message);
+    }
+
+    /// Regression for of-1dd: ~500 nested parens in a 1KB file used to
+    /// overflow the stack and abort the whole process. Must now be a clean
+    /// parse error.
+    #[test]
+    fn deeply_nested_aggregates_error_instead_of_crashing() {
+        let err = parse(&nested_aggregate_src(512)).unwrap_err();
+        assert!(err.message.contains("nesting too deep"), "{}", err.message);
+    }
+
+    /// Typed parameters recurse through the same path and must honour the
+    /// same limit.
+    #[test]
+    fn deeply_nested_typed_parameters_error_instead_of_crashing() {
+        let src = wrap(&format!(
+            "#1 = X({}0.{});",
+            "T(".repeat(512),
+            ")".repeat(512)
+        ));
+        let err = parse(&src).unwrap_err();
+        assert!(err.message.contains("nesting too deep"), "{}", err.message);
     }
 
     // ---- Error reporting ----
