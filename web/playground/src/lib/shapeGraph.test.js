@@ -1,6 +1,5 @@
 import { describe, expect, it } from 'vitest';
 import {
-  addShape,
   argLabel,
   chainOf,
   deleteShape,
@@ -9,7 +8,6 @@ import {
   listNodes,
   parseScript,
   referencedNames,
-  setTranslation,
   statementToSource,
   trailingTranslation,
   updateNumericArg,
@@ -211,78 +209,6 @@ return a;
   });
 });
 
-describe('setTranslation', () => {
-  it('replaces an existing trailing translate with the absolute position', () => {
-    const graph = parseScript(SIMPLE);
-    const { source } = setTranslation(graph, 'bump', [0.5, 1, -0.25]);
-    expect(source).toContain('const bump = Shape.sphere(0.55).translate(0.5, 1, -0.25);');
-  });
-
-  it('appends a translate when the chain has none', () => {
-    const graph = parseScript(SIMPLE);
-    const { source } = setTranslation(graph, 'hole', [1, 0, 0]);
-    expect(source).toContain('const hole = Shape.cylinder(0.28, 2).translate(1, 0, 0);');
-  });
-
-  it('coalesces stacked trailing translates into one', () => {
-    const graph = parseScript('const a = Shape.sphere(1).translate(1, 0, 0).translate(0, 1, 0);');
-    const { source } = setTranslation(graph, 'a', [2, 2, 2]);
-    expect(source).toBe('const a = Shape.sphere(1).translate(2, 2, 2);');
-  });
-
-  it('drops the call entirely for a zero translation', () => {
-    const graph = parseScript('const a = Shape.sphere(1).translate(1, 0, 0);');
-    const { source } = setTranslation(graph, 'a', [0, 0, 0]);
-    expect(source).toBe('const a = Shape.sphere(1);');
-  });
-
-  it('does not disturb translates that are not trailing', () => {
-    const graph = parseScript('const a = Shape.sphere(1).translate(1, 0, 0).union(b);');
-    const { source } = setTranslation(graph, 'a', [0, 5, 0]);
-    expect(source).toBe('const a = Shape.sphere(1).translate(1, 0, 0).union(b).translate(0, 5, 0);');
-  });
-});
-
-describe('addShape', () => {
-  it('inserts a def before the return and unions it into the result', () => {
-    const graph = parseScript(SIMPLE);
-    const { source, name } = addShape(graph, 'sphere', [0.5]);
-    expect(name).toBe('s1');
-    expect(source).toContain('const s1 = Shape.sphere(0.5);\nreturn solid.subtract(hole).union(s1);');
-    // The new script still parses fully canonically.
-    const reparsed = parseScript(source);
-    expect(reparsed.statements.map((s) => s.kind)).toEqual([
-      'def',
-      'def',
-      'def',
-      'def',
-      'def',
-      'ret',
-    ]);
-  });
-
-  it('generates fresh names that skip taken ones', () => {
-    const graph = parseScript('const s1 = Shape.sphere(1);\nreturn s1;');
-    const { name } = addShape(graph, 'box3', [0.5, 0.5, 0.5]);
-    expect(name).toBe('s2');
-  });
-
-  it('creates a return statement when the script has none', () => {
-    const graph = parseScript('// empty scene\n');
-    const { source } = addShape(graph, 'torus', [0.6, 0.2]);
-    expect(source).toBe('// empty scene\nconst s1 = Shape.torus(0.6, 0.2);\nreturn s1;\n');
-  });
-
-  it('keeps comments above the return statement intact', () => {
-    const src = 'const a = Shape.sphere(1);\n// the output\nreturn a;\n';
-    const graph = parseScript(src);
-    const { source } = addShape(graph, 'sphere', [0.5]);
-    expect(source).toBe(
-      'const a = Shape.sphere(1);\n// the output\nconst s1 = Shape.sphere(0.5);\nreturn a.union(s1);\n'
-    );
-  });
-});
-
 describe('deleteShape', () => {
   it('removes an unreferenced def and its line', () => {
     const src = 'const a = Shape.sphere(1);\nconst b = Shape.box3(1, 1, 1);\nreturn b;\n';
@@ -311,27 +237,18 @@ describe('argLabel', () => {
   });
 });
 
-describe('GUI -> script -> GUI roundtrip', () => {
-  it('a full edit session preserves hand-written content', () => {
+describe('statement-lane edit session', () => {
+  it('statement edits preserve hand-written content around them', () => {
     const src = `// My part, do not touch this comment.
 const base = Shape.box3(1, 0.4, 1);
 const custom = base.union(externallyDefined);
 return base;
 `;
-    let graph = parseScript(src);
-
-    const added = addShape(graph, 'cylinder', [0.3, 0.6]);
-    graph = parseScript(added.source);
-    const moved = setTranslation(graph, added.name, [0, 1, 0]);
-    graph = parseScript(moved.source);
-    const resized = updateNumericArg(graph, 'base', 0, 1, 0.5);
-    graph = parseScript(resized.source);
-
+    const resized = updateNumericArg(parseScript(src), 'base', 0, 1, 0.5);
     expect(resized.source).toBe(`// My part, do not touch this comment.
 const base = Shape.box3(1, 0.5, 1);
 const custom = base.union(externallyDefined);
-const s1 = Shape.cylinder(0.3, 0.6).translate(0, 1, 0);
-return base.union(s1);
+return base;
 `);
   });
 });

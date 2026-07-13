@@ -385,13 +385,6 @@ function findDef(graph, name) {
   return graph.statements.find((s) => s.kind === 'def' && s.name === name) ?? null;
 }
 
-function findRet(graph) {
-  for (let i = graph.statements.length - 1; i >= 0; i -= 1) {
-    if (graph.statements[i].kind === 'ret') return graph.statements[i];
-  }
-  return null;
-}
-
 function statementByNodeId(graph, nodeId) {
   const at = nodeId.match(/^(?:ret|raw)@(\d+)$/);
   if (at) return graph.statements[Number(at[1])] ?? null;
@@ -415,36 +408,9 @@ export function updateNumericArg(graph, nodeId, linkIndex, argIndex, value) {
   return respliceStatement(graph, stmt);
 }
 
-/**
- * Set the absolute trailing translation of a def node (what the gizmo edits).
- * Coalesces any existing trailing `.translate` calls into one; a ~zero
- * translation drops the call entirely.
- */
-export function setTranslation(graph, name, [x, y, z]) {
-  const stmt = findDef(graph, name);
-  if (!stmt) return { error: `no shape named "${name}"` };
-  let e = stmt.expr;
-  while (
-    e.kind === 'call' &&
-    e.method === 'translate' &&
-    e.args.length === 3 &&
-    e.args.every((a) => a.kind === 'num')
-  ) {
-    e = e.target;
-  }
-  const zero = [x, y, z].every((v) => Math.abs(v) < 5e-7);
-  stmt.expr = zero
-    ? e
-    : {
-        kind: 'call',
-        target: e,
-        method: 'translate',
-        args: [x, y, z].map((v) => ({ kind: 'num', value: v })),
-      };
-  return respliceStatement(graph, stmt);
-}
-
-/** Palette defaults: constructor arguments for each newly added primitive. */
+/** Palette defaults: constructor arguments for each newly added primitive.
+ * Adding one is a store mutation (storeSync.addPrimitiveNode), not a script
+ * splice — the script view is regenerated from the tree afterwards. */
 export const PALETTE = [
   { ctor: 'sphere', label: 'Sphere', args: [0.5] },
   { ctor: 'box3', label: 'Box', args: [0.5, 0.5, 0.5] },
@@ -452,49 +418,6 @@ export const PALETTE = [
   { ctor: 'cylinder', label: 'Cylinder', args: [0.3, 0.6] },
   { ctor: 'torus', label: 'Torus', args: [0.6, 0.2] },
 ];
-
-function freshName(graph) {
-  const taken = new Set();
-  for (const stmt of graph.statements) {
-    if (stmt.kind === 'def') {
-      taken.add(stmt.name);
-      referencedNames(stmt.expr).forEach((n) => taken.add(n));
-    } else if (stmt.kind === 'ret') {
-      referencedNames(stmt.expr).forEach((n) => taken.add(n));
-    }
-  }
-  for (let i = 1; ; i += 1) {
-    const name = `s${i}`;
-    if (!taken.has(name)) return name;
-  }
-}
-
-/**
- * Add a primitive from the palette: inserts a `const` definition and unions
- * it into the returned expression (creating `return <name>;` if the script
- * has no return statement). Returns { source, name }.
- */
-export function addShape(graph, ctor, args) {
-  const name = freshName(graph);
-  const argSrc = args.map(fmtNum).join(', ');
-  const defText = `const ${name} = Shape.${ctor}(${argSrc});\n`;
-  const ret = findRet(graph);
-  if (!ret) {
-    const base = graph.source.endsWith('\n') || graph.source === '' ? '' : '\n';
-    return { source: `${graph.source}${base}${defText}return ${name};\n`, name };
-  }
-  const newRet = {
-    kind: 'ret',
-    expr: {
-      kind: 'call',
-      target: ret.expr,
-      method: 'union',
-      args: [{ kind: 'expr', expr: { kind: 'ref', name } }],
-    },
-  };
-  const text = defText + statementToSource(newRet);
-  return { source: splice(graph.source, ret.start, ret.end, text), name };
-}
 
 /**
  * Delete a def node. Refuses (with { error }) when other statements still

@@ -22,12 +22,12 @@ import { deleteNode } from './lib/deleteNode.js';
 import { VIEW_SHORTCUTS } from './lib/views.js';
 import { buildFeatures, pruneTree, resolveKeys } from './lib/featureTree.js';
 import {
-  addShape,
   deleteShape,
   listNodes,
   parseScript,
   updateNumericArg,
 } from './lib/shapeGraph.js';
+import { addPrimitiveNode, assertStoreConsistency } from './lib/storeSync.js';
 import { buildSweepShape, opsBounds, profileToOps, sweepTreeNode } from './lib/sweep.js';
 import { createFaceRegionIndex } from './lib/facePlane.js';
 import { isFacePlane } from './lib/sketch/profile.js';
@@ -124,6 +124,10 @@ export default function App() {
 
   const scriptRef = useRef(DEFAULT_SCRIPT);
   const graphRef = useRef(graph);
+  // Store generation: bumped once per model commit. Remesh requests and the
+  // pruned-display recompute carry the generation they were issued for, and
+  // results from superseded generations are dropped instead of rendered.
+  const generationRef = useRef(0);
   const accuracyRef = useRef(DEFAULT_ACCURACY);
   const exactBooleansRef = useRef(false);
   const shapeRef = useRef(null);
@@ -143,7 +147,10 @@ export default function App() {
     selectedPathRef.current = null;
   }, []);
 
-  const remesh = useCallback(({ reframe = false } = {}) => {
+  const remesh = useCallback(({ reframe = false, generation = generationRef.current } = {}) => {
+    // Stale-render guard: a request issued for a superseded model generation
+    // must never reach the screen.
+    if (generation !== generationRef.current) return;
     const display = displayRef.current;
     if (display.mode === 'empty') {
       const key = ++meshKeyRef.current;
@@ -211,6 +218,9 @@ export default function App() {
   const evaluateScript = useCallback(() => {
     const api = wasmRef.current;
     if (!api) return;
+    // Each evaluation is a new model generation; anything still in flight for
+    // the previous one is now stale.
+    const generation = ++generationRef.current;
     setError(null);
     // Route booleans through the kernel's exact B-Rep pipeline when the
     // toggle is on (optional-chained: older pkg builds lack the export).
@@ -230,7 +240,12 @@ export default function App() {
     tracedRef.current = traced;
     setTree(traced.root);
     shapeRef.current = traced.root.shape;
-    remesh({ reframe: true });
+    // Dev-mode tripwire: the script view must describe exactly the tree that
+    // is about to render. Divergence means a mutation bypassed the store.
+    if (import.meta.env.DEV) {
+      assertStoreConsistency(scriptRef.current, traced.root);
+    }
+    remesh({ reframe: true, generation });
 
     if (selectedPathRef.current) {
       const restored = nodeAt(traced.root, selectedPathRef.current);
@@ -264,65 +279,94 @@ export default function App() {
     []
   );
 
-  // Script -> GUI: re-parse and re-evaluate, debounced behind keystrokes.
+  // THE single store commit: every model edit — script keystrokes, palette,
+  // gizmo, property panel, feature delete, sketch apply, sweep apply — lands
+  // here. It cancels any pending debounced edit, updates the script view
+  // (unless the edit came from the editor itself), re-derives the statement
+  // graph, and re-evaluates into the traced tree, which fans out to remesh +
+  // tree/panel updates. Nothing else may write scriptRef or call
+  // evaluateScript directly.
+  //
+  // `selectPath`: undefined keeps the current selection (restored by path
+  // after re-evaluation), null clears it, an array selects that path.
+  const commitScript = useCallback(
+    (source, { fromEditor = false, selectPath } = {}) => {
+      clearTimeout(editTimerRef.current);
+      if (selectPath !== undefined) selectedPathRef.current = selectPath;
+      scriptRef.current = source;
+      if (!fromEditor) editorRef.current?.setDoc(source);
+      commitGraph();
+      evaluateScript();
+    },
+    [commitGraph, evaluateScript]
+  );
+
+  // GUI-edit lane: serialize the mutated tree back into a canonical script.
+  // The script is a regenerated view — only the header comment survives a
+  // tree commit verbatim; statement layout is canonical form.
+  const commitTree = useCallback(
+    (newRoot, opts = {}) => {
+      commitScript(serializeWithHeader(newRoot), { ...opts, fromEditor: false });
+    },
+    [commitScript, serializeWithHeader]
+  );
+
+  // Script -> store: re-parse and re-evaluate, debounced behind keystrokes.
+  // A tree commit in the debounce window cancels the timer (the commit
+  // regenerated the script, superseding the keystrokes it was tracking).
   const handleScriptChange = useCallback(
     (source) => {
       if (source === scriptRef.current) return;
       scriptRef.current = source;
       clearTimeout(editTimerRef.current);
       editTimerRef.current = setTimeout(() => {
-        commitGraph();
-        evaluateScript();
+        commitScript(scriptRef.current, { fromEditor: true });
       }, EDIT_DEBOUNCE_MS);
     },
-    [commitGraph, evaluateScript]
+    [commitScript]
   );
 
   const runNow = useCallback(() => {
-    clearTimeout(editTimerRef.current);
-    commitGraph();
-    evaluateScript();
-  }, [commitGraph, evaluateScript]);
+    commitScript(scriptRef.current, { fromEditor: true });
+  }, [commitScript]);
 
   useEffect(() => () => clearTimeout(editTimerRef.current), []);
 
-  // GUI -> Script: apply a shapeGraph mutation, push the rewritten script
-  // into the editor, and refresh graph + shape immediately.
-  const applyMutation = useCallback(
+  // Palette add is a store mutation: union the new primitive onto the tree
+  // and let the commit regenerate the script from it.
+  const handleAddShape = useCallback(
+    (ctor, args) => {
+      commitTree(addPrimitiveNode(tracedRef.current?.root ?? null, ctor, args));
+    },
+    [commitTree]
+  );
+
+  // ScenePanel rows are statements, including hand-written raw code the tree
+  // cannot represent, so its edits are script-lane edits: rewrite the one
+  // statement, then commit the new source through the same funnel.
+  const applyStatementEdit = useCallback(
     (result) => {
       if (result.error) {
         setError(result.error);
-        return false;
+        return;
       }
-      scriptRef.current = result.source;
-      editorRef.current?.setDoc(result.source);
-      commitGraph();
-      evaluateScript();
-      return true;
+      commitScript(result.source);
     },
-    [commitGraph, evaluateScript]
-  );
-
-  const handleAddShape = useCallback(
-    (ctor, args) => {
-      const result = addShape(graphRef.current, ctor, args);
-      applyMutation(result);
-    },
-    [applyMutation]
+    [commitScript]
   );
 
   const handleDeleteShape = useCallback(
     (name) => {
-      applyMutation(deleteShape(graphRef.current, name));
+      applyStatementEdit(deleteShape(graphRef.current, name));
     },
-    [applyMutation]
+    [applyStatementEdit]
   );
 
   const handleUpdateArg = useCallback(
     (nodeId, linkIndex, argIndex, value) => {
-      applyMutation(updateNumericArg(graphRef.current, nodeId, linkIndex, argIndex, value));
+      applyStatementEdit(updateNumericArg(graphRef.current, nodeId, linkIndex, argIndex, value));
     },
-    [applyMutation]
+    [applyStatementEdit]
   );
 
   const selectNode = useCallback(
@@ -416,7 +460,7 @@ export default function App() {
   );
 
   // SolidWorks Delete gesture: remove the selected body/branch from the tree
-  // and push the rewritten script through the usual sync path.
+  // and commit through the store.
   const handleDeleteSelected = useCallback(() => {
     const root = tracedRef.current?.root;
     if (!root || !selectedNode) return;
@@ -426,12 +470,8 @@ export default function App() {
       return;
     }
     clearSelection();
-    const script = serializeWithHeader(result.root);
-    scriptRef.current = script;
-    editorRef.current?.setDoc(script);
-    commitGraph();
-    evaluateScript();
-  }, [selectedNode, clearSelection, serializeWithHeader, commitGraph, evaluateScript]);
+    commitTree(result.root, { selectPath: null });
+  }, [selectedNode, clearSelection, commitTree]);
 
   const handleTransform = useCallback(
     (event) => {
@@ -451,18 +491,13 @@ export default function App() {
         return;
       }
 
-      selectedPathRef.current = path;
-      const script = serializeWithHeader(newRoot);
-      scriptRef.current = script;
-      editorRef.current?.setDoc(script);
-      commitGraph();
-      evaluateScript();
+      commitTree(newRoot, { selectPath: path });
     },
-    [selectedNode, serializeWithHeader, commitGraph, evaluateScript]
+    [selectedNode, commitTree]
   );
 
-  // Property panel edits: mutate the traced tree, then push the serialized
-  // script through the same sync path the gizmo uses.
+  // Property panel edits: mutate the traced tree, then commit through the
+  // same store funnel the gizmo uses.
   const applyTreeEdit = useCallback(
     (result, nodeId) => {
       if (result.error) {
@@ -470,14 +505,11 @@ export default function App() {
         return;
       }
       if (result.root === tracedRef.current?.root) return;
-      selectedPathRef.current = pathTo(result.root, nodeId) ?? selectedPathRef.current;
-      const script = serializeWithHeader(result.root);
-      scriptRef.current = script;
-      editorRef.current?.setDoc(script);
-      commitGraph();
-      evaluateScript();
+      commitTree(result.root, {
+        selectPath: pathTo(result.root, nodeId) ?? selectedPathRef.current,
+      });
     },
-    [commitGraph, evaluateScript]
+    [commitTree]
   );
 
   const handleEditArg = useCallback(
@@ -510,6 +542,9 @@ export default function App() {
     const api = wasmRef.current;
     const root = tracedRef.current?.root;
     if (!api || !root) return;
+    // The recompute belongs to the generation whose tree it prunes; a store
+    // commit racing this effect supersedes it.
+    const generation = generationRef.current;
     const ids = resolveKeys(
       buildFeatures(root),
       [...hiddenKeys, ...suppressedKeys]
@@ -522,7 +557,7 @@ export default function App() {
       if (previous.mode === 'full') return;
       freePrevious();
       displayRef.current = { mode: 'full' };
-      remesh();
+      remesh({ generation });
       return;
     }
     const pruned = pruneTree(root, ids);
@@ -530,7 +565,7 @@ export default function App() {
     freePrevious();
     if (!pruned) {
       displayRef.current = { mode: 'empty' };
-      remesh();
+      remesh({ generation });
       return;
     }
     let traced;
@@ -539,11 +574,17 @@ export default function App() {
     } catch (err) {
       setError(`Recomputing without hidden features failed: ${String(err)}`);
       displayRef.current = { mode: 'full' };
-      remesh();
+      remesh({ generation });
+      return;
+    }
+    if (generation !== generationRef.current) {
+      // Superseded while recomputing: drop the result instead of rendering
+      // a scene from a stale tree.
+      freeNodes(traced.nodes);
       return;
     }
     displayRef.current = { mode: 'pruned', shape: traced.root.shape, nodes: traced.nodes };
-    remesh();
+    remesh({ generation });
   }, [tree, hiddenKeys, suppressedKeys, wasmReady, remesh]);
 
   const handleFeatureRename = useCallback((key, name) => {
@@ -573,18 +614,13 @@ export default function App() {
     });
   }, []);
 
-  // Committing a whole-tree edit (delete, sketch replacement): serialize and
-  // push through the same sync path the gizmo uses, with no selection carry.
+  // Committing a whole-tree edit (delete, sketch replacement): the same
+  // store funnel, with no selection carry.
   const commitRoot = useCallback(
     (newRoot) => {
-      selectedPathRef.current = null;
-      const script = serializeWithHeader(newRoot);
-      scriptRef.current = script;
-      editorRef.current?.setDoc(script);
-      commitGraph();
-      evaluateScript();
+      commitTree(newRoot, { selectPath: null });
     },
-    [commitGraph, evaluateScript]
+    [commitTree]
   );
 
   const handleFeatureDelete = useCallback(
@@ -732,18 +768,13 @@ export default function App() {
   }, []);
 
   // Commit the pending sweep: graft it onto the tree (unioned with any
-  // existing shape), then push the serialized script through the same sync
-  // path the gizmo uses.
+  // existing shape) and commit through the store.
   const applySweep = useCallback(() => {
     if (!sweep) return;
-    const script = serializeWithHeader(sweepTreeNode(tracedRef.current?.root ?? null, sweep));
-    scriptRef.current = script;
-    editorRef.current?.setDoc(script);
     setSweep(null);
     setSweepError(null);
-    commitGraph();
-    evaluateScript();
-  }, [sweep, serializeWithHeader, commitGraph, evaluateScript]);
+    commitTree(sweepTreeNode(tracedRef.current?.root ?? null, sweep));
+  }, [sweep, commitTree]);
 
   // Live preview: remesh the pending sweep whenever its parameters change.
   useEffect(() => {
@@ -804,13 +835,13 @@ export default function App() {
     return () => clearTimeout(timer);
   }, [toast]);
 
-  // First successful WASM init runs the default script once.
+  // First successful WASM init commits the current script once.
   const bootedRef = useRef(false);
   useEffect(() => {
     if (!wasmReady || bootedRef.current) return;
     bootedRef.current = true;
-    evaluateScript();
-  }, [wasmReady, evaluateScript]);
+    runNow();
+  }, [wasmReady, runNow]);
 
   useEffect(() => {
     function onKeyDown(event) {
