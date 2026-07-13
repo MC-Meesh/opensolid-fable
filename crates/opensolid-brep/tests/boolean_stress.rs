@@ -100,10 +100,12 @@
 //! ray hits and curved-region mesh refinement are wired, and 12 of the
 //! sphere-campaign tests pass with the gate lifted (each annotated
 //! "passes with the chart gate lifted"). The rest fail on the sibling
-//! bugs their `#[ignore]` messages name: of-7ld.6 (broad-phase box),
-//! of-43n (imprints crossing the seam level without/beyond a single
-//! wrap), of-rb4 (imprints through pole vertices), and the marched
-//! cylinder-sphere SSI not yet wired into `boolean()`.
+//! bugs their `#[ignore]` messages name: of-43n (imprints crossing the
+//! seam level without/beyond a single wrap — includes the random pair /
+//! face-cap / near-tangent tests, which reach imprinting now that
+//! of-7ld.6 fixed the broad-phase boxes), of-rb4 (imprints through pole
+//! vertices), and the marched cylinder-sphere SSI not yet wired into
+//! `boolean()`.
 
 use nalgebra::{Rotation3, Unit};
 use opensolid_brep::boolean::{intersect, subtract, unite};
@@ -1457,7 +1459,7 @@ fn rotated_block_cap_bite_volume_invariance() {
 /// intersection has the exact cap closed form, and the three-way volume
 /// identities must hold.
 #[test]
-#[ignore = "of-7ld.4 gate; lifted, fails on of-7ld.6: broad-phase box misses the clash"]
+#[ignore = "of-7ld.4 gate; lifted, fails on of-43n: imprint ring crosses the seam level without a clean single wrap"]
 fn random_sphere_face_caps_identity() {
     let mut rng = Rng::new(0x0F1_CA9);
     for case in 0..8 {
@@ -1649,7 +1651,7 @@ fn sphere_pair_lens_identities() {
 /// direction, separation strictly between the internal and external
 /// tangency distances with margin. Lens closed form + identities.
 #[test]
-#[ignore = "of-7ld.4 gate; lifted, fails on of-7ld.6: broad-phase box misses some clashes"]
+#[ignore = "of-7ld.4 gate; lifted, fails on of-43n: imprint ring crosses the seam level without a clean single wrap"]
 fn random_sphere_pairs_identity() {
     let mut rng = Rng::new(0x2_5EED_BA11);
     for case in 0..8 {
@@ -1696,7 +1698,7 @@ fn random_sphere_pairs_identity() {
 /// far above linear tolerance), so it must produce a valid solid; the
 /// volume check is a loose window because slivers tessellate coarsely.
 #[test]
-#[ignore = "of-7ld.4 gate; lifted (of-7ld.6 broad-phase fixed), needs of-7ld.2 sphere-sphere SSI"]
+#[ignore = "of-7ld.4 gate; lifted, fails on of-43n: imprint ring crosses the seam level without a clean single wrap"]
 fn sphere_pair_near_tangent_lens() {
     for eps in [1e-3, 1e-4] {
         let context = format!("near-tangent sphere pair, overlap {eps:.0e}");
