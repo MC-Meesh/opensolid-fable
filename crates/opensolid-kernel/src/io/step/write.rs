@@ -8,7 +8,9 @@
 //! - **Geometry**: [`Surface3`] → `plane`, `cylindrical_surface`,
 //!   `conical_surface`, `spherical_surface`, `toroidal_surface`;
 //!   [`Curve3`] → `line`, `circle`, `ellipse` (each positioned by
-//!   `axis2_placement_3d` built from `cartesian_point` / `direction`).
+//!   `axis2_placement_3d` built from `cartesian_point` / `direction`);
+//!   [`Curve3::Polyline`] (marched SSI edges) → degree-1
+//!   `b_spline_curve_with_knots` with knots at the vertex indices.
 //! - **Topology**: `Vertex` / `Edge` / `Loop` / `Face` / `Shell` / `Body` →
 //!   `vertex_point`, `edge_curve`, `oriented_edge`, `edge_loop`,
 //!   `face_outer_bound` / `face_bound`, `advanced_face`, `closed_shell`,
@@ -519,6 +521,27 @@ impl Emitter<'_> {
                     "ELLIPSE('',#{placement},{},{})",
                     fmt_real(major_radius),
                     fmt_real(minor_radius)
+                ))
+            }
+            Curve3::Polyline { ref points, .. } => {
+                // Degree-1 B-spline through the vertices with knots at the
+                // integers: identical parameterization to the kernel's
+                // vertex-index convention (marched SSI polylines).
+                let cps: Vec<u64> = points.iter().map(|p| self.emit_point(*p)).collect();
+                let n = points.len();
+                let mut mults = vec![1i64; n];
+                mults[0] = 2;
+                mults[n - 1] = 2;
+                let knots: Vec<String> = (0..n).map(|k| fmt_real(k as f64)).collect();
+                self.emit(format!(
+                    "B_SPLINE_CURVE_WITH_KNOTS('',1,{},.POLYLINE_FORM.,.F.,.F.,({}),({}),.UNSPECIFIED.)",
+                    ref_list(&cps),
+                    mults
+                        .iter()
+                        .map(|m| m.to_string())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    knots.join(",")
                 ))
             }
         };

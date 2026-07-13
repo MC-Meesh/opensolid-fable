@@ -40,12 +40,24 @@ pub trait CurveEval {
     }
 }
 
-/// Analytic 3D curve primitives.
+/// Analytic 3D curve primitives, plus the sampled polyline curve that
+/// carries marched (numerically traced) intersection geometry.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Curve3 {
     /// Infinite line through `origin` with unit direction `dir`,
     /// parameterized by arc length.
     Line { origin: Point3, dir: Vector3 },
+    /// Piecewise-linear curve through `points`, parameterized by vertex
+    /// index: `point(t)` interpolates segment `⌊t⌋` at fraction `t − ⌊t⌋`,
+    /// so the domain is `[0, len − 1]`. A closed polyline repeats its
+    /// first vertex as the last one (`points[len − 1] == points[0]`) and
+    /// is periodic with period `len − 1`.
+    ///
+    /// This is the exact-geometry representation of marched SSI curves
+    /// ([`crate::ssi::intersect_marched`]) whose intersections have no
+    /// closed form; fitting them as NURBS curves is a later hardening
+    /// pass.
+    Polyline { points: Vec<Point3>, closed: bool },
     /// Circle of `radius` about `center`, in the plane normal to the unit
     /// vector `axis`. The angular reference (t = 0) direction is derived
     /// deterministically from `axis`; see [`plane_basis`].
@@ -191,11 +203,43 @@ impl Curve3 {
         })
     }
 
+    /// Piecewise-linear curve through `points` parameterized by vertex
+    /// index (see [`Curve3::Polyline`]). `closed` polylines must repeat
+    /// their first point as the last one.
+    ///
+    /// # Errors
+    /// [`CoreError::InvalidArgument`] with fewer than 2 points, a
+    /// non-finite coordinate, or a closed polyline whose endpoints differ.
+    pub fn polyline(points: Vec<Point3>, closed: bool) -> CoreResult<Self> {
+        if points.len() < 2 {
+            return Err(CoreError::InvalidArgument {
+                argument: "points",
+                reason: format!("polyline needs at least 2 points, got {}", points.len()),
+            });
+        }
+        if points
+            .iter()
+            .any(|p| !p.coords.iter().all(|c| c.is_finite()))
+        {
+            return Err(CoreError::InvalidArgument {
+                argument: "points",
+                reason: "polyline points must be finite".into(),
+            });
+        }
+        if closed && points[0] != points[points.len() - 1] {
+            return Err(CoreError::InvalidArgument {
+                argument: "points",
+                reason: "a closed polyline must repeat its first point as the last one".into(),
+            });
+        }
+        Ok(Curve3::Polyline { points, closed })
+    }
+
     /// In-plane frame `(u, v)` for conic evaluation: `u` at t = 0, `v` at
     /// t = π/2.
     fn conic_frame(&self) -> Option<(Vector3, Vector3)> {
         match self {
-            Curve3::Line { .. } => None,
+            Curve3::Line { .. } | Curve3::Polyline { .. } => None,
             Curve3::Circle { axis, .. } => Some(plane_basis(axis)),
             Curve3::Ellipse {
                 axis, major_dir, ..
@@ -204,10 +248,29 @@ impl Curve3 {
     }
 }
 
+/// Segment index and interior fraction for a polyline parameter: `t`
+/// wrapped by the period for closed polylines, clamped to the domain for
+/// open ones, then split as `(⌊t⌋, t − ⌊t⌋)` with the final vertex mapped
+/// onto the last segment's end.
+fn polyline_segment(points: &[Point3], closed: bool, t: f64) -> (usize, f64) {
+    let segs = points.len() - 1;
+    let t = if closed {
+        t.rem_euclid(segs as f64)
+    } else {
+        t.clamp(0.0, segs as f64)
+    };
+    let i = (t.floor() as usize).min(segs - 1);
+    (i, t - i as f64)
+}
+
 impl CurveEval for Curve3 {
     fn point(&self, t: f64) -> Point3 {
         match self {
             Curve3::Line { origin, dir } => origin + dir * t,
+            Curve3::Polyline { points, closed } => {
+                let (i, f) = polyline_segment(points, *closed, t);
+                points[i] + (points[i + 1] - points[i]) * f
+            }
             Curve3::Circle { center, radius, .. } => {
                 let (u, v) = self.conic_frame().unwrap();
                 center + (u * t.cos() + v * t.sin()) * *radius
@@ -227,6 +290,12 @@ impl CurveEval for Curve3 {
     fn derivative(&self, t: f64) -> Vector3 {
         match self {
             Curve3::Line { dir, .. } => *dir,
+            // Piecewise constant: the chord vector of the segment under `t`
+            // (one parameter unit spans one segment).
+            Curve3::Polyline { points, closed } => {
+                let (i, _) = polyline_segment(points, *closed, t);
+                points[i + 1] - points[i]
+            }
             Curve3::Circle { radius, .. } => {
                 let (u, v) = self.conic_frame().unwrap();
                 (v * t.cos() - u * t.sin()) * *radius
@@ -244,7 +313,7 @@ impl CurveEval for Curve3 {
 
     fn second_derivative(&self, t: f64) -> Vector3 {
         match self {
-            Curve3::Line { .. } => Vector3::zeros(),
+            Curve3::Line { .. } | Curve3::Polyline { .. } => Vector3::zeros(),
             Curve3::Circle { radius, .. } => {
                 let (u, v) = self.conic_frame().unwrap();
                 (u * t.cos() + v * t.sin()) * -*radius
@@ -264,11 +333,16 @@ impl CurveEval for Curve3 {
         match self {
             Curve3::Line { .. } => (f64::NEG_INFINITY, f64::INFINITY),
             Curve3::Circle { .. } | Curve3::Ellipse { .. } => (0.0, TWO_PI),
+            Curve3::Polyline { points, .. } => (0.0, (points.len() - 1) as f64),
         }
     }
 
     fn is_closed(&self) -> bool {
-        !matches!(self, Curve3::Line { .. })
+        match self {
+            Curve3::Line { .. } => false,
+            Curve3::Circle { .. } | Curve3::Ellipse { .. } => true,
+            Curve3::Polyline { closed, .. } => *closed,
+        }
     }
 
     fn is_periodic(&self) -> bool {
@@ -276,10 +350,13 @@ impl CurveEval for Curve3 {
     }
 
     fn period(&self) -> Option<f64> {
-        if self.is_periodic() {
-            Some(TWO_PI)
-        } else {
-            None
+        match self {
+            Curve3::Circle { .. } | Curve3::Ellipse { .. } => Some(TWO_PI),
+            Curve3::Polyline {
+                points,
+                closed: true,
+            } => Some((points.len() - 1) as f64),
+            _ => None,
         }
     }
 }
@@ -623,5 +700,90 @@ mod tests {
             assert!(v.dot(&axis).abs() < EPS);
             assert_vec_eq(&u.cross(&v), &axis);
         }
+    }
+
+    fn open_polyline() -> Curve3 {
+        Curve3::polyline(
+            vec![
+                Point3::new(0.0, 0.0, 0.0),
+                Point3::new(1.0, 0.0, 0.0),
+                Point3::new(1.0, 2.0, 0.0),
+            ],
+            false,
+        )
+        .unwrap()
+    }
+
+    /// Closed unit square in the xy-plane, first vertex repeated last.
+    fn square_polyline() -> Curve3 {
+        Curve3::polyline(
+            vec![
+                Point3::new(0.0, 0.0, 0.0),
+                Point3::new(1.0, 0.0, 0.0),
+                Point3::new(1.0, 1.0, 0.0),
+                Point3::new(0.0, 1.0, 0.0),
+                Point3::new(0.0, 0.0, 0.0),
+            ],
+            true,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn polyline_evaluates_by_vertex_index() {
+        let c = open_polyline();
+        assert_point_eq(&c.point(0.0), &Point3::new(0.0, 0.0, 0.0));
+        assert_point_eq(&c.point(0.5), &Point3::new(0.5, 0.0, 0.0));
+        assert_point_eq(&c.point(1.0), &Point3::new(1.0, 0.0, 0.0));
+        assert_point_eq(&c.point(1.25), &Point3::new(1.0, 0.5, 0.0));
+        assert_point_eq(&c.point(2.0), &Point3::new(1.0, 2.0, 0.0));
+        // Out-of-domain parameters clamp to the endpoints.
+        assert_point_eq(&c.point(-3.0), &Point3::new(0.0, 0.0, 0.0));
+        assert_point_eq(&c.point(7.0), &Point3::new(1.0, 2.0, 0.0));
+        // Piecewise-constant derivative: the chord of the segment under t.
+        assert_vec_eq(&c.derivative(0.5), &Vector3::new(1.0, 0.0, 0.0));
+        assert_vec_eq(&c.derivative(1.5), &Vector3::new(0.0, 2.0, 0.0));
+        assert_vec_eq(&c.second_derivative(0.5), &Vector3::zeros());
+        assert_eq!(c.domain(), (0.0, 2.0));
+        assert!(!c.is_closed());
+        assert!(!c.is_periodic());
+        assert_eq!(c.period(), None);
+    }
+
+    #[test]
+    fn polyline_closed_wraps_periodically() {
+        let c = square_polyline();
+        assert_eq!(c.domain(), (0.0, 4.0));
+        assert!(c.is_closed());
+        assert!(c.is_periodic());
+        assert_eq!(c.period(), Some(4.0));
+        assert_point_eq(&c.point(4.0), &c.point(0.0));
+        assert_point_eq(&c.point(4.25), &c.point(0.25));
+        assert_point_eq(&c.point(-0.5), &c.point(3.5));
+        assert_vec_eq(&c.derivative(4.5), &c.derivative(0.5));
+    }
+
+    #[test]
+    fn polyline_rejects_invalid_input() {
+        assert!(Curve3::polyline(vec![Point3::origin()], false).is_err());
+        assert!(
+            Curve3::polyline(
+                vec![Point3::origin(), Point3::new(f64::NAN, 0.0, 0.0)],
+                false
+            )
+            .is_err()
+        );
+        // Closed polylines must repeat their first point as the last one.
+        assert!(
+            Curve3::polyline(
+                vec![
+                    Point3::origin(),
+                    Point3::new(1.0, 0.0, 0.0),
+                    Point3::new(0.0, 1.0, 0.0),
+                ],
+                true
+            )
+            .is_err()
+        );
     }
 }

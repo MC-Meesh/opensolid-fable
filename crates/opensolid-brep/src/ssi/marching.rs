@@ -343,7 +343,6 @@ impl<A: MarchSurface, B: MarchSurface> Marcher<'_, A, B> {
     /// remaining three parameters solve the (square) gap system so the
     /// final polyline vertex lies on the intersection *and* the boundary.
     fn correct_pinned(&self, start: MarchState, pin: usize) -> Option<(MarchState, Frames)> {
-        let free: Vec<usize> = (0..4).filter(|&k| k != pin).collect();
         let mut s = start;
         for _ in 0..MAX_CORRECTOR_ITERATIONS {
             let frames = self.frames(&s);
@@ -351,18 +350,28 @@ impl<A: MarchSurface, B: MarchSurface> Marcher<'_, A, B> {
             if gap.norm() <= self.gap_tol {
                 return Some((s, frames));
             }
-            let cols = [frames.au, frames.av, -frames.bu, -frames.bv];
-            let jac = Matrix3::from_columns(&[cols[free[0]], cols[free[1]], cols[free[2]]]);
-            let delta = jac.lu().solve(&(-gap))?;
-            for (i, &k) in free.iter().enumerate() {
-                s.0[k] += delta[i];
-            }
-            if s.0.iter().any(|v| !v.is_finite()) {
-                return None;
-            }
-            self.clamp(&mut s);
+            self.pinned_newton_step(&mut s, &frames, pin)?;
         }
         None
+    }
+
+    /// One Newton update of the pinned gap system: solve the 3×3 Jacobian
+    /// of the gap against the three parameters other than `pin` and apply
+    /// the (clamped) increment. `None` on a singular Jacobian or a
+    /// non-finite iterate.
+    fn pinned_newton_step(&self, s: &mut MarchState, frames: &Frames, pin: usize) -> Option<()> {
+        let free: Vec<usize> = (0..4).filter(|&k| k != pin).collect();
+        let cols = [frames.au, frames.av, -frames.bu, -frames.bv];
+        let jac = Matrix3::from_columns(&[cols[free[0]], cols[free[1]], cols[free[2]]]);
+        let delta = jac.lu().solve(&(-frames.gap()))?;
+        for (i, &k) in free.iter().enumerate() {
+            s.0[k] += delta[i];
+        }
+        if s.0.iter().any(|v| !v.is_finite()) {
+            return None;
+        }
+        self.clamp(s);
+        Some(())
     }
 
     /// March from `seed` with initial tangent orientation `dir` (±1),
@@ -743,6 +752,101 @@ pub fn intersect_marched(
                       are unsupported)",
         }),
     }
+}
+
+/// Re-converge a marched boundary vertex onto the exact intersection with
+/// its seam parameter held fixed, far past the tracer's own gap tolerance.
+///
+/// The tracer's boundary corrector ([`Marcher::correct_pinned`]) stops as
+/// soon as the surface gap drops below `tol.linear`, so two fragments cut
+/// at the same seam can end up ~`tol.linear` apart even though they
+/// terminate at the same geometric point. The boolean pipeline welds
+/// fragment junctions at a snap length many orders tighter, so it
+/// re-polishes each endpoint here: the parameter sitting exactly on a
+/// natural domain bound of its surface (the tracer pins it there
+/// bit-exactly) stays fixed while the three free parameters Newton-solve
+/// the gap system to `gap_tol`. Returns the polished point evaluated on
+/// the **pinned** surface — exactly on that surface's seam curve — or
+/// `None` when no parameter sits on a natural bound (a stalled fragment)
+/// or the tight solve does not converge.
+pub(crate) fn tighten_boundary_point(
+    a: &Surface3,
+    b: &Surface3,
+    params_a: (f64, f64),
+    params_b: (f64, f64),
+    gap_tol: f64,
+) -> Option<Point3> {
+    let state = [params_a.0, params_a.1, params_b.0, params_b.1];
+    let natural = [a.domain_u(), a.domain_v(), b.domain_u(), b.domain_v()];
+    let pin = (0..4).find(|&k| {
+        let (lo, hi) = natural[k];
+        (state[k] == lo && lo.is_finite()) || (state[k] == hi && hi.is_finite())
+    })?;
+    pin_intersection_point(a, b, state, pin, state[pin], gap_tol)
+}
+
+/// Extra Newton iterations past the acceptance tolerance in
+/// [`pin_intersection_point`]. Quadratic convergence reaches the rounding
+/// floor in one or two; the loop also stops as soon as an iteration fails
+/// to shrink the gap.
+const PIN_POLISH_ITERATIONS: usize = 3;
+
+/// Newton-solve the intersection of `a` and `b` with the parameter at
+/// index `pin` (into `[u_a, v_a, u_b, v_b]`) held fixed at `pin_value`,
+/// from `seed` (which must be within a marching step of the root).
+/// Returns the point evaluated on the pinned surface — exactly on its
+/// `pin_value` iso-curve — or `None` if the tight solve does not converge.
+///
+/// The root is polished past `gap_tol` to the numerical fixed point:
+/// acceptance at `gap_tol` alone leaves the iterate anywhere in a
+/// `gap_tol`-sized blob around the root (the seed itself may already
+/// qualify), so two callers solving the *same* junction from different
+/// seeds could disagree by ~`gap_tol` — above the boolean pipeline's weld
+/// epsilon. The extra iterations are monotone in the gap (kept only while
+/// they improve), so every caller lands on the same point to rounding
+/// error and downstream welds see bit-consistent junctions.
+pub(crate) fn pin_intersection_point(
+    a: &Surface3,
+    b: &Surface3,
+    seed: [f64; 4],
+    pin: usize,
+    pin_value: f64,
+    gap_tol: f64,
+) -> Option<Point3> {
+    let mut state = seed;
+    state[pin] = pin_value;
+    // Domains only clamp the Newton updates; the seed is already within a
+    // marching step of the root, so a generous window never binds while
+    // still guarding against a divergent iterate.
+    let domains = [0, 1, 2, 3].map(|k| (state[k] - 10.0, state[k] + 10.0));
+    let marcher = Marcher {
+        a,
+        b,
+        domains,
+        gap_tol,
+        h0: 0.0,
+        h_min: 0.0,
+    };
+    let (accepted, mut frames) = marcher.correct_pinned(MarchState(state), pin)?;
+    // Evaluate on the pinned surface so the point lies exactly on that
+    // surface's seam curve (the free-side evaluation is a gap away).
+    let on_pinned = |f: &Frames| if pin < 2 { f.pa } else { f.pb };
+    let mut best_gap = frames.gap().norm();
+    let mut best_point = on_pinned(&frames);
+    let mut s = accepted;
+    for _ in 0..PIN_POLISH_ITERATIONS {
+        if marcher.pinned_newton_step(&mut s, &frames, pin).is_none() {
+            break;
+        }
+        frames = marcher.frames(&s);
+        let gap = frames.gap().norm();
+        if gap >= best_gap {
+            break;
+        }
+        best_gap = gap;
+        best_point = on_pinned(&frames);
+    }
+    Some(best_point)
 }
 
 /// Reject the Villarceau configuration: a plane through the torus center
@@ -1342,5 +1446,102 @@ mod tests {
         };
         let result = intersect_marched(&s1, &s2, &default_tol());
         assert!(matches!(result, Err(CoreError::NotImplemented { .. })));
+    }
+
+    /// Fixture for the boundary-point polish: unit sphere and an offset
+    /// vertical cylinder whose intersection crosses the sphere's `u = 0`
+    /// seam meridian (the `y = 0, x > 0` half-plane) transversally at
+    /// `q = (c, 0, √(1 − c²))` with `c = 0.3 + √0.32` (the positive root
+    /// of `(x − 0.3)² + 0.2² = 0.6²`).
+    fn seam_junction_fixture() -> (Surface3, Surface3, Point3, (f64, f64), (f64, f64)) {
+        let sphere = Surface3::sphere(Point3::origin(), Vector3::z(), 1.0).unwrap();
+        let cyl_origin = Point3::new(0.3, 0.2, 0.0);
+        let cylinder = Surface3::cylinder(cyl_origin, Vector3::z(), 0.6).unwrap();
+        let c = 0.3 + 0.32_f64.sqrt();
+        let q = Point3::new(c, 0.0, (1.0 - c * c).sqrt());
+        // Sphere: point(u, v) = (cos v cos u, cos v sin u, sin v); the
+        // junction sits on the seam u = 0 at latitude v = asin(q.z).
+        let params_a = (0.0, q.z.asin());
+        // Cylinder: u from the radial direction, v the height along z.
+        let params_b = ((q.y - cyl_origin.y).atan2(q.x - cyl_origin.x), q.z);
+        assert!((sphere.point(params_a.0, params_a.1) - q).norm() < 1e-15);
+        assert!((cylinder.point(params_b.0, params_b.1) - q).norm() < 1e-15);
+        (sphere, cylinder, q, params_a, params_b)
+    }
+
+    /// A seed already inside `gap_tol` must still be polished onto the
+    /// exact junction: acceptance alone would return the perturbed seed
+    /// (~1e-5 off), and downstream welds need every caller of the same
+    /// junction to land on the same point.
+    #[test]
+    fn tighten_polishes_past_the_acceptance_tolerance() {
+        let (sphere, cylinder, q, (ua, va), (ub, vb)) = seam_junction_fixture();
+        let p = tighten_boundary_point(
+            &sphere,
+            &cylinder,
+            (ua, va + 3e-5),
+            (ub, vb - 2e-5),
+            1e-4, // above the seed's gap: accepted at iteration 0
+        )
+        .expect("pinned solve must converge");
+        assert!(
+            (p - q).norm() < 1e-10,
+            "polished endpoint {p:?} is {:e} from the exact junction {q:?}",
+            (p - q).norm()
+        );
+        // Evaluated on the pinned sphere at u = 0 exactly: on the seam.
+        assert_eq!(p.y, 0.0);
+    }
+
+    /// Two fragments cut at the same seam approach the junction from the
+    /// two cover sides (`u = 0` and `u = 2π`); their tightened endpoints
+    /// must agree far below any weld epsilon.
+    #[test]
+    fn tighten_agrees_across_seam_sides() {
+        let (sphere, cylinder, _, (_, va), (ub, vb)) = seam_junction_fixture();
+        let lo =
+            tighten_boundary_point(&sphere, &cylinder, (0.0, va + 3e-5), (ub, vb - 2e-5), 1e-4)
+                .expect("low-side solve must converge");
+        let hi = tighten_boundary_point(
+            &sphere,
+            &cylinder,
+            (TWO_PI, va - 2e-5),
+            (ub, vb + 3e-5),
+            1e-4,
+        )
+        .expect("high-side solve must converge");
+        assert!(
+            (lo - hi).norm() < 1e-12,
+            "seam-side endpoints disagree by {:e}",
+            (lo - hi).norm()
+        );
+    }
+
+    /// No parameter on a natural domain bound (a stalled fragment): the
+    /// tighten has no seam to pin and reports `None`.
+    #[test]
+    fn tighten_requires_a_boundary_parameter() {
+        let (sphere, cylinder, _, (_, va), (ub, vb)) = seam_junction_fixture();
+        assert!(tighten_boundary_point(&sphere, &cylinder, (1.0, va), (ub, vb), 1e-4).is_none());
+    }
+
+    /// Pinning a free-side parameter (the cylinder angle) evaluates the
+    /// result on THAT surface's iso-curve.
+    #[test]
+    fn pin_intersection_point_evaluates_on_the_pinned_surface() {
+        let (sphere, cylinder, q, (ua, va), (ub, vb)) = seam_junction_fixture();
+        let p = pin_intersection_point(
+            &sphere,
+            &cylinder,
+            [ua, va + 1e-5, ub, vb - 1e-5],
+            2,
+            ub,
+            1e-4,
+        )
+        .expect("pinned solve must converge");
+        assert!((p - q).norm() < 1e-10);
+        // Exactly on the cylinder's u = ub ruling line.
+        let ruling = cylinder.point(ub, p.z);
+        assert!((p - ruling).norm() < 1e-14);
     }
 }

@@ -51,8 +51,12 @@ use crate::check::CheckFailure;
 use crate::curve::{Curve3, CurveEval, TWO_PI, plane_basis};
 use crate::geometry::GeometryStore;
 use crate::project::CurveProject;
-use crate::ssi::{IntersectionKind, SurfaceIntersection, intersect as ssi_intersect};
-use crate::surface::Surface3;
+use crate::ssi::{
+    IntersectionKind, MarchedCurve, SurfaceIntersection, intersect as ssi_intersect,
+    intersect_marched,
+    marching::{pin_intersection_point, tighten_boundary_point},
+};
+use crate::surface::{Surface3, SurfaceEval};
 use crate::topology::{
     Body, BodyType, FaceSense, FinSense, LoopType, SYSTEM_RESOLUTION, ShellOrientation,
     TopologyStore,
@@ -1141,6 +1145,89 @@ fn broad_phase_face_box(
     }
 }
 
+/// Signed implicit residual of `p` against a primitive's locus: zero on
+/// the surface, smooth nearby. Used to polish marched clip endpoints onto
+/// exact face-boundary junctions. Cones are outside the marched MVP.
+fn surface_residual(s: &Surface3, p: &Point3) -> Option<f64> {
+    match *s {
+        Surface3::Plane { origin, normal } => Some(normal.dot(&(p - origin))),
+        Surface3::Sphere { center, radius, .. } => Some((p - center).norm() - radius),
+        Surface3::Cylinder {
+            origin,
+            axis,
+            radius,
+        } => {
+            let d = p - origin;
+            Some((d - axis * axis.dot(&d)).norm() - radius)
+        }
+        Surface3::Torus {
+            center,
+            axis,
+            major_radius,
+            minor_radius,
+        } => {
+            let d = p - center;
+            let h = axis.dot(&d);
+            let rho = (d - axis * h).norm();
+            Some((rho - major_radius).hypot(h) - minor_radius)
+        }
+        Surface3::Cone { .. } => None,
+    }
+}
+
+/// Spatial gradient of [`surface_residual`] at `p` (the unit normal of the
+/// residual's level set). `None` on the residual's singular sets (axis,
+/// center, tube centerline), where the polish gives up.
+fn surface_residual_gradient(s: &Surface3, p: &Point3) -> Option<Vector3> {
+    let unit = |v: Vector3| {
+        let n = v.norm();
+        (n > f64::MIN_POSITIVE).then(|| v / n)
+    };
+    match *s {
+        Surface3::Plane { normal, .. } => Some(normal),
+        Surface3::Sphere { center, .. } => unit(p - center),
+        Surface3::Cylinder { origin, axis, .. } => {
+            let d = p - origin;
+            unit(d - axis * axis.dot(&d))
+        }
+        Surface3::Torus {
+            center,
+            axis,
+            major_radius,
+            ..
+        } => {
+            let d = p - center;
+            let h = axis.dot(&d);
+            let radial = d - axis * h;
+            let rho = radial.norm();
+            if rho <= f64::MIN_POSITIVE {
+                return None;
+            }
+            unit((radial / rho) * (rho - major_radius) + axis * h)
+        }
+        Surface3::Cone { .. } => None,
+    }
+}
+
+/// Whether [`intersect_marched`] covers this surface pair (see its docs):
+/// the analytic pairs whose general configurations have no closed form.
+/// Mirrors its dispatch so the pipeline can keep the analytic error —
+/// which names the actual unsupported configuration — for every other
+/// pair.
+fn marched_ssi_supported(a: &Surface3, b: &Surface3) -> bool {
+    use Surface3::*;
+    matches!(
+        (a, b),
+        (Sphere { .. }, Cylinder { .. })
+            | (Cylinder { .. }, Sphere { .. })
+            | (
+                Torus { .. },
+                Plane { .. } | Cylinder { .. } | Sphere { .. } | Torus { .. }
+            )
+            | (Plane { .. } | Cylinder { .. } | Sphere { .. }, Torus { .. })
+    )
+}
+
 /// Boolean pipeline entry point.
 fn boolean(
     op: BooleanOp,
@@ -1240,21 +1327,21 @@ impl<'a> Pipeline<'a> {
             let (box_a, box_b) = (&boxes[0][fa], &boxes[1][fb]);
             let sa = &self.solids[0].faces[fa].surface;
             let sb = &self.solids[1].faces[fb].surface;
-            match ssi_intersect(sa, sb, &self.tol)? {
-                SurfaceIntersection::Empty => {}
-                SurfaceIntersection::Coincident => {
+            match ssi_intersect(sa, sb, &self.tol) {
+                Ok(SurfaceIntersection::Empty) => {}
+                Ok(SurfaceIntersection::Coincident) => {
                     return Err(CoreError::NotImplemented {
                         feature: "boolean operations on coincident faces \
                                   (transversal MVP)",
                     });
                 }
-                SurfaceIntersection::TangentPoint(_) => {
+                Ok(SurfaceIntersection::TangentPoint(_)) => {
                     return Err(CoreError::NotImplemented {
                         feature: "boolean operations with tangent face contact \
                                   (transversal MVP)",
                     });
                 }
-                SurfaceIntersection::Curves(curves) => {
+                Ok(SurfaceIntersection::Curves(curves)) => {
                     for ic in curves {
                         if ic.kind == IntersectionKind::Tangential {
                             return Err(CoreError::NotImplemented {
@@ -1265,9 +1352,124 @@ impl<'a> Pipeline<'a> {
                         self.clip_imprint(&ic.curve, fa, fb, box_a, box_b);
                     }
                 }
+                // Analytic SSI classifies the special configurations of the
+                // sphere/torus pairs exactly and reports the general
+                // positions (oblique plane-torus quartics, non-coaxial
+                // torus-torus, cylinder-sphere, ...) as NotImplemented;
+                // those are marched instead (of-yet). Pairs the marcher
+                // does not cover keep the analytic error.
+                Err(CoreError::NotImplemented { .. }) if marched_ssi_supported(sa, sb) => {
+                    for mc in intersect_marched(sa, sb, &self.tol)? {
+                        for curve in self.marched_polylines(mc, sa, sb) {
+                            self.clip_imprint(&curve, fa, fb, box_a, box_b);
+                        }
+                    }
+                }
+                Err(err) => return Err(err),
             }
         }
         Ok(())
+    }
+
+    /// Wrap a marched intersection curve as [`Curve3::Polyline`]s the
+    /// arrangement can host:
+    ///
+    /// - Open fragments get their endpoints re-polished onto the exact
+    ///   intersection ([`tighten_boundary_point`]): the tracer stops at its
+    ///   own looser gap tolerance, and the fragments meeting at one seam
+    ///   crossing must agree on it far below the pipeline's welding snap
+    ///   for their chains and vertices to rejoin.
+    /// - Closed curves are cut at any chart-seam crossings they carry. The
+    ///   tracer's hard domain bounds cut *most* wrapping curves into open
+    ///   fragments, but a loop seeded near a seam can close (the closure
+    ///   check fires before the boundary pin) and then wraps a periodic
+    ///   parameter; hosted as-is it would cross the face cover mid-atom
+    ///   and tear the arrangement. The wrap shows up as a near-period jump
+    ///   between consecutive parameter samples (interior samples stay
+    ///   inside the domain box), and each jump is cut at the exact seam
+    ///   point ([`pin_intersection_point`]).
+    fn marched_polylines(&self, mut mc: MarchedCurve, sa: &Surface3, sb: &Surface3) -> Vec<Curve3> {
+        if !mc.closed {
+            for k in [0, mc.points.len() - 1] {
+                if let Some(p) =
+                    tighten_boundary_point(sa, sb, mc.params_a[k], mc.params_b[k], self.snap * 0.5)
+                {
+                    mc.points[k] = p;
+                }
+            }
+            return vec![Curve3::Polyline {
+                points: mc.points,
+                closed: false,
+            }];
+        }
+
+        // Seam cuts on a closed curve: scalar ring position (vertex index
+        // + segment fraction) and the refined crossing point.
+        let track = |k: usize, i: usize| -> f64 {
+            match k {
+                0 => mc.params_a[i].0,
+                1 => mc.params_a[i].1,
+                2 => mc.params_b[i].0,
+                _ => mc.params_b[i].1,
+            }
+        };
+        let periods = [sa.period_u(), sa.period_v(), sb.period_u(), sb.period_v()];
+        let bounds = [sa.domain_u(), sa.domain_v(), sb.domain_u(), sb.domain_v()];
+        let mut cuts: Vec<(f64, Point3)> = Vec::new();
+        for i in 0..mc.points.len() - 1 {
+            for k in 0..4 {
+                let Some(period) = periods[k] else { continue };
+                let (w0, w1) = (track(k, i), track(k, i + 1));
+                let delta = w1 - w0;
+                if delta.abs() <= period / 2.0 {
+                    continue;
+                }
+                // Forward through the high bound (w drops by ~a period) or
+                // backward through the low one.
+                let (pin_value, w1_unwrapped) = if delta < 0.0 {
+                    (bounds[k].1, w1 + period)
+                } else {
+                    (bounds[k].0, w1 - period)
+                };
+                let s = ((pin_value - w0) / (w1_unwrapped - w0)).clamp(0.0, 1.0);
+                let seed = [track(0, i), track(1, i), track(2, i), track(3, i)];
+                let point = pin_intersection_point(sa, sb, seed, k, pin_value, self.snap * 0.5)
+                    .unwrap_or_else(|| mc.points[i] + (mc.points[i + 1] - mc.points[i]) * s);
+                cuts.push((i as f64 + s, point));
+            }
+        }
+        if cuts.is_empty() {
+            return vec![Curve3::Polyline {
+                points: mc.points,
+                closed: true,
+            }];
+        }
+        cuts.sort_by(|a, b| a.0.total_cmp(&b.0));
+
+        // Reassemble the ring as open fragments between consecutive cuts.
+        let n = mc.points.len() - 1; // distinct vertices
+        let mut fragments = Vec::new();
+        for j in 0..cuts.len() {
+            let (q0, p0) = cuts[j];
+            let (mut q1, p1) = cuts[(j + 1) % cuts.len()];
+            if j + 1 == cuts.len() {
+                q1 += n as f64;
+            }
+            let mut points = vec![p0];
+            let mut v = q0.floor() as usize + 1;
+            while (v as f64) < q1 - 1e-12 {
+                points.push(mc.points[v % n]);
+                v += 1;
+            }
+            points.push(p1);
+            if polyline_length(&points) > self.snap {
+                fragments.push(Curve3::Polyline {
+                    points,
+                    closed: false,
+                });
+            }
+        }
+        fragments
     }
 
     fn face_boxes(&self, s: SolidTag) -> Vec<BoundingBox3> {
@@ -1294,27 +1496,42 @@ impl<'a> Pipeline<'a> {
         box_a: &BoundingBox3,
         box_b: &BoundingBox3,
     ) {
-        // Parameter window: full period for closed conics, bbox slab clip
-        // for lines.
-        let (t_lo, t_hi, closed_curve) = match curve {
+        // Sampling stations: the full period for closed conics, a bbox
+        // slab clip for lines, the vertices for (marched) polylines. For
+        // closed curves the stations cover one period without repeating
+        // the start, and `period` drives the wrap arithmetic below.
+        let (ts, closed_curve, period) = match curve {
             Curve3::Line { origin, dir } => {
                 let joint = box_a.intersection(box_b);
-                match clip_line_to_box(origin, dir, &joint) {
-                    Some(range) => (range.0, range.1, false),
-                    None => return,
-                }
+                let Some((t_lo, t_hi)) = clip_line_to_box(origin, dir, &joint) else {
+                    return;
+                };
+                let n = IMPRINT_LINE_SAMPLES;
+                let ts = (0..=n)
+                    .map(|i| t_lo + (t_hi - t_lo) * i as f64 / n as f64)
+                    .collect::<Vec<f64>>();
+                (ts, false, 0.0)
             }
-            _ => (0.0, TWO_PI, true),
+            Curve3::Polyline { points, closed } => {
+                // Vertex-index parameterization: sampling at the integers
+                // walks the polyline exactly (the last vertex of a closed
+                // polyline repeats the first and is dropped).
+                let distinct = if *closed {
+                    points.len() - 1
+                } else {
+                    points.len()
+                };
+                let ts = (0..distinct).map(|i| i as f64).collect::<Vec<f64>>();
+                (ts, *closed, (points.len() - 1) as f64)
+            }
+            _ => {
+                let n = SAMPLES_PER_CIRCLE;
+                let ts = (0..n)
+                    .map(|i| TWO_PI * i as f64 / n as f64)
+                    .collect::<Vec<f64>>();
+                (ts, true, TWO_PI)
+            }
         };
-        let n = if closed_curve {
-            SAMPLES_PER_CIRCLE
-        } else {
-            IMPRINT_LINE_SAMPLES
-        };
-        let count = if closed_curve { n } else { n + 1 };
-        let ts: Vec<f64> = (0..count)
-            .map(|i| t_lo + (t_hi - t_lo) * i as f64 / n as f64)
-            .collect();
         let inside = |t: f64| -> bool {
             let p = curve.point(t);
             let pa = self.face_polys[0][fa].chart.param(&p, None);
@@ -1382,13 +1599,19 @@ impl<'a> Pipeline<'a> {
             // Refine entry point (before the run's first sample).
             let first_idx = run[0];
             let prev_idx = (first_idx + total - 1) % total;
+            let marched = matches!(curve, Curve3::Polyline { .. });
             if (closed_curve || first_idx > 0) && !flags[prev_idx] {
                 let mut t_out = ts[prev_idx];
                 let t_in = ts[first_idx];
                 if closed_curve && t_out > t_in {
-                    t_out -= TWO_PI;
+                    t_out -= period;
                 }
-                pts.push(curve.point(refine_crossing(&inside, t_out, t_in)));
+                let p = curve.point(refine_crossing(&inside, t_out, t_in));
+                pts.push(if marched {
+                    self.polish_clip_endpoint(p, fa, fb)
+                } else {
+                    p
+                });
             }
             pts.extend(run.iter().map(|&i| curve.point(ts[i])));
             // Refine exit point (after the run's last sample).
@@ -1398,11 +1621,27 @@ impl<'a> Pipeline<'a> {
                 let mut t_out = ts[next_idx];
                 let t_in = ts[last_idx];
                 if closed_curve && t_out < t_in {
-                    t_out += TWO_PI;
+                    t_out += period;
                 }
-                pts.push(curve.point(refine_crossing(&inside, t_out, t_in)));
+                let p = curve.point(refine_crossing(&inside, t_out, t_in));
+                pts.push(if marched {
+                    self.polish_clip_endpoint(p, fa, fb)
+                } else {
+                    p
+                });
             }
-            if pts.len() >= 2 && (pts[0] - pts[pts.len() - 1]).norm() > self.snap {
+            // An open marched fragment can genuinely close on itself: a
+            // ring cut at a single chart seam ends where it starts. Keep
+            // it as an open imprint (the arrangement's ring path accepts
+            // chains whose endpoints coincide) instead of dropping it
+            // through the endpoint-coincidence guard below, which only
+            // means "degenerate sliver" for analytic runs.
+            let endpoints_coincide = (pts[0] - pts[pts.len() - 1]).norm() <= self.snap;
+            let seam_cut_ring = !closed_curve
+                && matches!(curve, Curve3::Polyline { .. })
+                && endpoints_coincide
+                && polyline_length(&pts) > self.snap * 4.0;
+            if pts.len() >= 2 && (!endpoints_coincide || seam_cut_ring) {
                 self.imprints.push(Imprint {
                     face_a: fa,
                     face_b: fb,
@@ -1429,6 +1668,84 @@ impl<'a> Pipeline<'a> {
                 });
             }
         }
+    }
+
+    /// Polish a marched imprint's clip endpoint onto the exact junction it
+    /// approximates. The bisected crossing lies on a polyline **chord**, up
+    /// to a chord sagitta off the true intersection curve — but the true
+    /// endpoint is where that curve crosses a boundary edge of one host
+    /// face, i.e. the point on the crossed edge's exact curve where the
+    /// *other* solid's surface residual vanishes (the edge already lies on
+    /// its own solid's surface). Every imprint ending at that junction
+    /// solves the same one-dimensional root, so the polished endpoints
+    /// weld exactly; unpolished, two chords disagree by O(sagitta), far
+    /// beyond the welding snap, and the arrangement tears (chains end
+    /// mid-face, split points duplicate on the edge).
+    ///
+    /// Returns `p` unchanged when no boundary edge is plausibly involved
+    /// (a fragment endpoint pinned on a chart seam and already exact) or
+    /// the root refinement fails.
+    fn polish_clip_endpoint(&self, p: Point3, fa: usize, fb: usize) -> Point3 {
+        // The crossed edge: nearest over both faces' boundaries, accepted
+        // within a discretization-scale band (the endpoint can sit a chord
+        // sagitta off a curved boundary, but distinct edges are a face
+        // extent apart).
+        let mut best: Option<(f64, SolidTag, usize)> = None;
+        for (s, f) in [(0usize, fa), (1usize, fb)] {
+            let band = 0.02 * self.face_extents[s][f];
+            for lp in &self.solids[s].faces[f].loops {
+                for de in lp {
+                    let sampled = &self.edge_samples[s][de.edge];
+                    let d = polyline_distance(&sampled.points, sampled.closed, &p);
+                    if d <= band && best.map(|(bd, _, _)| d < bd).unwrap_or(true) {
+                        best = Some((d, s, de.edge));
+                    }
+                }
+            }
+        }
+        let Some((_, s, e)) = best else {
+            return p;
+        };
+        let edge = &self.solids[s].edges[e];
+        let other = &self.solids[1 - s];
+        // The imprint's face on the other solid carries the surface the
+        // junction must also lie on.
+        let sf = if s == 0 { fb } else { fa };
+        let surface = &other.faces[sf].surface;
+        let proj = edge.curve.project_point(&p);
+        let mut t = if edge.closed {
+            proj.t
+        } else {
+            proj.t.clamp(edge.t0, edge.t1)
+        };
+        // Newton on residual(edge(t)) = 0; the seed is within a chord
+        // sagitta of the root, far inside its basin for transversal
+        // crossings.
+        let sanity = 0.05 * self.face_extents[0][fa].min(self.face_extents[1][fb]);
+        for _ in 0..CLIP_REFINE_ITERATIONS {
+            let q = edge.curve.point(t);
+            let Some(r) = surface_residual(surface, &q) else {
+                return p;
+            };
+            if r.abs() <= self.snap * 0.5 {
+                return if (q - p).norm() <= sanity { q } else { p };
+            }
+            let Some(g) = surface_residual_gradient(surface, &q) else {
+                return p;
+            };
+            let slope = g.dot(&edge.curve.derivative(t));
+            if slope.abs() <= f64::MIN_POSITIVE {
+                return p;
+            }
+            t -= r / slope;
+            if !t.is_finite() {
+                return p;
+            }
+            if !edge.closed {
+                t = t.clamp(edge.t0, edge.t1);
+            }
+        }
+        p
     }
 
     /// Phase 3: register the global split events. Every open imprint
@@ -1490,10 +1807,22 @@ impl<'a> Pipeline<'a> {
                     imp.sampled.points[0],
                     imp.sampled.points[imp.sampled.points.len() - 1],
                 ] {
+                    // No early break: a marched fragment endpoint can land
+                    // on a seam edge of EACH solid at once (symmetric
+                    // torus-torus / sphere-cylinder contacts put the seam
+                    // crossings on shared symmetry planes), and both face
+                    // covers then need their boundary vertex.
                     for (s, f) in [(0usize, imp.face_a), (1usize, imp.face_b)] {
-                        if let Some(edge) = self.nearest_edge_of_face(&endpoint, s, f) {
+                        // The exact-curve variant is the fallback: marched
+                        // fragment endpoints sit bit-exact on seam-edge
+                        // curves whose parameter range starts below zero
+                        // (the sphere meridian), where the plain variant's
+                        // clamped projection misses the wrap-around.
+                        if let Some(edge) = self
+                            .nearest_edge_of_face(&endpoint, s, f)
+                            .or_else(|| self.nearest_edge_of_face_exact(&endpoint, s, f))
+                        {
                             events.push((CurveSource::Edge { solid: s, edge }, endpoint));
-                            break;
                         }
                     }
                 }
@@ -1765,12 +2094,23 @@ impl<'a> Pipeline<'a> {
                             .extend(atoms_by_source[&CurveSource::Imprint { index: i }].iter());
                     }
                 }
-                let barriers = self
-                    .seam_barriers
-                    .get(&(s, f))
-                    .map(Vec::as_slice)
-                    .unwrap_or_default();
-                for chain in merge_imprint_chains(&atoms, &imprint_ids, self.snap, barriers) {
+                // Chain barriers: the face's registered seam crossings
+                // (of-43n/of-rb4) plus every split point on its own
+                // boundary edges — marched fragments arrive pre-cut at
+                // chart seams, so their junctions END on a seam edge
+                // without crossing it and appear only as edge splits
+                // (of-yet).
+                let mut barriers = self.seam_barriers.get(&(s, f)).cloned().unwrap_or_default();
+                for lp in &face.loops {
+                    for de in lp {
+                        let source = CurveSource::Edge {
+                            solid: s,
+                            edge: de.edge,
+                        };
+                        barriers.extend(self.splits.get(&source).into_iter().flatten());
+                    }
+                }
+                for chain in merge_imprint_chains(&atoms, &imprint_ids, self.snap, &barriers) {
                     apply_chain(face_poly, &atoms, &mut regions, chain, self.snap)?;
                 }
 
@@ -2493,17 +2833,19 @@ fn reverse_chain(darts: &[(usize, bool)]) -> DartChain {
 /// (interior) endpoints. Closed atoms become single-dart chains.
 ///
 /// Chains never extend through a `barrier` point — the host face's own
-/// seam crossings (see `Pipeline::seam_barriers`). Those junctions lie on
-/// the face boundary, where a chain must terminate as a chord endpoint: a
-/// winding-0 ring seam-split into two chords shares BOTH endpoints
-/// between its halves and would otherwise re-merge into a full ring whose
-/// uv embedding straddles the cover edge (of-43n). On the imprint's other
-/// host face the same points are face-interior and carry no barrier, so
-/// the ring correctly re-merges and applies as an interior ring there.
-/// Sphere poles an imprint touches are barriers for the same reason: the
-/// pole is an existing topology vertex on the face boundary, and merging
-/// through it would fuse pole-to-pole chords into a closed chain that
-/// `apply_chain` mistakes for an interior ring (of-rb4).
+/// seam crossings (see `Pipeline::seam_barriers`) and the split points on
+/// its own boundary edges (marched fragment endpoints pre-cut at chart
+/// seams, of-yet). Those junctions lie on the face boundary, where a
+/// chain must terminate as a chord endpoint: a winding-0 ring seam-split
+/// into two chords shares BOTH endpoints between its halves and would
+/// otherwise re-merge into a full ring whose uv embedding straddles the
+/// cover edge (of-43n). On the imprint's other host face the same points
+/// are face-interior and carry no barrier, so the ring correctly
+/// re-merges and applies as an interior ring there. Sphere poles an
+/// imprint touches are barriers for the same reason: the pole is an
+/// existing topology vertex on the face boundary, and merging through it
+/// would fuse pole-to-pole chords into a closed chain that `apply_chain`
+/// mistakes for an interior ring (of-rb4).
 fn merge_imprint_chains(
     atoms: &[Atom],
     ids: &[usize],
@@ -2616,7 +2958,7 @@ fn match_chain_to_cycle(
     let (e_uv, e_p) = chain_poly[chain_poly.len() - 1];
     let axis_shifts = |period: Option<f64>| -> Vec<f64> {
         match period {
-            Some(p) => vec![-p, 0.0, p],
+            Some(p) => vec![0.0, -p, p],
             None => vec![0.0],
         }
     };

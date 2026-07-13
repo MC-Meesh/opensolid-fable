@@ -936,6 +936,12 @@ fn reverse_curve(curve: &Curve3) -> Curve3 {
             major_radius: *major_radius,
             minor_radius: *minor_radius,
         },
+        // Not produced by the reader (B-splines parse as NURBS), but the
+        // reversal is well-defined: walk the vertices backwards.
+        Curve3::Polyline { points, closed } => Curve3::Polyline {
+            points: points.iter().rev().copied().collect(),
+            closed: *closed,
+        },
     }
 }
 
@@ -943,7 +949,7 @@ fn reverse_curve(curve: &Curve3) -> Curve3 {
 /// `[0, 2π)`. `None` for lines.
 fn conic_angle(curve: &Curve3, p: &Point3) -> Option<f64> {
     match curve {
-        Curve3::Line { .. } => None,
+        Curve3::Line { .. } | Curve3::Polyline { .. } => None,
         Curve3::Circle { center, axis, .. } => {
             let (u, v) = plane_basis(axis);
             let r = p - center;

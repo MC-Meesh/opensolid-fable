@@ -293,6 +293,32 @@ impl CurveProject for Curve3 {
     fn project_point(&self, point: &Point3) -> CurveProjection {
         let seed = match self {
             Curve3::Line { origin, dir } => (point - origin).dot(dir),
+            // Piecewise linear: the per-segment minimum is exact, so scan
+            // every segment instead of Newton (the derivative is
+            // discontinuous at the vertices).
+            Curve3::Polyline { points, .. } => {
+                let mut best = (f64::INFINITY, 0.0);
+                for (i, w) in points.windows(2).enumerate() {
+                    let ab = w[1] - w[0];
+                    let len2 = ab.norm_squared();
+                    let s = if len2 > 0.0 {
+                        ((point - w[0]).dot(&ab) / len2).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    let d = (point - (w[0] + ab * s)).norm();
+                    if d < best.0 {
+                        best = (d, i as f64 + s);
+                    }
+                }
+                let t = best.1;
+                return CurveProjection {
+                    t,
+                    point: self.point(t),
+                    distance: best.0,
+                    converged: true,
+                };
+            }
             Curve3::Circle { center, axis, .. } => {
                 let (e_u, e_v) = plane_basis(axis);
                 let d = point - center;
@@ -1194,5 +1220,34 @@ mod tests {
         assert_near(clamped.restrict(-2.0), 0.0, "clamp low");
         assert_near(clamped.restrict(PI), 1.0, "clamp high");
         assert_near(clamped.restrict(0.4), 0.4, "interior untouched");
+    }
+
+    /// Polyline projection scans every segment for the exact per-segment
+    /// minimum (no Newton over the kinked parameterization).
+    #[test]
+    fn projects_onto_polyline() {
+        // L-shape: x-run then y-run.
+        let c = Curve3::polyline(
+            vec![
+                Point3::new(0.0, 0.0, 0.0),
+                Point3::new(2.0, 0.0, 0.0),
+                Point3::new(2.0, 2.0, 0.0),
+            ],
+            false,
+        )
+        .unwrap();
+        // Beside the middle of the second segment.
+        let p = Point3::new(3.0, 1.0, 0.0);
+        let proj = c.project_point(&p);
+        check_curve_projection(&c, &p, &proj);
+        assert_near(proj.t, 1.5, "second-segment parameter");
+        assert_near(proj.distance, 1.0, "distance to the segment");
+        // Nearest to the corner vertex: both segments tie there.
+        let proj = c.project_point(&Point3::new(3.0, -1.0, 0.0));
+        assert_near(proj.t, 1.0, "corner vertex parameter");
+        // Beyond the start: clamps to the first vertex.
+        let proj = c.project_point(&Point3::new(-1.0, -1.0, 0.0));
+        assert_near(proj.t, 0.0, "clamped start parameter");
+        assert_point_near(&proj.point, &Point3::origin(), "clamped start point");
     }
 }

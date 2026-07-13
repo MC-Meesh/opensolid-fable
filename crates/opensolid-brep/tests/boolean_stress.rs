@@ -72,7 +72,7 @@
 //! `Chart::new` rejected `Surface3::Sphere`/`Torus`; of-7ld.4 lifted
 //! that gate after the of-7ld.5/6/7 fixes, and the tests that pass are
 //! now live. The still-`#[ignore]`d remainder name their open blockers
-//! (of-2ql, of-yet). Run those with
+//! (of-2ql). Run those with
 //! `cargo test --test boolean_stress -- --ignored`.
 //!
 //! Bugs filed from the campaign's first run (2026-07-12, `Chart::new`
@@ -154,6 +154,13 @@
 //! arrival meridian. `hemisphere_imprint_through_poles` and
 //! `sphere_octant_on_block_corner` are live; 8 remain `#[ignore]`d
 //! (of-2ql residual slivers ×3, of-yet ×5).
+//!
+//! Update (of-yet): `find_imprints` now falls back to the of-7ld.2
+//! marched tracer (`ssi::intersect_marched`) when analytic SSI reports a
+//! supported pair's general configuration as NotImplemented; the marched
+//! polylines are hosted as `Curve3::Polyline` imprints. The five of-yet
+//! tests (oblique plane-torus, non-coaxial torus-torus, cylinder-sphere)
+//! run live; 3 remain `#[ignore]`d (of-2ql residual slivers).
 
 use nalgebra::{Rotation3, Unit};
 use opensolid_brep::boolean::{intersect, subtract, unite};
@@ -1613,7 +1620,6 @@ fn napkin_ring_coaxial_cylinder_drills_sphere() {
 /// no elementary closed form, so assert validity, genus, and the volume
 /// identities among the three boolean results.
 #[test]
-#[ignore = "of-yet: marched cylinder-sphere SSI not wired into boolean()"]
 fn offset_cylinder_drills_sphere_identity() {
     let context = "sphere minus offset through-cylinder";
     let (r, a, off) = (1.0, 0.4, 0.45);
@@ -1904,9 +1910,6 @@ fn half_torus_by_axis_plane() {
 /// the rotated axis, exactly as the boolean chart will). Both frames
 /// must reproduce the closed form.
 #[test]
-#[ignore = "of-yet: marched plane-torus SSI not wired into boolean() — the
-            rotated slab's oblique side planes broad-phase-clash with the torus; the
-            unrotated frame passes"]
 fn rotated_frame_torus_sunk_congruence() {
     let (major, minor, drop) = (2.0, 0.5, 0.2);
     let torus_center = Point3::new(0.0, 0.0, -drop);
@@ -1939,7 +1942,6 @@ fn rotated_frame_torus_sunk_congruence() {
 /// The block's side faces are off-axis planes parallel to the torus
 /// axis, whose torus sections are general quartics (marched SSI).
 #[test]
-#[ignore = "of-yet: marched plane-torus SSI not wired into boolean()"]
 fn block_severs_torus_tube() {
     let context = "block notch severing the torus tube";
     let (major, minor) = (2.0, 0.5);
@@ -1969,7 +1971,6 @@ fn block_severs_torus_tube() {
 /// inner half): the ring survives, genus stays 1. The bite is centered
 /// on the +X outer equator, crossing BOTH torus seams.
 #[test]
-#[ignore = "of-yet: marched plane-torus SSI not wired into boolean()"]
 fn block_notches_torus_outer_wall() {
     let context = "block notch in the torus outer wall across both seams";
     let (major, minor) = (2.0, 0.5);
@@ -2065,7 +2066,6 @@ fn coplanar_tori_major_shift_lens() {
 /// genuinely doubly-curved transversal contact with no closed form —
 /// assert validity and the pairwise volume identity.
 #[test]
-#[ignore = "of-yet: marched torus-torus SSI not wired into boolean()"]
 fn perpendicular_tori_identity() {
     let context = "perpendicular tori, tube-around-tube overlap";
     let mut scene = Scene::new();

@@ -285,6 +285,9 @@ fn sample_loop(
             Curve3::Circle { .. } | Curve3::Ellipse { .. } => {
                 angular_segments(t_to - t_from, options)
             }
+            // One parameter unit per chord: sampling at the vertices
+            // reproduces the polyline exactly.
+            Curve3::Polyline { .. } => ((t_to - t_from).abs().ceil() as usize).max(1),
         };
         for k in 0..segments {
             let t = t_from + (t_to - t_from) * k as f64 / segments as f64;

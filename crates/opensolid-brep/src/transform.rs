@@ -101,6 +101,11 @@ pub fn transform_body(
                 *axis = rotation * *axis;
                 *major_dir = rotation * *major_dir;
             }
+            Curve3::Polyline { points, .. } => {
+                for p in points.iter_mut() {
+                    *p = transform * *p;
+                }
+            }
         }
     }
 
