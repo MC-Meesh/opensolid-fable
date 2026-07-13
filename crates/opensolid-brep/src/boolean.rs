@@ -441,9 +441,7 @@ impl Chart {
     /// chart machinery below fully supports them.
     fn new(surface: &Surface3) -> CoreResult<Self> {
         match surface {
-            Surface3::Sphere { .. } => Err(CoreError::NotImplemented {
-                feature: "boolean parameter chart for spheres",
-            }),
+            // TEMP local gate lift for of-7ld.5 verification — DO NOT COMMIT
             Surface3::Torus { .. } => Err(CoreError::NotImplemented {
                 feature: "boolean parameter chart for tori",
             }),
@@ -651,6 +649,28 @@ impl Chart {
             _ => None,
         }
     }
+
+    /// Latitude (`±π/2`) of the sphere pole that `p` sits on, or `None`
+    /// when `p` is not on a pole (always `None` for non-sphere charts,
+    /// whose parameterizations never collapse a point). Uses the same
+    /// axis-distance floor as [`Chart::param`]'s pole convention, so a
+    /// point reads as a pole here exactly when `param` would refuse to
+    /// give it a longitude of its own.
+    fn pole_v(&self, p: &Point3) -> Option<f64> {
+        let Chart::Sphere {
+            center,
+            axis,
+            e_u,
+            e_v,
+            radius,
+        } = self
+        else {
+            return None;
+        };
+        let d = p - center;
+        (d.dot(e_u).hypot(d.dot(e_v)) <= radius * POLE_REL_EPS)
+            .then(|| std::f64::consts::FRAC_PI_2.copysign(d.dot(axis)))
+    }
 }
 
 /// Relative floor (fraction of the sphere radius) on a point's distance
@@ -829,6 +849,110 @@ fn map_polyline(chart: &Chart, points: &[Point3]) -> Vec<(f64, f64)> {
         out.push(chart.param(p, hint));
     }
     out
+}
+
+/// Angular slack under which a walk's departure meridian from a sphere
+/// pole reads as the arrival meridian retraced (a doubling-back, as at a
+/// seam-edge tip), rather than a genuinely distinct meridian. Well above
+/// the longitude noise of edge/imprint samples one sample step away from a
+/// pole, and far below any real inter-meridian angle the SSI repertoire
+/// produces.
+const POLE_TURN_EPS: f64 = 1e-6;
+
+/// Incremental embedding of a 3D walk into a chart's parameter cover:
+/// angle unwrapping toward the previous point, plus explicit handling of
+/// sphere poles, where the whole `u`-circle collapses to one point and the
+/// cover polygon needs a **pole closure edge** — zero length in 3D, up to
+/// a full period wide in `uv` (of-7ld.5).
+///
+/// A walk that touches a pole gets two cover points there: one at the
+/// arrival longitude `u_in` (inherited from the previous point, per
+/// [`Chart::param`]'s pole convention) and one at the departure longitude
+/// `u_out` of the next point's meridian. The horizontal segment between
+/// them is the pole row of the cover; it never affects even-odd
+/// containment (rays are cast in `+v`) but restores the shoelace area
+/// that a collapsed cover loses. Without it, a sphere face bounded only
+/// by its seam meridian embeds as two coincident vertical traversals —
+/// a zero-area polygon in which no interior sample point exists.
+///
+/// `u_out` is the representative of the departure meridian's longitude
+/// chosen so the pole row sweeps exactly the face-interior meridians. For
+/// a cycle wound CCW in the chart the interior lies left of the walk, so
+/// the row runs toward `-u` at the north pole and toward `+u` at the
+/// south pole (mirrored when `ccw` is `false`); a departure meridian
+/// within [`POLE_TURN_EPS`] of the arrival meridian is a doubling-back
+/// (e.g. the seam tip of a full sphere) and sweeps the full period.
+struct CoverEmbedder<'c> {
+    chart: &'c Chart,
+    /// Intended chart winding of the walk's cycles. `reconstruct` traces
+    /// every cycle CCW-in-chart; stored face loops are CCW only when the
+    /// face's outward side follows the surface normal.
+    ccw: bool,
+    last_uv: Option<(f64, f64)>,
+    /// Set while the walk stands on a pole: (pole latitude, pole point).
+    at_pole: Option<(f64, Point3)>,
+}
+
+impl<'c> CoverEmbedder<'c> {
+    fn new(chart: &'c Chart, ccw: bool) -> Self {
+        CoverEmbedder {
+            chart,
+            ccw,
+            last_uv: None,
+            at_pole: None,
+        }
+    }
+
+    /// Embed the walk's next point, appending one cover point — or two
+    /// when this point leaves a pole (the departure end of the pole row,
+    /// carrying the pole's 3D point, precedes it).
+    fn push(&mut self, p: Point3, out: &mut Vec<CoverPoint>) {
+        if let Some(vp) = self.chart.pole_v(&p) {
+            let u = self.last_uv.map_or(0.0, |(u, _)| u);
+            out.push(((u, vp), p));
+            self.last_uv = Some((u, vp));
+            self.at_pole = Some((vp, p));
+            return;
+        }
+        let uv = if let Some((vp, pole_pt)) = self.at_pole.take() {
+            let (u_in, _) = self.last_uv.expect("standing on a pole implies a uv");
+            let (raw_u, v) = self.chart.param(&p, None);
+            // Interior meridians sweep from the departure to the arrival
+            // longitude going the row's way; a CCW cycle keeps them left
+            // of the walk (north row toward -u, south row toward +u).
+            let toward_neg_u = self.ccw == (vp > 0.0);
+            let turn = if toward_neg_u {
+                (u_in - raw_u).rem_euclid(TWO_PI)
+            } else {
+                (raw_u - u_in).rem_euclid(TWO_PI)
+            };
+            let turn = if turn < POLE_TURN_EPS || TWO_PI - turn < POLE_TURN_EPS {
+                TWO_PI
+            } else {
+                turn
+            };
+            let u_out = if toward_neg_u {
+                u_in - turn
+            } else {
+                u_in + turn
+            };
+            out.push(((u_out, vp), pole_pt));
+            (u_out, v)
+        } else {
+            self.chart.param(&p, self.last_uv)
+        };
+        out.push((uv, p));
+        self.last_uv = Some(uv);
+    }
+
+    /// Shift the embedder's continuity hint after the caller relocated the
+    /// emitted cover points by whole periods.
+    fn shift(&mut self, du: f64, dv: f64) {
+        if let Some((u, v)) = &mut self.last_uv {
+            *u += du;
+            *v += dv;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -1061,8 +1185,16 @@ impl<'a> Pipeline<'a> {
                         let sampled = &edge_samples[s][de.edge];
                         append_directed(&mut pts3, sampled, de.forward);
                     }
-                    let uv = map_polyline(&chart, &pts3);
-                    loops.push(uv.into_iter().zip(pts3).collect());
+                    // Stored loops wind CCW as seen from the face's
+                    // outward side, which is CCW in the chart only when
+                    // that side follows the surface normal; the embedder
+                    // needs the true winding to orient pole closure rows.
+                    let mut emb = CoverEmbedder::new(&chart, face.outward_along_normal);
+                    let mut cover: Vec<CoverPoint> = Vec::with_capacity(pts3.len());
+                    for p in pts3 {
+                        emb.push(p, &mut cover);
+                    }
+                    loops.push(cover);
                 }
                 face_polys[s].push(FaceRegionPoly { chart, loops });
             }
@@ -1322,7 +1454,10 @@ impl<'a> Pipeline<'a> {
             }
             for (s, f) in [(0usize, imp.face_a), (1usize, imp.face_b)] {
                 let fp = &self.face_polys[s][f];
-                if !matches!(fp.chart, Chart::Cylinder { .. }) {
+                // Charts whose cover wraps in `u` and whose faces carry a
+                // seam meridian edge: cylinders and spheres. (Torus rings
+                // wrap two seams and are of-7ld.7's problem.)
+                if !matches!(fp.chart, Chart::Cylinder { .. } | Chart::Sphere { .. }) {
                     continue;
                 }
                 let Some(seam_point) = seam_crossing(fp, &imp.curve, &imp.sampled.points) else {
@@ -1968,7 +2103,10 @@ fn embed_walk(
     let mut poly: Vec<((f64, f64), Point3)> = Vec::new();
     let mut offsets = Vec::with_capacity(darts.len());
     let mut walk_pos: Option<Point3> = None;
-    let mut last_uv: Option<(f64, f64)> = None;
+    // Every cycle handed to this walk is intended CCW-in-chart
+    // (`reconstruct` reverses flipped face loops before embedding, and
+    // `apply_chain` builds region outers), so pole closure rows orient CCW.
+    let mut emb = CoverEmbedder::new(&face_poly.chart, true);
     for (k, &(ai, forward)) in darts.iter().enumerate() {
         let atom = &atoms[ai];
         let mut pts: Vec<Point3> = if forward {
@@ -1995,14 +2133,25 @@ fn embed_walk(
             pts.len() - 1
         };
         for p in &pts[..take] {
-            let raw = face_poly.chart.param(p, last_uv);
-            let uv = if last_uv.is_none() {
-                face_poly.localize(raw)
-            } else {
-                raw
-            };
-            poly.push((uv, *p));
-            last_uv = Some(uv);
+            let first = poly.is_empty();
+            emb.push(*p, &mut poly);
+            if first {
+                // Start the walk inside the face's cover window so
+                // intermediate unwrapping stays near it (the final
+                // mean-shift below does the real alignment).
+                let uv0 = poly[0].0;
+                let (du, dv) = {
+                    let local = face_poly.localize(uv0);
+                    (local.0 - uv0.0, local.1 - uv0.1)
+                };
+                if du != 0.0 || dv != 0.0 {
+                    for (uv, _) in poly.iter_mut() {
+                        uv.0 += du;
+                        uv.1 += dv;
+                    }
+                    emb.shift(du, dv);
+                }
+            }
         }
         walk_pos = Some(if atom.closed {
             pts[0]
