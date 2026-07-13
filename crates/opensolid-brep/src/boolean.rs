@@ -4852,17 +4852,19 @@ mod tests {
     }
 
     #[test]
-    fn sphere_inputs_hit_the_chart_gap() {
-        // Spheres extract fine but have no boolean parameter chart yet.
+    fn sphere_inputs_take_the_exact_path() {
+        // The of-7ld.4 promotion: sphere charts are admitted, so a
+        // transversal block-sphere boolean runs the exact pipeline
+        // end-to-end (a unit sphere at the origin dipping 0.5 deep into
+        // the block's x = -0.5 face — the cap-bite configuration).
         let (mut store, mut geo) = stores();
-        let a = block_at(&mut store, &mut geo, (2.0, 2.0, 2.0), (0.0, 0.0, 0.0));
+        let a = block_at(&mut store, &mut geo, (2.0, 2.0, 2.0), (-2.5, -1.0, -1.0));
         let b = primitives::sphere(&mut store, &mut geo, 1.0).expect("valid sphere");
-        let err = unite(&store, &geo, a, b, &tol()).unwrap_err();
+        let out = unite(&store, &geo, a, b, &tol()).expect("cap-bite union succeeds");
         assert!(
-            matches!(err, CoreError::NotImplemented { .. }),
-            "expected NotImplemented for sphere charts, got {err:?}"
+            out.check().is_empty(),
+            "union of block and sphere cap must be a valid solid"
         );
-        assert!(err.to_string().contains("sphere"), "unhelpful error: {err}");
     }
 
     #[test]
