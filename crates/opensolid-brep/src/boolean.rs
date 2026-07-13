@@ -406,10 +406,60 @@ enum Chart {
         e_v: Vector3,
         radius: f64,
     },
+    /// Latitude/longitude chart of a sphere: `u` is the longitude
+    /// (radians, period 2π) about `axis`, `v` is the latitude (radians,
+    /// clamped to `[-π/2, π/2]`, **not** periodic). The `u`-circle collapses
+    /// at the two poles (`v = ±π/2`), where longitude is undefined — see
+    /// [`Chart::param`] for the pole convention.
+    Sphere {
+        center: Point3,
+        axis: Vector3,
+        e_u: Vector3,
+        e_v: Vector3,
+        radius: f64,
+    },
+    /// Doubly-periodic chart of a torus: `u` is the major angle (radians,
+    /// period 2π) about `axis`, `v` is the minor angle (radians, period 2π)
+    /// around the tube. Both a `u`-seam meridian and a `v`-seam meridian
+    /// wrap; neither degenerates.
+    Torus {
+        center: Point3,
+        axis: Vector3,
+        e_u: Vector3,
+        e_v: Vector3,
+        major_radius: f64,
+        minor_radius: f64,
+    },
 }
 
 impl Chart {
+    /// Chart for a surface **as used by the boolean pipeline**. Sphere,
+    /// torus, and cone are rejected with [`CoreError::NotImplemented`] so
+    /// those surfaces route through the F-Rep fallback until their exact
+    /// stress suite is green (the of-7ld promotion policy) — even though
+    /// [`Chart::build`] can construct sphere and torus charts, and the
+    /// chart machinery below fully supports them.
     fn new(surface: &Surface3) -> CoreResult<Self> {
+        match surface {
+            Surface3::Sphere { .. } => Err(CoreError::NotImplemented {
+                feature: "boolean parameter chart for spheres",
+            }),
+            Surface3::Torus { .. } => Err(CoreError::NotImplemented {
+                feature: "boolean parameter chart for tori",
+            }),
+            Surface3::Cone { .. } => Err(CoreError::NotImplemented {
+                feature: "boolean parameter chart for cones",
+            }),
+            _ => Self::build(surface),
+        }
+    }
+
+    /// Build the parameter chart for any analytic surface OpenSolid can
+    /// invert (every variant except the cone). Unlike [`Chart::new`] this
+    /// does not apply the promotion gate; it exists so the chart machinery
+    /// and its unit tests can exercise sphere and torus charts before those
+    /// surfaces are wired into the pipeline.
+    fn build(surface: &Surface3) -> CoreResult<Self> {
         match surface {
             Surface3::Plane { origin, normal } => {
                 let (e_u, e_v) = plane_basis(normal);
@@ -434,19 +484,57 @@ impl Chart {
                     radius: *radius,
                 })
             }
-            other => Err(CoreError::NotImplemented {
-                feature: match other {
-                    Surface3::Cone { .. } => "boolean parameter chart for cones",
-                    Surface3::Sphere { .. } => "boolean parameter chart for spheres",
-                    Surface3::Torus { .. } => "boolean parameter chart for tori",
-                    _ => unreachable!(),
-                },
+            Surface3::Sphere {
+                center,
+                axis,
+                radius,
+            } => {
+                let (e_u, e_v) = plane_basis(axis);
+                Ok(Chart::Sphere {
+                    center: *center,
+                    axis: *axis,
+                    e_u,
+                    e_v,
+                    radius: *radius,
+                })
+            }
+            Surface3::Torus {
+                center,
+                axis,
+                major_radius,
+                minor_radius,
+            } => {
+                let (e_u, e_v) = plane_basis(axis);
+                Ok(Chart::Torus {
+                    center: *center,
+                    axis: *axis,
+                    e_u,
+                    e_v,
+                    major_radius: *major_radius,
+                    minor_radius: *minor_radius,
+                })
+            }
+            Surface3::Cone { .. } => Err(CoreError::NotImplemented {
+                feature: "boolean parameter chart for cones",
             }),
         }
     }
 
-    /// Parameters of a point assumed to lie on the surface. For cylinders
-    /// the angle is unwrapped to land within π of `hint`'s angle.
+    /// Parameters of a point assumed to lie on the surface.
+    ///
+    /// Angles are unwrapped toward `hint` (shifted by whole periods to land
+    /// within half a period of the hint's corresponding angle) so a sampled
+    /// polyline stays continuous across a seam: `u` for cylinder, sphere,
+    /// and torus charts, and additionally `v` for the torus.
+    ///
+    /// **Sphere pole convention.** Longitude is undefined at the poles
+    /// (`v = ±π/2`), where the whole `u`-circle collapses to one point. A
+    /// point within a hair of a pole (its distance from the axis below a
+    /// relative floor) therefore *inherits* the longitude of `hint` — or
+    /// `0` when there is no hint. An imprint threaded through a pole thus
+    /// keeps a continuous longitude across the pole instead of snapping to
+    /// an arbitrary `atan2` of near-zero components, which would otherwise
+    /// spawn a zero-width UV wedge (a degenerate region) at the pole.
     fn param(&self, p: &Point3, hint: Option<(f64, f64)>) -> (f64, f64) {
         match self {
             Chart::Plane {
@@ -463,38 +551,126 @@ impl Chart {
                 ..
             } => {
                 let d = p - origin;
-                let mut u = d.dot(e_v).atan2(d.dot(e_u));
-                if let Some((hu, _)) = hint {
-                    while u - hu > std::f64::consts::PI {
-                        u -= TWO_PI;
-                    }
-                    while hu - u > std::f64::consts::PI {
-                        u += TWO_PI;
-                    }
-                }
+                let u = unwrap_angle(d.dot(e_v).atan2(d.dot(e_u)), hint.map(|(u, _)| u));
                 (u, d.dot(axis))
+            }
+            Chart::Sphere {
+                center,
+                axis,
+                e_u,
+                e_v,
+                radius,
+            } => {
+                let d = p - center;
+                let z = d.dot(axis);
+                let v = (z / radius).clamp(-1.0, 1.0).asin();
+                let (x, y) = (d.dot(e_u), d.dot(e_v));
+                // Pole: the horizontal component vanishes and longitude is
+                // undefined; keep the hint's u for a continuous crossing.
+                let u = if x.hypot(y) <= radius * POLE_REL_EPS {
+                    hint.map(|(u, _)| u).unwrap_or(0.0)
+                } else {
+                    unwrap_angle(y.atan2(x), hint.map(|(u, _)| u))
+                };
+                (u, v)
+            }
+            Chart::Torus {
+                center,
+                axis,
+                e_u,
+                e_v,
+                major_radius,
+                ..
+            } => {
+                let d = p - center;
+                let z = d.dot(axis);
+                let (x, y) = (d.dot(e_u), d.dot(e_v));
+                let u = unwrap_angle(y.atan2(x), hint.map(|(u, _)| u));
+                // Minor angle from the tube center: radial excess over the
+                // major radius (cos side) against the axial height (sin side).
+                let w = x.hypot(y) - major_radius;
+                let v = unwrap_angle(z.atan2(w), hint.map(|(_, v)| v));
+                (u, v)
             }
         }
     }
 
-    /// Unit surface normal at parameters `(u, v)`.
-    fn normal(&self, u: f64) -> Vector3 {
+    /// Outward unit surface normal at parameters `(u, v)`. `v` is ignored
+    /// for planes and cylinders but genuinely needed for the sphere and
+    /// torus, whose normal tilts with latitude / minor angle.
+    fn normal(&self, u: f64, v: f64) -> Vector3 {
         match self {
             Chart::Plane { normal, .. } => *normal,
             Chart::Cylinder { e_u, e_v, .. } => e_u * u.cos() + e_v * u.sin(),
+            Chart::Sphere { e_u, e_v, axis, .. } | Chart::Torus { e_u, e_v, axis, .. } => {
+                let radial = e_u * u.cos() + e_v * u.sin();
+                radial * v.cos() + axis * v.sin()
+            }
         }
     }
 
-    /// Model-space length of one unit of `u`: the radius for cylinder
-    /// charts (where `u` is an angle in radians) and 1 for planes. Scaling
-    /// `u` by this puts both parameter axes in model units (arc length),
-    /// so uv distances are meaningful.
-    fn u_scale(&self) -> f64 {
+    /// Arc-length scale factors `(du_scale, dv_scale)` at latitude/minor
+    /// angle `v`: multiplying a small parameter step by these yields the
+    /// model-space displacement, putting both axes in one metric so uv
+    /// distances mix units correctly (of-9n8).
+    ///
+    /// - Plane: `(1, 1)` — both axes already model units.
+    /// - Cylinder: `(radius, 1)` — `u` is an angle, `v` a length.
+    /// - Sphere: `(radius·cos v, radius)` — the longitude circle shrinks
+    ///   toward the poles (scale → 0 there), latitude is uniform.
+    /// - Torus: `(major + minor·cos v, minor)` — the major circle's radius
+    ///   breathes with the minor angle; the minor circle is uniform.
+    fn uv_scale(&self, v: f64) -> (f64, f64) {
         match self {
-            Chart::Plane { .. } => 1.0,
-            Chart::Cylinder { radius, .. } => *radius,
+            Chart::Plane { .. } => (1.0, 1.0),
+            Chart::Cylinder { radius, .. } => (*radius, 1.0),
+            Chart::Sphere { radius, .. } => (radius * v.cos(), *radius),
+            Chart::Torus {
+                major_radius,
+                minor_radius,
+                ..
+            } => (major_radius + minor_radius * v.cos(), *minor_radius),
         }
     }
+
+    /// Period of the `u` axis (radians), or `None` when `u` is unbounded
+    /// (planes). Every curved chart wraps `u` every 2π.
+    fn period_u(&self) -> Option<f64> {
+        match self {
+            Chart::Plane { .. } => None,
+            _ => Some(TWO_PI),
+        }
+    }
+
+    /// Period of the `v` axis (radians), set only for the torus (whose
+    /// minor angle wraps). Cylinder `v` is an unbounded length and sphere
+    /// `v` is clamped latitude, so both are `None`.
+    fn period_v(&self) -> Option<f64> {
+        match self {
+            Chart::Torus { .. } => Some(TWO_PI),
+            _ => None,
+        }
+    }
+}
+
+/// Relative floor (fraction of the sphere radius) on a point's distance
+/// from the polar axis below which its longitude is treated as undefined.
+const POLE_REL_EPS: f64 = 1e-9;
+
+/// Shift `angle` by whole turns so it lands within π of `hint` (no-op when
+/// `hint` is `None`).
+fn unwrap_angle(angle: f64, hint: Option<f64>) -> f64 {
+    let Some(h) = hint else {
+        return angle;
+    };
+    let mut a = angle;
+    while a - h > std::f64::consts::PI {
+        a -= TWO_PI;
+    }
+    while h - a > std::f64::consts::PI {
+        a += TWO_PI;
+    }
+    a
 }
 
 // ---------------------------------------------------------------------
@@ -557,49 +733,80 @@ impl FaceRegionPoly {
 
     /// Containment for imprint clipping: like `contains` after
     /// `localize`, but robust on periodic charts. A sample that lands
-    /// exactly on the parameter cover's seam meridian (u = 0 / u = 2π on
-    /// a cylinder) sits on the cover polygon's boundary, where the strict
-    /// even-odd test is a float coin flip — yet such a point is
-    /// geometrically interior to the face whenever its v is. Resolve by
-    /// retrying with the angle nudged off the seam by a sub-tolerance
-    /// step (`snap` expressed as an angle at the chart radius); a point
-    /// genuinely outside the region stays outside under the nudge.
+    /// exactly on a parameter cover's seam meridian (`u = 0 / u = 2π`, and
+    /// for a torus the `v` seam too) sits on the cover polygon's boundary,
+    /// where the strict even-odd test is a float coin flip — yet such a
+    /// point is geometrically interior to the face whenever its opposite
+    /// coordinate is. Resolve by retrying with the on-seam coordinate
+    /// nudged off the seam by a sub-tolerance step (`snap`, a model-space
+    /// length, expressed as an angle via the local arc-length scale); a
+    /// point genuinely outside the region stays outside under the nudge.
     fn contains_for_clip(&self, uv: (f64, f64), snap: f64) -> bool {
         let local = self.localize(uv);
         if self.contains(local) {
             return true;
         }
-        let Chart::Cylinder { radius, .. } = self.chart else {
-            return false;
-        };
-        let eps = (snap / radius).max(1e-12);
-        self.contains(self.localize((local.0 + eps, local.1)))
-            || self.contains(self.localize((local.0 - eps, local.1)))
-    }
-
-    /// Bring an angle-like `u` into this polygon's neighborhood by shifting
-    /// whole periods (no-op for planes).
-    fn localize(&self, uv: (f64, f64)) -> (f64, f64) {
-        if !matches!(self.chart, Chart::Cylinder { .. }) {
-            return uv;
-        }
-        let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
-        for lp in &self.loops {
-            for ((u, _), _) in lp {
-                lo = lo.min(*u);
-                hi = hi.max(*u);
+        let (u_scale, v_scale) = self.chart.uv_scale(local.1);
+        if self.chart.period_u().is_some() {
+            let eps = (snap / u_scale.max(1e-12)).max(1e-12);
+            if self.contains(self.localize((local.0 + eps, local.1)))
+                || self.contains(self.localize((local.0 - eps, local.1)))
+            {
+                return true;
             }
         }
-        let center = 0.5 * (lo + hi);
-        let mut u = uv.0;
-        while u - center > std::f64::consts::PI {
-            u -= TWO_PI;
+        if self.chart.period_v().is_some() {
+            let eps = (snap / v_scale.max(1e-12)).max(1e-12);
+            if self.contains(self.localize((local.0, local.1 + eps)))
+                || self.contains(self.localize((local.0, local.1 - eps)))
+            {
+                return true;
+            }
         }
-        while center - u > std::f64::consts::PI {
-            u += TWO_PI;
-        }
-        (u, uv.1)
+        false
     }
+
+    /// Bring angle-like coordinates into this polygon's neighborhood by
+    /// shifting whole periods on each periodic axis (no-op on axes that do
+    /// not wrap, so planes are untouched and only the torus shifts `v`).
+    fn localize(&self, uv: (f64, f64)) -> (f64, f64) {
+        let period_u = self.chart.period_u();
+        let period_v = self.chart.period_v();
+        if period_u.is_none() && period_v.is_none() {
+            return uv;
+        }
+        let (mut lo_u, mut hi_u) = (f64::INFINITY, f64::NEG_INFINITY);
+        let (mut lo_v, mut hi_v) = (f64::INFINITY, f64::NEG_INFINITY);
+        for lp in &self.loops {
+            for ((u, v), _) in lp {
+                lo_u = lo_u.min(*u);
+                hi_u = hi_u.max(*u);
+                lo_v = lo_v.min(*v);
+                hi_v = hi_v.max(*v);
+            }
+        }
+        let u = match period_u {
+            Some(p) => shift_into_window(uv.0, 0.5 * (lo_u + hi_u), p),
+            None => uv.0,
+        };
+        let v = match period_v {
+            Some(p) => shift_into_window(uv.1, 0.5 * (lo_v + hi_v), p),
+            None => uv.1,
+        };
+        (u, v)
+    }
+}
+
+/// Shift `x` by whole periods so it lands within half a period of `center`.
+fn shift_into_window(x: f64, center: f64, period: f64) -> f64 {
+    let mut x = x;
+    while x - center > 0.5 * period {
+        x -= period;
+    }
+    while center - x > 0.5 * period {
+        x += period;
+    }
+    x
 }
 
 /// Does segment `a -> b` cross the upward ray from `p` (even-odd rule)?
@@ -1285,7 +1492,8 @@ impl<'a> Pipeline<'a> {
                     }
                     let hit = p + dir * t;
                     // Grazing incidence: retry with another direction.
-                    let n = fp.chart.normal(fp.chart.param(&hit, None).0);
+                    let (nu, nv) = fp.chart.param(&hit, None);
+                    let n = fp.chart.normal(nu, nv);
                     if n.dot(&dir).abs() < 1e-6 {
                         continue 'dirs;
                     }
@@ -1776,15 +1984,24 @@ fn embed_walk(
         });
     }
     // Align the whole polyline into the face's cover window so cycles,
-    // holes, and probes of one face are mutually comparable.
-    if let Chart::Cylinder { .. } = face_poly.chart {
-        if !poly.is_empty() {
+    // holes, and probes of one face are mutually comparable. Each periodic
+    // axis is aligned independently (only the torus wraps `v`).
+    if !poly.is_empty() {
+        if face_poly.chart.period_u().is_some() {
             let mean = poly.iter().map(|((u, _), _)| u).sum::<f64>() / poly.len() as f64;
-            let target = face_poly.localize((mean, 0.0)).0;
-            let shift = target - mean;
+            let shift = face_poly.localize((mean, 0.0)).0 - mean;
             if shift.abs() > 1e-9 {
                 for ((u, _), _) in poly.iter_mut() {
                     *u += shift;
+                }
+            }
+        }
+        if face_poly.chart.period_v().is_some() {
+            let mean = poly.iter().map(|((_, v), _)| v).sum::<f64>() / poly.len() as f64;
+            let shift = face_poly.localize((0.0, mean)).1 - mean;
+            if shift.abs() > 1e-9 {
+                for ((_, v), _) in poly.iter_mut() {
+                    *v += shift;
                 }
             }
         }
@@ -1878,15 +2095,18 @@ fn merge_imprint_chains(atoms: &[Atom], ids: &[usize], snap: f64) -> Vec<DartCha
 /// Match an embedded chain's endpoints to two distinct vertices of a
 /// cycle, allowing a whole-period shift of the chain (seam chords match
 /// the two cover copies of one 3D point). Distances and the acceptance
-/// band use the arc-length metric — `u` scaled by `u_scale` — because on
-/// cylinder charts `u` is radians while `v` is model units, and a mixed
-/// euclidean metric mis-ranks candidate vertices at extreme aspect ratios.
+/// band use the arc-length metric — `u` scaled by `scale.0`, `v` by
+/// `scale.1` — because on curved charts the parameter axes carry different
+/// units (cylinder: radians vs. model length; sphere/torus: two angles at
+/// different radii), and a mixed euclidean metric mis-ranks candidate
+/// vertices at extreme aspect ratios.
 fn match_chain_to_cycle(
     cycle: &Cycle,
     chain_poly: &[((f64, f64), Point3)],
     period: Option<f64>,
-    u_scale: f64,
+    scale: (f64, f64),
 ) -> Option<(usize, usize)> {
+    let (u_scale, v_scale) = scale;
     let (mut lo, mut hi) = (
         (f64::INFINITY, f64::INFINITY),
         (f64::NEG_INFINITY, f64::NEG_INFINITY),
@@ -1895,7 +2115,7 @@ fn match_chain_to_cycle(
         lo = (lo.0.min(*u), lo.1.min(*v));
         hi = (hi.0.max(*u), hi.1.max(*v));
     }
-    let eps = ((hi.0 - lo.0) * u_scale + (hi.1 - lo.1)).max(1e-12) * 1e-5;
+    let eps = ((hi.0 - lo.0) * u_scale + (hi.1 - lo.1) * v_scale).max(1e-12) * 1e-5;
     let s_uv = chain_poly[0].0;
     let e_uv = chain_poly[chain_poly.len() - 1].0;
     let shifts: Vec<f64> = match period {
@@ -1909,7 +2129,8 @@ fn match_chain_to_cycle(
             .enumerate()
             .map(|(k, &off)| {
                 let v = cycle.poly[off].0;
-                let d = (((v.0 - uv.0) * u_scale).powi(2) + (v.1 - uv.1).powi(2)).sqrt();
+                let d =
+                    (((v.0 - uv.0) * u_scale).powi(2) + ((v.1 - uv.1) * v_scale).powi(2)).sqrt();
                 (k, d)
             })
             .min_by(|a, b| a.1.total_cmp(&b.1))
@@ -1937,29 +2158,39 @@ fn cyclic_slice(darts: &[(usize, bool)], from: usize, to: usize) -> DartChain {
     }
 }
 
-/// Shift an angle-like probe by whole periods so its `u` lies within half
-/// a period of `poly`'s `u`-midrange (no-op without a period). Each cycle
-/// of a face is mean-aligned into the cover window independently, so two
-/// cycles hugging opposite cover edges can sit a whole period apart even
-/// though they overlap on the surface.
-fn localize_to_window(poly: &[CoverPoint], p: (f64, f64), period: Option<f64>) -> (f64, f64) {
-    let Some(per) = period else {
+/// Shift an angle-like probe by whole periods so each periodic coordinate
+/// lies within half a period of `poly`'s midrange on that axis (a no-op on
+/// axes without a period, so the `u`-only cylinder/sphere case shifts only
+/// `u` and the doubly-periodic torus shifts both). Each cycle of a face is
+/// mean-aligned into the cover window independently, so two cycles hugging
+/// opposite cover edges can sit a whole period apart even though they
+/// overlap on the surface.
+fn localize_to_window(
+    poly: &[CoverPoint],
+    p: (f64, f64),
+    period: (Option<f64>, Option<f64>),
+) -> (f64, f64) {
+    let (period_u, period_v) = period;
+    if period_u.is_none() && period_v.is_none() {
         return p;
+    }
+    let (mut lo_u, mut hi_u) = (f64::INFINITY, f64::NEG_INFINITY);
+    let (mut lo_v, mut hi_v) = (f64::INFINITY, f64::NEG_INFINITY);
+    for ((u, v), _) in poly {
+        lo_u = lo_u.min(*u);
+        hi_u = hi_u.max(*u);
+        lo_v = lo_v.min(*v);
+        hi_v = hi_v.max(*v);
+    }
+    let u = match period_u {
+        Some(per) => shift_into_window(p.0, 0.5 * (lo_u + hi_u), per),
+        None => p.0,
     };
-    let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
-    for ((u, _), _) in poly {
-        lo = lo.min(*u);
-        hi = hi.max(*u);
-    }
-    let center = 0.5 * (lo + hi);
-    let mut u = p.0;
-    while u - center > 0.5 * per {
-        u -= per;
-    }
-    while center - u > 0.5 * per {
-        u += per;
-    }
-    (u, p.1)
+    let v = match period_v {
+        Some(per) => shift_into_window(p.1, 0.5 * (lo_v + hi_v), per),
+        None => p.1,
+    };
+    (u, v)
 }
 
 /// Even-odd containment of a probe (already in the face cover) in a region.
@@ -1989,13 +2220,21 @@ fn apply_chain(
     snap: f64,
 ) -> CoreResult<()> {
     let (chain_poly, _) = embed_walk(face_poly, atoms, &chain, true);
-    let period = matches!(face_poly.chart, Chart::Cylinder { .. }).then_some(TWO_PI);
-
-    let u_scale = face_poly.chart.u_scale();
+    let period_u = face_poly.chart.period_u();
+    let period = (period_u, face_poly.chart.period_v());
+    // Arc-length metric evaluated at the chain's mean minor angle / latitude
+    // — the axis scales only vary with `v` on sphere/torus charts, and this
+    // band is narrow enough for a representative `v` to hold.
+    let rep_v = if chain_poly.is_empty() {
+        0.0
+    } else {
+        chain_poly.iter().map(|((_, v), _)| v).sum::<f64>() / chain_poly.len() as f64
+    };
+    let scale = face_poly.chart.uv_scale(rep_v);
     for ri in 0..regions.len() {
         for ci in 0..regions[ri].cycles.len() {
             let Some((vi, vj)) =
-                match_chain_to_cycle(&regions[ri].cycles[ci], &chain_poly, period, u_scale)
+                match_chain_to_cycle(&regions[ri].cycles[ci], &chain_poly, period_u, scale)
             else {
                 continue;
             };
@@ -2175,6 +2414,29 @@ fn chart_point(chart: &Chart, uv: (f64, f64)) -> Point3 {
         } => {
             let radial = e_u * uv.0.cos() + e_v * uv.0.sin();
             origin + radial * *radius + axis * uv.1
+        }
+        Chart::Sphere {
+            center,
+            axis,
+            e_u,
+            e_v,
+            radius,
+        } => {
+            let radial = e_u * uv.0.cos() + e_v * uv.0.sin();
+            center + (radial * uv.1.cos() + axis * uv.1.sin()) * *radius
+        }
+        Chart::Torus {
+            center,
+            axis,
+            e_u,
+            e_v,
+            major_radius,
+            minor_radius,
+        } => {
+            let radial = e_u * uv.0.cos() + e_v * uv.0.sin();
+            center
+                + radial * (major_radius + minor_radius * uv.1.cos())
+                + axis * (minor_radius * uv.1.sin())
         }
     }
 }
@@ -2769,9 +3031,9 @@ fn triangulate_mesh_face(mf: &MeshFace, weld_eps: f64) -> CoreResult<(Vec<Triang
         }
         let ps = [all_p[i0], all_p[i1], all_p[i2]];
         let normals = [
-            mf.chart.normal(all_uv[i0].0) * mf.normal_sign,
-            mf.chart.normal(all_uv[i1].0) * mf.normal_sign,
-            mf.chart.normal(all_uv[i2].0) * mf.normal_sign,
+            mf.chart.normal(all_uv[i0].0, all_uv[i0].1) * mf.normal_sign,
+            mf.chart.normal(all_uv[i1].0, all_uv[i1].1) * mf.normal_sign,
+            mf.chart.normal(all_uv[i2].0, all_uv[i2].1) * mf.normal_sign,
         ];
         // Keep zero-area slivers (collinear boundary chains need them to
         // pair their chord edges) but drop triangles with a zero-length
@@ -3278,6 +3540,271 @@ mod tests {
         assert_eq!(shell_genus_from_euler(3), None);
         // chi > 2 implies genus < 0 (more than one component in the shell).
         assert_eq!(shell_genus_from_euler(4), None);
+    }
+
+    // -----------------------------------------------------------------
+    // Sphere and torus charts (of-7ld.1)
+    // -----------------------------------------------------------------
+
+    const PI: f64 = std::f64::consts::PI;
+    const FRAC_PI_2: f64 = std::f64::consts::FRAC_PI_2;
+
+    /// A general (non-axis-aligned) tilt, so tests exercise the `e_u`/`e_v`
+    /// basis rather than accidentally passing on coordinate symmetry.
+    fn tilted_axis() -> Vector3 {
+        Vector3::new(1.0, 2.0, 3.0).normalize()
+    }
+
+    fn sphere_chart(center: Point3, radius: f64) -> Chart {
+        Chart::build(&Surface3::sphere(center, tilted_axis(), radius).unwrap()).unwrap()
+    }
+
+    fn torus_chart(center: Point3, major: f64, minor: f64) -> Chart {
+        Chart::build(&Surface3::torus(center, tilted_axis(), major, minor).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn chart_new_gates_sphere_and_torus_but_build_constructs_them() {
+        // The pipeline entry stays behind the of-7ld promotion policy...
+        let sphere = Surface3::sphere(Point3::origin(), Vector3::z(), 2.0).unwrap();
+        let torus = Surface3::torus(Point3::origin(), Vector3::z(), 3.0, 1.0).unwrap();
+        assert!(matches!(
+            Chart::new(&sphere),
+            Err(CoreError::NotImplemented { .. })
+        ));
+        assert!(matches!(
+            Chart::new(&torus),
+            Err(CoreError::NotImplemented { .. })
+        ));
+        // ...while the chart machinery can still build both.
+        assert!(matches!(Chart::build(&sphere), Ok(Chart::Sphere { .. })));
+        assert!(matches!(Chart::build(&torus), Ok(Chart::Torus { .. })));
+    }
+
+    #[test]
+    fn chart_period_helpers_match_surface_topology() {
+        let plane =
+            Chart::build(&Surface3::plane(Point3::origin(), Vector3::z()).unwrap()).unwrap();
+        let cyl = Chart::build(&Surface3::cylinder(Point3::origin(), Vector3::z(), 1.0).unwrap())
+            .unwrap();
+        let sph = sphere_chart(Point3::origin(), 2.0);
+        let tor = torus_chart(Point3::origin(), 4.0, 1.0);
+        assert_eq!((plane.period_u(), plane.period_v()), (None, None));
+        assert_eq!((cyl.period_u(), cyl.period_v()), (Some(TWO_PI), None));
+        assert_eq!((sph.period_u(), sph.period_v()), (Some(TWO_PI), None));
+        assert_eq!(
+            (tor.period_u(), tor.period_v()),
+            (Some(TWO_PI), Some(TWO_PI))
+        );
+    }
+
+    #[test]
+    fn sphere_param_round_trips_off_axis() {
+        let center = Point3::new(-1.0, 2.0, 0.5);
+        let radius = 2.5;
+        let chart = sphere_chart(center, radius);
+        for &u in &[0.0, 0.7, 2.0, PI, 4.5, TWO_PI - 0.3] {
+            for &v in &[-1.2, -0.4, 0.0, 0.6, 1.3] {
+                let p = chart_point(&chart, (u, v));
+                // Lands on the sphere.
+                assert!(((p - center).norm() - radius).abs() < 1e-9);
+                // Round-trips to the same parameters given a nearby hint.
+                let (u2, v2) = chart.param(&p, Some((u, v)));
+                assert!((u2 - u).abs() < 1e-9, "u {u} -> {u2}");
+                assert!((v2 - v).abs() < 1e-9, "v {v} -> {v2}");
+            }
+        }
+    }
+
+    #[test]
+    fn sphere_longitude_unwraps_toward_hint() {
+        let chart = sphere_chart(Point3::origin(), 1.0);
+        // A point just past the seam (u ≈ 0.1) reported near a hint at
+        // u ≈ 2π stays on the hint's branch, not wrapped back to ~0.1.
+        let p = chart_point(&chart, (0.1, 0.3));
+        let (u, _) = chart.param(&p, Some((TWO_PI, 0.3)));
+        assert!(
+            (u - (TWO_PI + 0.1)).abs() < 1e-9,
+            "expected ~2π+0.1, got {u}"
+        );
+    }
+
+    #[test]
+    fn sphere_poles_inherit_hint_longitude_and_do_not_degenerate() {
+        let center = Point3::new(3.0, 0.0, -1.0);
+        let radius = 1.7;
+        let chart = sphere_chart(center, radius);
+        let north = chart_point(&chart, (0.0, FRAC_PI_2));
+        let south = chart_point(&chart, (0.0, -FRAC_PI_2));
+        // At a pole the longitude is undefined; it inherits the hint...
+        for &hint_u in &[0.0, 1.3, PI, 5.0] {
+            let (u, v) = chart.param(&north, Some((hint_u, 0.0)));
+            assert!((u - hint_u).abs() < 1e-12, "north kept hint u");
+            assert!((v - FRAC_PI_2).abs() < 1e-9);
+            let (u, v) = chart.param(&south, Some((hint_u, 0.0)));
+            assert!((u - hint_u).abs() < 1e-12, "south kept hint u");
+            assert!((v + FRAC_PI_2).abs() < 1e-9);
+        }
+        // ...and defaults to 0 with no hint (still a well-defined param, so
+        // an imprint through the pole never spawns a zero-width UV wedge).
+        let (u, _) = chart.param(&north, None);
+        assert_eq!(u, 0.0);
+    }
+
+    #[test]
+    fn sphere_pole_touch_keeps_longitude_constant_no_wedge() {
+        // A meridian imprint that runs up to the pole and retreats down the
+        // *same* meridian must keep a single longitude throughout — the pole
+        // convention makes the singular sample inherit the incoming `u`, so
+        // the UV polyline is a retraced vertical segment (zero enclosed
+        // area) rather than a degenerate wedge fanning across longitudes.
+        // (A great circle passing *through* the pole onto the antipodal
+        // meridian genuinely flips `u` by π; that is inherent to lat/long
+        // charts, not a defect, so this tests the touch-and-return case.)
+        let chart = sphere_chart(Point3::origin(), 1.0);
+        let l = 0.9_f64;
+        let steps = 16;
+        let mut samples = Vec::new();
+        for i in 0..=steps {
+            let t = i as f64 / steps as f64;
+            samples.push(chart_point(&chart, (l, t * FRAC_PI_2)));
+        }
+        for i in 1..=steps {
+            let t = i as f64 / steps as f64;
+            samples.push(chart_point(&chart, (l, FRAC_PI_2 - t * FRAC_PI_2)));
+        }
+        let mut hint: Option<(f64, f64)> = None;
+        let mut us = Vec::new();
+        for p in &samples {
+            let (u, v) = chart.param(p, hint);
+            us.push(u);
+            hint = Some((u, v));
+        }
+        for (k, u) in us.iter().enumerate() {
+            assert!((u - l).abs() < 1e-9, "sample {k} longitude drifted: {u}");
+        }
+    }
+
+    #[test]
+    fn sphere_uv_scale_is_anisotropic_and_shrinks_at_poles() {
+        let radius = 3.0;
+        let chart = sphere_chart(Point3::origin(), radius);
+        // Equator: longitude arc uses the full radius; latitude too.
+        let (us, vs) = chart.uv_scale(0.0);
+        assert!((us - radius).abs() < 1e-12);
+        assert!((vs - radius).abs() < 1e-12);
+        // Mid-latitude: longitude scale is radius·cos(v).
+        let (us, vs) = chart.uv_scale(PI / 3.0);
+        assert!((us - radius * 0.5).abs() < 1e-12);
+        assert!((vs - radius).abs() < 1e-12);
+        // Near the pole the longitude circle collapses.
+        let (us, _) = chart.uv_scale(FRAC_PI_2);
+        assert!(us.abs() < 1e-9);
+    }
+
+    #[test]
+    fn sphere_normal_is_outward_radial() {
+        let center = Point3::new(0.5, -2.0, 1.0);
+        let radius = 1.4;
+        let chart = sphere_chart(center, radius);
+        for &(u, v) in &[(0.3, 0.2), (2.5, -0.9), (5.0, 1.1)] {
+            let p = chart_point(&chart, (u, v));
+            let n = chart.normal(u, v);
+            assert!((n.norm() - 1.0).abs() < 1e-12, "unit normal");
+            let outward = (p - center) / radius;
+            assert!((n - outward).norm() < 1e-9, "normal is outward radial");
+        }
+    }
+
+    #[test]
+    fn torus_param_round_trips_across_both_seams() {
+        let center = Point3::new(2.0, -1.0, 3.0);
+        let (major, minor) = (5.0, 1.5);
+        let chart = torus_chart(center, major, minor);
+        for &u in &[0.0, 1.1, PI, 4.0, TWO_PI - 0.2] {
+            for &v in &[0.0, 0.8, PI, 4.7, TWO_PI - 0.1] {
+                let p = chart_point(&chart, (u, v));
+                let (u2, v2) = chart.param(&p, Some((u, v)));
+                assert!((u2 - u).abs() < 1e-9, "u {u} -> {u2}");
+                assert!((v2 - v).abs() < 1e-9, "v {v} -> {v2}");
+            }
+        }
+    }
+
+    #[test]
+    fn torus_param_unwraps_both_axes_toward_hint() {
+        let chart = torus_chart(Point3::origin(), 4.0, 1.0);
+        // A point just past both seams reported near a hint one full period
+        // out on each axis stays on the hint's cover copy.
+        let p = chart_point(&chart, (0.15, 0.25));
+        let (u, v) = chart.param(&p, Some((TWO_PI, TWO_PI)));
+        assert!(
+            (u - (TWO_PI + 0.15)).abs() < 1e-9,
+            "major angle unwrapped: {u}"
+        );
+        assert!(
+            (v - (TWO_PI + 0.25)).abs() < 1e-9,
+            "minor angle unwrapped: {v}"
+        );
+    }
+
+    #[test]
+    fn torus_uv_scale_breathes_with_the_minor_angle() {
+        let (major, minor) = (6.0, 2.0);
+        let chart = torus_chart(Point3::origin(), major, minor);
+        // Outer equator (v = 0): major circle radius is major + minor.
+        let (us, vs) = chart.uv_scale(0.0);
+        assert!((us - (major + minor)).abs() < 1e-12);
+        assert!((vs - minor).abs() < 1e-12);
+        // Inner equator (v = π): major + minor·cos(π) = major - minor.
+        let (us, _) = chart.uv_scale(PI);
+        assert!((us - (major - minor)).abs() < 1e-12);
+        // Top of the tube (v = π/2): back to the bare major radius.
+        let (us, _) = chart.uv_scale(FRAC_PI_2);
+        assert!((us - major).abs() < 1e-12);
+    }
+
+    #[test]
+    fn torus_normal_points_away_from_the_tube_center() {
+        let center = Point3::new(-1.0, 0.0, 2.0);
+        let (major, minor) = (4.0, 1.2);
+        let chart = torus_chart(center, major, minor);
+        let Chart::Torus { e_u, e_v, .. } = &chart else {
+            unreachable!()
+        };
+        for &(u, v) in &[(0.4, 0.3), (2.2, 3.0), (5.1, 4.4)] {
+            let p = chart_point(&chart, (u, v));
+            let n = chart.normal(u, v);
+            assert!((n.norm() - 1.0).abs() < 1e-12);
+            // Tube center at major angle u; the outward normal is the unit
+            // vector from there to the surface point.
+            let radial = e_u * u.cos() + e_v * u.sin();
+            let tube_center = center + radial * major;
+            let outward = (p - tube_center) / minor;
+            assert!((n - outward).norm() < 1e-9, "normal away from tube axis");
+        }
+    }
+
+    #[test]
+    fn torus_face_localizes_both_periods_into_the_cover_window() {
+        // A torus cover quad living in u,v ∈ [0.2, 0.6]; a probe an entire
+        // period out on *each* axis must fold back into the window.
+        let chart = torus_chart(Point3::origin(), 4.0, 1.0);
+        let loop_uv = [(0.2, 0.2), (0.6, 0.2), (0.6, 0.6), (0.2, 0.6)];
+        let cover: Vec<_> = loop_uv
+            .iter()
+            .map(|&(u, v)| ((u, v), chart_point(&chart, (u, v))))
+            .collect();
+        let fp = FaceRegionPoly {
+            chart,
+            loops: vec![cover],
+        };
+        let (u, v) = fp.localize((0.4 + TWO_PI, 0.4 + TWO_PI));
+        assert!((u - 0.4).abs() < 1e-9, "u folded back: {u}");
+        assert!((v - 0.4).abs() < 1e-9, "v folded back: {v}");
+        let (u, v) = fp.localize((0.4 - TWO_PI, 0.4 - TWO_PI));
+        assert!((u - 0.4).abs() < 1e-9);
+        assert!((v - 0.4).abs() < 1e-9);
     }
 
     fn stores() -> (TopologyStore, GeometryStore) {
@@ -4040,7 +4567,7 @@ mod tests {
             poly,
         };
         let chain = [((0.005, 0.0), p), ((0.0, 999.995), p)];
-        let got = match_chain_to_cycle(&cycle, &chain, None, 1000.0);
+        let got = match_chain_to_cycle(&cycle, &chain, None, (1000.0, 1.0));
         assert_eq!(got, Some((1, 3)), "arc-length metric must prefer B over A");
     }
 
@@ -4108,12 +4635,12 @@ mod tests {
             !point_in_cycle(&cycle, probe),
             "raw probe sits outside the host's cover window"
         );
-        let local = localize_to_window(&cycle.poly, probe, Some(TWO_PI));
+        let local = localize_to_window(&cycle.poly, probe, (Some(TWO_PI), None));
         assert!((local.0 - 3.1).abs() < 1e-12);
         assert_eq!(local.1, 0.5);
         assert!(point_in_cycle(&cycle, local));
         // Planar charts: no period, no shift.
-        assert_eq!(localize_to_window(&cycle.poly, probe, None), probe);
+        assert_eq!(localize_to_window(&cycle.poly, probe, (None, None)), probe);
     }
 
     #[test]
