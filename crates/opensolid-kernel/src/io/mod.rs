@@ -1,10 +1,15 @@
-//! Mesh export: write a [`TriangleMesh`](crate::mesh::TriangleMesh) to
-//! standard interchange formats via any [`std::io::Write`] sink.
+//! Interchange I/O.
+//!
+//! Mesh export: write a [`TriangleMesh`](crate::mesh::TriangleMesh) to standard
+//! interchange formats via any [`std::io::Write`] sink.
 //!
 //! Formats:
 //! - Binary STL ([`write_stl_binary`]) — compact, the de-facto 3D-print format.
 //! - ASCII STL ([`write_stl_ascii`]) — human-readable STL.
 //! - Wavefront OBJ ([`write_obj`]) — positions + per-vertex normals, indexed.
+//!
+//! CAD import: [`step`] parses the STEP Part 21 (ISO-10303-21) exchange
+//! structure into a flat entity graph (syntax only; semantics live elsewhere).
 //!
 //! STL carries one facet normal per triangle; both STL writers recompute it
 //! from the triangle's vertex positions (right-hand rule) rather than trusting
@@ -15,6 +20,7 @@
 //! panic otherwise; use buffered writers for large meshes.
 
 pub mod obj;
+pub mod step;
 pub mod stl;
 
 pub use obj::write_obj;
