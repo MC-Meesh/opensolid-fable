@@ -92,7 +92,11 @@ impl SdfToBrepOptions {
     pub fn new(bounds: BoundingBox3, max_depth: u32) -> Self {
         let diagonal = (bounds.max - bounds.min).norm();
         Self {
-            mesh: AdaptiveMeshOptions { bounds, max_depth },
+            mesh: AdaptiveMeshOptions {
+                bounds,
+                max_depth,
+                accuracy: None,
+            },
             planar_angle_tol: 1e-4,
             planar_offset_tol: 1e-7 * diagonal,
         }

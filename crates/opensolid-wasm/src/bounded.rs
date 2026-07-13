@@ -9,8 +9,16 @@ use opensolid_core::error::CoreResult;
 use opensolid_core::mesh::TriangleMesh;
 use opensolid_core::types::{BoundingBox3, Point3, Transform3, Vector3};
 use opensolid_frep::mesh::{MeshOptions, mesh_sdf_indexed};
+use opensolid_frep::mesh_adaptive::{AdaptiveMeshOptions, mesh_sdf_adaptive_indexed};
 use opensolid_frep::primitives::{Box3, Capsule, Cylinder, RoundedBox, Sdf, Sphere, Torus};
 use opensolid_frep::{Extrude, Profile2D, Revolve, SdfTransformExt, Shape};
+
+/// Depth bounds for accuracy-driven adaptive meshing: the ceiling keeps the
+/// finest lattice at 512³ virtual cells so interactive remeshing stays
+/// within budget, the floor keeps the error estimate meaningful on a
+/// non-trivial base grid.
+const ADAPTIVE_MIN_DEPTH: u32 = 4;
+const ADAPTIVE_MAX_DEPTH: u32 = 9;
 
 /// A runtime-composable shape that carries a conservative axis-aligned
 /// bounding box of its surface, so meshing can auto-derive grid bounds.
@@ -286,6 +294,47 @@ impl BoundedShape {
         mesh_sdf_indexed(&self.shape, &MeshOptions { bounds, resolution })
     }
 
+    /// Mesh the shape with graded adaptive octree dual contouring to a
+    /// target `accuracy`: the maximum chordal deviation of the mesh from
+    /// the surface, in model units. The octree refines near curvature and
+    /// CSG feature edges (kept crisp by QEF vertex placement) and stays
+    /// coarse over flat regions. With `bound` set, the grid covers the
+    /// explicit cube `[-bound, bound]³`; otherwise bounds are auto-derived
+    /// from the tracked bounding box.
+    ///
+    /// The octree depth is derived from `accuracy` (finest cell roughly one
+    /// accuracy unit wide) and clamped to [`ADAPTIVE_MAX_DEPTH`], so
+    /// accuracies below about `extent / 2^9` degrade gracefully instead of
+    /// exploding the cell budget. Non-finite or non-positive accuracies
+    /// fall back to 0.5% of the meshed extent.
+    pub fn mesh_adaptive(&self, accuracy: f64, bound: Option<f64>) -> TriangleMesh {
+        let bounds = match bound {
+            Some(b) => symmetric_bounds(b, b, b),
+            // Any resolution >= 30 pads by the flat 10%, which exceeds the
+            // one-cell clearance the stitch needs at every allowed depth.
+            None => self.mesh_bounds(64),
+        };
+        let extent = max_extent(&bounds).max(1e-9);
+        let accuracy = if accuracy.is_finite() && accuracy > 0.0 {
+            accuracy
+        } else {
+            5e-3 * extent
+        };
+        let max_depth = (extent / accuracy)
+            .log2()
+            .ceil()
+            .clamp(ADAPTIVE_MIN_DEPTH as f64, ADAPTIVE_MAX_DEPTH as f64)
+            as u32;
+        mesh_sdf_adaptive_indexed(
+            &self.shape,
+            &AdaptiveMeshOptions {
+                bounds,
+                max_depth,
+                accuracy: Some(accuracy),
+            },
+        )
+    }
+
     /// Auto-derived meshing bounds: the tracked box padded so the surface
     /// stays strictly interior. The mesher does not stitch crossings in the
     /// boundary cell layer, so the pad must exceed one grid cell: at least
@@ -354,6 +403,99 @@ mod tests {
             assert!(b.contains(p), "vertex {p:?} outside mesh bounds");
         }
         mesh
+    }
+
+    /// The playground's default script: rounded box smooth-united with a
+    /// sphere, cylinder hole subtracted.
+    fn default_playground_scene() -> BoundedShape {
+        let body = BoundedShape::rounded_box(1.0, 0.55, 0.8, 0.15);
+        let bump = BoundedShape::sphere(0.55).translate(Vector3::new(0.0, 0.65, 0.0));
+        let hole = BoundedShape::cylinder(0.28, 2.0);
+        body.smooth_union(&bump, Some(0.25)).subtract(&hole)
+    }
+
+    /// Accuracy-driven adaptive meshing with auto bounds must stay
+    /// watertight and within the deviation target across the primitive
+    /// gallery (curved, flat, and sharp-rimmed shapes).
+    #[test]
+    fn mesh_adaptive_primitives_within_accuracy() {
+        let acc = 0.01;
+        for s in [
+            BoundedShape::sphere(1.0),
+            BoundedShape::box3(1.0, 0.5, 0.75),
+            BoundedShape::rounded_box(1.0, 0.5, 0.75, 0.2),
+            BoundedShape::cylinder(0.5, 1.0),
+            BoundedShape::torus(1.0, 0.3),
+        ] {
+            let mesh = s.mesh_adaptive(acc, None);
+            assert!(!mesh.is_empty(), "adaptive mesh is empty");
+            assert!(mesh.is_closed_manifold(), "adaptive mesh not manifold");
+            for p in &mesh.positions {
+                // 2x: leaves at the depth cap carry no per-vertex accuracy
+                // certificate (refinement was clamped, not converged).
+                assert!(
+                    s.shape.eval(p).abs() <= 2.0 * acc,
+                    "vertex {p:?} deviates beyond target"
+                );
+            }
+        }
+    }
+
+    /// The default playground scene (smooth blend + sharp hole rims) must
+    /// mesh watertight and on-target through the adaptive path.
+    #[test]
+    fn mesh_adaptive_default_scene_within_accuracy() {
+        let part = default_playground_scene();
+        let acc = 0.01;
+        let mesh = part.mesh_adaptive(acc, None);
+        assert!(!mesh.is_empty());
+        assert!(mesh.is_closed_manifold(), "default scene not manifold");
+        for p in &mesh.positions {
+            assert!(
+                part.shape.eval(p).abs() <= 2.0 * acc,
+                "vertex {p:?} deviates beyond target"
+            );
+        }
+    }
+
+    /// Garbage accuracies must not panic: they fall back to a sane default.
+    #[test]
+    fn mesh_adaptive_degenerate_accuracy() {
+        let s = BoundedShape::sphere(1.0);
+        for acc in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let mesh = s.mesh_adaptive(acc, None);
+            assert!(mesh.is_closed_manifold());
+        }
+        // Explicit bound works like the uniform path's.
+        assert!(s.mesh_adaptive(0.01, Some(1.5)).is_closed_manifold());
+    }
+
+    /// Perf measurement for the bead notes, not a gate:
+    /// `cargo test -p opensolid-wasm --release -- --ignored --nocapture`
+    #[test]
+    #[ignore = "perf measurement; run with --release -- --ignored --nocapture"]
+    fn adaptive_remesh_perf_default_scene() {
+        let part = default_playground_scene();
+        for acc in [0.02, 0.01, 0.005] {
+            let t0 = std::time::Instant::now();
+            let mesh = part.mesh_adaptive(acc, None);
+            let ms = t0.elapsed().as_secs_f64() * 1e3;
+            eprintln!(
+                "adaptive acc {acc}: {} tris, {} verts, {ms:.1} ms",
+                mesh.triangle_count(),
+                mesh.vertex_count()
+            );
+        }
+        for res in [64usize, 128] {
+            let t0 = std::time::Instant::now();
+            let mesh = part.mesh(res, None);
+            let ms = t0.elapsed().as_secs_f64() * 1e3;
+            eprintln!(
+                "uniform res {res}: {} tris, {} verts, {ms:.1} ms",
+                mesh.triangle_count(),
+                mesh.vertex_count()
+            );
+        }
     }
 
     #[test]

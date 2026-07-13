@@ -372,6 +372,37 @@ impl WasmShape {
             indices: flat.indices,
         }
     }
+
+    /// Mesh the shape adaptively to a target `accuracy`: the maximum
+    /// chordal deviation of the mesh from the exact surface, in model
+    /// units. The octree refines near curvature and CSG feature edges
+    /// (kept crisp by QEF vertex placement) and stays coarse over flat
+    /// regions, so triangle counts track surface complexity instead of a
+    /// global grid resolution. With `bound` set, the grid covers the
+    /// explicit cube `[-bound, bound]³` (the surface must lie strictly
+    /// inside it); otherwise bounds are derived from the shape's tracked
+    /// bounding box with padding. Accuracies far below 1/500th of the
+    /// shape's extent are clamped by the cell budget and degrade
+    /// gracefully.
+    /// Exact boolean results (see `isExact`) serve their validated analytic
+    /// tessellation, which ignores `accuracy` — it is already crisp.
+    #[wasm_bindgen(js_name = meshAdaptive)]
+    pub fn mesh_adaptive(&self, accuracy: f64, bound: Option<f64>) -> MeshData {
+        let exact_mesh = if exact::exact_enabled() {
+            self.exact.as_ref().and_then(|rep| rep.exact_mesh())
+        } else {
+            None
+        };
+        let flat = match exact_mesh {
+            Some(mesh) => flatten_mesh(mesh),
+            None => flatten_mesh(&self.inner.mesh_adaptive(accuracy, bound)),
+        };
+        MeshData {
+            positions: flat.positions,
+            normals: flat.normals,
+            indices: flat.indices,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -402,6 +433,20 @@ mod tests {
         let hole = WasmShape::cylinder(0.3, 2.0);
         let part = body.smooth_union(&bump, Some(0.25)).subtract(&hole);
         assert_valid(&part.mesh(48, None));
+    }
+
+    #[test]
+    fn mesh_adaptive_via_wasm_api() {
+        let body = WasmShape::rounded_box(1.0, 0.6, 0.8, 0.15);
+        let bump = WasmShape::sphere(0.55).translate(0.0, 0.7, 0.0);
+        let hole = WasmShape::cylinder(0.3, 2.0);
+        let part = body.smooth_union(&bump, Some(0.25)).subtract(&hole);
+        assert_valid(&part.mesh_adaptive(0.01, None));
+        assert_valid(&part.mesh_adaptive(0.01, Some(2.5)));
+        // Coarser accuracy must not cost more triangles.
+        let fine = part.mesh_adaptive(0.005, None);
+        let coarse = part.mesh_adaptive(0.05, None);
+        assert!(coarse.indices.len() < fine.indices.len());
     }
 
     #[test]
@@ -612,6 +657,28 @@ mod tests {
         assert!(
             coarse.positions.len() / 3 < sdf_verts,
             "analytic tessellation should be leaner than a 128-grid SDF mesh"
+        );
+    }
+
+    /// The adaptive path serves the same analytic tessellation for exact
+    /// boolean results: identical buffers at any accuracy, matching `mesh()`.
+    #[test]
+    fn exact_boolean_serves_analytic_mesh_adaptively() {
+        let _mode = exact_mode_on();
+        let part = WasmShape::box3(1.0, 0.4, 1.0).subtract(&WasmShape::cylinder(0.4, 1.0));
+        assert!(part.is_exact());
+
+        let coarse = part.mesh_adaptive(0.05, None);
+        let fine = part.mesh_adaptive(0.002, None);
+        assert_valid(&coarse);
+        assert_eq!(
+            coarse.positions, fine.positions,
+            "exact mesh must ignore the accuracy knob"
+        );
+        assert_eq!(
+            coarse.positions,
+            part.mesh(16, None).positions,
+            "adaptive and uniform paths must serve the same exact tessellation"
         );
     }
 

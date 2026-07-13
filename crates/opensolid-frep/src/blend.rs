@@ -37,11 +37,23 @@ impl<A: Sdf, B: Sdf> Sdf for SmoothUnion<A, B> {
         self.a.grad(p) * h + self.b.grad(p) * (1.0 - h)
     }
 
-    // Conservative widening: the polynomial smooth min deviates from the
-    // sharp min by at most radius/4 (attained at da == db), always downward,
-    // so [min.lo - r/4, min.hi] contains the blended field.
+    // The blend is exactly one child wherever the fields differ by at least
+    // `radius` (h clamps), so the interval is exact there; a fixed widening
+    // in those regions would leave a shell of unprunable cells at every
+    // octree depth. Only when the children can interact does the
+    // conservative widening apply: the polynomial smooth min deviates from
+    // the sharp min by at most radius/4 (attained at da == db), always
+    // downward, so [min.lo - r/4, min.hi] contains the blended field.
     fn eval_interval(&self, b: &BoundingBox3) -> Interval {
-        let sharp = self.a.eval_interval(b).min(&self.b.eval_interval(b));
+        let ia = self.a.eval_interval(b);
+        let ib = self.b.eval_interval(b);
+        if ib.lo - ia.hi >= self.radius {
+            return ia; // h = 1 everywhere: blend returns da
+        }
+        if ia.lo - ib.hi >= self.radius {
+            return ib; // h = 0 everywhere: blend returns db
+        }
+        let sharp = ia.min(&ib);
         Interval::new(sharp.lo - 0.25 * self.radius, sharp.hi)
     }
 }
@@ -73,9 +85,20 @@ impl<A: Sdf, B: Sdf> Sdf for SmoothSubtraction<A, B> {
     }
 
     // Smooth subtraction is -smin(-da, db, r), so it deviates from the
-    // sharp max(da, -db) by at most radius/4, always upward.
+    // sharp max(da, -db) by at most radius/4, always upward. As in
+    // [`SmoothUnion`], the result is exactly one child wherever h clamps
+    // (da + db at least `radius` from zero), keeping the interval exact —
+    // and prunable — away from the blend zone.
     fn eval_interval(&self, b: &BoundingBox3) -> Interval {
-        let sharp = self.a.eval_interval(b).max(&(-self.b.eval_interval(b)));
+        let ia = self.a.eval_interval(b);
+        let ib = self.b.eval_interval(b);
+        if ia.lo + ib.lo >= self.radius {
+            return ia; // h = 0 everywhere: blend returns da
+        }
+        if ia.hi + ib.hi <= -self.radius {
+            return -ib; // h = 1 everywhere: blend returns -db
+        }
+        let sharp = ia.max(&(-ib));
         Interval::new(sharp.lo, sharp.hi + 0.25 * self.radius)
     }
 }

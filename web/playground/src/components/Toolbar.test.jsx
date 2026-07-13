@@ -12,9 +12,9 @@ const noop = () => {};
 function render(overrides = {}) {
   return renderToString(
     <Toolbar
-      resolution={64}
-      onResolutionChange={noop}
-      onResolutionCommit={noop}
+      accuracy={0.01}
+      onAccuracyChange={noop}
+      onAccuracyCommit={noop}
       exactBooleans={false}
       onExactBooleansChange={noop}
       onRun={noop}
@@ -26,11 +26,11 @@ function render(overrides = {}) {
 }
 
 describe('Toolbar', () => {
-  it('renders run, STL, resolution, and the exact-booleans toggle', () => {
+  it('renders run, STL, accuracy, and the exact-booleans toggle', () => {
     const html = render();
     expect(html).toContain('Run');
     expect(html).toContain('Download STL');
-    expect(html).toContain('Resolution');
+    expect(html).toContain('Accuracy');
     expect(html).toContain('Exact booleans');
     expect(html).toMatch(/type="checkbox"(?![^>]*checked)/);
   });
@@ -48,7 +48,7 @@ describe('Toolbar', () => {
   it('disables all controls before WASM is ready', () => {
     const html = render({ disabled: true });
     const disabledCount = (html.match(/disabled/g) ?? []).length;
-    // Run, STL, resolution slider, exact-booleans checkbox.
+    // Run, STL, accuracy slider, exact-booleans checkbox.
     expect(disabledCount).toBe(4);
   });
 });

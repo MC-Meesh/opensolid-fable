@@ -32,14 +32,17 @@ import { buildSweepShape, opsBounds, profileToOps, sweepTreeNode } from './lib/s
 import { detectFacePlane } from './lib/facePlane.js';
 import { isFacePlane } from './lib/sketch/profile.js';
 
-const DEFAULT_RESOLUTION = 64;
+// Adaptive meshing target: maximum chordal deviation from the exact
+// surface, in model units. The octree refines near curvature and CSG
+// feature edges and stays coarse on flat regions.
+const DEFAULT_ACCURACY = 0.01;
 const EDIT_DEBOUNCE_MS = 400;
-// Hover ghosts are transient; a coarse mesh keeps pointer moves cheap.
-const HOVER_RESOLUTION = 32;
+// Hover ghosts are transient; a coarse accuracy keeps pointer moves cheap.
+const HOVER_ACCURACY_FACTOR = 8;
 const TOAST_MS = 3500;
 
-function meshShape(shape, resolution) {
-  const data = shape.mesh(resolution);
+function meshShape(shape, accuracy) {
+  const data = shape.meshAdaptive(accuracy);
   const positions = data.positions;
   const normals = data.normals;
   const indices = data.indices;
@@ -57,7 +60,7 @@ export default function App() {
   // WasmContext) — App only reads status and the bound API classes.
   const { status: wasmStatus, error: wasmError, api: wasm, ready: wasmReady, retry: retryWasm } = useWasm();
   const [error, setError] = useState(null);
-  const [resolution, setResolution] = useState(DEFAULT_RESOLUTION);
+  const [accuracy, setAccuracy] = useState(DEFAULT_ACCURACY);
   const [exactBooleans, setExactBooleans] = useState(false);
   const [wireframe, setWireframe] = useState(false);
   const [mesh, setMesh] = useState(null);
@@ -112,7 +115,7 @@ export default function App() {
 
   const scriptRef = useRef(DEFAULT_SCRIPT);
   const graphRef = useRef(graph);
-  const resolutionRef = useRef(DEFAULT_RESOLUTION);
+  const accuracyRef = useRef(DEFAULT_ACCURACY);
   const exactBooleansRef = useRef(false);
   const shapeRef = useRef(null);
   const tracedRef = useRef(null);
@@ -148,11 +151,11 @@ export default function App() {
     const shape = display.mode === 'pruned' ? display.shape : shapeRef.current;
     if (!shape) return;
     setError(null);
-    const res = resolutionRef.current;
+    const acc = accuracyRef.current;
     const started = performance.now();
     let data;
     try {
-      data = shape.mesh(res);
+      data = shape.meshAdaptive(acc);
     } catch (err) {
       setError(`Meshing failed: ${String(err)}`);
       return;
@@ -188,7 +191,7 @@ export default function App() {
     setStats({
       triangles: indices.length / 3,
       vertices: positions.length / 3,
-      resolution: res,
+      accuracy: acc,
       exact: Boolean(shape.isExact?.()),
       elapsedMs,
     });
@@ -225,8 +228,8 @@ export default function App() {
       if (restored && restored.shape) {
         setSelectedNode(restored);
         try {
-          const res = resolutionRef.current;
-          setSelectedMesh(meshShape(restored.shape, res));
+          const acc = accuracyRef.current;
+          setSelectedMesh(meshShape(restored.shape, acc));
           setSelectedPivot(shapePivot(restored.shape));
         } catch {
           clearSelection();
@@ -328,8 +331,8 @@ export default function App() {
       selectedPathRef.current = pathTo(root, node.id);
       if (node.shape) {
         try {
-          const res = resolutionRef.current;
-          setSelectedMesh(meshShape(node.shape, res));
+          const acc = accuracyRef.current;
+          setSelectedMesh(meshShape(node.shape, acc));
           setSelectedPivot(shapePivot(node.shape));
         } catch {
           clearSelection();
@@ -383,7 +386,7 @@ export default function App() {
       let ghost = hoverCacheRef.current.get(id);
       if (!ghost) {
         try {
-          ghost = meshShape(picked.shape, HOVER_RESOLUTION);
+          ghost = meshShape(picked.shape, accuracyRef.current * HOVER_ACCURACY_FACTOR);
           hoverCacheRef.current.set(id, ghost);
         } catch {
           ghost = null;
@@ -714,7 +717,7 @@ export default function App() {
     let shape = null;
     try {
       shape = buildSweepShape(wasm.WasmShape, wasm.WasmProfile2D, sweep);
-      setPreviewMesh(meshShape(shape, resolutionRef.current));
+      setPreviewMesh(meshShape(shape, accuracyRef.current));
       setSweepError(null);
     } catch (err) {
       setPreviewMesh(null);
@@ -807,12 +810,14 @@ export default function App() {
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [clearSelection, sweep, cancelSweep, sketchOpen, handleDeleteSelected]);
 
-  const handleResolutionChange = useCallback((value) => {
-    resolutionRef.current = value;
-    setResolution(value);
+  const handleAccuracyChange = useCallback((value) => {
+    accuracyRef.current = value;
+    setAccuracy(value);
   }, []);
 
-  const handleResolutionCommit = useCallback(() => {
+  const handleAccuracyCommit = useCallback(() => {
+    // Meshes cached at the old accuracy are stale.
+    hoverCacheRef.current.clear();
     remesh();
   }, [remesh]);
 
@@ -873,9 +878,9 @@ export default function App() {
         </ErrorBoundary>
         {error && <pre className="error">{error}</pre>}
         <Toolbar
-          resolution={resolution}
-          onResolutionChange={handleResolutionChange}
-          onResolutionCommit={handleResolutionCommit}
+          accuracy={accuracy}
+          onAccuracyChange={handleAccuracyChange}
+          onAccuracyCommit={handleAccuracyCommit}
           exactBooleans={exactBooleans}
           onExactBooleansChange={handleExactBooleansChange}
           onRun={runNow}
