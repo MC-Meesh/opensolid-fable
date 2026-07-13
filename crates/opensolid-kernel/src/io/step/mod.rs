@@ -1,11 +1,13 @@
-//! STEP Part 21 (ISO-10303-21) physical-file reader: **syntax only**.
+//! STEP Part 21 (ISO-10303-21) exchange: parsing, AP203 import, AP203 export.
 //!
-//! This module parses the textual exchange structure of a STEP file into a
-//! flat entity graph — a map from instance name (`#123`) to a typed record.
-//! The parsing layer has **no geometry knowledge**: it does not know what a
-//! `CARTESIAN_POINT` is, only that it is a keyword with a list of parameters.
-//! Turning that graph into kernel geometry/topology (AP203 semantics) is the
-//! [`read`] submodule — see [`read::read_step`].
+//! This module's own types parse the textual exchange structure of a STEP
+//! file into a flat entity graph — a map from instance name (`#123`) to a
+//! typed record. The parsing layer has **no geometry knowledge**: it does
+//! not know what a `CARTESIAN_POINT` is, only that it is a keyword with a
+//! list of parameters. Turning that graph into kernel geometry/topology
+//! (AP203 semantics) is the [`read`] submodule — see [`read::read_step`] —
+//! and the reverse direction, serializing kernel B-Rep bodies to an AP203
+//! file, is the [`write`] submodule — see [`write::write_step`].
 //!
 //! # What it handles
 //!
@@ -51,6 +53,7 @@
 mod lex;
 mod parse;
 pub mod read;
+pub mod write;
 
 use std::collections::HashMap;
 
@@ -59,6 +62,7 @@ pub use read::{
     Diagnostic, ImportedSolid, Severity, SolidOutcome, StepImport, StepReadOptions, read_step,
     read_step_bytes,
 };
+pub use write::{LengthUnit, StepWriteError, StepWriteOptions, write_step};
 
 /// A parsed STEP Part 21 file: its header records plus the data-section entity
 /// graph, indexed by instance name for O(1) lookup.
