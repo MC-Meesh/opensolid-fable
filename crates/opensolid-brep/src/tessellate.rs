@@ -31,10 +31,16 @@
 //!   loops), but faces with inner loops (holes) are still rejected with
 //!   [`CoreError::NotImplemented`]. Full constrained Delaunay triangulation
 //!   (hole bridging, as in [`crate::boolean`]) is a later pass.
-//! - Quadric faces are assumed to cover their surface's **full angular
-//!   range** (the full `u` period, and the full `v` domain/period for
-//!   spheres and tori), as the primitive and sweep constructors produce.
-//!   Trimmed quadric faces (from booleans) arrive with the CDT pass.
+//! - Quadric faces must cover their surface's **full angular range** (the
+//!   full `u` period, and the full `v` domain/period for spheres and tori),
+//!   as the primitive and sweep constructors produce. Violations are
+//!   *detected* and rejected with [`CoreError::NotImplemented`] instead of
+//!   silently gridding the whole surface (of-q6u): cylinder/cone boundaries
+//!   must cover the `u` period (checked by projecting boundary samples),
+//!   and sphere/torus boundaries must consist purely of seams (every edge
+//!   traversed with net-zero sense). Trimmed quadric faces (from booleans)
+//!   arrive with the CDT pass ([`crate::boolean::BooleanOutput::tessellate`]
+//!   already handles them).
 //! - The only fidelity control is [`TessellationOptions::angular_step`];
 //!   chord tolerance, edge-length bounds, and adaptive refinement are
 //!   deferred.
@@ -43,7 +49,7 @@ use crate::curve::{Curve3, CurveEval, plane_basis};
 use crate::geometry::GeometryStore;
 use crate::project::SurfaceProject;
 use crate::surface::{Surface3, SurfaceEval};
-use crate::topology::{Body, Face, FaceSense, Fin, Loop, TopologyStore};
+use crate::topology::{Body, Edge, Face, FaceSense, Fin, FinSense, Loop, TopologyStore};
 use opensolid_core::error::{CoreError, CoreResult};
 use opensolid_core::mesh::TriangleMesh;
 use opensolid_core::{EntityId, Point3, Vector3};
@@ -180,12 +186,14 @@ fn tessellate_face_into(
             Ok(())
         }
         Surface3::Sphere { .. } => {
+            require_seam_closed_boundary(store, face_id, face)?;
             let (v_lo, v_hi) = surface.domain_v();
             let n_v = angular_segments(v_hi - v_lo, options);
             grid_face(surface, 0.0, v_lo, v_hi, false, n_v, flip, options, mesh);
             Ok(())
         }
         Surface3::Torus { .. } => {
+            require_seam_closed_boundary(store, face_id, face)?;
             let period = surface.period_v().expect("torus is v-periodic");
             let n_v = angular_segments(period, options);
             grid_face(surface, 0.0, 0.0, period, true, n_v, flip, options, mesh);
@@ -306,21 +314,85 @@ fn fin_curve<'g>(
         .curve(curve_id)
         .ok_or_else(|| invalid_face(face_id, "has an edge referencing a stale curve id"))?;
     let (t_from, t_to) = match fin.sense {
-        crate::topology::FinSense::Forward => (edge.t_start, edge.t_end),
-        crate::topology::FinSense::Reversed => (edge.t_end, edge.t_start),
+        FinSense::Forward => (edge.t_start, edge.t_end),
+        FinSense::Reversed => (edge.t_end, edge.t_start),
     };
     Ok((curve, t_from, t_to))
+}
+
+/// Boundary samples per fin when recovering parameter ranges and checking
+/// angular coverage. Fine enough that a full circular fin leaves `u` gaps
+/// of `period/32` — well under the [`MIN_PERIOD_COVERAGE`] slack — so the
+/// coverage guard cleanly separates full rings from trimmed wedges.
+const BOUNDARY_SAMPLES: usize = 32;
+
+/// Minimum fraction of the `u` period a cylinder/cone face's boundary must
+/// cover for the full-period grid to be a faithful tessellation. Boundaries
+/// missing more than this slack (trimmed wedges) are rejected rather than
+/// silently rendered as the whole surface of revolution (of-q6u).
+const MIN_PERIOD_COVERAGE: f64 = 0.9;
+
+/// Guard that a face on a *closed* surface (sphere, torus) covers the whole
+/// surface: its boundary must cancel, i.e. every edge appears in the face's
+/// loops with as many `Forward` as `Reversed` fins — pure seams, as the
+/// primitive constructors and STEP reader produce. A trimmed face (cap,
+/// zone, wedge, imported partial revolve) has at least one real boundary
+/// edge traversed once; gridding the full closed surface for it would be
+/// grossly wrong (of-q6u). Faces closed only by singular vertex loops (no
+/// fins) pass vacuously.
+///
+/// # Errors
+/// [`CoreError::NotImplemented`] if any boundary edge is not a seam.
+fn require_seam_closed_boundary(
+    store: &TopologyStore,
+    face_id: EntityId<Face>,
+    face: &Face,
+) -> CoreResult<()> {
+    let mut net: std::collections::HashMap<EntityId<Edge>, i32> = std::collections::HashMap::new();
+    for loop_id in face
+        .outer_loop
+        .into_iter()
+        .chain(face.inner_loops.iter().copied())
+    {
+        for &fin_id in store.fins_of_loop(loop_id) {
+            let fin = store
+                .fin(fin_id)
+                .ok_or_else(|| invalid_face(face_id, "loop references a stale fin"))?;
+            *net.entry(fin.edge).or_insert(0) += match fin.sense {
+                FinSense::Forward => 1,
+                FinSense::Reversed => -1,
+            };
+        }
+    }
+    if net.values().any(|&n| n != 0) {
+        return Err(CoreError::NotImplemented {
+            feature: "tessellating trimmed sphere/torus faces \
+                      (boundary edges are not all seams; needs the CDT pass)",
+        });
+    }
+    Ok(())
 }
 
 /// The `u` anchor and `v` range spanned by a face's boundary, recovered by
 /// projecting boundary-edge samples onto the surface (for surfaces with an
 /// unbounded `v` domain: cylinders and cones).
 ///
-/// The anchor is the `u` of the first boundary sample — a rim vertex. The
-/// boundary circles of a transformed body are re-anchored to start at an
-/// arbitrary angle ([`crate::transform`]), so the grid's `u` columns must
-/// start at the same angle for its rim vertices to coincide with the
-/// adjacent faces' boundary samples and weld watertight.
+/// The anchor is the `u` of the first non-singular boundary sample — a rim
+/// vertex. The boundary circles of a transformed body are re-anchored to
+/// start at an arbitrary angle ([`crate::transform`]), so the grid's `u`
+/// columns must start at the same angle for its rim vertices to coincide
+/// with the adjacent faces' boundary samples and weld watertight.
+///
+/// Also guards the tessellator's full-period assumption: the samples' `u`
+/// values must cover the period to within [`MIN_PERIOD_COVERAGE`] (largest
+/// circular gap as the uncovered arc). A trimmed wedge fails this and is
+/// rejected instead of silently gridding the whole surface (of-q6u).
+/// Samples at parameterization singularities (cone apex) are excluded —
+/// their `u` is arbitrary.
+///
+/// # Errors
+/// [`CoreError::NotImplemented`] if the boundary covers materially less
+/// than the full `u` period.
 fn boundary_param_range(
     store: &TopologyStore,
     geo: &GeometryStore,
@@ -328,7 +400,9 @@ fn boundary_param_range(
     face: &Face,
     surface: &Surface3,
 ) -> CoreResult<(f64, f64, f64)> {
+    let period = surface.period_u().expect("quadric surfaces are u-periodic");
     let mut u_anchor = None;
+    let mut us = Vec::new();
     let mut lo = f64::INFINITY;
     let mut hi = f64::NEG_INFINITY;
     for loop_id in face
@@ -338,14 +412,17 @@ fn boundary_param_range(
     {
         for &fin_id in store.fins_of_loop(loop_id) {
             let (curve, t_from, t_to) = fin_curve(store, geo, face_id, fin_id)?;
-            for k in 0..=4 {
-                let t = t_from + (t_to - t_from) * k as f64 / 4.0;
+            for k in 0..=BOUNDARY_SAMPLES {
+                let t = t_from + (t_to - t_from) * k as f64 / BOUNDARY_SAMPLES as f64;
                 let projected = surface.project_point(&curve.point(t));
-                if u_anchor.is_none() {
-                    u_anchor = Some(projected.u);
-                }
                 lo = lo.min(projected.v);
                 hi = hi.max(projected.v);
+                if !surface.is_singular(projected.u, projected.v) {
+                    if u_anchor.is_none() {
+                        u_anchor = Some(projected.u);
+                    }
+                    us.push(projected.u.rem_euclid(period));
+                }
             }
         }
     }
@@ -354,6 +431,23 @@ fn boundary_param_range(
             face_id,
             "boundary does not span a v range on its unbounded surface",
         ));
+    }
+
+    // Largest angular arc between consecutive boundary samples (including
+    // the wrap-around from last back to first) is the uncovered span.
+    us.sort_unstable_by(f64::total_cmp);
+    let mut max_gap = match (us.first(), us.last()) {
+        (Some(first), Some(last)) => period - last + first,
+        _ => period,
+    };
+    for pair in us.windows(2) {
+        max_gap = max_gap.max(pair[1] - pair[0]);
+    }
+    if period - max_gap < MIN_PERIOD_COVERAGE * period {
+        return Err(CoreError::NotImplemented {
+            feature: "tessellating trimmed cylinder/cone faces \
+                      (boundary covers less than the full u period; needs the CDT pass)",
+        });
     }
     Ok((u_anchor.expect("v range implies samples"), lo, hi))
 }
@@ -871,5 +965,194 @@ mod tests {
             "got {err}"
         );
         assert!(err.to_string().contains("surface"), "unhelpful: {err}");
+    }
+
+    mod trimmed_face_guard {
+        use super::*;
+        use crate::topology::{BodyType, FinSense, LoopType, SYSTEM_RESOLUTION, ShellOrientation};
+
+        /// Empty store pair plus one face on one shell, with `surface`
+        /// attached — the scaffolding every trimmed-face fixture needs.
+        fn face_on(
+            store: &mut TopologyStore,
+            geo: &mut GeometryStore,
+            surface: Surface3,
+        ) -> EntityId<Face> {
+            let body = store.create_body(BodyType::Solid);
+            let shell = store.create_shell(body, true, ShellOrientation::Outward);
+            let face = store.create_face(shell, FaceSense::Positive);
+            store.faces.get_mut(face).expect("just created").surface =
+                Some(geo.add_surface(surface));
+            face
+        }
+
+        fn expect_not_implemented(
+            store: &TopologyStore,
+            geo: &GeometryStore,
+            face: EntityId<Face>,
+        ) {
+            let err = tessellate_face(store, geo, face, &TessellationOptions::default())
+                .expect_err("trimmed quadric face must be rejected, not gridded in full");
+            assert!(
+                matches!(err, CoreError::NotImplemented { .. }),
+                "got {err:?}"
+            );
+        }
+
+        /// A half-period cylinder wedge (two half-rims and two axial sides)
+        /// must be rejected, not silently rendered as the full cylinder.
+        #[test]
+        fn rejects_half_cylinder_wedge() {
+            let mut store = TopologyStore::new();
+            let mut geo = GeometryStore::new();
+            let (r, h) = (1.0, 2.0);
+            let axis = Vector3::z();
+            let face = face_on(
+                &mut store,
+                &mut geo,
+                Surface3::cylinder(Point3::origin(), axis, r).unwrap(),
+            );
+
+            let bottom = geo.add_curve(Curve3::circle(Point3::origin(), axis, r).unwrap());
+            let top = geo.add_curve(Curve3::circle(Point3::new(0.0, 0.0, h), axis, r).unwrap());
+            let side0 = geo.add_curve(Curve3::line(Point3::new(r, 0.0, 0.0), axis).unwrap());
+            let side1 = geo.add_curve(Curve3::line(Point3::new(-r, 0.0, 0.0), axis).unwrap());
+
+            let vb0 = store.create_vertex(Point3::new(r, 0.0, 0.0), SYSTEM_RESOLUTION);
+            let vb1 = store.create_vertex(Point3::new(-r, 0.0, 0.0), SYSTEM_RESOLUTION);
+            let vt0 = store.create_vertex(Point3::new(r, 0.0, h), SYSTEM_RESOLUTION);
+            let vt1 = store.create_vertex(Point3::new(-r, 0.0, h), SYSTEM_RESOLUTION);
+
+            let e_bottom =
+                store.create_edge_with_curve(vb0, vb1, SYSTEM_RESOLUTION, bottom, 0.0, PI);
+            let e_top = store.create_edge_with_curve(vt0, vt1, SYSTEM_RESOLUTION, top, 0.0, PI);
+            let e_side0 = store.create_edge_with_curve(vb0, vt0, SYSTEM_RESOLUTION, side0, 0.0, h);
+            let e_side1 = store.create_edge_with_curve(vb1, vt1, SYSTEM_RESOLUTION, side1, 0.0, h);
+            store.create_loop(
+                face,
+                LoopType::Outer,
+                &[
+                    (e_bottom, FinSense::Forward),
+                    (e_side1, FinSense::Forward),
+                    (e_top, FinSense::Reversed),
+                    (e_side0, FinSense::Reversed),
+                ],
+            );
+
+            expect_not_implemented(&store, &geo, face);
+        }
+
+        /// A spherical cap (one latitude-circle boundary, traversed once —
+        /// not a seam) must be rejected, not rendered as the full sphere.
+        #[test]
+        fn rejects_sphere_cap() {
+            let mut store = TopologyStore::new();
+            let mut geo = GeometryStore::new();
+            let r = 2.0;
+            let latitude = PI / 4.0;
+            let (rim_r, rim_z) = (r * latitude.cos(), r * latitude.sin());
+            let face = face_on(
+                &mut store,
+                &mut geo,
+                Surface3::sphere(Point3::origin(), Vector3::z(), r).unwrap(),
+            );
+
+            let rim = geo.add_curve(
+                Curve3::circle(Point3::new(0.0, 0.0, rim_z), Vector3::z(), rim_r).unwrap(),
+            );
+            let v_rim = store.create_vertex(Point3::new(rim_r, 0.0, rim_z), SYSTEM_RESOLUTION);
+            let e_rim =
+                store.create_edge_with_curve(v_rim, v_rim, SYSTEM_RESOLUTION, rim, 0.0, TAU);
+            store.create_loop(face, LoopType::Outer, &[(e_rim, FinSense::Forward)]);
+
+            expect_not_implemented(&store, &geo, face);
+        }
+
+        /// A half-torus band (two tube-circle boundaries, each traversed
+        /// once) must be rejected, not rendered as the full torus.
+        #[test]
+        fn rejects_half_torus_band() {
+            let mut store = TopologyStore::new();
+            let mut geo = GeometryStore::new();
+            let (major, minor) = (3.0, 1.0);
+            let face = face_on(
+                &mut store,
+                &mut geo,
+                Surface3::torus(Point3::origin(), Vector3::z(), major, minor).unwrap(),
+            );
+
+            let tube_start = geo.add_curve(
+                Curve3::circle(Point3::new(major, 0.0, 0.0), -Vector3::y(), minor).unwrap(),
+            );
+            let tube_end = geo.add_curve(
+                Curve3::circle(Point3::new(-major, 0.0, 0.0), Vector3::y(), minor).unwrap(),
+            );
+            let v_start =
+                store.create_vertex(Point3::new(major + minor, 0.0, 0.0), SYSTEM_RESOLUTION);
+            let v_end =
+                store.create_vertex(Point3::new(-major - minor, 0.0, 0.0), SYSTEM_RESOLUTION);
+            let e_start = store.create_edge_with_curve(
+                v_start,
+                v_start,
+                SYSTEM_RESOLUTION,
+                tube_start,
+                0.0,
+                TAU,
+            );
+            let e_end =
+                store.create_edge_with_curve(v_end, v_end, SYSTEM_RESOLUTION, tube_end, 0.0, TAU);
+            // Revolve-style loop layout: end circle outer, start circle inner.
+            store.create_loop(face, LoopType::Outer, &[(e_end, FinSense::Forward)]);
+            store.create_loop(face, LoopType::Inner, &[(e_start, FinSense::Reversed)]);
+
+            expect_not_implemented(&store, &geo, face);
+        }
+
+        /// A wall whose rims are split into two half-circle edges each (as
+        /// imprinting produces) still covers the full period and must pass
+        /// the coverage guard.
+        #[test]
+        fn accepts_full_ring_of_split_arcs() {
+            let mut store = TopologyStore::new();
+            let mut geo = GeometryStore::new();
+            let (r, h) = (1.5, 2.0);
+            let axis = Vector3::z();
+            let face = face_on(
+                &mut store,
+                &mut geo,
+                Surface3::cylinder(Point3::origin(), axis, r).unwrap(),
+            );
+
+            let bottom = geo.add_curve(Curve3::circle(Point3::origin(), axis, r).unwrap());
+            let top = geo.add_curve(Curve3::circle(Point3::new(0.0, 0.0, h), axis, r).unwrap());
+            let seam = geo.add_curve(Curve3::line(Point3::new(r, 0.0, 0.0), axis).unwrap());
+
+            let vb0 = store.create_vertex(Point3::new(r, 0.0, 0.0), SYSTEM_RESOLUTION);
+            let vb1 = store.create_vertex(Point3::new(-r, 0.0, 0.0), SYSTEM_RESOLUTION);
+            let vt0 = store.create_vertex(Point3::new(r, 0.0, h), SYSTEM_RESOLUTION);
+            let vt1 = store.create_vertex(Point3::new(-r, 0.0, h), SYSTEM_RESOLUTION);
+
+            let e_b1 = store.create_edge_with_curve(vb0, vb1, SYSTEM_RESOLUTION, bottom, 0.0, PI);
+            let e_b2 = store.create_edge_with_curve(vb1, vb0, SYSTEM_RESOLUTION, bottom, PI, TAU);
+            let e_t1 = store.create_edge_with_curve(vt0, vt1, SYSTEM_RESOLUTION, top, 0.0, PI);
+            let e_t2 = store.create_edge_with_curve(vt1, vt0, SYSTEM_RESOLUTION, top, PI, TAU);
+            let e_seam = store.create_edge_with_curve(vb0, vt0, SYSTEM_RESOLUTION, seam, 0.0, h);
+            store.create_loop(
+                face,
+                LoopType::Outer,
+                &[
+                    (e_b1, FinSense::Forward),
+                    (e_b2, FinSense::Forward),
+                    (e_seam, FinSense::Forward),
+                    (e_t2, FinSense::Reversed),
+                    (e_t1, FinSense::Reversed),
+                    (e_seam, FinSense::Reversed),
+                ],
+            );
+
+            let mesh = tessellate_face(&store, &geo, face, &TessellationOptions::default())
+                .expect("full-ring boundary must pass the coverage guard");
+            assert_within(mesh.total_area(), TAU * r * h, 0.05, "split-ring wall area");
+        }
     }
 }
