@@ -1,10 +1,12 @@
-//! Marching surface-surface intersection for NURBS surfaces
-//! (transversal MVP).
+//! Marching surface-surface intersection (transversal MVP).
 //!
 //! [`intersect_nurbs`] traces the intersection curves of two
 //! [`NurbsSurface`]s as dense polylines (fitting the result as a NURBS
 //! curve is a later hardening pass), per spec/02-geometry.md §5.3 at the
-//! spec/12 "minimum viable" level:
+//! spec/12 "minimum viable" level. [`intersect_marched`] runs the same
+//! tracer over analytic primitive pairs whose intersection has no
+//! closed form among the [`crate::curve::Curve3`] variants (see its docs
+//! for the pair table); both share the algorithm below:
 //!
 //! 1. **Seeding** — a parameter grid over surface A is evaluated and each
 //!    node is projected onto surface B ([`SurfaceProject`], of-uui.5); the
@@ -29,9 +31,10 @@
 //! are the hardening pass of spec/12. Surfaces that do not intersect
 //! return an empty curve set, not an error.
 
+use crate::curve::{TWO_PI, plane_basis};
 use crate::nurbs::NurbsSurface;
 use crate::project::SurfaceProject;
-use crate::surface::SurfaceEval;
+use crate::surface::{Surface3, SurfaceEval};
 use nalgebra::{Matrix3, Matrix4, Vector4};
 use opensolid_core::error::{CoreError, CoreResult};
 use opensolid_core::tolerance::ToleranceContext;
@@ -56,6 +59,26 @@ const MAX_STEPS: usize = 10_000;
 
 /// Consecutive step halvings allowed before a branch is abandoned.
 const MAX_STEP_HALVINGS: usize = 6;
+
+/// Surface access required by the marching tracer: first-order evaluation
+/// for the stepping frames, plus closest-point projection
+/// ([`SurfaceProject`]) and normals ([`SurfaceEval`]) for grid seeding.
+trait MarchSurface: SurfaceEval + SurfaceProject {
+    /// Point and first partials `(S, S_u, S_v)` at `(u, v)`.
+    fn eval1(&self, u: f64, v: f64) -> (Point3, Vector3, Vector3) {
+        (self.point(u, v), self.du(u, v), self.dv(u, v))
+    }
+}
+
+impl MarchSurface for NurbsSurface {
+    fn eval1(&self, u: f64, v: f64) -> (Point3, Vector3, Vector3) {
+        // Fused basis evaluation: one derivatives() call instead of three.
+        let d = self.derivatives(u, v, 1);
+        (Point3::origin() + d[0][0], d[1][0], d[0][1])
+    }
+}
+
+impl MarchSurface for Surface3 {}
 
 /// One intersection curve traced by marching, as a dense polyline with
 /// the parameter preimages on both surfaces.
@@ -134,12 +157,12 @@ fn near_tangency_error(at: &Point3, sin: f64) -> CoreError {
     }
 }
 
-/// Marching context: the surface pair, their domain boxes, and the
-/// tolerances/step sizes derived from the tolerance context and the
-/// geometry scale.
-struct Marcher<'a> {
-    a: &'a NurbsSurface,
-    b: &'a NurbsSurface,
+/// Marching context: the surface pair, the domain boxes to march over,
+/// and the tolerances/step sizes derived from the tolerance context and
+/// the geometry scale.
+struct Marcher<'a, A: MarchSurface, B: MarchSurface> {
+    a: &'a A,
+    b: &'a B,
     /// Domain interval per parameter, indexed like [`MarchState`].
     domains: [(f64, f64); 4],
     /// Convergence tolerance on `|S_a - S_b|`.
@@ -150,17 +173,17 @@ struct Marcher<'a> {
     h_min: f64,
 }
 
-impl Marcher<'_> {
+impl<A: MarchSurface, B: MarchSurface> Marcher<'_, A, B> {
     fn frames(&self, s: &MarchState) -> Frames {
-        let da = self.a.derivatives(s.0[0], s.0[1], 1);
-        let db = self.b.derivatives(s.0[2], s.0[3], 1);
+        let (pa, au, av) = self.a.eval1(s.0[0], s.0[1]);
+        let (pb, bu, bv) = self.b.eval1(s.0[2], s.0[3]);
         Frames {
-            pa: Point3::origin() + da[0][0],
-            au: da[1][0],
-            av: da[0][1],
-            pb: Point3::origin() + db[0][0],
-            bu: db[1][0],
-            bv: db[0][1],
+            pa,
+            au,
+            av,
+            pb,
+            bu,
+            bv,
         }
     }
 
