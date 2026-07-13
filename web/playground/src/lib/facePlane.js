@@ -1,10 +1,12 @@
-// Face-plane detection for "sketch on a face" (of-4eh.16): given the
-// triangle the user clicked on the displayed F-Rep mesh, grow the maximal
-// connected planar region around it and derive a sketch plane
-// `{ origin, normal, u, v, extent }` — origin at the region centroid,
-// (u, v) a right-handed WYSIWYG basis (u × v = normal), extent the region
-// radius for indicator/grid sizing. Curved surfaces are rejected so the
-// caller can explain instead of silently sketching on a facet.
+// Face-plane detection for "sketch on a face" (of-4eh.16) and face
+// hover/selection highlighting (of-4eh.18): given a triangle of the
+// displayed F-Rep mesh, grow the maximal connected planar region around it
+// and derive a sketch plane `{ origin, normal, u, v, extent }` — origin at
+// the region centroid, (u, v) a right-handed WYSIWYG basis (u × v = normal),
+// extent the region radius for indicator/grid sizing. Results also carry the
+// region's triangle indices (`tris`) so callers can paint the face. Curved
+// surfaces are rejected so the caller can explain instead of silently
+// sketching on a facet.
 //
 // Kept free of three.js and React so it can be unit-tested on plain
 // position/index arrays (same pattern as picking.js).
@@ -152,33 +154,19 @@ function meshDiagonal(positions) {
 }
 
 /**
- * Classify the mesh face under the clicked triangle `faceIndex` and derive
- * its sketch plane.
- *
- * Grows the connected region of triangles whose normals stay within
- * `NORMAL_TOL_DEG` of the seed's and whose vertices stay within a small
- * offset of the seed's plane, then checks the region reads as planar: enough
- * triangles and a normal spread under `SPREAD_TOL_DEG` (a curved surface
- * fills the admission tolerance; a true face's spread is float noise).
- *
- * Returns `{ planar: true, plane: { origin, normal, u, v, extent } }` or
- * `{ planar: false, reason }`.
+ * Grow the connected planar region around seed triangle `faceIndex` and
+ * classify it (see `detectFacePlane`). `neighbors` and `offsetTol` are
+ * precomputed by the caller so an index over one mesh can amortize them.
  */
-export function detectFacePlane(positions, indices, faceIndex) {
-  const triCount = indices.length / 3;
-  if (!Number.isInteger(faceIndex) || faceIndex < 0 || faceIndex >= triCount) {
-    return { planar: false, reason: 'no triangle under the cursor' };
-  }
+function growFaceRegion(positions, indices, faceIndex, neighbors, offsetTol) {
   const seedArea = triAreaNormal(positions, indices, faceIndex);
   const seedNormal = normalize(seedArea);
   if (!seedNormal) {
-    return { planar: false, reason: 'degenerate triangle under the cursor' };
+    return { planar: false, reason: 'degenerate triangle under the cursor', tris: [faceIndex] };
   }
   const seedPoint = vertex(positions, triVertexIds(indices, faceIndex)[0]);
-  const offsetTol = OFFSET_TOL_FACTOR * meshDiagonal(positions) + 1e-12;
   const cosTol = Math.cos((NORMAL_TOL_DEG * Math.PI) / 180);
 
-  const neighbors = buildAdjacency(indices);
   const accepted = new Set([faceIndex]);
   const queue = [faceIndex];
   while (queue.length > 0) {
@@ -197,8 +185,9 @@ export function detectFacePlane(positions, indices, faceIndex) {
     }
   }
 
+  const tris = Array.from(accepted);
   if (accepted.size < MIN_REGION_TRIS) {
-    return { planar: false, reason: 'face is too small to classify as planar' };
+    return { planar: false, reason: 'face is too small to classify as planar', tris };
   }
 
   // Area-weighted average normal and centroid over the region.
@@ -217,7 +206,7 @@ export function detectFacePlane(positions, indices, faceIndex) {
   }
   const normal = normalize(avgNormal);
   if (!normal || totalArea <= 0) {
-    return { planar: false, reason: 'face region has no area' };
+    return { planar: false, reason: 'face region has no area', tris };
   }
   for (let k = 0; k < 3; k += 1) centroid[k] /= totalArea;
 
@@ -225,7 +214,7 @@ export function detectFacePlane(positions, indices, faceIndex) {
   for (const tri of accepted) {
     const n = normalize(triAreaNormal(positions, indices, tri));
     if (n && dot(n, normal) < cosSpread) {
-      return { planar: false, reason: 'face is curved' };
+      return { planar: false, reason: 'face is curved', tris };
     }
   }
 
@@ -244,5 +233,56 @@ export function detectFacePlane(positions, indices, faceIndex) {
   return {
     planar: true,
     plane: { origin: centroid, normal, u, v, extent },
+    tris,
   };
+}
+
+/**
+ * Region index over one mesh: `regionAt(faceIndex)` classifies the face
+ * containing that triangle (same result shape as `detectFacePlane`).
+ * Adjacency and the offset tolerance are built lazily once, and every
+ * triangle of a computed region maps to the shared result object — so
+ * pointer-move hovers inside one face are O(1) after the first hit, and two
+ * seeds on the same face always yield the identical region (no highlight
+ * shimmer between neighboring triangles).
+ */
+export function createFaceRegionIndex(positions, indices) {
+  const triCount = indices.length / 3;
+  let neighbors = null;
+  let offsetTol = null;
+  const byTri = new Map();
+
+  function regionAt(faceIndex) {
+    if (!Number.isInteger(faceIndex) || faceIndex < 0 || faceIndex >= triCount) {
+      return { planar: false, reason: 'no triangle under the cursor', tris: [] };
+    }
+    const cached = byTri.get(faceIndex);
+    if (cached) return cached;
+    neighbors ??= buildAdjacency(indices);
+    offsetTol ??= OFFSET_TOL_FACTOR * meshDiagonal(positions) + 1e-12;
+    const result = growFaceRegion(positions, indices, faceIndex, neighbors, offsetTol);
+    for (const tri of result.tris) byTri.set(tri, result);
+    return result;
+  }
+
+  return { regionAt };
+}
+
+/**
+ * Classify the mesh face under the clicked triangle `faceIndex` and derive
+ * its sketch plane.
+ *
+ * Grows the connected region of triangles whose normals stay within
+ * `NORMAL_TOL_DEG` of the seed's and whose vertices stay within a small
+ * offset of the seed's plane, then checks the region reads as planar: enough
+ * triangles and a normal spread under `SPREAD_TOL_DEG` (a curved surface
+ * fills the admission tolerance; a true face's spread is float noise).
+ *
+ * Returns `{ planar: true, plane: { origin, normal, u, v, extent }, tris }`
+ * or `{ planar: false, reason, tris }` — `tris` is the grown region's
+ * triangle indices either way. Repeated queries over one mesh should use
+ * `createFaceRegionIndex` instead, which amortizes the adjacency build.
+ */
+export function detectFacePlane(positions, indices, faceIndex) {
+  return createFaceRegionIndex(positions, indices).regionAt(faceIndex);
 }

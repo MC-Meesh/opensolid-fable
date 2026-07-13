@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   axisAngleFromBasis,
+  createFaceRegionIndex,
   detectFacePlane,
   facePlaneBasis,
 } from './facePlane.js';
@@ -193,5 +194,59 @@ describe('detectFacePlane', () => {
     expect(
       detectFacePlane(degenerate.positions, degenerate.indices, 0).planar
     ).toBe(false);
+  });
+
+  it('reports the region triangles for highlighting', () => {
+    const { positions, indices } = lShell();
+    const result = detectFacePlane(positions, indices, 0);
+    // The 4x4 top face is 32 triangles and stops at the welded edge.
+    expect(result.tris).toHaveLength(32);
+    expect(result.tris).toContain(0);
+    expect(result.tris).not.toContain(32);
+  });
+});
+
+describe('createFaceRegionIndex', () => {
+  function lShell() {
+    const pool = gridMesh([0, 1, 0], [0, 0, 0.25], [0.25, 0, 0], 4, 4);
+    return gridMesh([0, 1, 1], [0, -0.25, 0], [0.25, 0, 0], 4, 4, pool);
+  }
+
+  it('classifies faces like detectFacePlane', () => {
+    const { positions, indices } = lShell();
+    const index = createFaceRegionIndex(positions, indices);
+    const region = index.regionAt(0);
+    expect(region.planar).toBe(true);
+    expect(closeTo3(region.plane.normal, [0, 1, 0])).toBe(true);
+    expect(region.tris).toHaveLength(32);
+  });
+
+  it('returns the same cached region object for any seed inside it', () => {
+    const { positions, indices } = lShell();
+    const index = createFaceRegionIndex(positions, indices);
+    const fromFirst = index.regionAt(0);
+    const fromLast = index.regionAt(31);
+    expect(fromLast).toBe(fromFirst);
+    // A different face is a different region.
+    expect(index.regionAt(32)).not.toBe(fromFirst);
+  });
+
+  it('caches curved regions as non-planar', () => {
+    const { positions, indices } = curvedStrip(2, Math.PI / 2, 32);
+    const index = createFaceRegionIndex(positions, indices);
+    const region = index.regionAt(10);
+    expect(region.planar).toBe(false);
+    expect(index.regionAt(11)).toBe(region);
+  });
+
+  it('rejects out-of-range seeds with an empty region', () => {
+    const { positions, indices } = lShell();
+    const index = createFaceRegionIndex(positions, indices);
+    expect(index.regionAt(-1)).toEqual({
+      planar: false,
+      reason: 'no triangle under the cursor',
+      tris: [],
+    });
+    expect(index.regionAt(null).planar).toBe(false);
   });
 });

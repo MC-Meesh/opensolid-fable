@@ -29,7 +29,7 @@ import {
   updateNumericArg,
 } from './lib/shapeGraph.js';
 import { buildSweepShape, opsBounds, profileToOps, sweepTreeNode } from './lib/sweep.js';
-import { detectFacePlane } from './lib/facePlane.js';
+import { createFaceRegionIndex } from './lib/facePlane.js';
 import { isFacePlane } from './lib/sketch/profile.js';
 
 // Adaptive meshing target: maximum chordal deviation from the exact
@@ -37,8 +37,6 @@ import { isFacePlane } from './lib/sketch/profile.js';
 // feature edges and stays coarse on flat regions.
 const DEFAULT_ACCURACY = 0.01;
 const EDIT_DEBOUNCE_MS = 400;
-// Hover ghosts are transient; a coarse accuracy keeps pointer moves cheap.
-const HOVER_ACCURACY_FACTOR = 8;
 const TOAST_MS = 3500;
 
 function meshShape(shape, accuracy) {
@@ -79,7 +77,10 @@ export default function App() {
   const [sweep, setSweep] = useState(null);
   const [sweepError, setSweepError] = useState(null);
   const [previewMesh, setPreviewMesh] = useState(null);
-  const [hoverMesh, setHoverMesh] = useState(null);
+  // Hovered planar face: `{ meshKey, tris }` — triangle indices into the
+  // displayed mesh, shown as an in-place darkening (of-4eh.18). meshKey
+  // guards against painting stale triangles onto a rebuilt mesh.
+  const [hoverFace, setHoverFace] = useState(null);
   const [profileClosed, setProfileClosed] = useState(false);
   // Face pick for sketch-on-face: the detectFacePlane result of the last
   // click that hit the mesh (planar face plane, or the reason it isn't
@@ -89,8 +90,8 @@ export default function App() {
   const [toast, setToast] = useState(null);
   const profileRef = useRef(null);
   const viewportRef = useRef(null);
-  const hoverCacheRef = useRef(new Map());
-  const hoveredIdRef = useRef(null);
+  // Face-region index over the displayed mesh, rebuilt lazily per mesh key.
+  const faceRegionsRef = useRef({ key: null, index: null });
 
   // Feature tree (presentation layer over the traced tree): user renames,
   // per-feature visibility/suppression, panel collapse, and the sketch
@@ -137,13 +138,14 @@ export default function App() {
   const remesh = useCallback(({ reframe = false } = {}) => {
     const display = displayRef.current;
     if (display.mode === 'empty') {
-      meshRef.current = { positions: new Float32Array(0), indices: new Uint32Array(0) };
+      const key = ++meshKeyRef.current;
+      meshRef.current = { positions: new Float32Array(0), indices: new Uint32Array(0), key };
       setMesh({
         positions: new Float32Array(0),
         normals: new Float32Array(0),
         indices: new Uint32Array(0),
         frame: null,
-        key: ++meshKeyRef.current,
+        key,
       });
       setStats(null);
       return;
@@ -186,8 +188,9 @@ export default function App() {
       };
     }
 
-    meshRef.current = { positions, indices };
-    setMesh({ positions, normals, indices, frame, key: ++meshKeyRef.current });
+    const key = ++meshKeyRef.current;
+    meshRef.current = { positions, indices, key };
+    setMesh({ positions, normals, indices, frame, key });
     setStats({
       triangles: indices.length / 3,
       vertices: positions.length / 3,
@@ -211,11 +214,9 @@ export default function App() {
       setError(String(err?.stack || err));
       return;
     }
-    // Node identities (and their WASM shapes) change on every run.
-    hoverCacheRef.current.clear();
-    hoveredIdRef.current = null;
-    setHoverMesh(null);
-    // The displayed mesh is rebuilt, so a picked face's triangles are stale.
+    // The displayed mesh is rebuilt, so hovered/picked face triangles are
+    // stale (the region index re-keys itself off the new mesh key).
+    setHoverFace(null);
     setPickedFace(null);
     if (tracedRef.current) freeNodes(tracedRef.current.nodes);
     tracedRef.current = traced;
@@ -342,6 +343,19 @@ export default function App() {
     [selectedNode, clearSelection]
   );
 
+  // Lazily (re)build the face-region index for the currently displayed mesh.
+  const faceRegions = useCallback(() => {
+    const displayed = meshRef.current;
+    if (!displayed?.indices?.length) return null;
+    if (faceRegionsRef.current.key !== displayed.key) {
+      faceRegionsRef.current = {
+        key: displayed.key,
+        index: createFaceRegionIndex(displayed.positions, displayed.indices),
+      };
+    }
+    return faceRegionsRef.current.index;
+  }, []);
+
   const handlePick = useCallback(
     (point, faceIndex) => {
       const root = tracedRef.current?.root;
@@ -352,13 +366,9 @@ export default function App() {
         return;
       }
       // Remember the clicked mesh face (independent of the body-selection
-      // toggle) so "Sketch" can open on it.
-      const displayed = meshRef.current;
-      setPickedFace(
-        displayed && faceIndex !== null
-          ? detectFacePlane(displayed.positions, displayed.indices, faceIndex)
-          : null
-      );
+      // toggle) so "Sketch" can open on it and the viewport can tint it.
+      const region = faceIndex !== null ? faceRegions()?.regionAt(faceIndex) : null;
+      setPickedFace(region ? { ...region, meshKey: meshRef.current.key } : null);
       const candidates = pickCandidates(root);
       const picked = pickNodeAt(candidates, point);
       if (picked) {
@@ -367,34 +377,34 @@ export default function App() {
         clearSelection();
       }
     },
-    [selectNode, clearSelection]
+    [selectNode, clearSelection, faceRegions]
   );
 
-  // Hover highlight: resolve the pointer to a leaf node (same query as
-  // click-picking) and show a faint ghost, distinct from the selection ghost.
+  // Hover highlight: resolve the pointer's triangle to its planar face
+  // region and darken it in place on the main mesh — no overlay geometry,
+  // so nothing to z-fight (of-4eh.18). Curved surfaces get no highlight,
+  // which keeps hover an honest "you can sketch here" affordance.
   const handleHover = useCallback(
-    (point) => {
-      const root = tracedRef.current?.root;
-      const picked = root && point ? pickNodeAt(pickCandidates(root), point) : null;
-      const id = picked?.id ?? null;
-      if (id === hoveredIdRef.current) return;
-      hoveredIdRef.current = id;
-      if (!picked?.shape || picked.id === selectedNode?.id) {
-        setHoverMesh(null);
+    (point, faceIndex) => {
+      const displayed = meshRef.current;
+      if (!point || faceIndex === null || !displayed) {
+        setHoverFace(null);
         return;
       }
-      let ghost = hoverCacheRef.current.get(id);
-      if (!ghost) {
-        try {
-          ghost = meshShape(picked.shape, accuracyRef.current * HOVER_ACCURACY_FACTOR);
-          hoverCacheRef.current.set(id, ghost);
-        } catch {
-          ghost = null;
-        }
+      const region = faceRegions()?.regionAt(faceIndex);
+      if (!region?.planar) {
+        setHoverFace(null);
+        return;
       }
-      setHoverMesh(ghost);
+      // Regions are shared objects, so identity says "same face": keep the
+      // previous state to skip re-renders while the pointer stays on it.
+      setHoverFace((prev) =>
+        prev && prev.tris === region.tris && prev.meshKey === displayed.key
+          ? prev
+          : { meshKey: displayed.key, tris: region.tris }
+      );
     },
-    [selectedNode]
+    [faceRegions]
   );
 
   // SolidWorks Delete gesture: remove the selected body/branch from the tree
@@ -816,8 +826,8 @@ export default function App() {
   }, []);
 
   const handleAccuracyCommit = useCallback(() => {
-    // Meshes cached at the old accuracy are stale.
-    hoverCacheRef.current.clear();
+    // The re-tessellated mesh renumbers triangles; face states are stale.
+    setHoverFace(null);
     remesh();
   }, [remesh]);
 
@@ -917,7 +927,14 @@ export default function App() {
             gizmoMode={gizmoMode}
             selectedMesh={selectedMesh}
             selectedPivot={selectedPivot}
-            hoverMesh={hoverMesh}
+            hoverFaceTris={
+              mesh && hoverFace?.meshKey === mesh.key ? hoverFace.tris : null
+            }
+            selectedFaceTris={
+              mesh && pickedFace?.planar && pickedFace.meshKey === mesh.key
+                ? pickedFace.tris
+                : null
+            }
             previewMesh={previewMesh}
             onPick={handlePick}
             onHover={handleHover}

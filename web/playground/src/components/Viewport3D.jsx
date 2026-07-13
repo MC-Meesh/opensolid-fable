@@ -14,6 +14,7 @@ import {
   sketchViewPose,
 } from '../lib/sketchView.js';
 import { isFacePlane } from '../lib/sketch/profile.js';
+import { HOVER_RGB, SELECTED_RGB, expandToNonIndexed, paintHighlights } from '../lib/faceHighlight.js';
 
 // World convention: Y up, ground grid in the XZ plane, front view looks
 // along -Z. Standard view directions live in lib/views.js.
@@ -156,23 +157,15 @@ function updateInfiniteGrid(grid, camera, target) {
   grid.scale.setScalar(levels.fadeDist * 2);
 }
 
-// Selection ghost: solid accent tint. Hover ghost: fainter neutral wash so
-// the two states read differently at a glance.
+// Selection ghost: solid accent tint (attached to the gizmo anchor so it
+// previews the transform while dragging). Face hover/selection highlighting
+// paints the main mesh's vertex colors instead — see lib/faceHighlight.js.
 const HIGHLIGHT_MATERIAL = new THREE.MeshStandardMaterial({
   color: 0x4fc3f7,
   metalness: 0.1,
   roughness: 0.4,
   transparent: true,
   opacity: 0.35,
-  depthWrite: false,
-});
-
-const HOVER_MATERIAL = new THREE.MeshStandardMaterial({
-  color: 0xdde6f2,
-  metalness: 0.05,
-  roughness: 0.6,
-  transparent: true,
-  opacity: 0.16,
   depthWrite: false,
 });
 
@@ -195,7 +188,8 @@ const Viewport3D = forwardRef(function Viewport3D(
     gizmoMode,
     selectedMesh,
     selectedPivot,
-    hoverMesh,
+    hoverFaceTris,
+    selectedFaceTris,
     previewMesh,
     onPick,
     onHover,
@@ -280,18 +274,16 @@ const Viewport3D = forwardRef(function Viewport3D(
     const grid = createInfiniteGrid();
     scene.add(grid);
 
+    // vertexColors multiplies the face-highlight color attribute into the
+    // base color (all-white when nothing is highlighted).
     const material = new THREE.MeshStandardMaterial({
       color: 0x5f9ee8,
       metalness: 0.15,
       roughness: 0.5,
+      vertexColors: true,
     });
     const meshObject = new THREE.Mesh(new THREE.BufferGeometry(), material);
     scene.add(meshObject);
-
-    const hoverObject = new THREE.Mesh(new THREE.BufferGeometry(), HOVER_MATERIAL);
-    hoverObject.renderOrder = 1;
-    hoverObject.visible = false;
-    scene.add(hoverObject);
 
     const ghostMesh = new THREE.Mesh(new THREE.BufferGeometry(), HIGHLIGHT_MATERIAL);
     ghostMesh.renderOrder = 1;
@@ -382,7 +374,7 @@ const Viewport3D = forwardRef(function Viewport3D(
           return;
         }
         const hit = castAt(hoverX, hoverY);
-        cb(hit ? [hit.point.x, hit.point.y, hit.point.z] : null);
+        cb(hit ? [hit.point.x, hit.point.y, hit.point.z] : null, hit?.faceIndex ?? null);
       });
     }
 
@@ -498,8 +490,8 @@ const Viewport3D = forwardRef(function Viewport3D(
       transformControlsHelper,
       anchor,
       ghostMesh,
-      hoverObject,
       previewObject,
+      paintedTris: [],
       cameraAnim: null,
       sketchOrtho: false,
       savedView: null,
@@ -524,7 +516,6 @@ const Viewport3D = forwardRef(function Viewport3D(
       orbitControls.dispose();
       meshObject.geometry.dispose();
       ghostMesh.geometry.dispose();
-      hoverObject.geometry.dispose();
       previewObject.geometry.dispose();
       material.dispose();
       grid.geometry.dispose();
@@ -572,12 +563,18 @@ const Viewport3D = forwardRef(function Viewport3D(
   useEffect(() => {
     const ctx = sceneRef.current;
     if (!ctx || !mesh) return;
+    // Non-indexed with a color attribute so face highlighting can paint
+    // per-triangle colors without bleeding into adjacent faces. Triangle
+    // order matches the source mesh, so raycast faceIndex still addresses
+    // the original index buffer.
+    const { positions, normals, colors } = expandToNonIndexed(mesh);
     const geometry = new THREE.BufferGeometry();
-    geometry.setAttribute('position', new THREE.BufferAttribute(mesh.positions, 3));
-    geometry.setAttribute('normal', new THREE.BufferAttribute(mesh.normals, 3));
-    geometry.setIndex(new THREE.BufferAttribute(mesh.indices, 1));
+    geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geometry.setAttribute('normal', new THREE.BufferAttribute(normals, 3));
+    geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
     ctx.meshObject.geometry.dispose();
     ctx.meshObject.geometry = geometry;
+    ctx.paintedTris = [];
     if (mesh.frame) frameCamera(ctx, mesh.frame);
   }, [mesh]);
 
@@ -602,21 +599,19 @@ const Viewport3D = forwardRef(function Viewport3D(
     }
   }, [previewMesh]);
 
+  // Face hover/selection: darken the region's triangles in the main mesh's
+  // color attribute (selected paints after hover, so it wins on overlap).
+  // Runs after the mesh effect above, so a rebuilt mesh starts unpainted.
   useEffect(() => {
     const ctx = sceneRef.current;
-    if (!ctx) return;
-    if (hoverMesh) {
-      const geo = new THREE.BufferGeometry();
-      geo.setAttribute('position', new THREE.BufferAttribute(hoverMesh.positions, 3));
-      geo.setAttribute('normal', new THREE.BufferAttribute(hoverMesh.normals, 3));
-      geo.setIndex(new THREE.BufferAttribute(hoverMesh.indices, 1));
-      ctx.hoverObject.geometry.dispose();
-      ctx.hoverObject.geometry = geo;
-      ctx.hoverObject.visible = true;
-    } else {
-      ctx.hoverObject.visible = false;
-    }
-  }, [hoverMesh]);
+    const colorAttr = ctx?.meshObject.geometry.getAttribute('color');
+    if (!colorAttr) return;
+    const regions = [];
+    if (hoverFaceTris) regions.push({ tris: hoverFaceTris, rgb: HOVER_RGB });
+    if (selectedFaceTris) regions.push({ tris: selectedFaceTris, rgb: SELECTED_RGB });
+    ctx.paintedTris = paintHighlights(colorAttr.array, ctx.paintedTris, regions);
+    colorAttr.needsUpdate = true;
+  }, [mesh, hoverFaceTris, selectedFaceTris]);
 
   // SolidWorks-style "Normal To": entering sketch mode (or switching planes
   // mid-sketch) flies the camera orthogonal to the sketch plane and switches
