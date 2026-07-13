@@ -441,7 +441,7 @@ impl Chart {
     /// chart machinery below fully supports them.
     fn new(surface: &Surface3) -> CoreResult<Self> {
         match surface {
-            // TEMP local gate lift for of-7ld.5 verification — DO NOT COMMIT
+            // TEMP-GATE-LIFT
             Surface3::Torus { .. } => Err(CoreError::NotImplemented {
                 feature: "boolean parameter chart for tori",
             }),
@@ -1464,7 +1464,7 @@ impl<'a> Pipeline<'a> {
                     continue;
                 };
                 events.push((CurveSource::Imprint { index: ii }, seam_point));
-                if let Some(edge) = self.nearest_edge_of_face(&seam_point, s, f) {
+                if let Some(edge) = self.nearest_edge_of_face_exact(&seam_point, s, f) {
                     events.push((CurveSource::Edge { solid: s, edge }, seam_point));
                 }
             }
@@ -1483,6 +1483,44 @@ impl<'a> Pipeline<'a> {
             for de in lp {
                 let sampled = &self.edge_samples[s][de.edge];
                 let d = polyline_distance(&sampled.points, sampled.closed, p);
+                if best.is_none() || d < best.expect("checked").0 {
+                    best = Some((d, de.edge));
+                }
+            }
+        }
+        let (d, e) = best?;
+        (d <= self.snap * EDGE_MATCH_SNAP).then_some(e)
+    }
+
+    /// Like [`Self::nearest_edge_of_face`], but measured against the
+    /// edges' **exact curves** instead of their sampled polylines. Seam
+    /// crossings are refined onto the exact imprint curve at the seam
+    /// meridian's chart angle ([`refine_seam_point`]), so they sit on the
+    /// seam edge's exact curve to root-find precision — but up to a
+    /// polyline sagitta (`≈ 5.4e-4 * r`, far beyond the acceptance band)
+    /// away from its samples when the seam edge is a circular arc, as on
+    /// a sphere. Cylinder seams are straight, which is the only reason
+    /// the polyline test ever worked for them (of-7ld.5).
+    fn nearest_edge_of_face_exact(&self, p: &Point3, s: SolidTag, f: usize) -> Option<usize> {
+        let mut best: Option<(f64, usize)> = None;
+        for lp in &self.solids[s].faces[f].loops {
+            for de in lp {
+                let edge = &self.solids[s].edges[de.edge];
+                let mut t = edge.curve.project_point(p).t;
+                if let Some(period) = edge.curve.period() {
+                    // Bring the projection into the edge's parameter
+                    // window [t0, t0 + period).
+                    t = edge.t0 + (t - edge.t0).rem_euclid(period);
+                }
+                // Off-range projections fall back to the nearer endpoint
+                // (periodic wraparound makes a plain clamp wrong).
+                let d = if t <= edge.t1 {
+                    (edge.curve.point(t.max(edge.t0)) - p).norm()
+                } else {
+                    (edge.curve.point(edge.t0) - p)
+                        .norm()
+                        .min((edge.curve.point(edge.t1) - p).norm())
+                };
                 if best.is_none() || d < best.expect("checked").0 {
                     best = Some((d, de.edge));
                 }
@@ -2125,16 +2163,21 @@ fn embed_walk(
                 pts.rotate_left(rot);
             }
         }
-        offsets.push(poly.len());
         let last_dart = k + 1 == darts.len();
         let take = if atom.closed || (last_dart && keep_final) {
             pts.len()
         } else {
             pts.len() - 1
         };
-        for p in &pts[..take] {
+        for (j, p) in pts[..take].iter().enumerate() {
             let first = poly.is_empty();
             emb.push(*p, &mut poly);
+            if j == 0 {
+                // The dart's vertex is the point itself — when it leaves a
+                // pole, the departure end of the pole row is emitted just
+                // before it and belongs to the traversal, not the vertex.
+                offsets.push(poly.len() - 1);
+            }
             if first {
                 // Start the walk inside the face's cover window so
                 // intermediate unwrapping stays near it (the final
@@ -2649,6 +2692,21 @@ fn ray_surface_hits(surface: &Surface3, p: &Point3, dir: &Vector3) -> Vec<f64> {
             let sq = disc.sqrt();
             vec![(-b - sq) / (2.0 * a), (-b + sq) / (2.0 * a)]
         }
+        Surface3::Sphere { center, radius, .. } => {
+            // |p + t d - c|² = r².
+            let oc = p - center;
+            let a = dir.norm_squared();
+            let b = 2.0 * oc.dot(dir);
+            let c = oc.norm_squared() - radius * radius;
+            let disc = b * b - 4.0 * a * c;
+            if disc <= 0.0 {
+                return Vec::new();
+            }
+            let sq = disc.sqrt();
+            vec![(-b - sq) / (2.0 * a), (-b + sq) / (2.0 * a)]
+        }
+        // Torus rays need quartic roots — of-7ld.7 territory, and tori are
+        // still behind the Chart::new promotion gate.
         _ => Vec::new(),
     }
 }
@@ -3185,15 +3243,24 @@ fn triangulate_mesh_face(mf: &MeshFace, weld_eps: f64) -> CoreResult<(Vec<Triang
     // never touch the boundary (so cross-face welding is untouched), boundary
     // ring edges are constraints that are never flipped, and the whole
     // construction is deterministic. See `refine_curved_region`.
-    if let Chart::Cylinder { radius, .. } = mf.chart {
-        refine_curved_region(
+    match mf.chart {
+        Chart::Cylinder { radius, .. } => refine_curved_region(
             &mut tris,
             &mut all_uv,
             &mut all_p,
             &mf.chart,
-            radius,
+            (radius, 1.0),
             &ring_ranges,
-        );
+        ),
+        Chart::Sphere { radius, .. } => refine_curved_region(
+            &mut tris,
+            &mut all_uv,
+            &mut all_p,
+            &mf.chart,
+            (radius, radius),
+            &ring_ranges,
+        ),
+        _ => {}
     }
 
     // Emit 3D triangles; flip winding when the outward normal opposes the
@@ -3510,7 +3577,12 @@ fn refine_curved_region(
     all_uv: &mut Vec<(f64, f64)>,
     all_p: &mut Vec<Point3>,
     chart: &Chart,
-    radius: f64,
+    // Arc-length scale of each parameter axis: `(radius, 1)` on a
+    // cylinder (angle × length), `(radius, radius)` on a sphere (two
+    // angles). The `u` scale takes the axis' widest circle; that only
+    // makes margins and column counts conservative where the circle
+    // shrinks (sphere poles).
+    (s_u, s_v): (f64, f64),
     ring_ranges: &[(usize, usize)],
 ) {
     if tris.is_empty() || ring_ranges.is_empty() {
@@ -3546,26 +3618,28 @@ fn refine_curved_region(
     let mut mesh = FlipMesh::from_tris(tris, all_uv);
 
     // Interior lattice of Steiner points, spread strictly inside the region
-    // bounding box. `u` (the curved direction) is spaced at most one sampling
-    // pitch apart so retriangulation can bound every edge's u-span; `v` maps
-    // linearly on a cylinder, so its spacing only shapes triangles and never
-    // affects fidelity — it is spaced at the same arc length, capped so thin
-    // or tall faces stay cheap. At least one interior row and column are laid
-    // whenever the region has area (so even a thin full-wrap band still gets
-    // its wide chords broken up).
-    let s = radius.abs().max(1e-12);
+    // bounding box. `u` (a curved direction on every chart refined here) is
+    // spaced at most one sampling pitch apart so retriangulation can bound
+    // every edge's u-span; `v` is spaced at the same arc length — converted
+    // back to parameter units through its own scale, so a cylinder's length
+    // axis and a sphere's latitude angle both come out at one pitch of arc —
+    // capped so thin or tall faces stay cheap. At least one interior row and
+    // column are laid whenever the region has area (so even a thin full-wrap
+    // band still gets its wide chords broken up).
+    let s_u = s_u.abs().max(1e-12);
+    let s_v = s_v.abs().max(1e-12);
     let n_cols = (((u1 - u0) / pitch).ceil() as usize).max(2) - 1;
     let step_u = (u1 - u0) / (n_cols + 1) as f64;
-    let pitch_v = (s * pitch).max(1e-12);
+    let pitch_v = (s_u * pitch / s_v).max(1e-12);
     let n_rows = (((v1 - v0) / pitch_v).ceil() as usize).clamp(2, 256) - 1;
     let step_v = (v1 - v0) / (n_rows + 1) as f64;
 
     // Keep interior points a quarter-cell clear of the boundary (in the
-    // arc-length metric, `u` scaled by the radius so it is isotropic in 3D):
+    // arc-length metric, each axis scaled so it is isotropic in 3D):
     // enough that they never weld to a boundary vertex and never insert on a
     // boundary edge, while small enough that a thin band keeps its row.
     let margin2 = {
-        let m = 0.25 * (step_u * s).min(step_v);
+        let m = 0.25 * (step_u * s_u).min(step_v * s_v);
         m * m
     };
 
@@ -3576,7 +3650,7 @@ fn refine_curved_region(
                 continue;
             }
             // Clearance from every boundary edge, in arc-length metric.
-            let scaled = |p: (f64, f64)| (p.0 * s, p.1);
+            let scaled = |p: (f64, f64)| (p.0 * s_u, p.1 * s_v);
             let ps = scaled(uv);
             let mut clear = true;
             'rings: for &(start, len) in ring_ranges {
