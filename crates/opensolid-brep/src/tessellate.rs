@@ -15,9 +15,10 @@
 //!   surface is recovered by projecting boundary-edge samples onto the
 //!   surface.
 //!
-//! Per-vertex normals come from [`SurfaceEval::normal`] — outward for the
-//! primitive conventions ([`crate::primitives`]), so consistently wound
-//! loops produce consistently wound triangles.
+//! Per-vertex normals come from [`SurfaceEval::normal`], negated for
+//! [`FaceSense::Negative`] faces so they point outward from the material;
+//! triangle winding follows the same outward direction. Boolean outputs
+//! routinely bind tool-derived faces with Negative sense (of-as6).
 //!
 //! [`tessellate_body`] concatenates the per-face meshes and welds them:
 //! adjacent faces sample their shared edges at identical curve parameters,
@@ -42,7 +43,7 @@ use crate::curve::{Curve3, CurveEval, plane_basis};
 use crate::geometry::GeometryStore;
 use crate::project::SurfaceProject;
 use crate::surface::{Surface3, SurfaceEval};
-use crate::topology::{Body, Face, Fin, Loop, TopologyStore};
+use crate::topology::{Body, Face, FaceSense, Fin, Loop, TopologyStore};
 use opensolid_core::error::{CoreError, CoreResult};
 use opensolid_core::mesh::TriangleMesh;
 use opensolid_core::{EntityId, Point3, Vector3};
@@ -165,25 +166,29 @@ fn tessellate_face_into(
         .surface(surface_id)
         .ok_or_else(|| invalid_face(face_id, "references a stale surface id"))?;
 
+    // A Negative-sense face's outward normal opposes its surface normal
+    // (boolean outputs encode tool-derived faces this way — see
+    // `crate::boolean`): flip emitted normals and winding to stay outward.
+    let flip = face.sense == FaceSense::Negative;
     match surface {
         Surface3::Plane { .. } => {
-            fan_planar_face(store, geo, face_id, face, surface, options, mesh)
+            fan_planar_face(store, geo, face_id, face, surface, flip, options, mesh)
         }
         Surface3::Cylinder { .. } | Surface3::Cone { .. } => {
             let (u_anchor, v_lo, v_hi) = boundary_param_range(store, geo, face_id, face, surface)?;
-            grid_face(surface, u_anchor, v_lo, v_hi, false, 1, options, mesh);
+            grid_face(surface, u_anchor, v_lo, v_hi, false, 1, flip, options, mesh);
             Ok(())
         }
         Surface3::Sphere { .. } => {
             let (v_lo, v_hi) = surface.domain_v();
             let n_v = angular_segments(v_hi - v_lo, options);
-            grid_face(surface, 0.0, v_lo, v_hi, false, n_v, options, mesh);
+            grid_face(surface, 0.0, v_lo, v_hi, false, n_v, flip, options, mesh);
             Ok(())
         }
         Surface3::Torus { .. } => {
             let period = surface.period_v().expect("torus is v-periodic");
             let n_v = angular_segments(period, options);
-            grid_face(surface, 0.0, 0.0, period, true, n_v, options, mesh);
+            grid_face(surface, 0.0, 0.0, period, true, n_v, flip, options, mesh);
             Ok(())
         }
     }
@@ -191,12 +196,14 @@ fn tessellate_face_into(
 
 /// Ear-clip triangulate a planar face's outer loop polygon. Correct for
 /// concave outlines, unlike the old first-vertex fan (of-6dw).
+#[allow(clippy::too_many_arguments)]
 fn fan_planar_face(
     store: &TopologyStore,
     geo: &GeometryStore,
     face_id: EntityId<Face>,
     face: &Face,
     surface: &Surface3,
+    flip: bool,
     options: &TessellationOptions,
     mesh: &mut TriangleMesh,
 ) -> CoreResult<()> {
@@ -216,9 +223,17 @@ fn fan_planar_face(
         ));
     }
 
-    let normal = surface
+    let surface_normal = surface
         .normal(0.0, 0.0)
         .expect("planes have a normal everywhere");
+    // The face's outward normal (of-as6): Negative-sense faces oppose their
+    // surface normal, and their loops wind CCW about *outward* — building
+    // the basis about outward keeps ear_clip's winding outward-facing.
+    let normal = if flip {
+        -surface_normal
+    } else {
+        surface_normal
+    };
     let base = mesh.positions.len();
     for point in &polygon {
         mesh.positions.push(*point);
@@ -346,7 +361,9 @@ fn boundary_param_range(
 /// Tessellate a quadric face over its parameter rectangle:
 /// `u` over the full period starting at `u_anchor` (wrapped by index), `v`
 /// over `[v_lo, v_hi]` with `n_v` segments (wrapped if `wrap_v`). Singular
-/// rows (sphere poles, cone apex) collapse to a single vertex.
+/// rows (sphere poles, cone apex) collapse to a single vertex. `flip`
+/// reverses emitted normals and winding, for Negative-sense faces whose
+/// outward direction opposes the surface normal.
 #[allow(clippy::too_many_arguments)]
 fn grid_face(
     surface: &Surface3,
@@ -355,6 +372,7 @@ fn grid_face(
     v_hi: f64,
     wrap_v: bool,
     n_v: usize,
+    flip: bool,
     options: &TessellationOptions,
     mesh: &mut TriangleMesh,
 ) {
@@ -378,7 +396,8 @@ fn grid_face(
             let u = u_anchor + period * i as f64 / n_u as f64;
             row.push(mesh.positions.len());
             mesh.positions.push(surface.point(u, v));
-            mesh.normals.push(grid_normal(surface, u, v, v_lo, v_hi));
+            let normal = grid_normal(surface, u, v, v_lo, v_hi);
+            mesh.normals.push(if flip { -normal } else { normal });
         }
         rows.push(row);
     }
@@ -390,10 +409,12 @@ fn grid_face(
     for j in 0..n_v {
         for i in 0..n_u {
             // Quad corners in (u, v): a --u--> b, then +v to c/d. Winding
-            // follows du × dv, the outward normal.
+            // follows du × dv, the surface normal — reversed when the
+            // face's outward direction opposes it.
             let (a, b) = (at(j, i), at(j, i + 1));
             let (d, c) = (at(j + 1, i), at(j + 1, i + 1));
-            for tri in [[a, b, c], [a, c, d]] {
+            for [p, q, r] in [[a, b, c], [a, c, d]] {
+                let tri = if flip { [p, r, q] } else { [p, q, r] };
                 if tri[0] != tri[1] && tri[1] != tri[2] && tri[0] != tri[2] {
                     mesh.indices.push(tri);
                 }
@@ -668,6 +689,112 @@ mod tests {
             let [a, b, c] = tri.map(|i| mesh.positions[i]);
             let facing = (b - a).cross(&(c - a));
             assert!(facing.z > 0.0, "triangle winds inward: {facing:?}");
+        }
+    }
+
+    /// of-as6: a subtract's tool-derived faces bind the tool's surfaces
+    /// with `FaceSense::Negative` (outward opposes the surface normal).
+    /// Ignoring the sense wound those caps inward, so the welded mesh
+    /// failed the manifold orientation check on every imprinted edge.
+    #[test]
+    fn boolean_corner_notch_tessellates_closed() {
+        use opensolid_core::Transform3;
+        use opensolid_core::tolerance::ToleranceContext;
+
+        let mut store = TopologyStore::new();
+        let mut geo = GeometryStore::new();
+        let a = primitives::block(&mut store, &mut geo, 2.0, 2.0, 2.0).expect("valid block");
+        let b = primitives::block(&mut store, &mut geo, 2.0, 2.0, 2.0).expect("valid block");
+        crate::transform::transform_body(
+            &mut store,
+            &mut geo,
+            b,
+            &Transform3::translation(1.0, 1.0, 1.0),
+        )
+        .expect("rigid translation");
+        let out = crate::boolean::subtract(&store, &geo, a, b, &ToleranceContext::default())
+            .expect("transversal subtract");
+        assert!(out.check().is_empty(), "boolean result must be valid");
+
+        let mesh = tessellate_body(
+            &out.store,
+            &out.geo,
+            out.body,
+            &TessellationOptions::default(),
+        )
+        .expect("tessellation succeeds");
+        assert!(mesh.is_closed_manifold(), "L-shape mesh must be watertight");
+        assert_eq!(euler_characteristic(&mesh), 2);
+        // Unit corner removed from the 2×2×2 block: volume 8 - 1, area
+        // unchanged at 24 (three notch walls replace the removed corner).
+        assert!((signed_volume(&mesh) - 7.0).abs() < 1e-9);
+        assert!((mesh.total_area() - 24.0).abs() < 1e-9);
+    }
+
+    /// A valid body re-encoded with inward surface normals (negated plane
+    /// normal + Negative sense, as an importer may produce — of-alr) must
+    /// tessellate identically to its all-Positive twin.
+    #[test]
+    fn flipped_encoding_block_tessellates_identically() {
+        let mut store = TopologyStore::new();
+        let mut geo = GeometryStore::new();
+        let body = primitives::block(&mut store, &mut geo, 2.0, 3.0, 4.0).expect("valid block");
+        for face_id in store.faces_of_body(body) {
+            let surface_id = store.face(face_id).unwrap().surface.expect("bound surface");
+            let flipped = match geo.surface(surface_id).expect("live surface") {
+                Surface3::Plane { origin, normal } => {
+                    Surface3::plane(*origin, -*normal).expect("valid plane")
+                }
+                other => panic!("block faces are planes, got {other:?}"),
+            };
+            let new_id = geo.add_surface(flipped);
+            let face = store.faces.get_mut(face_id).expect("live face");
+            face.surface = Some(new_id);
+            face.sense = crate::topology::FaceSense::Negative;
+        }
+
+        let mesh = tessellate_body(&store, &geo, body, &TessellationOptions::default())
+            .expect("tessellation succeeds");
+        assert!(mesh.is_closed_manifold());
+        assert!((signed_volume(&mesh) - 24.0).abs() < 1e-9);
+        for (position, normal) in mesh.positions.iter().zip(&mesh.normals) {
+            assert!(
+                normal.dot(&position.coords) > 0.0,
+                "inward vertex normal at {position:?}"
+            );
+        }
+    }
+
+    /// The quadric grid honors face sense too: flipping a sphere's faces to
+    /// Negative reverses winding and normals wholesale, yielding a still-
+    /// manifold mesh that bounds the same region from the other side.
+    #[test]
+    fn negative_sense_sphere_winds_inward() {
+        let mut store = TopologyStore::new();
+        let mut geo = GeometryStore::new();
+        let body = primitives::sphere(&mut store, &mut geo, 1.0).expect("valid sphere");
+        let outward = tessellate_body(&store, &geo, body, &TessellationOptions::default())
+            .expect("tessellation succeeds");
+        for face_id in store.faces_of_body(body) {
+            store.faces.get_mut(face_id).expect("live face").sense =
+                crate::topology::FaceSense::Negative;
+        }
+        let inward = tessellate_body(&store, &geo, body, &TessellationOptions::default())
+            .expect("tessellation succeeds");
+        assert!(inward.is_closed_manifold(), "flip preserves manifoldness");
+        assert!(
+            (signed_volume(&inward) + signed_volume(&outward)).abs() < 1e-9,
+            "Negative sense reverses the enclosed signed volume"
+        );
+        // On a unit sphere at the origin the exact outward normal is the
+        // position itself; Negative sense must emit the negation. (The two
+        // meshes' vertex orders differ — weld numbers vertices in triangle
+        // order — so compare against the analytic normal, not index-wise.)
+        for (position, normal) in inward.positions.iter().zip(&inward.normals) {
+            assert!(
+                (normal + position.coords).norm() < 1e-9,
+                "normal {normal:?} at {position:?} does not point inward"
+            );
         }
     }
 

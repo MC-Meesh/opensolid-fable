@@ -33,10 +33,13 @@
 //!   crafted file aborts the process.
 //! - of-83h: reader ignores declared length units; metre and millimetre
 //!   files import identical geometry (1000× scale error for one of them).
-//! - of-as6: `tessellate_body` yields non-closed-manifold meshes for simple
-//!   planar boolean outputs (L-shape subtract, cylinder edge notch) whose
-//!   `BooleanOutput::tessellate()` is closed — this is why the volume half
-//!   of the boolean round-trip gate is conditional.
+//! - of-as6 (fixed): `tessellate_body` ignored `FaceSense::Negative`, so
+//!   planar boolean outputs (L-shape subtract) meshed with inward-wound
+//!   tool faces and failed the manifold check even though
+//!   `BooleanOutput::tessellate()` was closed. Trimmed quadric faces
+//!   (cylinder edge notch) still tessellate over the full period — of-2i3
+//!   — which is why the volume half of the round-trip gate stays
+//!   conditional.
 //! - of-kb8: the reader duplicates shared geometry instances (one
 //!   `Curve3`/`Surface3` per referencing edge/face), so `write ∘ read` is
 //!   only byte-identical from the second write onwards when the source
@@ -147,8 +150,8 @@ fn assert_counts_equal(
 }
 
 /// Volume via the standalone store tessellator, only when it produces a
-/// closed manifold (see of-as6 for why it often does not on boolean
-/// outputs).
+/// closed manifold (see of-2i3 for why it does not on boolean outputs
+/// with trimmed quadric faces).
 fn closed_volume(store: &TopologyStore, geo: &GeometryStore, body: EntityId<Body>) -> Option<f64> {
     let mesh = tessellate_body(store, geo, body, &TessellationOptions::default()).ok()?;
     mass_properties(&mesh).ok().map(|mp| mp.volume)
@@ -157,7 +160,7 @@ fn closed_volume(store: &TopologyStore, geo: &GeometryStore, body: EntityId<Body
 /// The full round-trip gate: write → read (exact B-Rep, no error
 /// diagnostics, clean check) → identical Euler counts → write again and
 /// require the byte-identical file (fixed point). Volume is compared when
-/// the tessellator can measure both sides (of-as6 gates the rest).
+/// the tessellator can measure both sides (of-2i3 gates the rest).
 fn assert_round_trip(
     store: &TopologyStore,
     geo: &GeometryStore,
