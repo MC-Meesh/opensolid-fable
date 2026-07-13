@@ -31,7 +31,7 @@
 use crate::curve::{TWO_PI, plane_basis};
 use crate::topology::SYSTEM_RESOLUTION;
 use opensolid_core::error::{CoreError, CoreResult};
-use opensolid_core::types::{Point3, Vector3};
+use opensolid_core::types::{BoundingBox3, Point3, Vector3};
 
 /// Evaluation interface for parametric surfaces.
 pub trait SurfaceEval {
@@ -244,6 +244,38 @@ impl Surface3 {
             major_radius,
             minor_radius,
         })
+    }
+
+    /// Exact axis-aligned bounding box of the full surface, for the
+    /// bounded primitives (sphere, torus); `None` for the unbounded ones
+    /// (plane, cylinder, cone).
+    ///
+    /// The torus box comes from the tube-center circle's box dilated by
+    /// the tube radius: the circle's half-extent along world axis `i` is
+    /// `R·√(1 − axisᵢ²)`, and the Minkowski sum with the radius-`r` tube
+    /// ball adds exactly `r` per axis.
+    pub fn bounding_box(&self) -> Option<BoundingBox3> {
+        match self {
+            Surface3::Sphere { center, radius, .. } => {
+                let r = Vector3::new(*radius, *radius, *radius);
+                Some(BoundingBox3::new(center - r, center + r))
+            }
+            Surface3::Torus {
+                center,
+                axis,
+                major_radius,
+                minor_radius,
+            } => {
+                let circle_half = |a: f64| major_radius * (1.0 - a * a).max(0.0).sqrt();
+                let h = Vector3::new(
+                    circle_half(axis.x) + minor_radius,
+                    circle_half(axis.y) + minor_radius,
+                    circle_half(axis.z) + minor_radius,
+                );
+                Some(BoundingBox3::new(center - h, center + h))
+            }
+            Surface3::Plane { .. } | Surface3::Cylinder { .. } | Surface3::Cone { .. } => None,
+        }
     }
 
     /// The unit axis defining this surface's frame.
@@ -827,5 +859,80 @@ mod tests {
                 "R={major} r={minor}: got {err}"
             );
         }
+    }
+
+    #[test]
+    fn bounding_box_none_for_unbounded_surfaces() {
+        let plane = Surface3::plane(Point3::origin(), Vector3::z()).expect("valid surface");
+        let cyl = Surface3::cylinder(Point3::origin(), Vector3::z(), 1.0).expect("valid surface");
+        let cone =
+            Surface3::cone(Point3::origin(), Vector3::z(), FRAC_PI_4, 1.0).expect("valid surface");
+        assert!(plane.bounding_box().is_none());
+        assert!(cyl.bounding_box().is_none());
+        assert!(cone.bounding_box().is_none());
+    }
+
+    #[test]
+    fn sphere_bounding_box_is_exact() {
+        let s = Surface3::sphere(
+            Point3::new(1.0, -2.0, 3.0),
+            Vector3::new(1.0, 1.0, 0.0),
+            2.5,
+        )
+        .expect("valid surface");
+        let bb = s.bounding_box().expect("sphere is bounded");
+        assert_point_eq(&bb.min, &Point3::new(-1.5, -4.5, 0.5));
+        assert_point_eq(&bb.max, &Point3::new(3.5, 0.5, 5.5));
+    }
+
+    #[test]
+    fn torus_bounding_box_axis_aligned_is_exact() {
+        // Axis = Z: box is ±(R + r) laterally, ±r axially.
+        let t = Surface3::torus(Point3::new(1.0, 2.0, 3.0), Vector3::z(), 3.0, 0.5)
+            .expect("valid surface");
+        let bb = t.bounding_box().expect("torus is bounded");
+        assert_point_eq(&bb.min, &Point3::new(-2.5, -1.5, 2.5));
+        assert_point_eq(&bb.max, &Point3::new(4.5, 5.5, 3.5));
+    }
+
+    /// For a tilted torus the box must contain every surface point (dense
+    /// sample) and be tight: some sample must come within sampling error
+    /// of each of the six box faces.
+    #[test]
+    fn torus_bounding_box_tilted_contains_samples_and_is_tight() {
+        let t = Surface3::torus(
+            Point3::new(-1.0, 0.5, 2.0),
+            Vector3::new(1.0, 2.0, -1.0),
+            2.0,
+            0.7,
+        )
+        .expect("valid surface");
+        let bb = t.bounding_box().expect("torus is bounded");
+        let n = 200;
+        let mut sampled = BoundingBox3::EMPTY;
+        for i in 0..n {
+            for j in 0..n {
+                let u = TWO_PI * i as f64 / n as f64;
+                let v = TWO_PI * j as f64 / n as f64;
+                let p = t.point(u, v);
+                assert!(
+                    p.x >= bb.min.x - EPS
+                        && p.y >= bb.min.y - EPS
+                        && p.z >= bb.min.z - EPS
+                        && p.x <= bb.max.x + EPS
+                        && p.y <= bb.max.y + EPS
+                        && p.z <= bb.max.z + EPS,
+                    "point {p:?} at ({u},{v}) escapes box {bb:?}"
+                );
+                sampled = sampled.union(&BoundingBox3::from_points([p]));
+            }
+        }
+        // Sampling a 200×200 grid reaches within O((2π/200)²·R) of each
+        // extreme; 1e-2 is comfortably above that error and far below r.
+        let slack = 1e-2;
+        assert!(
+            (sampled.min - bb.min).norm() < slack && (sampled.max - bb.max).norm() < slack,
+            "box not tight: exact {bb:?} vs sampled {sampled:?}"
+        );
     }
 }

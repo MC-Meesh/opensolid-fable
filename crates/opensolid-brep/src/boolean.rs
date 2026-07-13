@@ -990,6 +990,32 @@ struct Pipeline<'a> {
     splits: HashMap<CurveSource, Vec<Point3>>,
 }
 
+/// Broad-phase bounding box for one face.
+///
+/// Boundary samples are useless for a closed face: a full sphere's only
+/// boundary is the seam meridian (a half-circle in one plane), so its
+/// sample box is flat along the seam-plane normal and misses shallow
+/// clashes entirely (of-7ld.6). Bounded surfaces (sphere, torus) instead
+/// use their exact surface box — a safe overestimate for partial faces,
+/// since the broad phase only feeds candidates to SSI. `contact` dilates
+/// the box so touching contacts still clash and reach SSI (which rejects
+/// them as tangent, not silently misses them).
+fn broad_phase_face_box(
+    surface: &Surface3,
+    boundary: impl Iterator<Item = Point3>,
+    contact: f64,
+) -> BoundingBox3 {
+    match surface.bounding_box() {
+        Some(exact) => exact.dilate(contact),
+        None => {
+            let bounds = BoundingBox3::from_points(boundary);
+            // Boundary samples underestimate curved interiors; dilate by a
+            // fraction of the face extent to cover the sagitta.
+            bounds.dilate(bounds.extents().norm() * 0.05 + contact)
+        }
+    }
+}
+
 /// Boolean pipeline entry point.
 fn boolean(
     op: BooleanOp,
@@ -1113,12 +1139,13 @@ impl<'a> Pipeline<'a> {
     fn face_boxes(&self, s: SolidTag) -> Vec<BoundingBox3> {
         self.face_polys[s]
             .iter()
-            .map(|fp| {
-                let bounds = BoundingBox3::from_points(fp.loops.iter().flatten().map(|&(_, p)| p));
-                // Dilate: boundary samples underestimate curved interiors,
-                // and touching contacts must still clash so they reach SSI
-                // (which rejects them as tangent, not silently misses them).
-                bounds.dilate(bounds.extents().norm() * 0.05 + self.tol.linear + self.snap)
+            .zip(&self.solids[s].faces)
+            .map(|(fp, face)| {
+                broad_phase_face_box(
+                    &face.surface,
+                    fp.loops.iter().flatten().map(|&(_, p)| p),
+                    self.tol.linear + self.snap,
+                )
             })
             .collect()
     }
@@ -3516,6 +3543,7 @@ mod tests {
     use super::*;
     use crate::check::MAX_ALLOWED_TOLERANCE;
     use crate::primitives;
+    use crate::surface::SurfaceEval;
     use crate::transform::{rotate_body, translate_body};
 
     fn tol() -> ToleranceContext {
@@ -3579,6 +3607,92 @@ mod tests {
         // ...while the chart machinery can still build both.
         assert!(matches!(Chart::build(&sphere), Ok(Chart::Sphere { .. })));
         assert!(matches!(Chart::build(&torus), Ok(Chart::Torus { .. })));
+    }
+
+    // -----------------------------------------------------------------
+    // Broad-phase face boxes (of-7ld.6)
+    // -----------------------------------------------------------------
+
+    /// Seam meridian of a unit-ish sphere about +Z: the half-circle in the
+    /// xz-plane, the ONLY boundary loop a closed sphere face has.
+    fn seam_meridian(center: Point3, radius: f64) -> Vec<Point3> {
+        (0..=32)
+            .map(|i| {
+                let v = -FRAC_PI_2 + PI * i as f64 / 32.0;
+                center + Vector3::new(v.cos(), 0.0, v.sin()) * radius
+            })
+            .collect()
+    }
+
+    /// Regression for of-7ld.6: two unit spheres 2−1e-3 apart (razor-thin
+    /// lens). Boxes built from seam-only boundary samples are flat along
+    /// the seam-plane normal and miss the clash; the exact surface boxes
+    /// must overlap so the pair reaches SSI.
+    #[test]
+    fn broad_phase_sphere_boxes_clash_on_near_tangent_pair() {
+        let d = 2.0 - 1e-3;
+        let centers = [Point3::origin(), Point3::new(d, 0.0, 0.0)];
+        let contact = tol().linear;
+
+        // The failure mode being fixed: seam-sample boxes do not overlap.
+        let seam_boxes = centers.map(|c| {
+            let bb = BoundingBox3::from_points(seam_meridian(c, 1.0));
+            bb.dilate(bb.extents().norm() * 0.05 + contact)
+        });
+        assert!(
+            seam_boxes[0].intersection(&seam_boxes[1]).is_empty(),
+            "seam-only boxes unexpectedly clash — scenario no longer exercises the bug"
+        );
+
+        // The fix: exact surface boxes clash.
+        let face_boxes = centers.map(|c| {
+            let surface = Surface3::sphere(c, Vector3::z(), 1.0).unwrap();
+            broad_phase_face_box(&surface, seam_meridian(c, 1.0).into_iter(), contact)
+        });
+        assert!(
+            !face_boxes[0].intersection(&face_boxes[1]).is_empty(),
+            "near-tangent sphere pair produced no clash candidate: {face_boxes:?}"
+        );
+    }
+
+    /// Bounded surfaces take the exact surface box (contact-dilated) even
+    /// when boundary samples cover a tiny sliver of the surface.
+    #[test]
+    fn broad_phase_torus_box_is_exact_surface_box() {
+        let surface =
+            Surface3::torus(Point3::new(1.0, -2.0, 0.5), tilted_axis(), 3.0, 0.5).unwrap();
+        let contact = 1e-4;
+        // Boundary: a single tube meridian, hopelessly unrepresentative.
+        let boundary: Vec<Point3> = (0..=16)
+            .map(|i| surface.point(0.0, TWO_PI * i as f64 / 16.0))
+            .collect();
+        let bb = broad_phase_face_box(&surface, boundary.into_iter(), contact);
+        let exact = surface.bounding_box().unwrap().dilate(contact);
+        assert!(
+            (bb.min - exact.min).norm() < 1e-12 && (bb.max - exact.max).norm() < 1e-12,
+            "expected exact surface box {exact:?}, got {bb:?}"
+        );
+    }
+
+    /// Unbounded surfaces keep the boundary-sample box with sagitta + contact
+    /// dilation.
+    #[test]
+    fn broad_phase_plane_box_falls_back_to_boundary_samples() {
+        let surface = Surface3::plane(Point3::origin(), Vector3::z()).unwrap();
+        let corners = [
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(2.0, 0.0, 0.0),
+            Point3::new(2.0, 1.0, 0.0),
+            Point3::new(0.0, 1.0, 0.0),
+        ];
+        let contact = 1e-3;
+        let bb = broad_phase_face_box(&surface, corners.into_iter(), contact);
+        let raw = BoundingBox3::from_points(corners);
+        let expected = raw.dilate(raw.extents().norm() * 0.05 + contact);
+        assert!(
+            (bb.min - expected.min).norm() < 1e-12 && (bb.max - expected.max).norm() < 1e-12,
+            "expected sample box {expected:?}, got {bb:?}"
+        );
     }
 
     #[test]

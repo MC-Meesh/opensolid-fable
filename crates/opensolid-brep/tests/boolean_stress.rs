@@ -1686,7 +1686,7 @@ fn random_sphere_pairs_identity() {
 /// far above linear tolerance), so it must produce a valid solid; the
 /// volume check is a loose window because slivers tessellate coarsely.
 #[test]
-#[ignore = "of-7ld.4 gate; lifted, of-7ld.6 broad-phase miss; then needs of-7ld.2 sphere-sphere SSI"]
+#[ignore = "of-7ld.4 gate; lifted (of-7ld.6 broad-phase fixed), needs of-7ld.2 sphere-sphere SSI"]
 fn sphere_pair_near_tangent_lens() {
     for eps in [1e-3, 1e-4] {
         let context = format!("near-tangent sphere pair, overlap {eps:.0e}");
