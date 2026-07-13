@@ -433,32 +433,10 @@ enum Chart {
 }
 
 impl Chart {
-    /// Chart for a surface **as used by the boolean pipeline**. Sphere,
-    /// torus, and cone are rejected with [`CoreError::NotImplemented`] so
-    /// those surfaces route through the F-Rep fallback until their exact
-    /// stress suite is green (the of-7ld promotion policy) — even though
-    /// [`Chart::build`] can construct sphere and torus charts, and the
-    /// chart machinery below fully supports them.
-    fn new(surface: &Surface3) -> CoreResult<Self> {
-        match surface {
-            Surface3::Sphere { .. } => Err(CoreError::NotImplemented {
-                feature: "boolean parameter chart for spheres",
-            }),
-            Surface3::Torus { .. } => Err(CoreError::NotImplemented {
-                feature: "boolean parameter chart for tori",
-            }),
-            Surface3::Cone { .. } => Err(CoreError::NotImplemented {
-                feature: "boolean parameter chart for cones",
-            }),
-            _ => Self::build(surface),
-        }
-    }
-
     /// Build the parameter chart for any analytic surface OpenSolid can
-    /// invert (every variant except the cone). Unlike [`Chart::new`] this
-    /// does not apply the promotion gate; it exists so the chart machinery
-    /// and its unit tests can exercise sphere and torus charts before those
-    /// surfaces are wired into the pipeline.
+    /// invert. Spheres and tori are admitted (the of-7ld promotion);
+    /// cones are rejected with [`CoreError::NotImplemented`] so they
+    /// route through the F-Rep fallback.
     fn build(surface: &Surface3) -> CoreResult<Self> {
         match surface {
             Surface3::Plane { origin, normal } => {
@@ -1179,7 +1157,7 @@ impl<'a> Pipeline<'a> {
         let mut face_polys: [Vec<FaceRegionPoly>; 2] = [Vec::new(), Vec::new()];
         for s in 0..2 {
             for face in &solids[s].faces {
-                let chart = Chart::new(&face.surface)?;
+                let chart = Chart::build(&face.surface)?;
                 let mut loops = Vec::new();
                 for lp in &face.loops {
                     let mut pts3: Vec<Point3> = Vec::new();
@@ -3976,21 +3954,18 @@ mod tests {
     }
 
     #[test]
-    fn chart_new_gates_sphere_and_torus_but_build_constructs_them() {
-        // The pipeline entry stays behind the of-7ld promotion policy...
+    fn chart_build_admits_sphere_and_torus_but_rejects_cone() {
+        // Spheres and tori are in the boolean pipeline (of-7ld.4
+        // promotion); cones still route through the F-Rep fallback.
         let sphere = Surface3::sphere(Point3::origin(), Vector3::z(), 2.0).unwrap();
         let torus = Surface3::torus(Point3::origin(), Vector3::z(), 3.0, 1.0).unwrap();
-        assert!(matches!(
-            Chart::new(&sphere),
-            Err(CoreError::NotImplemented { .. })
-        ));
-        assert!(matches!(
-            Chart::new(&torus),
-            Err(CoreError::NotImplemented { .. })
-        ));
-        // ...while the chart machinery can still build both.
+        let cone = Surface3::cone(Point3::origin(), Vector3::z(), 0.5, 1.0).unwrap();
         assert!(matches!(Chart::build(&sphere), Ok(Chart::Sphere { .. })));
         assert!(matches!(Chart::build(&torus), Ok(Chart::Torus { .. })));
+        assert!(matches!(
+            Chart::build(&cone),
+            Err(CoreError::NotImplemented { .. })
+        ));
     }
 
     // -----------------------------------------------------------------

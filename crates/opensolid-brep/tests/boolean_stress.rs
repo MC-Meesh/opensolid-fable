@@ -67,13 +67,13 @@
 //! - results are invariant under rigid rotation of both operands.
 //!
 //! Sections (6)-(8) are the sphere/torus campaign (of-7ld.3), written
-//! BEFORE those surfaces are enabled in the exact pipeline (the of-7ld
-//! promotion policy). Every test there starts `#[ignore]`d: `Chart::new`
-//! still rejects `Surface3::Sphere`/`Torus` (of-7ld.4 lifts that gate),
-//! and several cases additionally need the of-7ld.2 SSI extension
-//! (sphere-sphere, cylinder-sphere, torus-torus, general plane-torus).
-//! This suite going green is the promotion gate for sphere/torus in
-//! `boolean()`. Run with `cargo test --test boolean_stress -- --ignored`.
+//! BEFORE those surfaces were enabled in the exact pipeline (the of-7ld
+//! promotion policy). Every test there started `#[ignore]`d while
+//! `Chart::new` rejected `Surface3::Sphere`/`Torus`; of-7ld.4 lifted
+//! that gate after the of-7ld.5/6/7 fixes, and the tests that pass are
+//! now live. The still-`#[ignore]`d remainder name their open blockers
+//! (of-43n, of-rb4, of-yet, of-2ql). Run those with
+//! `cargo test --test boolean_stress -- --ignored`.
 //!
 //! Bugs filed from the campaign's first run (2026-07-12, `Chart::new`
 //! gate lifted locally):
@@ -118,6 +118,13 @@
 //! torus-torus lenses, and the slab∪torus MeshSdf round trip pass
 //! end-to-end. Still open: wiring marched SSI (oblique plane-torus,
 //! non-coaxial torus-torus) into boolean(), of-43n, and of-rb4.
+//!
+//! Update (of-7ld.4 promotion): `Chart::new` admits spheres and tori —
+//! sphere/torus booleans in supported configurations now take the exact
+//! B-Rep path end-to-end (the hybrid kernel still diverts any exact-path
+//! shortfall to the F-Rep fallback). 42 of the 55 tests here run live;
+//! the 13 still `#[ignore]`d fail on of-43n (5), of-rb4 (2), of-yet
+//! (marched SSI wiring, 5), and of-2ql (napkin-ring volume accuracy, 1).
 
 use nalgebra::{Rotation3, Unit};
 use opensolid_brep::boolean::{intersect, subtract, unite};
@@ -1268,19 +1275,16 @@ fn sphere_cap_bite(scale: f64) {
 }
 
 #[test]
-#[ignore = "of-7ld.4 gate: passes with the chart gate lifted (of-7ld.5 fixed) — un-ignore at promotion"]
 fn sphere_cap_bite_scale_1() {
     sphere_cap_bite(1.0);
 }
 
 #[test]
-#[ignore = "of-7ld.4 gate: passes with the chart gate lifted (of-7ld.5 fixed) — un-ignore at promotion"]
 fn sphere_cap_bite_scale_0_001() {
     sphere_cap_bite(0.001);
 }
 
 #[test]
-#[ignore = "of-7ld.4 gate: passes with the chart gate lifted (of-7ld.5 fixed) — un-ignore at promotion"]
 fn sphere_cap_bite_scale_1000() {
     sphere_cap_bite(1000.0);
 }
@@ -1291,7 +1295,6 @@ fn sphere_cap_bite_scale_1000() {
 /// full-wrap cylinder band), and the difference is a genus-1 through
 /// hole with lens-shaped mouths.
 #[test]
-#[ignore = "of-7ld.4 gate: passes with the chart gate lifted (of-7ld.5 fixed) — un-ignore at promotion"]
 fn sphere_band_through_slab() {
     let context = "sphere through 2-thick slab (band + lens through-hole)";
     let r = 1.5;
@@ -1338,7 +1341,7 @@ fn spherical_band_volume_r15() -> f64 {
 /// meeting in pairwise junctions — an imprint NETWORK, not a single
 /// chain — and the octant contains the sphere's south pole.
 #[test]
-#[ignore = "of-7ld.4 gate; lifted, fails on of-rb4: imprints through pole vertices"]
+#[ignore = "of-rb4: imprints through pole vertices break region topology"]
 fn sphere_octant_on_block_corner() {
     let context = "sphere centered on block corner (octant intersection)";
     let r = 0.8;
@@ -1385,7 +1388,7 @@ fn sphere_octant_on_block_corner() {
 /// seam edge — an imprint threaded through existing topology at the
 /// exact points where longitude is undefined.
 #[test]
-#[ignore = "of-7ld.4 gate; lifted, fails on of-rb4: imprints through pole vertices"]
+#[ignore = "of-rb4: imprints through pole vertices break region topology"]
 fn hemisphere_imprint_through_poles() {
     let context = "half-space block ∩ sphere: meridian imprint through both poles";
     let r = 1.0;
@@ -1404,7 +1407,7 @@ fn hemisphere_imprint_through_poles() {
 /// seam meridian (u = 0) twice, so the trimmed regions must share the
 /// seam edge correctly.
 #[test]
-#[ignore = "of-7ld.4 gate; lifted, fails on of-43n: seam-crossing ring never split (winding 0)"]
+#[ignore = "of-43n: seam-crossing ring never split (winding 0)"]
 fn sphere_side_cap_crosses_seam() {
     let context = "block bites +X cap: imprint crosses the seam meridian";
     let (r, h) = (1.0, 0.7);
@@ -1439,7 +1442,7 @@ fn sphere_side_cap_crosses_seam() {
 /// while the imprint circle sweeps across the seam and poles at generic
 /// angles.
 #[test]
-#[ignore = "of-7ld.4 gate; lifted, fails on of-43n: non-monotonic imprint crosses the seam level more than once"]
+#[ignore = "of-43n: non-monotonic imprint crosses the seam level more than once"]
 fn rotated_block_cap_bite_volume_invariance() {
     let mut rng = Rng::new(0x5F3E_7E11);
     let (r, h) = (1.0, 0.6);
@@ -1471,7 +1474,7 @@ fn rotated_block_cap_bite_volume_invariance() {
 /// intersection has the exact cap closed form, and the three-way volume
 /// identities must hold.
 #[test]
-#[ignore = "of-7ld.4 gate; lifted, fails on of-43n: imprint ring crosses the seam level without a clean single wrap"]
+#[ignore = "of-43n: imprint ring crosses the seam level without a clean single wrap"]
 fn random_sphere_face_caps_identity() {
     let mut rng = Rng::new(0x0F1_CA9);
     for case in 0..8 {
@@ -1534,7 +1537,6 @@ fn random_sphere_face_caps_identity() {
 /// [`Scene::sphere_with_axis`], the block rotated in place. Both frames
 /// must reproduce the closed form.
 #[test]
-#[ignore = "of-7ld.4 gate: passes with the chart gate lifted (of-7ld.5 fixed) — un-ignore at promotion"]
 fn rotated_frame_sphere_cap_congruence() {
     let (r, h) = (1.0, 0.6);
     let sphere_center = Point3::new(3.0, 3.0, 2.0 + (r - h));
@@ -1565,7 +1567,7 @@ fn rotated_frame_sphere_cap_congruence() {
 /// classic napkin ring, volume (4π/3)(r² − a²)^{3/2} independent of the
 /// imprint details, genus 1.
 #[test]
-#[ignore = "of-7ld.4 gate: passes with the chart gate lifted (of-7ld.5 fixed) — un-ignore at promotion"]
+#[ignore = "of-2ql: valid genus-1 solid but volume off 1.1e-2 relative (allowed 5e-3)"]
 fn napkin_ring_coaxial_cylinder_drills_sphere() {
     let context = "sphere minus coaxial through-cylinder (napkin ring)";
     let (r, a) = (1.0, 0.5);
@@ -1587,7 +1589,7 @@ fn napkin_ring_coaxial_cylinder_drills_sphere() {
 /// no elementary closed form, so assert validity, genus, and the volume
 /// identities among the three boolean results.
 #[test]
-#[ignore = "of-7ld.4 gate; lifted, needs marched cylinder-sphere SSI wired into the boolean pipeline (of-7ld.2 follow-up)"]
+#[ignore = "of-yet: marched cylinder-sphere SSI not wired into boolean()"]
 fn offset_cylinder_drills_sphere_identity() {
     let context = "sphere minus offset through-cylinder";
     let (r, a, off) = (1.0, 0.4, 0.45);
@@ -1617,7 +1619,7 @@ fn offset_cylinder_drills_sphere_identity() {
 /// form (two caps against the radical plane), checked together with the
 /// inclusion–exclusion identity for equal and unequal radii.
 #[test]
-#[ignore = "of-7ld.4 gate; lifted, fails on of-43n: lens circle crosses both seams without wrapping"]
+#[ignore = "of-43n: lens circle crosses both seams without wrapping"]
 fn sphere_pair_lens_identities() {
     for (r1, r2, d) in [(1.0, 1.0, 1.2), (1.0, 0.6, 0.9), (0.8, 0.8, 1.4)] {
         let context = format!("sphere pair r1={r1} r2={r2} d={d}");
@@ -1663,7 +1665,7 @@ fn sphere_pair_lens_identities() {
 /// direction, separation strictly between the internal and external
 /// tangency distances with margin. Lens closed form + identities.
 #[test]
-#[ignore = "of-7ld.4 gate; lifted, fails on of-43n: imprint ring crosses the seam level without a clean single wrap"]
+#[ignore = "of-43n: imprint ring crosses the seam level without a clean single wrap"]
 fn random_sphere_pairs_identity() {
     let mut rng = Rng::new(0x2_5EED_BA11);
     for case in 0..8 {
@@ -1710,7 +1712,6 @@ fn random_sphere_pairs_identity() {
 /// far above linear tolerance), so it must produce a valid solid; the
 /// volume check is a loose window because slivers tessellate coarsely.
 #[test]
-#[ignore = "of-7ld.4 gate; lifted, fails on of-43n: imprint ring crosses the seam level without a clean single wrap"]
 fn sphere_pair_near_tangent_lens() {
     for eps in [1e-3, 1e-4] {
         let context = format!("near-tangent sphere pair, overlap {eps:.0e}");
@@ -1736,7 +1737,6 @@ fn sphere_pair_near_tangent_lens() {
 /// NotImplemented/Degenerate rejection is acceptable under the
 /// transversal MVP contract; a panic or an invalid "success" is a bug.
 #[test]
-#[ignore = "of-7ld.4: passes with the chart gate lifted — un-ignore at promotion"]
 fn sphere_pair_sub_tolerance_tangency() {
     let context = "sphere pair 1e-7 inside external tangency";
     let d = 2.0 - 1e-7;
@@ -1814,19 +1814,16 @@ fn torus_sunk_in_slab(scale: f64) {
 }
 
 #[test]
-#[ignore = "of-7ld.4 gate; passes with the gate lifted (of-7ld.7 fixed) — un-ignore at promotion"]
 fn torus_sunk_in_slab_scale_1() {
     torus_sunk_in_slab(1.0);
 }
 
 #[test]
-#[ignore = "of-7ld.4 gate; passes with the gate lifted (of-7ld.7 fixed) — un-ignore at promotion"]
 fn torus_sunk_in_slab_scale_0_001() {
     torus_sunk_in_slab(0.001);
 }
 
 #[test]
-#[ignore = "of-7ld.4 gate; passes with the gate lifted (of-7ld.7 fixed) — un-ignore at promotion"]
 fn torus_sunk_in_slab_scale_1000() {
     torus_sunk_in_slab(1000.0);
 }
@@ -1836,7 +1833,6 @@ fn torus_sunk_in_slab_scale_1000() {
 /// each crossing the major seam edge transversally. The union grows a
 /// half-ring arch on the block — a genuine handle, genus 1.
 #[test]
-#[ignore = "of-7ld.4 gate; passes with the gate lifted (of-7ld.7 fixed) — un-ignore at promotion"]
 fn half_torus_by_axis_plane() {
     let context = "torus halved by the axis-containing plane x = 0";
     let (major, minor) = (2.0, 0.5);
@@ -1884,9 +1880,9 @@ fn half_torus_by_axis_plane() {
 /// the rotated axis, exactly as the boolean chart will). Both frames
 /// must reproduce the closed form.
 #[test]
-#[ignore = "of-7ld.4 gate; unrotated frame passes (of-7ld.7 fixed); rotated frame needs
-            marched plane-torus SSI wired into boolean() — the rotated slab's oblique side
-            planes broad-phase-clash with the torus"]
+#[ignore = "of-yet: marched plane-torus SSI not wired into boolean() — the
+            rotated slab's oblique side planes broad-phase-clash with the torus; the
+            unrotated frame passes"]
 fn rotated_frame_torus_sunk_congruence() {
     let (major, minor, drop) = (2.0, 0.5, 0.2);
     let torus_center = Point3::new(0.0, 0.0, -drop);
@@ -1919,7 +1915,7 @@ fn rotated_frame_torus_sunk_congruence() {
 /// The block's side faces are off-axis planes parallel to the torus
 /// axis, whose torus sections are general quartics (marched SSI).
 #[test]
-#[ignore = "of-7ld.4 gate; needs marched plane-torus SSI wired into boolean() (of-7ld.7 itself is fixed)"]
+#[ignore = "of-yet: marched plane-torus SSI not wired into boolean()"]
 fn block_severs_torus_tube() {
     let context = "block notch severing the torus tube";
     let (major, minor) = (2.0, 0.5);
@@ -1949,7 +1945,7 @@ fn block_severs_torus_tube() {
 /// inner half): the ring survives, genus stays 1. The bite is centered
 /// on the +X outer equator, crossing BOTH torus seams.
 #[test]
-#[ignore = "of-7ld.4 gate; needs marched plane-torus SSI wired into boolean() (of-7ld.7 itself is fixed)"]
+#[ignore = "of-yet: marched plane-torus SSI not wired into boolean()"]
 fn block_notches_torus_outer_wall() {
     let context = "block notch in the torus outer wall across both seams";
     let (major, minor) = (2.0, 0.5);
@@ -1980,7 +1976,6 @@ fn block_notches_torus_outer_wall() {
 /// intersection is the revolved circle-circle lens (Pappus about the
 /// common centroid radius R) — an exact closed form — and a full ring.
 #[test]
-#[ignore = "of-7ld.4 gate; passes with the gate lifted (of-7ld.7 fixed) — un-ignore at promotion"]
 fn coaxial_tori_axial_shift_lens() {
     let context = "coaxial tori shifted 0.6 along the axis";
     let (major, minor, shift) = (2.0, 0.5, 0.6);
@@ -2015,7 +2010,6 @@ fn coaxial_tori_axial_shift_lens() {
 /// the cross-sections are equal circles offset radially, so Pappus about
 /// the lens centroid radius (R1 + R2)/2 gives the exact intersection.
 #[test]
-#[ignore = "of-7ld.4 gate; passes with the gate lifted (of-7ld.7 fixed) — un-ignore at promotion"]
 fn coplanar_tori_major_shift_lens() {
     let context = "coplanar tori, major radii 2.0 and 2.6";
     let (r1, r2, minor) = (2.0, 2.6, 0.5);
@@ -2047,7 +2041,7 @@ fn coplanar_tori_major_shift_lens() {
 /// genuinely doubly-curved transversal contact with no closed form —
 /// assert validity and the pairwise volume identity.
 #[test]
-#[ignore = "of-7ld.4 gate; needs marched non-coaxial torus-torus SSI wired into boolean()"]
+#[ignore = "of-yet: marched torus-torus SSI not wired into boolean()"]
 fn perpendicular_tori_identity() {
     let context = "perpendicular tori, tube-around-tube overlap";
     let mut scene = Scene::new();
@@ -2078,7 +2072,6 @@ fn perpendicular_tori_identity() {
 /// without crossing. Structured rejection is acceptable; a panic or an
 /// invalid success is a bug.
 #[test]
-#[ignore = "of-7ld.4: passes with the chart gate lifted — un-ignore at promotion"]
 fn perpendicular_tori_channel_tangency() {
     let context = "perpendicular tori tangent along the channel curve";
     let mut scene = Scene::new();
@@ -2108,7 +2101,6 @@ fn perpendicular_tori_channel_tangency() {
 /// succeed; slivers tessellate coarsely, so the volume check is a
 /// window, and validity is the real assertion.
 #[test]
-#[ignore = "of-7ld.4 gate: passes with the chart gate lifted (of-7ld.5 fixed) — un-ignore at promotion"]
 fn plane_grazes_sphere_tiny_caps() {
     for h in [1e-3, 1e-4] {
         let context = format!("sphere dips {h:.0e} into the slab top");
@@ -2134,7 +2126,6 @@ fn plane_grazes_sphere_tiny_caps() {
 /// sub-tolerance contact. Structured rejection or a valid, untouched
 /// result are both acceptable; a panic or invalid success is a bug.
 #[test]
-#[ignore = "of-7ld.4: passes with the chart gate lifted — un-ignore at promotion"]
 fn plane_grazes_sphere_sub_tolerance() {
     let context = "sphere dips 1e-7 into the slab top";
     let r = 1.0;
@@ -2154,7 +2145,6 @@ fn plane_grazes_sphere_sub_tolerance() {
 /// Boolean output → tessellate → MeshSdf → dual-contour re-mesh volume
 /// agreement, for a sphere cap subtraction.
 #[test]
-#[ignore = "of-7ld.4 gate: passes with the chart gate lifted (of-7ld.5 fixed) — un-ignore at promotion"]
 fn round_trip_slab_minus_sphere_cap() {
     let mut scene = Scene::new();
     let slab = scene.block([0.0, 0.0, 0.0], [4.0, 4.0, 2.0]);
@@ -2165,7 +2155,6 @@ fn round_trip_slab_minus_sphere_cap() {
 
 /// The same SDF round-trip for a slab ∪ sunk torus (curved ridge ring).
 #[test]
-#[ignore = "of-7ld.4 gate; passes with the gate lifted (of-7ld.7 fixed) — un-ignore at promotion"]
 fn round_trip_slab_union_torus() {
     let mut scene = Scene::new();
     let slab = scene.block([-4.0, -4.0, -4.0], [4.0, 4.0, 0.0]);
@@ -2177,7 +2166,6 @@ fn round_trip_slab_union_torus() {
 /// Tangential sphere/torus contacts must never panic: every outcome is
 /// either a fully valid solid or a structured error.
 #[test]
-#[ignore = "of-7ld.4: passes with the chart gate lifted — un-ignore at promotion"]
 fn no_panics_on_sphere_torus_tangencies() {
     let mut scene = Scene::new();
     let ball = scene.sphere(Point3::origin(), 1.0);
