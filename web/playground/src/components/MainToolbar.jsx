@@ -1,5 +1,9 @@
 // Main viewport toolbar, grouped by workflow like the SolidWorks CommandManager:
-// Sketch | Features | View. Disabled buttons keep a tooltip explaining why.
+// Sketch | Features | View | Export, plus an overflow menu for the rarely
+// touched meshing settings. Disabled buttons keep a tooltip explaining why.
+// One row, no wrapping: view buttons are icon-only (tooltips carry the names)
+// so the whole strip fits beside the side panel at 1280px-wide windows.
+import MeshSettings from './MeshSettings.jsx';
 
 const ICON = {
   viewBox: '0 0 16 16',
@@ -69,9 +73,28 @@ const Icons = {
       <path d="M5 13 L8 7.5 L11 13 M6.5 5.2 L8 7.5 L9.5 5.2" />
     </svg>
   ),
+  stl: (
+    <svg {...ICON}>
+      <path d="M8 2 v7.5 M5.2 6.8 L8 9.5 L10.8 6.8" />
+      <path d="M2.5 12.5 h11" />
+    </svg>
+  ),
+  step: (
+    <svg {...ICON}>
+      <path d="M2.5 5 L8 2.2 L13.5 5 V11 L8 13.8 L2.5 11 Z" />
+      <path d="M2.5 5 L8 7.8 L13.5 5 M8 7.8 V13.8" />
+    </svg>
+  ),
+  menu: (
+    <svg {...ICON}>
+      <circle cx="3" cy="8" r="1" fill="currentColor" />
+      <circle cx="8" cy="8" r="1" fill="currentColor" />
+      <circle cx="13" cy="8" r="1" fill="currentColor" />
+    </svg>
+  ),
 };
 
-function ToolButton({ icon, label, title, disabledReason, active, disabled, onClick }) {
+function ToolButton({ icon, label, title, disabledReason, active, disabled, compact, onClick }) {
   return (
     <span className="tool-wrap" title={disabled ? disabledReason : title}>
       <button
@@ -79,10 +102,11 @@ function ToolButton({ icon, label, title, disabledReason, active, disabled, onCl
         className={`main-tool${active ? ' active' : ''}`}
         disabled={disabled}
         aria-pressed={active}
+        aria-label={label}
         onClick={onClick}
       >
         {Icons[icon]}
-        <span className="tool-label">{label}</span>
+        {!compact && <span className="tool-label">{label}</span>}
       </button>
     </span>
   );
@@ -100,6 +124,10 @@ export default function MainToolbar({
   onFit,
   wireframe,
   onWireframeChange,
+  onDownloadStl,
+  onDownloadStep,
+  exactBooleans,
+  onExactBooleansChange,
 }) {
   const notReady = 'Still loading the WASM kernel';
   return (
@@ -157,6 +185,7 @@ export default function MainToolbar({
           title="Front view (1)"
           disabledReason={notReady}
           disabled={disabled}
+          compact
           onClick={() => onView('front')}
         />
         <ToolButton
@@ -165,6 +194,7 @@ export default function MainToolbar({
           title="Top view (5)"
           disabledReason={notReady}
           disabled={disabled}
+          compact
           onClick={() => onView('top')}
         />
         <ToolButton
@@ -173,6 +203,7 @@ export default function MainToolbar({
           title="Right view (4)"
           disabledReason={notReady}
           disabled={disabled}
+          compact
           onClick={() => onView('right')}
         />
         <ToolButton
@@ -181,6 +212,7 @@ export default function MainToolbar({
           title="Isometric view (7)"
           disabledReason={notReady}
           disabled={disabled}
+          compact
           onClick={() => onView('iso')}
         />
         <ToolButton
@@ -190,9 +222,48 @@ export default function MainToolbar({
           disabledReason={notReady}
           active={wireframe}
           disabled={disabled}
+          compact
           onClick={() => onWireframeChange(!wireframe)}
         />
       </div>
+      <div className="tool-sep" />
+      <div className="tool-group" aria-label="Export">
+        <span className="tool-group-label">Export</span>
+        <ToolButton
+          icon="stl"
+          label="STL"
+          title="Download the displayed mesh as binary STL"
+          disabledReason={notReady}
+          disabled={disabled}
+          onClick={onDownloadStl}
+        />
+        <ToolButton
+          icon="step"
+          label="STEP"
+          title="Export STEP (AP203). Exact B-Rep models export analytic surfaces; organic shapes export as faceted geometry."
+          disabledReason={notReady}
+          disabled={disabled}
+          onClick={onDownloadStep}
+        />
+      </div>
+      {/* Rare, set-and-forget controls live behind an overflow menu so the
+          strip stays one row. <details> keeps it stateless and SSR-safe. */}
+      <details className="tool-menu">
+        <summary
+          className="main-tool"
+          title="Meshing settings (exact booleans)"
+          aria-label="Meshing settings"
+        >
+          {Icons.menu}
+        </summary>
+        <div className="tool-menu-panel">
+          <MeshSettings
+            exactBooleans={exactBooleans}
+            onExactBooleansChange={onExactBooleansChange}
+            disabled={disabled}
+          />
+        </div>
+      </details>
     </div>
   );
 }

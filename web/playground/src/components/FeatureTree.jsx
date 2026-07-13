@@ -162,7 +162,11 @@ function FeatureRow({
  * parameters in the property panel.
  *
  * Purely presentational — every action is delegated to App, which owns the
- * script/tree source of truth. Collapsible to a thin strip.
+ * script/tree source of truth.
+ *
+ * `embedded` drops the panel's own header/collapse chrome: the sidebar's
+ * Tree tab already names and shows/hides it. The standalone (dockable)
+ * rendering keeps the header and can collapse to a thin strip.
  */
 export default function FeatureTree({
   features,
@@ -170,6 +174,7 @@ export default function FeatureTree({
   hiddenKeys,
   suppressedKeys,
   collapsed,
+  embedded = false,
   disabled,
   onToggleCollapse,
   onSelect,
@@ -180,7 +185,7 @@ export default function FeatureTree({
 }) {
   const [closedKeys, setClosedKeys] = useState(() => new Set());
 
-  if (collapsed) {
+  if (collapsed && !embedded) {
     return (
       <div className="feature-tree collapsed">
         <button
@@ -210,17 +215,19 @@ export default function FeatureTree({
   }
 
   return (
-    <div className="feature-tree">
-      <div className="feature-tree-header">
-        <span>Features</span>
-        <button
-          className="feature-collapse"
-          title="Collapse feature tree"
-          onClick={onToggleCollapse}
-        >
-          ◂
-        </button>
-      </div>
+    <div className={`feature-tree${embedded ? ' embedded' : ''}`}>
+      {!embedded && (
+        <div className="feature-tree-header">
+          <span>Features</span>
+          <button
+            className="feature-collapse"
+            title="Collapse feature tree"
+            onClick={onToggleCollapse}
+          >
+            ◂
+          </button>
+        </div>
+      )}
       <div className="feature-tree-body" role="tree">
         {features.length === 0 && (
           <div className="feature-tree-empty">

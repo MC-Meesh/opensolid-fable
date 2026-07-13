@@ -4,10 +4,8 @@ import ErrorBoundary from './components/ErrorBoundary.jsx';
 import WasmErrorScreen from './components/WasmErrorScreen.jsx';
 import ScriptEditor from './components/ScriptEditor.jsx';
 import Viewport3D from './components/Viewport3D.jsx';
-import Toolbar from './components/Toolbar.jsx';
 import MainToolbar from './components/MainToolbar.jsx';
 import StatusBar from './components/StatusBar.jsx';
-import ScenePanel from './components/ScenePanel.jsx';
 import FeatureTree from './components/FeatureTree.jsx';
 import PropertyPanel from './components/PropertyPanel.jsx';
 import SketchCanvas from './components/SketchCanvas.jsx';
@@ -21,12 +19,7 @@ import { setNodeArg, setBooleanOp } from './lib/propertyEdit.js';
 import { deleteNode } from './lib/deleteNode.js';
 import { VIEW_SHORTCUTS } from './lib/views.js';
 import { buildFeatures, pruneTree, resolveKeys } from './lib/featureTree.js';
-import {
-  deleteShape,
-  listNodes,
-  parseScript,
-  updateNumericArg,
-} from './lib/shapeGraph.js';
+import { PALETTE } from './lib/shapeGraph.js';
 import { addPrimitiveNode, assertStoreConsistency } from './lib/storeSync.js';
 import { buildSweepShape, opsBounds, profileToOps, sweepTreeNode } from './lib/sweep.js';
 import { createFaceRegionIndex } from './lib/facePlane.js';
@@ -41,6 +34,12 @@ import { isFacePlane } from './lib/sketch/profile.js';
 const MESH_ACCURACY = 0.005;
 const EDIT_DEBOUNCE_MS = 400;
 const TOAST_MS = 3500;
+
+// Side panel (Code | Tree tabs) resize clamp: wide enough for the editor,
+// never so wide the viewport starves at 1280px windows.
+const SIDEBAR_MIN = 240;
+const SIDEBAR_MAX = 560;
+const SIDEBAR_DEFAULT = 340;
 
 function downloadBlob(blob, filename) {
   const link = document.createElement('a');
@@ -110,22 +109,23 @@ export default function App() {
   const [featureNames, setFeatureNames] = useState({});
   const [hiddenKeys, setHiddenKeys] = useState(() => new Set());
   const [suppressedKeys, setSuppressedKeys] = useState(() => new Set());
-  const [featuresCollapsed, setFeaturesCollapsed] = useState(false);
   const [editingSketch, setEditingSketch] = useState(null); // { nodeId, name }
+
+  // Side panel: one tabbed panel (Code | Tree) with a draggable splitter.
+  // Both panes stay mounted (CSS-hidden) — the CodeMirror instance and the
+  // tree's expand state must survive tab switches.
+  const [sidebarTab, setSidebarTab] = useState('code');
+  const [sidebarWidth, setSidebarWidth] = useState(SIDEBAR_DEFAULT);
+  const sidebarWidthRef = useRef(SIDEBAR_DEFAULT);
   const sketchCanvasRef = useRef(null);
   // What the viewport shows: the full model, a pruned re-evaluation (some
   // features hidden/suppressed), or nothing (everything hidden). Pruned mode
   // owns its traced nodes and frees them when replaced.
   const displayRef = useRef({ mode: 'full' });
 
-  // Bidirectional sync: the shape operation graph parsed from the script.
-  // GUI mutations (palette, parameter edits) rewrite individual statements
-  // and push the new script text into the editor, preserving all hand-written
-  // code. The graph is re-derived after every change from either side.
-  const [graph, setGraph] = useState(() => parseScript(DEFAULT_SCRIPT));
-
+  // Bidirectional sync: the script text is the source of truth; every model
+  // edit funnels through commitScript below.
   const scriptRef = useRef(DEFAULT_SCRIPT);
-  const graphRef = useRef(graph);
   // Store generation: bumped once per model commit. Remesh requests and the
   // pruned-display recompute carry the generation they were issued for, and
   // results from superseded generations are dropped instead of rendered.
@@ -266,12 +266,6 @@ export default function App() {
     }
   }, [remesh, clearSelection]);
 
-  const commitGraph = useCallback(() => {
-    const next = parseScript(scriptRef.current);
-    graphRef.current = next;
-    setGraph(next);
-  }, []);
-
   // Tree-based GUI edits regenerate the whole script; keep the leading
   // comment block (the API-reference header) so it survives every edit.
   const serializeWithHeader = useCallback(
@@ -282,10 +276,9 @@ export default function App() {
   // THE single store commit: every model edit — script keystrokes, palette,
   // gizmo, property panel, feature delete, sketch apply, sweep apply — lands
   // here. It cancels any pending debounced edit, updates the script view
-  // (unless the edit came from the editor itself), re-derives the statement
-  // graph, and re-evaluates into the traced tree, which fans out to remesh +
-  // tree/panel updates. Nothing else may write scriptRef or call
-  // evaluateScript directly.
+  // (unless the edit came from the editor itself), and re-evaluates into the
+  // traced tree, which fans out to remesh + tree/panel updates. Nothing else
+  // may write scriptRef or call evaluateScript directly.
   //
   // `selectPath`: undefined keeps the current selection (restored by path
   // after re-evaluation), null clears it, an array selects that path.
@@ -295,10 +288,9 @@ export default function App() {
       if (selectPath !== undefined) selectedPathRef.current = selectPath;
       scriptRef.current = source;
       if (!fromEditor) editorRef.current?.setDoc(source);
-      commitGraph();
       evaluateScript();
     },
-    [commitGraph, evaluateScript]
+    [evaluateScript]
   );
 
   // GUI-edit lane: serialize the mutated tree back into a canonical script.
@@ -339,34 +331,6 @@ export default function App() {
       commitTree(addPrimitiveNode(tracedRef.current?.root ?? null, ctor, args));
     },
     [commitTree]
-  );
-
-  // ScenePanel rows are statements, including hand-written raw code the tree
-  // cannot represent, so its edits are script-lane edits: rewrite the one
-  // statement, then commit the new source through the same funnel.
-  const applyStatementEdit = useCallback(
-    (result) => {
-      if (result.error) {
-        setError(result.error);
-        return;
-      }
-      commitScript(result.source);
-    },
-    [commitScript]
-  );
-
-  const handleDeleteShape = useCallback(
-    (name) => {
-      applyStatementEdit(deleteShape(graphRef.current, name));
-    },
-    [applyStatementEdit]
-  );
-
-  const handleUpdateArg = useCallback(
-    (nodeId, linkIndex, argIndex, value) => {
-      applyStatementEdit(updateNumericArg(graphRef.current, nodeId, linkIndex, argIndex, value));
-    },
-    [applyStatementEdit]
   );
 
   const selectNode = useCallback(
@@ -892,56 +856,112 @@ export default function App() {
     setProfileClosed(Boolean(profile?.closed));
   }, []);
 
-  const graphNodes = useMemo(() => listNodes(graph), [graph]);
+  // Splitter drag: clamp so the editor stays usable and the viewport never
+  // starves. Listeners go on the window — the pointer outruns a 5px handle.
+  const startSplitterDrag = useCallback((event) => {
+    event.preventDefault();
+    const startX = event.clientX;
+    const startWidth = sidebarWidthRef.current;
+    const onMove = (e) => {
+      const width = Math.min(
+        SIDEBAR_MAX,
+        Math.max(SIDEBAR_MIN, startWidth + (e.clientX - startX))
+      );
+      sidebarWidthRef.current = width;
+      setSidebarWidth(width);
+    };
+    const onUp = () => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+    };
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+  }, []);
 
   return (
     <div className="app">
-      <FeatureTree
-        features={features}
-        selectedId={selectedNode?.id}
-        hiddenKeys={hiddenKeys}
-        suppressedKeys={suppressedKeys}
-        collapsed={featuresCollapsed}
-        disabled={!wasmReady}
-        onToggleCollapse={() => setFeaturesCollapsed((v) => !v)}
-        onSelect={handleFeatureSelect}
-        onRename={handleFeatureRename}
-        onToggleHide={handleToggleHide}
-        onToggleSuppress={handleToggleSuppress}
-        onDelete={handleFeatureDelete}
-      />
-      <div className="left">
-        <header>
-          <h1>OpenSolid Playground</h1>
-          <p>Edit the script or the scene — both stay in sync.</p>
-        </header>
-        <ScenePanel
-          nodes={graphNodes}
-          selected={null}
-          onSelect={() => {}}
-          onAddShape={handleAddShape}
-          onDeleteShape={handleDeleteShape}
-          onUpdateArg={handleUpdateArg}
-          disabled={!wasmReady}
-        />
-        <ErrorBoundary name="Script editor">
-          <ScriptEditor
-            ref={editorRef}
-            initialDoc={DEFAULT_SCRIPT}
-            onChange={handleScriptChange}
-            onRun={runNow}
+      <aside className="sidebar" style={{ width: sidebarWidth }}>
+        <div className="sidebar-header">
+          <span
+            className="brand"
+            title="Edit the script or the scene — both stay in sync."
+          >
+            OpenSolid Playground
+          </span>
+          <button
+            className="run-btn"
+            onClick={runNow}
+            disabled={!wasmReady}
+            title="Run the script (Ctrl/Cmd+Enter)"
+          >
+            Run
+          </button>
+        </div>
+        <div className="sidebar-tabs" role="tablist" aria-label="Side panel">
+          <button
+            role="tab"
+            aria-selected={sidebarTab === 'code'}
+            className={sidebarTab === 'code' ? 'active' : ''}
+            onClick={() => setSidebarTab('code')}
+          >
+            Code
+          </button>
+          <button
+            role="tab"
+            aria-selected={sidebarTab === 'tree'}
+            className={sidebarTab === 'tree' ? 'active' : ''}
+            onClick={() => setSidebarTab('tree')}
+          >
+            Tree
+          </button>
+        </div>
+        <div className={`sidebar-pane${sidebarTab === 'code' ? '' : ' hidden'}`}>
+          <ErrorBoundary name="Script editor">
+            <ScriptEditor
+              ref={editorRef}
+              initialDoc={DEFAULT_SCRIPT}
+              onChange={handleScriptChange}
+              onRun={runNow}
+            />
+          </ErrorBoundary>
+        </div>
+        <div className={`sidebar-pane${sidebarTab === 'tree' ? '' : ' hidden'}`}>
+          <div className="palette">
+            {PALETTE.map((item) => (
+              <button
+                key={item.ctor}
+                className="secondary"
+                disabled={!wasmReady}
+                title={`Add ${item.label.toLowerCase()} to the scene`}
+                onClick={() => handleAddShape(item.ctor, item.args)}
+              >
+                + {item.label}
+              </button>
+            ))}
+          </div>
+          <FeatureTree
+            embedded
+            features={features}
+            selectedId={selectedNode?.id}
+            hiddenKeys={hiddenKeys}
+            suppressedKeys={suppressedKeys}
+            disabled={!wasmReady}
+            onSelect={handleFeatureSelect}
+            onRename={handleFeatureRename}
+            onToggleHide={handleToggleHide}
+            onToggleSuppress={handleToggleSuppress}
+            onDelete={handleFeatureDelete}
           />
-        </ErrorBoundary>
+        </div>
         {error && <pre className="error">{error}</pre>}
-        <Toolbar
-          exactBooleans={exactBooleans}
-          onExactBooleansChange={handleExactBooleansChange}
-          onRun={runNow}
-          onDownloadStl={downloadStl}
-          onDownloadStep={downloadStep}
-          disabled={!wasmReady}
-        />
-      </div>
+      </aside>
+      <div
+        className="splitter"
+        role="separator"
+        aria-orientation="vertical"
+        title="Drag to resize the side panel"
+        onPointerDown={startSplitterDrag}
+      />
       <div className="right">
         <MainToolbar
           disabled={!wasmReady}
@@ -959,6 +979,10 @@ export default function App() {
           onFit={() => viewportRef.current?.zoomToFit()}
           wireframe={wireframe}
           onWireframeChange={setWireframe}
+          onDownloadStl={downloadStl}
+          onDownloadStep={downloadStep}
+          exactBooleans={exactBooleans}
+          onExactBooleansChange={handleExactBooleansChange}
         />
         <ErrorBoundary name="3D viewport">
           <Viewport3D

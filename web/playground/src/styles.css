@@ -20,125 +20,106 @@ body {
   background: var(--bg);
   color: var(--text);
 }
+/* App chrome is locked to the viewport: nothing at document level ever
+   scrolls. The only scrollable regions live INSIDE the side panel (editor,
+   tree list, error readout) and the floating viewport overlays. */
 .app {
-  display: grid;
-  grid-template-columns: auto minmax(300px, 28%) 1fr;
+  display: flex;
   height: 100%;
+  overflow: hidden;
 }
-.left {
+
+/* ---- side panel: one tabbed panel (Code | Tree), resizable ---- */
+.sidebar {
+  flex: none;
   display: flex;
   flex-direction: column;
+  min-width: 240px;
+  max-width: 560px;
+  min-height: 0;
   border-right: 1px solid var(--border);
   background: var(--panel);
-  min-width: 0;
 }
-header {
-  padding: 10px 14px;
+.sidebar-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px 8px 14px;
+}
+.brand {
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.run-btn {
+  flex: none;
+  padding: 4px 14px;
+  font-size: 12px;
+}
+.sidebar-tabs {
+  display: flex;
+  flex: none;
   border-bottom: 1px solid var(--border);
 }
-header h1 { font-size: 15px; margin: 0; font-weight: 600; }
-header p { margin: 2px 0 0; font-size: 12px; color: var(--muted); }
-.scene-panel {
-  border-bottom: 1px solid var(--border);
-  max-height: 32%;
-  overflow-y: auto;
-  flex-shrink: 0;
+.sidebar-tabs button {
+  flex: 1;
+  background: transparent;
+  color: var(--muted);
+  border: none;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  padding: 6px 10px;
   font-size: 12.5px;
+  font-weight: 600;
 }
+.sidebar-tabs button:hover:not(:disabled) { color: var(--text); filter: none; }
+.sidebar-tabs button.active {
+  color: var(--text);
+  border-bottom-color: var(--accent);
+}
+.sidebar-pane {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.sidebar-pane.hidden { display: none; }
+.splitter {
+  flex: none;
+  width: 5px;
+  margin-left: -1px; /* sits on the sidebar's border */
+  cursor: col-resize;
+  touch-action: none;
+}
+.splitter:hover { background: color-mix(in srgb, var(--accent) 35%, transparent); }
 .palette {
   display: flex;
   flex-wrap: wrap;
+  flex: none;
   gap: 6px;
   padding: 8px 14px;
+  border-bottom: 1px solid var(--border);
 }
 .palette button {
   padding: 3px 9px;
   font-size: 12px;
 }
-.scene-panel .scene-list {
-  list-style: none;
-  margin: 0;
-  padding: 0 0 6px;
-}
-.scene-panel .node-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 5px 14px;
-  cursor: pointer;
-}
-.scene-panel .node-row:hover { background: color-mix(in srgb, var(--accent) 8%, transparent); }
-.scene-panel .node.selected .node-row {
-  background: color-mix(in srgb, var(--accent) 16%, transparent);
-}
-.scene-panel .node-name {
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-weight: 600;
-  min-width: 6ch;
-}
-.scene-panel .node-label {
-  flex: 1;
-  color: var(--muted);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.scene-panel .node-delete {
-  background: transparent;
-  color: var(--muted);
-  border: none;
-  padding: 0 4px;
-  font-size: 14px;
-  line-height: 1;
-}
-.scene-panel .node-delete:hover:not(:disabled) { color: var(--error); }
-.scene-panel .node.raw {
-  padding: 5px 14px;
-  color: var(--muted);
-}
-.scene-panel .node.raw code {
-  font-size: 11.5px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  display: block;
-}
-.node-params {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px 10px;
-  padding: 4px 14px 8px 28px;
-}
-.node-params .param {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  color: var(--muted);
-  font-size: 11.5px;
-}
-.node-params input[type="number"] {
-  width: 64px;
-  background: var(--bg);
-  color: var(--text);
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  padding: 2px 6px;
-  font-size: 12px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-}
-.node-params input[type="number"]:focus {
-  outline: none;
-  border-color: var(--accent);
-}
-/* ---- feature tree (docked left, SolidWorks FeatureManager style) ---- */
+/* ---- feature tree (SolidWorks FeatureManager style) ----
+   Embedded in the sidebar's Tree tab it fills the pane; the .collapsed
+   strip only applies to the standalone docked rendering. */
 .feature-tree {
   display: flex;
   flex-direction: column;
-  width: 216px;
   min-width: 0;
-  border-right: 1px solid var(--border);
   background: var(--panel);
   font-size: 12.5px;
+}
+.feature-tree.embedded {
+  flex: 1;
+  min-height: 0;
 }
 .feature-tree.collapsed {
   width: 26px;
@@ -316,22 +297,14 @@ header p { margin: 2px 0 0; font-size: 12px; color: var(--muted); }
   overflow: hidden;
 }
 .editor .cm-editor { height: 100%; }
-.toolbar {
+.mesh-settings {
   display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 10px 14px;
-  border-top: 1px solid var(--border);
-  flex-wrap: wrap;
+  flex-direction: column;
+  gap: 10px;
   font-size: 12.5px;
 }
-.toolbar label { display: flex; align-items: center; gap: 6px; }
-.toolbar input[type="range"] { width: 110px; accent-color: var(--accent); }
-.toolbar input[type="checkbox"] { accent-color: var(--accent); }
-.toolbar .resolution-value {
-  min-width: 3ch;
-  font-variant-numeric: tabular-nums;
-}
+.mesh-settings label { display: flex; align-items: center; gap: 6px; }
+.mesh-settings input[type="checkbox"] { accent-color: var(--accent); }
 button {
   background: var(--accent);
   color: var(--on-accent);
@@ -366,12 +339,18 @@ button.danger:hover:not(:disabled) {
   max-height: 30%;
   overflow: auto;
 }
-.right { position: relative; min-width: 0; }
+.right {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+}
 .viewport { position: absolute; inset: 0; }
 .viewport-canvas { position: absolute; inset: 0; }
 .viewport canvas { display: block; }
 
-/* ---- main toolbar (Sketch | Features | View) ---- */
+/* ---- main toolbar (Sketch | Features | View | Export + overflow menu) ----
+   One row, never wraps; overflow must stay visible so the settings menu
+   panel can drop below the strip. */
 .main-toolbar {
   position: absolute;
   top: 0;
@@ -379,13 +358,13 @@ button.danger:hover:not(:disabled) {
   right: 0;
   z-index: 4;
   display: flex;
+  flex-wrap: nowrap;
   align-items: center;
   gap: 2px;
   padding: 5px 10px;
   background: color-mix(in srgb, var(--panel) 94%, transparent);
   border-bottom: 1px solid var(--border);
   backdrop-filter: blur(6px);
-  overflow-x: auto;
 }
 .tool-group {
   display: flex;
@@ -431,6 +410,42 @@ button.main-tool.active {
 }
 button.main-tool svg { flex: none; }
 .tool-label { white-space: nowrap; }
+
+/* Overflow menu (<details>): rare, set-and-forget controls. */
+.tool-menu {
+  position: relative;
+  margin-left: auto;
+  flex: none;
+}
+.tool-menu summary {
+  display: flex;
+  align-items: center;
+  list-style: none;
+  cursor: pointer;
+  color: var(--text);
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  padding: 5px 7px;
+}
+.tool-menu summary::-webkit-details-marker { display: none; }
+.tool-menu summary:hover { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+.tool-menu[open] summary {
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.tool-menu-panel {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 8px);
+  z-index: 5;
+  min-width: 250px;
+  padding: 12px 14px;
+  background: color-mix(in srgb, var(--panel) 96%, transparent);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  backdrop-filter: blur(6px);
+}
 
 /* ---- orientation triad ---- */
 .view-triad {

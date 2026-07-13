@@ -28,8 +28,27 @@ describe('App', () => {
     );
     expect(html).toContain('OpenSolid Playground');
     expect(html).toContain('Sketch');
-    expect(html).toContain('Features'); // docked feature tree
+    expect(html).toContain('Features'); // toolbar workflow group
     expect(html).toContain('Loading WASM');
+  });
+
+  it('renders the tabbed side panel with Code and Tree panes', () => {
+    const loader = fakeLoader({ status: 'idle', error: null, api: null });
+    const html = renderToString(
+      <WasmProvider loader={loader}>
+        <App />
+      </WasmProvider>
+    );
+    expect(html).toContain('sidebar-tabs');
+    expect(html).toContain('>Code<');
+    expect(html).toContain('>Tree<');
+    // Both panes stay mounted so editor/tree state survives tab switches;
+    // the inactive one is CSS-hidden.
+    expect(html).toContain('sidebar-pane hidden');
+    expect(html).toContain('role="separator"'); // draggable splitter
+    // The stacked-panels layout is gone.
+    expect(html).not.toContain('scene-panel');
+    expect(html).not.toContain('class="left"');
   });
 
   it('renders the actionable error screen (not a spinner) when WASM init failed', () => {

@@ -79,4 +79,12 @@ describe('FeatureTree', () => {
     expect(html).toContain('Show feature tree');
     expect(html).not.toContain('feature-row');
   });
+
+  it('drops its own header chrome when embedded in the sidebar Tree tab', () => {
+    const html = render({ embedded: true, features: sampleFeatures() });
+    expect(html).toContain('feature-tree embedded');
+    expect(html).not.toContain('feature-tree-header');
+    expect(html).not.toContain('Collapse feature tree');
+    expect(html).toContain('Extrude1'); // rows still render
+  });
 });

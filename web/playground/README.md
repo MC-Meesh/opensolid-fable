@@ -6,20 +6,26 @@ orbit it in a three.js viewer, and download the result as binary STL.
 
 React + Vite SPA. The UI is componentized under `src/components/`:
 
-- **App** — owns all state (script, resolution, wireframe, mesh, stats,
-  feature selection) and the WASM shape lifecycle
-- **FeatureTree** — CAD feature history docked on the left edge (SolidWorks
-  FeatureManager style): chronological features (Box1, Sketch1, Extrude1,
-  Union1 …) derived from the construction tree, with renameable rows, an eye
-  visibility toggle, suppress and delete actions. Clicking a sketch feature
-  re-enters sketch mode on it; clicking any other feature isolates it and
-  opens its parameters. Collapsible to a thin strip.
-- **ScriptEditor** — CodeMirror 6 editor with JS syntax highlighting
+- **App** — owns all state (script, accuracy, wireframe, mesh, stats,
+  feature selection) and the WASM shape lifecycle. The chrome is one
+  window-height, no document scrolling: a resizable tabbed side panel
+  (**Code | Tree**) plus the viewport, separated by a draggable splitter.
+- **FeatureTree** — CAD feature history in the side panel's Tree tab
+  (SolidWorks FeatureManager style): chronological features (Box1, Sketch1,
+  Extrude1, Union1 …) derived from the construction tree, with renameable
+  rows, an eye visibility toggle, suppress and delete actions. Clicking a
+  sketch feature re-enters sketch mode on it; clicking any other feature
+  isolates it and opens its parameters. The tab also hosts the shape palette
+  (add primitives).
+- **ScriptEditor** — CodeMirror 6 editor with JS syntax highlighting (the
+  Code tab)
 - **Viewport3D** — three.js canvas with OrbitControls and the orientation triad
-- **MainToolbar** — workflow-grouped toolbar over the viewport
-  (Sketch | Features | View)
-- **Toolbar** — Run / Download STL buttons, resolution slider
-- **StatusBar** — triangle/vertex counts, grid size, mesh time
+- **MainToolbar** — single-row workflow-grouped toolbar over the viewport
+  (Sketch | Features | View | Export) with an overflow menu for the meshing
+  settings
+- **MeshSettings** — exact-booleans toggle (in the toolbar's overflow menu);
+  meshing accuracy is fixed at a high-precision default
+- **StatusBar** — triangle/vertex counts, accuracy, mesh time
 
 The only non-npm generated piece is `pkg/`, the wasm-bindgen output for the
 `opensolid-wasm` crate.
@@ -114,11 +120,12 @@ to snap to the view looking down that axis (hollow tip = negative direction).
 
 ## Using the playground
 
-- **Left pane** — a JS snippet that must `return` a shape. It runs with one
-  binding in scope, `Shape` (the `WasmShape` class). Press **Run** or
-  Ctrl/Cmd+Enter to re-evaluate and re-mesh. Errors (syntax, thrown
-  exceptions, wrong return type) appear below the editor.
-- **Feature tree (docked left)** — every run traces the script's shape
+- **Code tab (side panel)** — a JS snippet that must `return` a shape. It
+  runs with one binding in scope, `Shape` (the `WasmShape` class). Press
+  **Run** (side panel header) or Ctrl/Cmd+Enter to re-evaluate and re-mesh.
+  Errors (syntax, thrown exceptions, wrong return type) appear at the bottom
+  of the side panel. Drag the splitter to resize the panel.
+- **Tree tab (side panel)** — every run traces the script's shape
   operations into a construction tree (see `src/lib/sceneTree.js`), and
   `src/lib/featureTree.js` presents it as a chronological feature history.
   Click a feature to isolate it and edit its parameters in the property
@@ -127,12 +134,16 @@ to snap to the view looking down that axis (hollow tip = negative direction).
   the displayed mesh with that feature bypassed — the script itself is never
   modified; *delete* rewrites the script without the feature. Double-click a
   name to rename it (display-only). A shape reused in several places (e.g.
-  built in a loop) appears once, at its creation position.
-- **Resolution slider** — dual-contouring grid resolution (32–128 cells per
-  axis). Re-meshes the current shape without re-running the script.
-- **Wireframe** — toggles wireframe rendering.
-- **Download STL** — assembles a binary STL in JS from the current mesh
-  buffers (facet normals recomputed from geometry) and downloads it.
+  built in a loop) appears once, at its creation position. The palette at
+  the top adds primitives as new script statements.
+- **Exact booleans** (toolbar overflow menu) — routes sharp booleans through
+  the kernel's exact B-Rep pipeline. Meshing accuracy is fixed at a
+  high-precision default (no user knob); scripts needing another target can
+  call the wasm `meshAdaptive(accuracy)` API directly.
+- **Wireframe** — toggles wireframe rendering (View group).
+- **Export STL / STEP** (toolbar Export group) — STL assembles a binary STL
+  in JS from the current mesh buffers; STEP serializes the shape itself
+  (analytic surfaces for exact B-Rep chains, faceted otherwise).
 
 ### Shape API
 

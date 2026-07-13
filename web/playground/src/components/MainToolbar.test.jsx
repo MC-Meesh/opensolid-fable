@@ -21,20 +21,36 @@ function render(overrides = {}) {
       onFit={noop}
       wireframe={false}
       onWireframeChange={noop}
+      onDownloadStl={noop}
+      onDownloadStep={noop}
+      exactBooleans={false}
+      onExactBooleansChange={noop}
       {...overrides}
     />
   );
 }
 
 describe('MainToolbar', () => {
-  it('renders the three workflow groups with labeled buttons', () => {
+  it('renders the four workflow groups with labeled buttons', () => {
     const html = render();
     expect(html).toContain('Sketch');
     expect(html).toContain('Features');
     expect(html).toContain('View');
-    for (const label of ['Extrude', 'Revolve', 'Fit', 'Front', 'Top', 'Right', 'Iso', 'Wireframe']) {
+    expect(html).toContain('Export');
+    for (const label of ['Extrude', 'Revolve', 'Fit', 'Front', 'Top', 'Right', 'Iso', 'Wireframe', 'STL', 'STEP']) {
       expect(html).toContain(label);
     }
+  });
+
+  it('explains faceted export of organic shapes in the STEP tooltip', () => {
+    const html = render();
+    expect(html).toMatch(/title="[^"]*organic shapes export as faceted geometry/);
+  });
+
+  it('keeps the meshing settings in the overflow menu', () => {
+    const html = render();
+    expect(html).toContain('tool-menu');
+    expect(html).toContain('Exact booleans');
   });
 
   it('disables sweep buttons with a tooltip explaining why', () => {

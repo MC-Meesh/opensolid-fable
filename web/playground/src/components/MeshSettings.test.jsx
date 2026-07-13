@@ -1,47 +1,32 @@
 /**
  * Server-render smoke tests, matching MainToolbar.test.jsx: catch reference
- * errors and check the meshing controls (including the exact-booleans
- * toggle) render with the right state.
+ * errors and check the exact-booleans toggle renders with the right state.
+ * (Meshing accuracy is fixed — deliberately no slider to test.)
  */
 import { describe, expect, it } from 'vitest';
 import { renderToString } from 'react-dom/server';
-import Toolbar from './Toolbar.jsx';
+import MeshSettings from './MeshSettings.jsx';
 
 const noop = () => {};
 
 function render(overrides = {}) {
   return renderToString(
-    <Toolbar
+    <MeshSettings
       exactBooleans={false}
       onExactBooleansChange={noop}
-      onRun={noop}
-      onDownloadStl={noop}
-      onDownloadStep={noop}
       disabled={false}
       {...overrides}
     />
   );
 }
 
-describe('Toolbar', () => {
-  it('renders run, STL, STEP, and the exact-booleans toggle', () => {
+describe('MeshSettings', () => {
+  it('renders the exact-booleans toggle (and no accuracy slider)', () => {
     const html = render();
-    expect(html).toContain('Run');
-    expect(html).toContain('Download STL');
-    expect(html).toContain('Download STEP');
     expect(html).toContain('Exact booleans');
     expect(html).toMatch(/type="checkbox"(?![^>]*checked)/);
-  });
-
-  it('has no accuracy slider: meshing precision is a fixed default', () => {
-    const html = render();
-    expect(html).not.toContain('Accuracy');
     expect(html).not.toContain('type="range"');
-  });
-
-  it('explains faceted export of organic shapes in the STEP tooltip', () => {
-    const html = render();
-    expect(html).toMatch(/title="[^"]*organic shapes export as faceted geometry/);
+    expect(html).not.toContain('Accuracy');
   });
 
   it('checks the exact-booleans box when the mode is on', () => {
@@ -54,10 +39,10 @@ describe('Toolbar', () => {
     expect(html).toMatch(/title="[^"]*exact B-Rep pipeline/);
   });
 
-  it('disables all controls before WASM is ready', () => {
+  it('disables the toggle before WASM is ready', () => {
     const html = render({ disabled: true });
     const disabledCount = (html.match(/disabled/g) ?? []).length;
-    // Run, STL, STEP, exact-booleans checkbox.
-    expect(disabledCount).toBe(4);
+    // Just the exact-booleans checkbox.
+    expect(disabledCount).toBe(1);
   });
 });
