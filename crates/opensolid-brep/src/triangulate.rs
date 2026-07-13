@@ -31,7 +31,10 @@
 /// triangle), and the containment test carries a tolerance so sub-nanometre
 /// noise cannot make a run-spanning ear look empty — clipping such a false
 /// ear would strand the run as an untriangulated collinear remnant.
-pub(crate) fn ear_clip(uv: &[(f64, f64)]) -> Vec<[usize; 3]> {
+///
+/// Public because the kernel's STEP import fallback tessellator clips
+/// planar face outlines with the same routine.
+pub fn ear_clip(uv: &[(f64, f64)]) -> Vec<[usize; 3]> {
     let n = uv.len();
     if n < 3 {
         return Vec::new();

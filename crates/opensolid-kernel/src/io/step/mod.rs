@@ -2,10 +2,10 @@
 //!
 //! This module parses the textual exchange structure of a STEP file into a
 //! flat entity graph — a map from instance name (`#123`) to a typed record.
-//! It has **no geometry knowledge**: it does not know what a `CARTESIAN_POINT`
-//! is, only that it is a keyword with a list of parameters. Turning that graph
-//! into kernel geometry/topology (AP203/AP214 semantics) is a separate layer
-//! (the *mapper*).
+//! The parsing layer has **no geometry knowledge**: it does not know what a
+//! `CARTESIAN_POINT` is, only that it is a keyword with a list of parameters.
+//! Turning that graph into kernel geometry/topology (AP203 semantics) is the
+//! [`read`] submodule — see [`read::read_step`].
 //!
 //! # What it handles
 //!
@@ -50,10 +50,15 @@
 
 mod lex;
 mod parse;
+pub mod read;
 
 use std::collections::HashMap;
 
 pub use parse::{StepError, parse, parse_bytes};
+pub use read::{
+    Diagnostic, ImportedSolid, Severity, SolidOutcome, StepImport, StepReadOptions, read_step,
+    read_step_bytes,
+};
 
 /// A parsed STEP Part 21 file: its header records plus the data-section entity
 /// graph, indexed by instance name for O(1) lookup.
