@@ -1092,6 +1092,12 @@ struct Pipeline<'a> {
     imprints: Vec<Imprint>,
     /// Split points per curve source, as 3D points.
     splits: HashMap<CurveSource, Vec<Point3>>,
+    /// Seam-crossing points per (solid, face): where closed imprints cross
+    /// that face's seam. On the host face these are boundary junctions, so
+    /// `merge_imprint_chains` must terminate chains there instead of
+    /// re-merging the seam-split chords of a winding-0 ring back into a
+    /// full ring whose uv embedding would straddle the cover edge (of-43n).
+    seam_barriers: HashMap<(SolidTag, usize), Vec<Point3>>,
 }
 
 /// Broad-phase bounding box for one face.
@@ -1197,6 +1203,7 @@ impl<'a> Pipeline<'a> {
             face_extents,
             imprints: Vec::new(),
             splits: HashMap::new(),
+            seam_barriers: HashMap::new(),
         })
     }
 
@@ -1412,13 +1419,17 @@ impl<'a> Pipeline<'a> {
     /// Phase 3: register the global split events. Every open imprint
     /// endpoint lies on some original edge of one of the solids and splits
     /// it there. Closed imprints hosted on a periodic face additionally
-    /// wrap that face's parameter cover; they are cut where they cross the
-    /// face's seam on each wrapped axis — `u` for cylinder/sphere/torus
-    /// covers, `v` too for the doubly-periodic torus — splitting both the
-    /// imprint and the seam edge, so the cover polygon sees them as
-    /// boundary-to-boundary chords (of-7ld.7).
+    /// straddle that face's parameter cover; they are cut at EVERY point
+    /// where they cross the face's seam on each wrapped axis — `u` for
+    /// cylinder/sphere/torus covers, `v` too for the doubly-periodic torus
+    /// — splitting both the imprint and the seam edge, so the cover
+    /// polygon sees them as boundary-to-boundary chords (of-7ld.7). A ring
+    /// that wraps the axis crosses once (plus backtracking pairs); a
+    /// winding-0 ring straddling the seam crosses an even number of times
+    /// and becomes that many chords (of-43n).
     fn collect_splits(&mut self) {
         let mut events: Vec<(CurveSource, Point3)> = Vec::new();
+        let mut barriers: Vec<((SolidTag, usize), Point3)> = Vec::new();
         for (ii, imp) in self.imprints.iter().enumerate() {
             if !imp.sampled.closed {
                 for endpoint in [
@@ -1443,22 +1454,24 @@ impl<'a> Pipeline<'a> {
                     if period.is_none() {
                         continue;
                     }
-                    let Some(seam_point) = seam_crossing(fp, &imp.curve, &imp.sampled.points, axis)
-                    else {
-                        continue;
-                    };
-                    events.push((CurveSource::Imprint { index: ii }, seam_point));
-                    // Exact-curve edge matching: sphere/torus seam edges
-                    // are circular arcs whose sampled polylines sag far
-                    // beyond the acceptance band (of-7ld.5).
-                    if let Some(edge) = self.nearest_edge_of_face_exact(&seam_point, s, f) {
-                        events.push((CurveSource::Edge { solid: s, edge }, seam_point));
+                    for seam_point in seam_crossings(fp, &imp.curve, &imp.sampled.points, axis) {
+                        events.push((CurveSource::Imprint { index: ii }, seam_point));
+                        // Exact-curve edge matching: sphere/torus seam edges
+                        // are circular arcs whose sampled polylines sag far
+                        // beyond the acceptance band (of-7ld.5).
+                        if let Some(edge) = self.nearest_edge_of_face_exact(&seam_point, s, f) {
+                            events.push((CurveSource::Edge { solid: s, edge }, seam_point));
+                        }
+                        barriers.push(((s, f), seam_point));
                     }
                 }
             }
         }
         for (source, p) in events {
             self.splits.entry(source).or_default().push(p);
+        }
+        for (key, p) in barriers {
+            self.seam_barriers.entry(key).or_default().push(p);
         }
     }
 
@@ -1636,7 +1649,12 @@ impl<'a> Pipeline<'a> {
                             .extend(atoms_by_source[&CurveSource::Imprint { index: i }].iter());
                     }
                 }
-                for chain in merge_imprint_chains(&atoms, &imprint_ids, self.snap) {
+                let barriers = self
+                    .seam_barriers
+                    .get(&(s, f))
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                for chain in merge_imprint_chains(&atoms, &imprint_ids, self.snap, barriers) {
                     apply_chain(face_poly, &atoms, &mut regions, chain, self.snap)?;
                 }
 
@@ -1974,32 +1992,36 @@ impl SeamAxis {
     }
 }
 
-/// Where a closed imprint on a periodic face crosses the face's seam
-/// along `axis` (the minimum side of its cover window on that axis), if
-/// it wraps that axis's period. The sampled polyline `points` locates the
-/// bracketing samples; the crossing is then refined against the exact
-/// `curve` by bisecting `w(t) = level` (`w` the axis coordinate), so the
-/// returned point lies on the curve (and on the seam) to root-find
-/// precision. Interpolating the bracketing chord instead would leave the
-/// point off the curve by up to the sagitta
-/// `r * (1 - cos(pi / SAMPLES_PER_CIRCLE)) ≈ 5.4e-4 * r`, which crosses
+/// Every point where a closed imprint on a periodic face crosses the
+/// face's seam along `axis` (the minimum side of its cover window on that
+/// axis). The sampled polyline `points` locates the bracketing samples;
+/// each crossing is then refined against the exact `curve` by bisecting
+/// `w(t) = level` (`w` the axis coordinate), so the returned points lie
+/// on the curve (and on the seam) to root-find precision. Interpolating
+/// the bracketing chord instead would leave the point off the curve by up
+/// to the sagitta `r * (1 - cos(pi / SAMPLES_PER_CIRCLE)) ≈ 5.4e-4 * r`,
+/// which crosses
 /// [`MAX_ALLOWED_TOLERANCE`](crate::check::MAX_ALLOWED_TOLERANCE) once
 /// r ≳ 19 and would be recorded as the seam vertex's tolerance.
 ///
-/// Only the FIRST crossing of the seam level is returned. That is exact
-/// for the current SSI repertoire — lines, circles, and ellipses are
-/// monotonic graphs of the wrapped axis on their host cover, so a closed
-/// imprint that wraps the period crosses each seam level exactly once.
-/// Future non-monotonic imprints (unequal-radius cylinder-cylinder
-/// quartics, NURBS SSI) can cross a level several times; each crossing
-/// would need its own split or the imprint is left as a non-chordable
-/// chain.
-fn seam_crossing(
+/// In unwrapped coordinates the seam is every level `seam_w + 2πk`, so
+/// all instances inside the polyline's range are scanned. A ring that
+/// wraps the period crosses an odd number of times (once when it is a
+/// monotonic graph of `w`, as lines, circles, and ellipses are on their
+/// host cover; non-monotonic backtracking adds cancelling pairs). A
+/// winding-0 ring that straddles the seam without enclosing the chart's
+/// axis crosses an even number of times — e.g. a sphere cap about a point
+/// ON the seam meridian crosses it twice (of-43n) — and previously was
+/// never split at all, leaving its uv embedding straddling the cover
+/// edge. A sample landing exactly on a level registers its crossing from
+/// both adjacent segments; `split_sampled`'s snap merge deduplicates the
+/// repeat downstream.
+fn seam_crossings(
     face_poly: &FaceRegionPoly,
     curve: &Curve3,
     points: &[Point3],
     axis: SeamAxis,
-) -> Option<Point3> {
+) -> Vec<Point3> {
     let uv = map_polyline(&face_poly.chart, points);
     // Closing segment: unwrap the first point relative to the last.
     let close_w = {
@@ -2013,12 +2035,7 @@ fn seam_crossing(
         }
         w
     };
-    let winding = close_w - axis.coord(uv[0]);
-    if winding.abs() < 1.0 {
-        return None; // does not wrap this axis's period
-    }
-    // Seam level: the face cover's minimum along the axis, brought into
-    // the polyline's unwrapped range.
+    // Seam level: the face cover's minimum along the axis.
     let mut seam_w = f64::INFINITY;
     for lp in &face_poly.loops {
         for (q, _) in lp {
@@ -2032,38 +2049,41 @@ fn seam_crossing(
         .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), w| {
             (lo.min(w), hi.max(w))
         });
+    // First seam level instance strictly above w_min; scan every instance
+    // up to w_max.
     let mut level = seam_w;
+    while level > w_min {
+        level -= TWO_PI;
+    }
     while level <= w_min {
         level += TWO_PI;
     }
-    while level > w_max {
-        level -= TWO_PI;
-    }
-    if level <= w_min {
-        return None;
-    }
     let n = uv.len();
-    for i in 0..n {
-        let w0 = axis.coord(uv[i]);
-        let w1 = if i + 1 < n {
-            axis.coord(uv[i + 1])
-        } else {
-            close_w
-        };
-        if (w0 - level) * (w1 - level) <= 0.0 && (w1 - w0).abs() > 1e-15 {
-            let p0 = points[i];
-            let p1 = points[(i + 1) % n];
-            return Some(refine_seam_point(
-                &face_poly.chart,
-                curve,
-                axis,
-                level,
-                (uv[i], w1),
-                (&p0, &p1),
-            ));
+    let mut crossings = Vec::new();
+    while level <= w_max {
+        for i in 0..n {
+            let w0 = axis.coord(uv[i]);
+            let w1 = if i + 1 < n {
+                axis.coord(uv[i + 1])
+            } else {
+                close_w
+            };
+            if (w0 - level) * (w1 - level) <= 0.0 && (w1 - w0).abs() > 1e-15 {
+                let p0 = points[i];
+                let p1 = points[(i + 1) % n];
+                crossings.push(refine_seam_point(
+                    &face_poly.chart,
+                    curve,
+                    axis,
+                    level,
+                    (uv[i], w1),
+                    (&p0, &p1),
+                ));
+            }
         }
+        level += TWO_PI;
     }
-    None
+    crossings
 }
 
 /// Refine a seam crossing bracketed by consecutive imprint samples
@@ -2301,8 +2321,23 @@ fn reverse_chain(darts: &[(usize, bool)]) -> DartChain {
 
 /// Merge a face's imprint atoms into maximal chains through their shared
 /// (interior) endpoints. Closed atoms become single-dart chains.
-fn merge_imprint_chains(atoms: &[Atom], ids: &[usize], snap: f64) -> Vec<DartChain> {
+///
+/// Chains never extend through a `barrier` point — the host face's own
+/// seam crossings (see `Pipeline::seam_barriers`). Those junctions lie on
+/// the face boundary, where a chain must terminate as a chord endpoint: a
+/// winding-0 ring seam-split into two chords shares BOTH endpoints
+/// between its halves and would otherwise re-merge into a full ring whose
+/// uv embedding straddles the cover edge (of-43n). On the imprint's other
+/// host face the same points are face-interior and carry no barrier, so
+/// the ring correctly re-merges and applies as an interior ring there.
+fn merge_imprint_chains(
+    atoms: &[Atom],
+    ids: &[usize],
+    snap: f64,
+    barriers: &[Point3],
+) -> Vec<DartChain> {
     use std::collections::HashSet;
+    let at_barrier = |p: &Point3| barriers.iter().any(|b| (p - b).norm() <= snap * 4.0);
     let mut chains: Vec<DartChain> = ids
         .iter()
         .filter(|&&ai| atoms[ai].closed)
@@ -2328,6 +2363,9 @@ fn merge_imprint_chains(atoms: &[Atom], ids: &[usize], snap: f64) -> Vec<DartCha
         loop {
             let &(a, fwd) = chain.back().expect("non-empty");
             let (_, end) = dart_endpoints(&atoms[a], fwd);
+            if at_barrier(&end) {
+                break;
+            }
             let cands = adjacency.matches(&end);
             match cands.iter().find(|(c, _)| !used.contains(c)) {
                 Some(&(c, at_start)) => {
@@ -2340,6 +2378,9 @@ fn merge_imprint_chains(atoms: &[Atom], ids: &[usize], snap: f64) -> Vec<DartCha
         loop {
             let &(a, fwd) = chain.front().expect("non-empty");
             let (start, _) = dart_endpoints(&atoms[a], fwd);
+            if at_barrier(&start) {
+                break;
+            }
             let cands = adjacency.matches(&start);
             match cands.iter().find(|(c, _)| !used.contains(c)) {
                 Some(&(c, at_start)) => {
@@ -2365,12 +2406,20 @@ fn merge_imprint_chains(atoms: &[Atom], ids: &[usize], snap: f64) -> Vec<DartCha
 /// length; sphere/torus: two angles at different radii), and a mixed
 /// euclidean metric mis-ranks candidate vertices at extreme aspect
 /// ratios.
+///
+/// ALL viable vertex pairs are returned, best score first. A chord with
+/// BOTH endpoints on the same seam (a seam-split winding-0 ring half,
+/// of-43n) matches the two cover copies of its endpoints equally well —
+/// the scores tie at zero and the geometry alone cannot rank them —
+/// but slicing the host cycle at the wrong copies winds one piece CW.
+/// `apply_chain` disambiguates by trying candidates until the split
+/// yields two CCW pieces.
 fn match_chain_to_cycle(
     cycle: &Cycle,
     chain_poly: &[((f64, f64), Point3)],
     periods: (Option<f64>, Option<f64>),
     scale: (f64, f64),
-) -> Option<(usize, usize)> {
+) -> Vec<(usize, usize)> {
     let (u_scale, v_scale) = scale;
     let (mut lo, mut hi) = (
         (f64::INFINITY, f64::INFINITY),
@@ -2404,20 +2453,19 @@ fn match_chain_to_cycle(
             .min_by(|a, b| a.1.total_cmp(&b.1))
             .expect("cycle has darts")
     };
-    let mut best: Option<(f64, usize, usize)> = None;
+    let mut cands: Vec<(f64, usize, usize)> = Vec::new();
     for &su in &shifts_u {
         for &sv in &shifts_v {
             let (i, di) = nearest((s_uv.0 + su, s_uv.1 + sv));
             let (j, dj) = nearest((e_uv.0 + su, e_uv.1 + sv));
-            if di <= eps && dj <= eps && i != j {
-                let score = di + dj;
-                if best.is_none() || score < best.expect("checked").0 {
-                    best = Some((score, i, j));
-                }
+            if di <= eps && dj <= eps && i != j && !cands.iter().any(|&(_, a, b)| (a, b) == (i, j))
+            {
+                cands.push((di + dj, i, j));
             }
         }
     }
-    best.map(|(_, i, j)| (i, j))
+    cands.sort_by(|a, b| a.0.total_cmp(&b.0));
+    cands.into_iter().map(|(_, i, j)| (i, j)).collect()
 }
 
 fn cyclic_slice(darts: &[(usize, bool)], from: usize, to: usize) -> DartChain {
@@ -2500,61 +2548,93 @@ fn apply_chain(
         chain_poly.iter().map(|((_, v), _)| v).sum::<f64>() / chain_poly.len() as f64
     };
     let scale = face_poly.chart.uv_scale(rep_v);
-    for ri in 0..regions.len() {
-        for ci in 0..regions[ri].cycles.len() {
-            let Some((vi, vj)) =
-                match_chain_to_cycle(&regions[ri].cycles[ci], &chain_poly, period, scale)
-            else {
+    // Locate the host region and split vertices. Endpoint proximity alone
+    // cannot decide either — a seam chord's endpoints coincide in 3D with
+    // vertex copies on EVERY region bordering the seam at those points,
+    // and on the two cover copies within one region (score ties at zero,
+    // of-43n). Splitting a CCW outer cycle with a transversal chord of its
+    // region yields two CCW pieces, so the first (region, vertex-pair)
+    // whose split comes out both-CCW is the geometric host; a wrong copy
+    // pair or a neighboring region slices a boundary complement instead
+    // and winds one piece CW. Falls back to the best-scoring match if no
+    // split is both-CCW (preserving the pre-of-43n behavior).
+    let split_at = |ri: usize, (vi, vj): (usize, usize)| {
+        let outer = &regions[ri].cycles[0];
+        let mut darts_one = chain.clone();
+        darts_one.extend(cyclic_slice(&outer.darts, vj, vi));
+        let mut darts_two = reverse_chain(&chain);
+        darts_two.extend(cyclic_slice(&outer.darts, vi, vj));
+        (
+            embed_cycle(face_poly, atoms, darts_one),
+            embed_cycle(face_poly, atoms, darts_two),
+        )
+    };
+    let mut fallback: Option<(usize, (usize, usize))> = None;
+    let mut chosen: Option<(usize, Cycle, Cycle)> = None;
+    'regions: for (ri, region) in regions.iter().enumerate() {
+        for (ci, cycle) in region.cycles.iter().enumerate() {
+            let candidates = match_chain_to_cycle(cycle, &chain_poly, period, scale);
+            if candidates.is_empty() {
                 continue;
-            };
+            }
             if ci != 0 {
                 return Err(CoreError::NotImplemented {
                     feature: "boolean imprints chording a hole boundary (transversal MVP)",
                 });
             }
-            // The chain runs vertex vi -> vertex vj of the outer cycle.
-            let outer = regions[ri].cycles[0].clone();
-            let holes: Vec<Cycle> = regions[ri].cycles[1..].to_vec();
-            let mut darts_one = chain.clone();
-            darts_one.extend(cyclic_slice(&outer.darts, vj, vi));
-            let mut darts_two = reverse_chain(&chain);
-            darts_two.extend(cyclic_slice(&outer.darts, vi, vj));
-            let cycle_one = embed_cycle(face_poly, atoms, darts_one);
-            let cycle_two = embed_cycle(face_poly, atoms, darts_two);
-            let mut region_one = Region {
-                cycles: vec![cycle_one],
-            };
-            let mut region_two = Region {
-                cycles: vec![cycle_two],
-            };
-            for mut hole in holes {
-                let probe = hole.poly[0].0;
-                let one = localize_to_window(&region_one.cycles[0].poly, probe, period);
-                let in_one = point_in_cycle(&region_one.cycles[0], one);
-                let localized = if in_one {
-                    one
-                } else {
-                    localize_to_window(&region_two.cycles[0].poly, probe, period)
-                };
-                // Keep the hole in its host's cover window so later
-                // even-odd tests and tessellation see the outer cycle and
-                // its holes as one polygon set.
-                let shift = localized.0 - probe.0;
-                if shift != 0.0 {
-                    for ((u, _), _) in hole.poly.iter_mut() {
-                        *u += shift;
-                    }
-                }
-                if in_one {
-                    region_one.cycles.push(hole);
-                } else {
-                    region_two.cycles.push(hole);
+            for &pair in &candidates {
+                let (one, two) = split_at(ri, pair);
+                if one.area > 0.0 && two.area > 0.0 {
+                    chosen = Some((ri, one, two));
+                    break 'regions;
                 }
             }
-            regions[ri] = region_one;
-            regions.push(region_two);
-            return Ok(());
+            if fallback.is_none() {
+                fallback = Some((ri, candidates[0]));
+            }
         }
+    }
+    if chosen.is_none() {
+        if let Some((ri, pair)) = fallback {
+            let (one, two) = split_at(ri, pair);
+            chosen = Some((ri, one, two));
+        }
+    }
+    if let Some((ri, cycle_one, cycle_two)) = chosen {
+        let holes: Vec<Cycle> = regions[ri].cycles[1..].to_vec();
+        let mut region_one = Region {
+            cycles: vec![cycle_one],
+        };
+        let mut region_two = Region {
+            cycles: vec![cycle_two],
+        };
+        for mut hole in holes {
+            let probe = hole.poly[0].0;
+            let one = localize_to_window(&region_one.cycles[0].poly, probe, period);
+            let in_one = point_in_cycle(&region_one.cycles[0], one);
+            let localized = if in_one {
+                one
+            } else {
+                localize_to_window(&region_two.cycles[0].poly, probe, period)
+            };
+            // Keep the hole in its host's cover window so later
+            // even-odd tests and tessellation see the outer cycle and
+            // its holes as one polygon set.
+            let shift = localized.0 - probe.0;
+            if shift != 0.0 {
+                for ((u, _), _) in hole.poly.iter_mut() {
+                    *u += shift;
+                }
+            }
+            if in_one {
+                region_one.cycles.push(hole);
+            } else {
+                region_two.cycles.push(hole);
+            }
+        }
+        regions[ri] = region_one;
+        regions.push(region_two);
+        return Ok(());
     }
 
     // No boundary match: the chain must close on itself (an interior ring).
@@ -4982,7 +5062,9 @@ mod tests {
             minor_radius: r,
         };
         let points = ring_samples(&curve);
-        let p = seam_crossing(&fp, &curve, &points, SeamAxis::U).expect("ring wraps the period");
+        let crossings = seam_crossings(&fp, &curve, &points, SeamAxis::U);
+        assert_eq!(crossings.len(), 1, "wrap-once ring crosses the seam once");
+        let p = crossings[0];
         // Seam angle u = π on this ring is curve parameter t = π - phase.
         let expected = curve.point(std::f64::consts::PI - phase);
         assert!(
@@ -5010,7 +5092,9 @@ mod tests {
             minor_radius: r,
         };
         let points = ring_samples(&curve);
-        let p = seam_crossing(&fp, &curve, &points, SeamAxis::U).expect("ring wraps the period");
+        let crossings = seam_crossings(&fp, &curve, &points, SeamAxis::U);
+        assert_eq!(crossings.len(), 1, "wrap-once ring crosses the seam once");
+        let p = crossings[0];
         // This section satisfies u(t) = t, so the seam angle is hit at
         // t = seam_u (mod 2π).
         let expected = curve.point(seam_u);
@@ -5238,8 +5322,9 @@ mod tests {
         let curve = Curve3::circle(Point3::new(0.0, 0.0, v0.sin()), Vector3::z(), v0.cos())
             .expect("valid cap circle");
         let points = ring_samples(&curve);
-        let p =
-            seam_crossing(&fp, &curve, &points, SeamAxis::U).expect("cap ring wraps the period");
+        let crossings = seam_crossings(&fp, &curve, &points, SeamAxis::U);
+        assert_eq!(crossings.len(), 1, "cap ring wraps the period once");
+        let p = crossings[0];
         assert!(
             (p - Point3::new(v0.cos(), 0.0, v0.sin())).norm() < 1e-9,
             "seam vertex must sit on the u = 0 meridian at the cap latitude, got {p:?}"
@@ -5286,7 +5371,9 @@ mod tests {
             minor_radius: 2.4,
         };
         let points = ring_samples(&curve);
-        let p = seam_crossing(&fp, &curve, &points, SeamAxis::U).expect("latitude ring wraps u");
+        let crossings = seam_crossings(&fp, &curve, &points, SeamAxis::U);
+        assert_eq!(crossings.len(), 1, "latitude ring wraps u once");
+        let p = crossings[0];
         let expected = Point3::new(2.4, 0.0, 0.3);
         assert!(
             (p - expected).norm() < 1e-9,
@@ -5294,7 +5381,7 @@ mod tests {
             (p - expected).norm()
         );
         assert!(
-            seam_crossing(&fp, &curve, &points, SeamAxis::V).is_none(),
+            seam_crossings(&fp, &curve, &points, SeamAxis::V).is_empty(),
             "constant-v ring must not report a v-seam crossing"
         );
     }
@@ -5309,7 +5396,9 @@ mod tests {
         let curve = Curve3::circle(Point3::new(0.0, 2.0, 0.0), Vector3::x(), 0.5)
             .expect("valid tube circle");
         let points = ring_samples(&curve);
-        let p = seam_crossing(&fp, &curve, &points, SeamAxis::V).expect("tube ring wraps v");
+        let crossings = seam_crossings(&fp, &curve, &points, SeamAxis::V);
+        assert_eq!(crossings.len(), 1, "tube ring wraps v once");
+        let p = crossings[0];
         let expected = Point3::new(0.0, 2.5, 0.0);
         assert!(
             (p - expected).norm() < 1e-9,
@@ -5317,9 +5406,116 @@ mod tests {
             (p - expected).norm()
         );
         assert!(
-            seam_crossing(&fp, &curve, &points, SeamAxis::U).is_none(),
+            seam_crossings(&fp, &curve, &points, SeamAxis::U).is_empty(),
             "constant-u ring must not report a u-seam crossing"
         );
+    }
+
+    /// A unit sphere face's full cover (axis +Z, seam meridian through +X):
+    /// `[0, 2π] × [-π/2, π/2]`, as the one-face sphere primitive covers it.
+    fn full_sphere_poly() -> FaceRegionPoly {
+        let chart = Chart::Sphere {
+            center: Point3::new(0.0, 0.0, 0.0),
+            axis: Vector3::new(0.0, 0.0, 1.0),
+            e_u: Vector3::new(1.0, 0.0, 0.0),
+            e_v: Vector3::new(0.0, 1.0, 0.0),
+            radius: 1.0,
+        };
+        let corners = [
+            (0.0, -FRAC_PI_2),
+            (TWO_PI, -FRAC_PI_2),
+            (TWO_PI, FRAC_PI_2),
+            (0.0, FRAC_PI_2),
+        ];
+        let lp = corners
+            .iter()
+            .map(|&uv| (uv, chart_point(&chart, uv)))
+            .collect();
+        FaceRegionPoly {
+            chart,
+            loops: vec![lp],
+        }
+    }
+
+    #[test]
+    fn seam_crossings_winding0_sphere_cap_reports_both() {
+        // Cap boundary circle about +X (half-angle 0.6) on the unit
+        // sphere: it straddles the u = 0 seam meridian without enclosing
+        // the polar axis (u-winding 0), so it crosses the seam TWICE — at
+        // latitudes ±0.6 on the +X meridian. The old first-crossing-only
+        // logic returned nothing for winding-0 rings, leaving the ring
+        // whole and its uv embedding straddling the cover edge (of-43n).
+        let fp = full_sphere_poly();
+        let alpha: f64 = 0.6;
+        let curve = Curve3::circle(
+            Point3::new(alpha.cos(), 0.0, 0.0),
+            Vector3::x(),
+            alpha.sin(),
+        )
+        .expect("valid cap circle");
+        let points = ring_samples(&curve);
+        let mut crossings = seam_crossings(&fp, &curve, &points, SeamAxis::U);
+        assert_eq!(
+            crossings.len(),
+            2,
+            "winding-0 straddling ring crosses twice"
+        );
+        crossings.sort_by(|a, b| a.z.total_cmp(&b.z));
+        for (p, z) in crossings.iter().zip([-alpha.sin(), alpha.sin()]) {
+            let expected = Point3::new(alpha.cos(), 0.0, z);
+            assert!(
+                (p - expected).norm() < 1e-9,
+                "seam crossing off the +X meridian by {:.3e}",
+                (p - expected).norm()
+            );
+        }
+    }
+
+    #[test]
+    fn seam_crossings_empty_for_cap_clear_of_the_seam() {
+        // The same cap rotated to +Y: u spans a band around π/2, nowhere
+        // near a seam level instance, so no crossing may be reported.
+        let fp = full_sphere_poly();
+        let alpha: f64 = 0.6;
+        let curve = Curve3::circle(
+            Point3::new(0.0, alpha.cos(), 0.0),
+            Vector3::y(),
+            alpha.sin(),
+        )
+        .expect("valid cap circle");
+        let points = ring_samples(&curve);
+        assert!(
+            seam_crossings(&fp, &curve, &points, SeamAxis::U).is_empty(),
+            "cap away from the seam must not report a crossing"
+        );
+    }
+
+    #[test]
+    fn merge_imprint_chains_terminates_at_barriers() {
+        // Two open atoms sharing BOTH endpoints (a ring seam-split at two
+        // crossings). With the junctions marked as barriers each half must
+        // stay its own boundary-to-boundary chord; without barriers they
+        // re-merge into one full-ring chain (the correct behavior on the
+        // imprint's OTHER host face, where the seam points are interior).
+        let snap = 1e-9;
+        let p1 = Point3::new(1.0, 0.0, -0.5);
+        let p2 = Point3::new(1.0, 0.0, 0.5);
+        let atoms = vec![
+            Atom {
+                points: vec![p1, Point3::new(0.8, 0.6, 0.0), p2],
+                closed: false,
+            },
+            Atom {
+                points: vec![p2, Point3::new(0.8, -0.6, 0.0), p1],
+                closed: false,
+            },
+        ];
+        let split = merge_imprint_chains(&atoms, &[0, 1], snap, &[p1, p2]);
+        assert_eq!(split.len(), 2, "barriers keep the chords separate");
+        assert!(split.iter().all(|c| c.len() == 1));
+        let merged = merge_imprint_chains(&atoms, &[0, 1], snap, &[]);
+        assert_eq!(merged.len(), 1, "no barriers: halves re-merge");
+        assert_eq!(merged[0].len(), 2);
     }
 
     #[test]
@@ -5346,7 +5542,11 @@ mod tests {
         };
         let chain = [((FRAC_PI_2, TWO_PI), p), ((FRAC_PI_2, 2.0 * TWO_PI), p)];
         let got = match_chain_to_cycle(&cycle, &chain, (Some(TWO_PI), Some(TWO_PI)), (2.5, 0.5));
-        assert_eq!(got, Some((1, 4)), "v-period shift must recover the chord");
+        assert_eq!(
+            got.first(),
+            Some(&(1, 4)),
+            "v-period shift must recover the chord"
+        );
     }
 
     #[test]
@@ -5406,7 +5606,11 @@ mod tests {
         };
         let chain = [((0.005, 0.0), p), ((0.0, 999.995), p)];
         let got = match_chain_to_cycle(&cycle, &chain, (None, None), (1000.0, 1.0));
-        assert_eq!(got, Some((1, 3)), "arc-length metric must prefer B over A");
+        assert_eq!(
+            got.first(),
+            Some(&(1, 3)),
+            "arc-length metric must prefer B over A"
+        );
     }
 
     #[test]

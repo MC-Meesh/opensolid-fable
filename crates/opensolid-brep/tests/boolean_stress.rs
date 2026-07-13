@@ -72,7 +72,7 @@
 //! `Chart::new` rejected `Surface3::Sphere`/`Torus`; of-7ld.4 lifted
 //! that gate after the of-7ld.5/6/7 fixes, and the tests that pass are
 //! now live. The still-`#[ignore]`d remainder name their open blockers
-//! (of-43n, of-rb4, of-yet, of-2ql). Run those with
+//! (of-rb4, of-yet, of-2ql). Run those with
 //! `cargo test --test boolean_stress -- --ignored`.
 //!
 //! Bugs filed from the campaign's first run (2026-07-12, `Chart::new`
@@ -125,6 +125,17 @@
 //! shortfall to the F-Rep fallback). 42 of the 55 tests here run live;
 //! the 13 still `#[ignore]`d fail on of-43n (5), of-rb4 (2), of-yet
 //! (marched SSI wiring, 5), and of-2ql (napkin-ring volume accuracy, 1).
+//!
+//! Update (of-43n fix): closed imprint rings are now split at EVERY
+//! seam-level crossing — winding-0 rings straddling the seam become two
+//! boundary-to-boundary chords (chain merging stops at the seam
+//! junctions; chord-to-cycle matching disambiguates the tied cover-copy
+//! vertices by requiring both split pieces CCW). The two purely
+//! seam-topological tests (side cap across the seam, rotated cap-bite
+//! invariance) run live; the other three formerly-of-43n tests now get
+//! past imprinting but still miss volume/manifold checks on of-2ql's
+//! refinement-lattice slivers — their `#[ignore]` messages now name
+//! of-2ql.
 
 use nalgebra::{Rotation3, Unit};
 use opensolid_brep::boolean::{intersect, subtract, unite};
@@ -1407,7 +1418,6 @@ fn hemisphere_imprint_through_poles() {
 /// seam meridian (u = 0) twice, so the trimmed regions must share the
 /// seam edge correctly.
 #[test]
-#[ignore = "of-43n: seam-crossing ring never split (winding 0)"]
 fn sphere_side_cap_crosses_seam() {
     let context = "block bites +X cap: imprint crosses the seam meridian";
     let (r, h) = (1.0, 0.7);
@@ -1442,7 +1452,6 @@ fn sphere_side_cap_crosses_seam() {
 /// while the imprint circle sweeps across the seam and poles at generic
 /// angles.
 #[test]
-#[ignore = "of-43n: non-monotonic imprint crosses the seam level more than once"]
 fn rotated_block_cap_bite_volume_invariance() {
     let mut rng = Rng::new(0x5F3E_7E11);
     let (r, h) = (1.0, 0.6);
@@ -1474,7 +1483,7 @@ fn rotated_block_cap_bite_volume_invariance() {
 /// intersection has the exact cap closed form, and the three-way volume
 /// identities must hold.
 #[test]
-#[ignore = "of-43n: imprint ring crosses the seam level without a clean single wrap"]
+#[ignore = "of-2ql: refinement lattice slivers — case 1 union tessellation not a closed manifold (of-43n seam splits fixed)"]
 fn random_sphere_face_caps_identity() {
     let mut rng = Rng::new(0x0F1_CA9);
     for case in 0..8 {
@@ -1619,7 +1628,7 @@ fn offset_cylinder_drills_sphere_identity() {
 /// form (two caps against the radical plane), checked together with the
 /// inclusion–exclusion identity for equal and unequal radii.
 #[test]
-#[ignore = "of-43n: lens circle crosses both seams without wrapping"]
+#[ignore = "of-2ql: refinement lattice slivers — thin-lens (r=0.8, d=1.4) volume 1.0e-2 low (of-43n seam splits fixed)"]
 fn sphere_pair_lens_identities() {
     for (r1, r2, d) in [(1.0, 1.0, 1.2), (1.0, 0.6, 0.9), (0.8, 0.8, 1.4)] {
         let context = format!("sphere pair r1={r1} r2={r2} d={d}");
@@ -1665,7 +1674,7 @@ fn sphere_pair_lens_identities() {
 /// direction, separation strictly between the internal and external
 /// tangency distances with margin. Lens closed form + identities.
 #[test]
-#[ignore = "of-43n: imprint ring crosses the seam level without a clean single wrap"]
+#[ignore = "of-2ql: refinement lattice slivers — case 1 lens volume 5.6e-3 low, allowed 5e-3 (of-43n seam splits fixed)"]
 fn random_sphere_pairs_identity() {
     let mut rng = Rng::new(0x2_5EED_BA11);
     for case in 0..8 {
