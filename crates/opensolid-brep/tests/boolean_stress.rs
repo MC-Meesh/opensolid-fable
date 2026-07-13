@@ -94,6 +94,19 @@
 //! With the gate lifted, the four structured-rejection tests (tangency
 //! and sub-tolerance guards) already pass; all other campaign tests fail
 //! on of-7ld.5/6/7 or on SSI pairs pending the of-7ld.2 merge.
+//!
+//! of-7ld.7 FIXED (2026-07-12): closed imprints on any periodic chart are
+//! now split at every wrapped seam axis (torus `u` AND `v`, sphere `u` —
+//! was cylinder-only), split closed edges keep their topological vertex
+//! as an atom boundary, chord matching shifts whole periods on both axes,
+//! ray classification handles sphere/torus, and the curved-chart interior
+//! lattice covers sphere/torus (half-cell staggered so pitch-aligned
+//! boundary samples cannot fold it). With the gate lifted locally, all
+//! sunk-slab scales, the axis-plane half torus, the coaxial/coplanar
+//! torus-torus lenses, and the slab∪torus MeshSdf round trip pass
+//! end-to-end. Still open with the gate lifted: wiring marched SSI
+//! (oblique plane-torus, non-coaxial torus-torus) into boolean(), and the
+//! sphere-side of-7ld.5/6.
 
 use nalgebra::{Rotation3, Unit};
 use opensolid_brep::boolean::{intersect, subtract, unite};
@@ -1790,19 +1803,19 @@ fn torus_sunk_in_slab(scale: f64) {
 }
 
 #[test]
-#[ignore = "of-7ld.4 gate; lifted, fails on of-7ld.7: torus imprint chains never close"]
+#[ignore = "of-7ld.4 gate; passes with the gate lifted (of-7ld.7 fixed) — un-ignore at promotion"]
 fn torus_sunk_in_slab_scale_1() {
     torus_sunk_in_slab(1.0);
 }
 
 #[test]
-#[ignore = "of-7ld.4 gate; lifted, fails on of-7ld.7: torus imprint chains never close"]
+#[ignore = "of-7ld.4 gate; passes with the gate lifted (of-7ld.7 fixed) — un-ignore at promotion"]
 fn torus_sunk_in_slab_scale_0_001() {
     torus_sunk_in_slab(0.001);
 }
 
 #[test]
-#[ignore = "of-7ld.4 gate; lifted, fails on of-7ld.7: torus imprint chains never close"]
+#[ignore = "of-7ld.4 gate; passes with the gate lifted (of-7ld.7 fixed) — un-ignore at promotion"]
 fn torus_sunk_in_slab_scale_1000() {
     torus_sunk_in_slab(1000.0);
 }
@@ -1812,7 +1825,7 @@ fn torus_sunk_in_slab_scale_1000() {
 /// each crossing the major seam edge transversally. The union grows a
 /// half-ring arch on the block — a genuine handle, genus 1.
 #[test]
-#[ignore = "of-7ld.4 gate; lifted, fails on of-7ld.7: torus imprint chains never close"]
+#[ignore = "of-7ld.4 gate; passes with the gate lifted (of-7ld.7 fixed) — un-ignore at promotion"]
 fn half_torus_by_axis_plane() {
     let context = "torus halved by the axis-containing plane x = 0";
     let (major, minor) = (2.0, 0.5);
@@ -1860,7 +1873,9 @@ fn half_torus_by_axis_plane() {
 /// the rotated axis, exactly as the boolean chart will). Both frames
 /// must reproduce the closed form.
 #[test]
-#[ignore = "of-7ld.4 gate; lifted, fails on of-7ld.7: torus imprint chains never close"]
+#[ignore = "of-7ld.4 gate; unrotated frame passes (of-7ld.7 fixed); rotated frame needs
+            marched plane-torus SSI wired into boolean() — the rotated slab's oblique side
+            planes broad-phase-clash with the torus"]
 fn rotated_frame_torus_sunk_congruence() {
     let (major, minor, drop) = (2.0, 0.5, 0.2);
     let torus_center = Point3::new(0.0, 0.0, -drop);
@@ -1893,7 +1908,7 @@ fn rotated_frame_torus_sunk_congruence() {
 /// The block's side faces are off-axis planes parallel to the torus
 /// axis, whose torus sections are general quartics (marched SSI).
 #[test]
-#[ignore = "of-7ld.4 gate + of-7ld.2 marched plane-torus SSI (in MQ); then likely of-7ld.7"]
+#[ignore = "of-7ld.4 gate; needs marched plane-torus SSI wired into boolean() (of-7ld.7 itself is fixed)"]
 fn block_severs_torus_tube() {
     let context = "block notch severing the torus tube";
     let (major, minor) = (2.0, 0.5);
@@ -1923,7 +1938,7 @@ fn block_severs_torus_tube() {
 /// inner half): the ring survives, genus stays 1. The bite is centered
 /// on the +X outer equator, crossing BOTH torus seams.
 #[test]
-#[ignore = "of-7ld.4 gate + of-7ld.2 marched plane-torus SSI (in MQ); then likely of-7ld.7"]
+#[ignore = "of-7ld.4 gate; needs marched plane-torus SSI wired into boolean() (of-7ld.7 itself is fixed)"]
 fn block_notches_torus_outer_wall() {
     let context = "block notch in the torus outer wall across both seams";
     let (major, minor) = (2.0, 0.5);
@@ -1954,7 +1969,7 @@ fn block_notches_torus_outer_wall() {
 /// intersection is the revolved circle-circle lens (Pappus about the
 /// common centroid radius R) — an exact closed form — and a full ring.
 #[test]
-#[ignore = "of-7ld.4 gate + of-7ld.2 torus-torus SSI (in MQ); then likely of-7ld.7"]
+#[ignore = "of-7ld.4 gate; passes with the gate lifted (of-7ld.7 fixed) — un-ignore at promotion"]
 fn coaxial_tori_axial_shift_lens() {
     let context = "coaxial tori shifted 0.6 along the axis";
     let (major, minor, shift) = (2.0, 0.5, 0.6);
@@ -1989,7 +2004,7 @@ fn coaxial_tori_axial_shift_lens() {
 /// the cross-sections are equal circles offset radially, so Pappus about
 /// the lens centroid radius (R1 + R2)/2 gives the exact intersection.
 #[test]
-#[ignore = "of-7ld.4 gate + of-7ld.2 torus-torus SSI (in MQ); then likely of-7ld.7"]
+#[ignore = "of-7ld.4 gate; passes with the gate lifted (of-7ld.7 fixed) — un-ignore at promotion"]
 fn coplanar_tori_major_shift_lens() {
     let context = "coplanar tori, major radii 2.0 and 2.6";
     let (r1, r2, minor) = (2.0, 2.6, 0.5);
@@ -2021,7 +2036,7 @@ fn coplanar_tori_major_shift_lens() {
 /// genuinely doubly-curved transversal contact with no closed form —
 /// assert validity and the pairwise volume identity.
 #[test]
-#[ignore = "of-7ld.4 gate + of-7ld.2 torus-torus SSI (in MQ); then likely of-7ld.7"]
+#[ignore = "of-7ld.4 gate; needs marched non-coaxial torus-torus SSI wired into boolean()"]
 fn perpendicular_tori_identity() {
     let context = "perpendicular tori, tube-around-tube overlap";
     let mut scene = Scene::new();
@@ -2139,7 +2154,7 @@ fn round_trip_slab_minus_sphere_cap() {
 
 /// The same SDF round-trip for a slab ∪ sunk torus (curved ridge ring).
 #[test]
-#[ignore = "of-7ld.4 gate; lifted, fails on of-7ld.7: torus imprint chains never close"]
+#[ignore = "of-7ld.4 gate; passes with the gate lifted (of-7ld.7 fixed) — un-ignore at promotion"]
 fn round_trip_slab_union_torus() {
     let mut scene = Scene::new();
     let slab = scene.block([-4.0, -4.0, -4.0], [4.0, 4.0, 0.0]);

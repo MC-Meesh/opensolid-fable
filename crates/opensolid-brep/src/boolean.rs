@@ -1301,8 +1301,10 @@ impl<'a> Pipeline<'a> {
     /// endpoint lies on some original edge of one of the solids and splits
     /// it there. Closed imprints hosted on a periodic face additionally
     /// wrap that face's parameter cover; they are cut where they cross the
-    /// face's seam meridian (splitting both the imprint and the seam edge)
-    /// so the cover polygon sees them as boundary-to-boundary chords.
+    /// face's seam on each wrapped axis — `u` for cylinder/sphere/torus
+    /// covers, `v` too for the doubly-periodic torus — splitting both the
+    /// imprint and the seam edge, so the cover polygon sees them as
+    /// boundary-to-boundary chords (of-7ld.7).
     fn collect_splits(&mut self) {
         let mut events: Vec<(CurveSource, Point3)> = Vec::new();
         for (ii, imp) in self.imprints.iter().enumerate() {
@@ -1322,15 +1324,21 @@ impl<'a> Pipeline<'a> {
             }
             for (s, f) in [(0usize, imp.face_a), (1usize, imp.face_b)] {
                 let fp = &self.face_polys[s][f];
-                if !matches!(fp.chart, Chart::Cylinder { .. }) {
-                    continue;
-                }
-                let Some(seam_point) = seam_crossing(fp, &imp.curve, &imp.sampled.points) else {
-                    continue;
-                };
-                events.push((CurveSource::Imprint { index: ii }, seam_point));
-                if let Some(edge) = self.nearest_edge_of_face(&seam_point, s, f) {
-                    events.push((CurveSource::Edge { solid: s, edge }, seam_point));
+                for (axis, period) in [
+                    (SeamAxis::U, fp.chart.period_u()),
+                    (SeamAxis::V, fp.chart.period_v()),
+                ] {
+                    if period.is_none() {
+                        continue;
+                    }
+                    let Some(seam_point) = seam_crossing(fp, &imp.curve, &imp.sampled.points, axis)
+                    else {
+                        continue;
+                    };
+                    events.push((CurveSource::Imprint { index: ii }, seam_point));
+                    if let Some(edge) = self.nearest_edge_of_face(&seam_point, s, f) {
+                        events.push((CurveSource::Edge { solid: s, edge }, seam_point));
+                    }
                 }
             }
         }
@@ -1340,14 +1348,27 @@ impl<'a> Pipeline<'a> {
     }
 
     /// The boundary edge of face `(s, f)` nearest to `p`, if within
-    /// acceptance distance (bisection leaves imprint endpoints on the
-    /// region boundary; polyline sag bounds the residual).
+    /// acceptance distance. Each edge is measured both against its sampled
+    /// polyline (open-imprint endpoints are bisected onto the region
+    /// boundary polyline, so they sit on it) and against its exact curve
+    /// (seam-crossing events are refined onto the exact imprint curve, so
+    /// on a curved seam edge they sit a full sagitta off the polyline —
+    /// of-7ld.7). The exact-curve parameter is clamped to the edge's range
+    /// so an unbounded line extension cannot capture a distant point.
     fn nearest_edge_of_face(&self, p: &Point3, s: SolidTag, f: usize) -> Option<usize> {
         let mut best: Option<(f64, usize)> = None;
         for lp in &self.solids[s].faces[f].loops {
             for de in lp {
                 let sampled = &self.edge_samples[s][de.edge];
-                let d = polyline_distance(&sampled.points, sampled.closed, p);
+                let mut d = polyline_distance(&sampled.points, sampled.closed, p);
+                let edge = &self.solids[s].edges[de.edge];
+                let proj = edge.curve.project_point(p);
+                let t = if edge.closed {
+                    proj.t
+                } else {
+                    proj.t.clamp(edge.t0, edge.t1)
+                };
+                d = d.min((p - edge.curve.point(t)).norm());
                 if best.is_none() || d < best.expect("checked").0 {
                     best = Some((d, de.edge));
                 }
@@ -1374,7 +1395,17 @@ impl<'a> Pipeline<'a> {
         for s in 0..2 {
             for (e, sampled) in self.edge_samples[s].iter().enumerate() {
                 let source = CurveSource::Edge { solid: s, edge: e };
-                let splits = self.splits.get(&source).cloned().unwrap_or_default();
+                let mut splits = self.splits.get(&source).cloned().unwrap_or_default();
+                // A split closed edge loses embed_walk's ring rotation:
+                // the loop walk still enters and leaves it at its
+                // topological vertex, so the vertex must bound an atom
+                // too or the traversal tears there (full-wrap imprints
+                // crossing the torus seam circles, of-7ld.7). Inserted
+                // first so a coincident imprint split defers to the
+                // vertex's exact position in `split_sampled`'s dedup.
+                if sampled.closed && !splits.is_empty() {
+                    splits.insert(0, sampled.points[0]);
+                }
                 push_all(
                     &mut atoms,
                     &mut by_source,
@@ -1771,79 +1802,110 @@ fn polyline_length(points: &[Point3]) -> f64 {
     points.windows(2).map(|w| (w[1] - w[0]).norm()).sum()
 }
 
+/// Which parameter axis of a chart a seam crossing works along: `U` for
+/// the seam meridian of cylinder/sphere/torus covers, `V` for the torus's
+/// second (minor-angle) seam.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeamAxis {
+    U,
+    V,
+}
+
+impl SeamAxis {
+    /// This axis's coordinate of a parameter pair.
+    fn coord(self, uv: (f64, f64)) -> f64 {
+        match self {
+            SeamAxis::U => uv.0,
+            SeamAxis::V => uv.1,
+        }
+    }
+}
+
 /// Where a closed imprint on a periodic face crosses the face's seam
-/// meridian (the minimum-u side of its cover window), if it wraps the
-/// period. The sampled polyline `points` locates the bracketing samples;
-/// the crossing is then refined against the exact `curve` by bisecting
-/// `u(t) = level`, so the returned point lies on the curve (and on the
-/// seam meridian) to root-find precision. Interpolating the bracketing
-/// chord instead would leave the point off the curve by up to the sagitta
+/// along `axis` (the minimum side of its cover window on that axis), if
+/// it wraps that axis's period. The sampled polyline `points` locates the
+/// bracketing samples; the crossing is then refined against the exact
+/// `curve` by bisecting `w(t) = level` (`w` the axis coordinate), so the
+/// returned point lies on the curve (and on the seam) to root-find
+/// precision. Interpolating the bracketing chord instead would leave the
+/// point off the curve by up to the sagitta
 /// `r * (1 - cos(pi / SAMPLES_PER_CIRCLE)) ≈ 5.4e-4 * r`, which crosses
 /// [`MAX_ALLOWED_TOLERANCE`](crate::check::MAX_ALLOWED_TOLERANCE) once
 /// r ≳ 19 and would be recorded as the seam vertex's tolerance.
 ///
 /// Only the FIRST crossing of the seam level is returned. That is exact
 /// for the current SSI repertoire — lines, circles, and ellipses are
-/// u-monotonic graphs on a cylinder cover, so a closed imprint that wraps
-/// the period crosses each seam level exactly once. Future non-monotonic
-/// imprints (unequal-radius cylinder-cylinder quartics, NURBS SSI) can
-/// cross a level several times; each crossing would need its own split or
-/// the imprint is left as a non-chordable chain.
-fn seam_crossing(face_poly: &FaceRegionPoly, curve: &Curve3, points: &[Point3]) -> Option<Point3> {
+/// monotonic graphs of the wrapped axis on their host cover, so a closed
+/// imprint that wraps the period crosses each seam level exactly once.
+/// Future non-monotonic imprints (unequal-radius cylinder-cylinder
+/// quartics, NURBS SSI) can cross a level several times; each crossing
+/// would need its own split or the imprint is left as a non-chordable
+/// chain.
+fn seam_crossing(
+    face_poly: &FaceRegionPoly,
+    curve: &Curve3,
+    points: &[Point3],
+    axis: SeamAxis,
+) -> Option<Point3> {
     let uv = map_polyline(&face_poly.chart, points);
     // Closing segment: unwrap the first point relative to the last.
-    let close_u = {
-        let mut u = uv[0].0;
-        let last = uv[uv.len() - 1].0;
-        while u - last > std::f64::consts::PI {
-            u -= TWO_PI;
+    let close_w = {
+        let mut w = axis.coord(uv[0]);
+        let last = axis.coord(uv[uv.len() - 1]);
+        while w - last > std::f64::consts::PI {
+            w -= TWO_PI;
         }
-        while last - u > std::f64::consts::PI {
-            u += TWO_PI;
+        while last - w > std::f64::consts::PI {
+            w += TWO_PI;
         }
-        u
+        w
     };
-    let winding = close_u - uv[0].0;
+    let winding = close_w - axis.coord(uv[0]);
     if winding.abs() < 1.0 {
-        return None; // does not wrap the period
+        return None; // does not wrap this axis's period
     }
-    // Seam level: the face cover's minimum u, brought into the polyline's
-    // unwrapped range.
-    let mut seam_u = f64::INFINITY;
+    // Seam level: the face cover's minimum along the axis, brought into
+    // the polyline's unwrapped range.
+    let mut seam_w = f64::INFINITY;
     for lp in &face_poly.loops {
-        for ((u, _), _) in lp {
-            seam_u = seam_u.min(*u);
+        for (q, _) in lp {
+            seam_w = seam_w.min(axis.coord(*q));
         }
     }
-    let (u_min, u_max) = uv
+    let (w_min, w_max) = uv
         .iter()
-        .map(|(u, _)| *u)
-        .chain([close_u])
-        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), u| {
-            (lo.min(u), hi.max(u))
+        .map(|&q| axis.coord(q))
+        .chain([close_w])
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), w| {
+            (lo.min(w), hi.max(w))
         });
-    let mut level = seam_u;
-    while level <= u_min {
+    let mut level = seam_w;
+    while level <= w_min {
         level += TWO_PI;
     }
-    while level > u_max {
+    while level > w_max {
         level -= TWO_PI;
     }
-    if level <= u_min {
+    if level <= w_min {
         return None;
     }
     let n = uv.len();
     for i in 0..n {
-        let (u0, _) = uv[i];
-        let u1 = if i + 1 < n { uv[i + 1].0 } else { close_u };
-        if (u0 - level) * (u1 - level) <= 0.0 && (u1 - u0).abs() > 1e-15 {
+        let w0 = axis.coord(uv[i]);
+        let w1 = if i + 1 < n {
+            axis.coord(uv[i + 1])
+        } else {
+            close_w
+        };
+        if (w0 - level) * (w1 - level) <= 0.0 && (w1 - w0).abs() > 1e-15 {
             let p0 = points[i];
             let p1 = points[(i + 1) % n];
             return Some(refine_seam_point(
                 &face_poly.chart,
                 curve,
+                axis,
                 level,
-                (u0, u1),
+                (uv[i], w1),
                 (&p0, &p1),
             ));
         }
@@ -1852,16 +1914,19 @@ fn seam_crossing(face_poly: &FaceRegionPoly, curve: &Curve3, points: &[Point3]) 
 }
 
 /// Refine a seam crossing bracketed by consecutive imprint samples
-/// `p0`/`p1` (unwrapped angles `u0`/`u1` straddling `level`) to a point on
-/// the exact `curve` at chart angle `level`, by bisecting `u(t) = level`
-/// over the curve-parameter bracket recovered by closest-point projection.
+/// `p0`/`p1` (`hint_uv` the unwrapped parameters at `p0`, `w1` the axis
+/// coordinate at `p1`, straddling `level`) to a point on the exact
+/// `curve` at axis coordinate `level`, by bisecting `w(t) = level` over
+/// the curve-parameter bracket recovered by closest-point projection.
 fn refine_seam_point(
     chart: &Chart,
     curve: &Curve3,
+    axis: SeamAxis,
     level: f64,
-    (u0, u1): (f64, f64),
+    (hint_uv, w1): ((f64, f64), f64),
     (p0, p1): (&Point3, &Point3),
 ) -> Point3 {
+    let w0 = axis.coord(hint_uv);
     let t0 = curve.project_point(p0).t;
     let mut t1 = curve.project_point(p1).t;
     if let Some(period) = curve.period() {
@@ -1871,10 +1936,10 @@ fn refine_seam_point(
             t1 += period;
         }
     }
-    // Angles along the bracket stay within a sample step of `u0`, far
-    // inside the ±π unwrap window of the hint.
-    let residual = |t: f64| chart.param(&curve.point(t), Some((u0, 0.0))).0 - level;
-    let (mut fa, fb) = (u0 - level, u1 - level);
+    // Angles along the bracket stay within a sample step of `hint_uv`,
+    // far inside the ±π unwrap window of the hint.
+    let residual = |t: f64| axis.coord(chart.param(&curve.point(t), Some(hint_uv))) - level;
+    let (mut fa, fb) = (w0 - level, w1 - level);
     if fa == 0.0 {
         return curve.point(t0);
     }
@@ -1884,7 +1949,7 @@ fn refine_seam_point(
     if fa * fb > 0.0 || t1 <= t0 {
         // Projection disagrees with the polyline bracketing (degenerate
         // segment); fall back to the chord point.
-        return *p0 + (*p1 - *p0) * ((level - u0) / (u1 - u0));
+        return *p0 + (*p1 - *p0) * ((level - w0) / (w1 - w0));
     }
     let (mut ta, mut tb) = (t0, t1);
     for _ in 0..CLIP_REFINE_ITERATIONS {
@@ -2120,17 +2185,18 @@ fn merge_imprint_chains(atoms: &[Atom], ids: &[usize], snap: f64) -> Vec<DartCha
 }
 
 /// Match an embedded chain's endpoints to two distinct vertices of a
-/// cycle, allowing a whole-period shift of the chain (seam chords match
-/// the two cover copies of one 3D point). Distances and the acceptance
-/// band use the arc-length metric — `u` scaled by `scale.0`, `v` by
-/// `scale.1` — because on curved charts the parameter axes carry different
-/// units (cylinder: radians vs. model length; sphere/torus: two angles at
-/// different radii), and a mixed euclidean metric mis-ranks candidate
-/// vertices at extreme aspect ratios.
+/// cycle, allowing a whole-period shift of the chain on each periodic
+/// axis (seam chords match the two cover copies of one 3D point).
+/// Distances and the acceptance band use the arc-length metric — `u`
+/// scaled by `scale.0`, `v` by `scale.1` — because on curved charts the
+/// parameter axes carry different units (cylinder: radians vs. model
+/// length; sphere/torus: two angles at different radii), and a mixed
+/// euclidean metric mis-ranks candidate vertices at extreme aspect
+/// ratios.
 fn match_chain_to_cycle(
     cycle: &Cycle,
     chain_poly: &[((f64, f64), Point3)],
-    period: Option<f64>,
+    periods: (Option<f64>, Option<f64>),
     scale: (f64, f64),
 ) -> Option<(usize, usize)> {
     let (u_scale, v_scale) = scale;
@@ -2145,10 +2211,13 @@ fn match_chain_to_cycle(
     let eps = ((hi.0 - lo.0) * u_scale + (hi.1 - lo.1) * v_scale).max(1e-12) * 1e-5;
     let s_uv = chain_poly[0].0;
     let e_uv = chain_poly[chain_poly.len() - 1].0;
-    let shifts: Vec<f64> = match period {
-        Some(p) => vec![-p, 0.0, p],
-        None => vec![0.0],
+    let axis_shifts = |period: Option<f64>| -> Vec<f64> {
+        match period {
+            Some(p) => vec![-p, 0.0, p],
+            None => vec![0.0],
+        }
     };
+    let (shifts_u, shifts_v) = (axis_shifts(periods.0), axis_shifts(periods.1));
     let nearest = |uv: (f64, f64)| -> (usize, f64) {
         cycle
             .dart_offsets
@@ -2164,13 +2233,15 @@ fn match_chain_to_cycle(
             .expect("cycle has darts")
     };
     let mut best: Option<(f64, usize, usize)> = None;
-    for &sh in &shifts {
-        let (i, di) = nearest((s_uv.0 + sh, s_uv.1));
-        let (j, dj) = nearest((e_uv.0 + sh, e_uv.1));
-        if di <= eps && dj <= eps && i != j {
-            let score = di + dj;
-            if best.is_none() || score < best.expect("checked").0 {
-                best = Some((score, i, j));
+    for &su in &shifts_u {
+        for &sv in &shifts_v {
+            let (i, di) = nearest((s_uv.0 + su, s_uv.1 + sv));
+            let (j, dj) = nearest((e_uv.0 + su, e_uv.1 + sv));
+            if di <= eps && dj <= eps && i != j {
+                let score = di + dj;
+                if best.is_none() || score < best.expect("checked").0 {
+                    best = Some((score, i, j));
+                }
             }
         }
     }
@@ -2247,8 +2318,7 @@ fn apply_chain(
     snap: f64,
 ) -> CoreResult<()> {
     let (chain_poly, _) = embed_walk(face_poly, atoms, &chain, true);
-    let period_u = face_poly.chart.period_u();
-    let period = (period_u, face_poly.chart.period_v());
+    let period = (face_poly.chart.period_u(), face_poly.chart.period_v());
     // Arc-length metric evaluated at the chain's mean minor angle / latitude
     // — the axis scales only vary with `v` on sphere/torus charts, and this
     // band is narrow enough for a representative `v` to hold.
@@ -2261,7 +2331,7 @@ fn apply_chain(
     for ri in 0..regions.len() {
         for ci in 0..regions[ri].cycles.len() {
             let Some((vi, vj)) =
-                match_chain_to_cycle(&regions[ri].cycles[ci], &chain_poly, period_u, scale)
+                match_chain_to_cycle(&regions[ri].cycles[ci], &chain_poly, period, scale)
             else {
                 continue;
             };
@@ -2316,9 +2386,13 @@ fn apply_chain(
     }
 
     // No boundary match: the chain must close on itself (an interior ring).
+    // A single closed atom is a ring by construction — its polyline closes
+    // implicitly, so its first and last SAMPLES sit a full sample step
+    // apart and must not be held to the snap-coincidence test.
+    let is_ring_atom = chain.len() == 1 && atoms[chain[0].0].closed;
     let start = chain_poly[0].1;
     let end = chain_poly[chain_poly.len() - 1].1;
-    if (start - end).norm() > snap * 100.0 {
+    if !is_ring_atom && (start - end).norm() > snap * 100.0 {
         return Err(CoreError::Degenerate {
             context: "boolean::imprint",
             reason: "an imprint chain ends in a face interior without closing \
@@ -2469,6 +2543,13 @@ fn chart_point(chart: &Chart, uv: (f64, f64)) -> Point3 {
 }
 
 /// Analytic ray-surface intersection parameters (unbounded surface).
+///
+/// The torus branch is not closed-form: its quartic is sign-sampled and
+/// bisected instead (see [`ray_torus_hits`]), which is sound for the ray
+/// PARITY classification this feeds — a bracket hiding an even root pair
+/// (a graze) flips no sign, and skipping a root pair changes no parity;
+/// genuinely tangent hits are already rejected by the caller's grazing
+/// check and retried along another direction.
 fn ray_surface_hits(surface: &Surface3, p: &Point3, dir: &Vector3) -> Vec<f64> {
     match surface {
         Surface3::Plane { origin, normal } => {
@@ -2500,8 +2581,82 @@ fn ray_surface_hits(surface: &Surface3, p: &Point3, dir: &Vector3) -> Vec<f64> {
             let sq = disc.sqrt();
             vec![(-b - sq) / (2.0 * a), (-b + sq) / (2.0 * a)]
         }
-        _ => Vec::new(),
+        Surface3::Sphere { center, radius, .. } => {
+            // |p + t d - c|² = r².
+            let oc = p - center;
+            let a = dir.norm_squared();
+            let b = 2.0 * oc.dot(dir);
+            let c = oc.norm_squared() - radius * radius;
+            let disc = b * b - 4.0 * a * c;
+            if disc <= 0.0 {
+                return Vec::new();
+            }
+            let sq = disc.sqrt();
+            vec![(-b - sq) / (2.0 * a), (-b + sq) / (2.0 * a)]
+        }
+        Surface3::Torus {
+            center,
+            axis,
+            major_radius,
+            minor_radius,
+        } => ray_torus_hits(center, axis, *major_radius, *minor_radius, p, dir),
+        Surface3::Cone { .. } => Vec::new(),
     }
+}
+
+/// Samples along the ray window that can intersect the torus's bounding
+/// sphere. 4·SAMPLES_PER_CIRCLE resolves every sign change of the degree-4
+/// implicit residual whose odd-multiplicity roots are further apart than
+/// ~1/384 of the window; closer pairs are even-parity brackets that the
+/// parity classification may soundly skip (see [`ray_surface_hits`]).
+const RAY_TORUS_SAMPLES: usize = 4 * SAMPLES_PER_CIRCLE;
+
+/// Ray-torus intersection parameters by sign-sampled bisection of the
+/// torus's implicit residual `(|q_perp| - R)² + q_z² - r²` along the ray,
+/// restricted to the window where the ray is inside the torus's bounding
+/// sphere (radius `R + r` about its center — outside it the residual is
+/// strictly positive).
+fn ray_torus_hits(
+    center: &Point3,
+    axis: &Vector3,
+    major_radius: f64,
+    minor_radius: f64,
+    p: &Point3,
+    dir: &Vector3,
+) -> Vec<f64> {
+    let residual = |t: f64| {
+        let q = p + dir * t - center;
+        let z = q.dot(axis);
+        let w = (q - axis * z).norm() - major_radius;
+        w * w + z * z - minor_radius * minor_radius
+    };
+    // Bounding-sphere window (dilated so window-edge roots stay interior).
+    let bound = (major_radius + minor_radius) * 1.001;
+    let oc = p - center;
+    let a = dir.norm_squared();
+    let b = 2.0 * oc.dot(dir);
+    let c = oc.norm_squared() - bound * bound;
+    let disc = b * b - 4.0 * a * c;
+    if disc <= 0.0 {
+        return Vec::new();
+    }
+    let sq = disc.sqrt();
+    let (t_lo, t_hi) = ((-b - sq) / (2.0 * a), (-b + sq) / (2.0 * a));
+    let mut hits = Vec::new();
+    let step = (t_hi - t_lo) / RAY_TORUS_SAMPLES as f64;
+    let mut prev_t = t_lo;
+    let mut prev_f = residual(prev_t);
+    for i in 1..=RAY_TORUS_SAMPLES {
+        let t = t_lo + step * i as f64;
+        let f = residual(t);
+        if (prev_f <= 0.0) != (f <= 0.0) {
+            let inside = |t: f64| (residual(t) <= 0.0) == (f <= 0.0);
+            hits.push(refine_crossing(&inside, prev_t, t));
+        }
+        prev_t = t;
+        prev_f = f;
+    }
+    hits
 }
 
 // ---------------------------------------------------------------------
@@ -3036,13 +3191,31 @@ fn triangulate_mesh_face(mf: &MeshFace, weld_eps: f64) -> CoreResult<(Vec<Triang
     // never touch the boundary (so cross-face welding is untouched), boundary
     // ring edges are constraints that are never flipped, and the whole
     // construction is deterministic. See `refine_curved_region`.
-    if let Chart::Cylinder { radius, .. } = mf.chart {
+    // Per-chart lattice parameters: the v-row spacing in v units, and the
+    // arc-length scales that make the clearance metric isotropic in 3D.
+    // Cylinder v is a model length (rows at one sampling pitch of arc);
+    // sphere/torus v is an angle (rows at the angular pitch directly). The
+    // u scale is each chart's widest u-circle radius — conservative for
+    // clearance where the circle shrinks (sphere poles, torus bore).
+    let pitch = TWO_PI / SAMPLES_PER_CIRCLE as f64;
+    let lattice = match mf.chart {
+        Chart::Cylinder { radius, .. } => Some((radius.abs() * pitch, (radius.abs(), 1.0))),
+        Chart::Sphere { radius, .. } => Some((pitch, (radius.abs(), radius.abs()))),
+        Chart::Torus {
+            major_radius,
+            minor_radius,
+            ..
+        } => Some((pitch, (major_radius + minor_radius, minor_radius))),
+        Chart::Plane { .. } => None,
+    };
+    if let Some((pitch_v, scale)) = lattice {
         refine_curved_region(
             &mut tris,
             &mut all_uv,
             &mut all_p,
             &mf.chart,
-            radius,
+            pitch_v,
+            scale,
             &ring_ranges,
         );
     }
@@ -3342,11 +3515,15 @@ fn ring_contains(uv: (f64, f64), verts: &[(f64, f64)], ring_ranges: &[(usize, us
     inside
 }
 
-/// Retriangulate a cylinder face's ear-clip result into a constrained
+/// Retriangulate a curved face's ear-clip result into a constrained
 /// Delaunay mesh seeded with a lattice of interior points, so every triangle
-/// edge spans at most about one sampling pitch in `u` (the curved direction).
-/// The flat 3D chords then hug the surface instead of cutting long secants
-/// through it.
+/// edge spans at most about one sampling pitch in `u` (always an angle on
+/// curved charts) and `pitch_v` in `v`. The flat 3D chords then hug the
+/// surface instead of cutting long secants through it.
+///
+/// `pitch_v` is the interior row spacing in `v` units (model length on a
+/// cylinder, radians on sphere/torus); `scale` converts each parameter axis
+/// to model arc length for the boundary-clearance metric.
 ///
 /// `tris` is a valid triangulation of the region using only boundary
 /// vertices; `ring_ranges` gives each original boundary ring's index span in
@@ -3361,7 +3538,8 @@ fn refine_curved_region(
     all_uv: &mut Vec<(f64, f64)>,
     all_p: &mut Vec<Point3>,
     chart: &Chart,
-    radius: f64,
+    pitch_v: f64,
+    scale: (f64, f64),
     ring_ranges: &[(usize, usize)],
 ) {
     if tris.is_empty() || ring_ranges.is_empty() {
@@ -3397,37 +3575,49 @@ fn refine_curved_region(
     let mut mesh = FlipMesh::from_tris(tris, all_uv);
 
     // Interior lattice of Steiner points, spread strictly inside the region
-    // bounding box. `u` (the curved direction) is spaced at most one sampling
-    // pitch apart so retriangulation can bound every edge's u-span; `v` maps
-    // linearly on a cylinder, so its spacing only shapes triangles and never
-    // affects fidelity — it is spaced at the same arc length, capped so thin
-    // or tall faces stay cheap. At least one interior row and column are laid
-    // whenever the region has area (so even a thin full-wrap band still gets
-    // its wide chords broken up).
-    let s = radius.abs().max(1e-12);
+    // bounding box. `u` (always an angle here) is spaced at most one sampling
+    // pitch apart so retriangulation can bound every edge's u-span; `v` rows
+    // are spaced `pitch_v` apart, capped so thin or tall faces stay cheap.
+    // At least one interior row and column are laid whenever the region has
+    // area (so even a thin full-wrap band still gets its wide chords broken
+    // up).
+    let (su, sv) = (scale.0.abs().max(1e-12), scale.1.abs().max(1e-12));
     let n_cols = (((u1 - u0) / pitch).ceil() as usize).max(2) - 1;
     let step_u = (u1 - u0) / (n_cols + 1) as f64;
-    let pitch_v = (s * pitch).max(1e-12);
+    let pitch_v = pitch_v.max(1e-12);
     let n_rows = (((v1 - v0) / pitch_v).ceil() as usize).clamp(2, 256) - 1;
     let step_v = (v1 - v0) / (n_rows + 1) as f64;
 
     // Keep interior points a quarter-cell clear of the boundary (in the
-    // arc-length metric, `u` scaled by the radius so it is isotropic in 3D):
-    // enough that they never weld to a boundary vertex and never insert on a
-    // boundary edge, while small enough that a thin band keeps its row.
+    // arc-length metric, each axis scaled to model length so it is isotropic
+    // in 3D): enough that they never weld to a boundary vertex and never
+    // insert on a boundary edge, while small enough that a thin band keeps
+    // its row.
     let margin2 = {
-        let m = 0.25 * (step_u * s).min(step_v);
+        let m = 0.25 * (step_u * su).min(step_v * sv);
         m * m
     };
 
-    for iu in 1..=n_cols {
-        for iv in 1..=n_rows {
-            let uv = (u0 + iu as f64 * step_u, v0 + iv as f64 * step_v);
+    // Staggered by half a cell: boundary polylines are sampled on the same
+    // angular pitch the lattice uses (both anchor at the seam), so an
+    // unstaggered lattice lands columns EXACTLY under boundary vertices.
+    // The constrained triangulation then stacks zero-uv-area triangles
+    // along that shared line, which on a doubly-curved chart map to two
+    // overlapping bent 3D slivers with cancelling normals — a fold that
+    // MeshSdf rejects (of-7ld.7). Half-step offsets keep every lattice
+    // point maximally clear of the boundary sample grid while the extra
+    // row/column keeps all gaps at or under one pitch.
+    for iu in 1..=n_cols + 1 {
+        for iv in 1..=n_rows + 1 {
+            let uv = (
+                u0 + (iu as f64 - 0.5) * step_u,
+                v0 + (iv as f64 - 0.5) * step_v,
+            );
             if !ring_contains(uv, all_uv, ring_ranges) {
                 continue;
             }
             // Clearance from every boundary edge, in arc-length metric.
-            let scaled = |p: (f64, f64)| (p.0 * s, p.1);
+            let scaled = |p: (f64, f64)| (p.0 * su, p.1 * sv);
             let ps = scaled(uv);
             let mut clear = true;
             'rings: for &(start, len) in ring_ranges {
@@ -4621,7 +4811,7 @@ mod tests {
             minor_radius: r,
         };
         let points = ring_samples(&curve);
-        let p = seam_crossing(&fp, &curve, &points).expect("ring wraps the period");
+        let p = seam_crossing(&fp, &curve, &points, SeamAxis::U).expect("ring wraps the period");
         // Seam angle u = π on this ring is curve parameter t = π - phase.
         let expected = curve.point(std::f64::consts::PI - phase);
         assert!(
@@ -4649,7 +4839,7 @@ mod tests {
             minor_radius: r,
         };
         let points = ring_samples(&curve);
-        let p = seam_crossing(&fp, &curve, &points).expect("ring wraps the period");
+        let p = seam_crossing(&fp, &curve, &points, SeamAxis::U).expect("ring wraps the period");
         // This section satisfies u(t) = t, so the seam angle is hit at
         // t = seam_u (mod 2π).
         let expected = curve.point(seam_u);
@@ -4658,6 +4848,144 @@ mod tests {
             "seam vertex off the exact curve by {:.3e}",
             (p - expected).norm()
         );
+    }
+
+    /// A torus face's full `[0, 2π]²` cover (the fundamental square of the
+    /// one-face torus primitives build), R = 2, r = 0.5, axis +Z.
+    fn full_torus_poly() -> FaceRegionPoly {
+        let chart = Chart::Torus {
+            center: Point3::new(0.0, 0.0, 0.0),
+            axis: Vector3::new(0.0, 0.0, 1.0),
+            e_u: Vector3::new(1.0, 0.0, 0.0),
+            e_v: Vector3::new(0.0, 1.0, 0.0),
+            major_radius: 2.0,
+            minor_radius: 0.5,
+        };
+        let corners = [(0.0, 0.0), (TWO_PI, 0.0), (TWO_PI, TWO_PI), (0.0, TWO_PI)];
+        let lp = corners
+            .iter()
+            .map(|&uv| (uv, chart_point(&chart, uv)))
+            .collect();
+        FaceRegionPoly {
+            chart,
+            loops: vec![lp],
+        }
+    }
+
+    #[test]
+    fn seam_crossing_torus_latitude_ring_cuts_minor_seam_only() {
+        // Latitude circle from the plane z = 0.3 (outer branch, radius
+        // R + sqrt(r² − 0.3²) = 2.4): wraps `u`, constant `v`. Its basis is
+        // rotated 0.3 rad against the chart so samples straddle the seam
+        // (an equal-radius ellipse, as in the cylinder tests). It must cut
+        // the minor (u = 0) seam at (2.4, 0, 0.3) exactly — and must NOT
+        // report a `v` crossing (of-7ld.7).
+        let fp = full_torus_poly();
+        let phase: f64 = 0.3;
+        let curve = Curve3::Ellipse {
+            center: Point3::new(0.0, 0.0, 0.3),
+            axis: Vector3::new(0.0, 0.0, 1.0),
+            major_dir: Vector3::new(phase.cos(), phase.sin(), 0.0),
+            major_radius: 2.4,
+            minor_radius: 2.4,
+        };
+        let points = ring_samples(&curve);
+        let p = seam_crossing(&fp, &curve, &points, SeamAxis::U).expect("latitude ring wraps u");
+        let expected = Point3::new(2.4, 0.0, 0.3);
+        assert!(
+            (p - expected).norm() < 1e-9,
+            "u-seam vertex off the minor seam by {:.3e}",
+            (p - expected).norm()
+        );
+        assert!(
+            seam_crossing(&fp, &curve, &points, SeamAxis::V).is_none(),
+            "constant-v ring must not report a v-seam crossing"
+        );
+    }
+
+    #[test]
+    fn seam_crossing_torus_tube_ring_cuts_major_seam_only() {
+        // Tube cross-section circle at u = π/2 (center (0, R, 0), plane
+        // x = 0): wraps `v`, constant `u`. It must cut the major (v = 0)
+        // seam at the outer equator point (0, R + r, 0) — and must NOT
+        // report a `u` crossing (of-7ld.7).
+        let fp = full_torus_poly();
+        let curve = Curve3::circle(Point3::new(0.0, 2.0, 0.0), Vector3::x(), 0.5)
+            .expect("valid tube circle");
+        let points = ring_samples(&curve);
+        let p = seam_crossing(&fp, &curve, &points, SeamAxis::V).expect("tube ring wraps v");
+        let expected = Point3::new(0.0, 2.5, 0.0);
+        assert!(
+            (p - expected).norm() < 1e-9,
+            "v-seam vertex off the outer equator by {:.3e}",
+            (p - expected).norm()
+        );
+        assert!(
+            seam_crossing(&fp, &curve, &points, SeamAxis::U).is_none(),
+            "constant-u ring must not report a u-seam crossing"
+        );
+    }
+
+    #[test]
+    fn match_chain_accepts_whole_period_shift_in_v() {
+        // A v-wrapping seam chord embedded one whole v-period above its
+        // host cycle's window (as a torus tube imprint can be after cover
+        // alignment) must still match the two cover copies of its seam
+        // vertex (of-7ld.7).
+        let p = Point3::new(0.0, 0.0, 0.0);
+        let verts = [
+            (0.0, 0.0),
+            (FRAC_PI_2, 0.0),
+            (TWO_PI, 0.0),
+            (TWO_PI, TWO_PI),
+            (FRAC_PI_2, TWO_PI),
+            (0.0, TWO_PI),
+        ];
+        let poly: Vec<CoverPoint> = verts.iter().map(|&uv| (uv, p)).collect();
+        let cycle = Cycle {
+            darts: vec![(0, true); 6],
+            area: shoelace(&poly),
+            dart_offsets: vec![0, 1, 2, 3, 4, 5],
+            poly,
+        };
+        let chain = [((FRAC_PI_2, TWO_PI), p), ((FRAC_PI_2, 2.0 * TWO_PI), p)];
+        let got = match_chain_to_cycle(&cycle, &chain, (Some(TWO_PI), Some(TWO_PI)), (2.5, 0.5));
+        assert_eq!(got, Some((1, 4)), "v-period shift must recover the chord");
+    }
+
+    #[test]
+    fn ray_torus_hits_are_parity_correct() {
+        let center = Point3::new(0.0, 0.0, 0.0);
+        let axis = Vector3::new(0.0, 0.0, 1.0);
+        // Diameter ray through both tube lobes: four transversal hits at
+        // x = ±1.5, ±2.5.
+        let hits = ray_torus_hits(
+            &center,
+            &axis,
+            2.0,
+            0.5,
+            &Point3::new(-5.0, 0.0, 0.0),
+            &Vector3::new(1.0, 0.0, 0.0),
+        );
+        assert_eq!(hits.len(), 4, "expected 4 hits, got {hits:?}");
+        let mut xs: Vec<f64> = hits.iter().map(|t| -5.0 + t).collect();
+        xs.sort_by(f64::total_cmp);
+        for (x, expected) in xs.iter().zip([-2.5, -1.5, 1.5, 2.5]) {
+            assert!(
+                (x - expected).abs() < 1e-9,
+                "hit at x = {x}, expected {expected}"
+            );
+        }
+        // Ray up the axis through the bore: no hits.
+        let hits = ray_torus_hits(
+            &center,
+            &axis,
+            2.0,
+            0.5,
+            &Point3::new(0.0, 0.0, -5.0),
+            &Vector3::new(0.0, 0.0, 1.0),
+        );
+        assert!(hits.is_empty(), "bore ray must miss, got {hits:?}");
     }
 
     #[test]
@@ -4681,7 +5009,7 @@ mod tests {
             poly,
         };
         let chain = [((0.005, 0.0), p), ((0.0, 999.995), p)];
-        let got = match_chain_to_cycle(&cycle, &chain, None, (1000.0, 1.0));
+        let got = match_chain_to_cycle(&cycle, &chain, (None, None), (1000.0, 1.0));
         assert_eq!(got, Some((1, 3)), "arc-length metric must prefer B over A");
     }
 
