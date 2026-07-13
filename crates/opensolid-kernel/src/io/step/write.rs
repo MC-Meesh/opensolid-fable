@@ -992,9 +992,15 @@ mod tests {
         };
         let text = write_step(&store, &geo, &[body], &options).expect("write");
         assert!(text.contains("SI_UNIT($,.METRE.)"));
-        // Units are declarative; the round trip is unaffected.
-        let (_, _, bodies) = reimport(&text);
+        // The reader honours the declared unit (of-83h): a metre file's
+        // coordinates come back ×1000, in the kernel's millimetres.
+        let (store2, geo2, bodies) = reimport(&text);
         assert_eq!(bodies.len(), 1);
+        let v = volume(&store2, &geo2, bodies[0]);
+        assert!(
+            (v - 1.0e9).abs() / 1.0e9 <= 1e-9,
+            "1 m³ block must re-import as 1e9 mm³, got {v}"
+        );
     }
 
     #[test]

@@ -38,8 +38,17 @@
 //! why. A failed or fallen-back solid leaves no partial entities in the
 //! stores.
 //!
-//! Header units (`SI_UNIT` etc.) are not interpreted: coordinates import
-//! verbatim in the file's length unit.
+//! # Units
+//!
+//! The declared length unit is honoured: the reader resolves the
+//! `LENGTH_UNIT` of every `GLOBAL_UNIT_ASSIGNED_CONTEXT` (`SI_UNIT`
+//! prefix/name, or a `CONVERSION_BASED_UNIT` such as inch) and scales all
+//! coordinates, vector magnitudes, and radii into the kernel convention,
+//! **millimetres**, on import. The applied factor is exposed as
+//! [`StepImport::length_scale`]. Files with no interpretable length unit
+//! import verbatim (scale 1); an uninterpretable or conflicting
+//! declaration emits a [`Severity::Warning`] diagnostic. Angle units are
+//! not yet interpreted (see of-ed1): angles import verbatim as radians.
 //!
 //! # Example
 //!
@@ -172,6 +181,12 @@ pub struct ImportedSolid {
 pub struct StepImport {
     pub solids: Vec<ImportedSolid>,
     pub diagnostics: Vec<Diagnostic>,
+    /// Millimetres per file length unit, resolved from the file's
+    /// `GLOBAL_UNIT_ASSIGNED_CONTEXT` (1.0 when no length unit is declared
+    /// or it cannot be interpreted). All imported geometry has already
+    /// been multiplied by this factor — coordinates in the stores (and
+    /// fallback meshes) are always millimetres.
+    pub length_scale: f64,
 }
 
 impl StepImport {
@@ -452,6 +467,131 @@ fn typed_record<'f>(
 }
 
 // ---------------------------------------------------------------------
+// Unit resolution
+// ---------------------------------------------------------------------
+
+/// Multiplier for an ISO 10303-41 `si_prefix` enumeration name.
+fn si_prefix_factor(prefix: &str) -> Option<f64> {
+    Some(match prefix {
+        "EXA" => 1e18,
+        "PETA" => 1e15,
+        "TERA" => 1e12,
+        "GIGA" => 1e9,
+        "MEGA" => 1e6,
+        "KILO" => 1e3,
+        "HECTO" => 1e2,
+        "DECA" => 1e1,
+        "DECI" => 1e-1,
+        "CENTI" => 1e-2,
+        "MILLI" => 1e-3,
+        "MICRO" => 1e-6,
+        "NANO" => 1e-9,
+        "PICO" => 1e-12,
+        "FEMTO" => 1e-15,
+        "ATTO" => 1e-18,
+        _ => return None,
+    })
+}
+
+/// Millimetres per one of length unit `#unit_id`: an `SI_UNIT` is a prefix
+/// of the metre, a `CONVERSION_BASED_UNIT` (e.g. inch) chains through its
+/// `(LENGTH_)MEASURE_WITH_UNIT` into another length unit, followed at most
+/// `depth` links deep (guards reference cycles). `None` when the
+/// declaration cannot be interpreted.
+fn length_unit_in_mm(file: &StepFile, unit_id: u64, depth: u32) -> Option<f64> {
+    if depth == 0 {
+        return None;
+    }
+    let inst = file.get(unit_id)?;
+    if let Some(si) = inst.entity.part("SI_UNIT") {
+        let prefix = match si.attributes.first()? {
+            Value::Unset => 1.0,
+            Value::Enum(name) => si_prefix_factor(name)?,
+            _ => return None,
+        };
+        (si.attributes.get(1)?.as_enum()? == "METRE").then_some(prefix * 1000.0)
+    } else if let Some(cbu) = inst.entity.part("CONVERSION_BASED_UNIT") {
+        // CONVERSION_BASED_UNIT(name, conversion_factor): the factor is a
+        // measure-with-unit whose value counts another length unit.
+        let measure = file.get(cbu.attributes.get(1)?.as_ref_id()?)?;
+        let rec = measure
+            .entity
+            .part("LENGTH_MEASURE_WITH_UNIT")
+            .or_else(|| measure.entity.part("MEASURE_WITH_UNIT"))?;
+        let value = as_number(rec.attributes.first()?)?;
+        if !(value.is_finite() && value > 0.0) {
+            return None;
+        }
+        let base = length_unit_in_mm(file, rec.attributes.get(1)?.as_ref_id()?, depth - 1)?;
+        Some(value * base)
+    } else {
+        None
+    }
+}
+
+/// Resolve the file's declared length unit to a coordinate scale factor
+/// (millimetres per file unit — the kernel convention is millimetres).
+/// Files declaring no length unit import verbatim (scale 1). An
+/// uninterpretable declaration warns and is skipped; declarations that
+/// disagree across contexts warn and the first interpretable one wins.
+fn resolve_length_scale(file: &StepFile, diagnostics: &mut Vec<Diagnostic>) -> f64 {
+    let mut resolved: Option<(u64, f64)> = None;
+    for inst in &file.data {
+        let Some(ctx) = inst.entity.part("GLOBAL_UNIT_ASSIGNED_CONTEXT") else {
+            continue;
+        };
+        let Some(units) = ctx.attributes.first().and_then(Value::as_list) else {
+            continue;
+        };
+        for unit in units {
+            let Some(unit_id) = unit.as_ref_id() else {
+                continue;
+            };
+            let is_length = file
+                .get(unit_id)
+                .is_some_and(|u| u.entity.part("LENGTH_UNIT").is_some());
+            if !is_length {
+                continue;
+            }
+            match (length_unit_in_mm(file, unit_id, 4), resolved) {
+                (Some(scale), None) => resolved = Some((unit_id, scale)),
+                (Some(scale), Some((first_id, first))) => {
+                    if (scale - first).abs() > first.abs() * 1e-9 {
+                        diagnostics.push(Diagnostic {
+                            entity: Some(unit_id),
+                            severity: Severity::Warning,
+                            message: format!(
+                                "conflicting length units: #{first_id} is {first} mm but \
+                                 #{unit_id} is {scale} mm; using #{first_id}"
+                            ),
+                        });
+                    }
+                }
+                (None, _) => diagnostics.push(Diagnostic {
+                    entity: Some(unit_id),
+                    severity: Severity::Warning,
+                    message: "cannot interpret declared LENGTH_UNIT; coordinates import verbatim"
+                        .to_string(),
+                }),
+            }
+        }
+    }
+    let Some((unit_id, scale)) = resolved else {
+        return 1.0;
+    };
+    if scale != 1.0 {
+        diagnostics.push(Diagnostic {
+            entity: Some(unit_id),
+            severity: Severity::Info,
+            message: format!(
+                "declared length unit is {scale} mm; coordinates scaled into millimetres"
+            ),
+        });
+    }
+    scale
+}
+
+// ---------------------------------------------------------------------
 // Geometry resolvers
 // ---------------------------------------------------------------------
 
@@ -475,10 +615,13 @@ fn triple(rec: &SimpleRecord, index: usize, entity: u64) -> MapResult<[f64; 3]> 
     Ok(out)
 }
 
-fn resolve_point(file: &StepFile, id: u64, referrer: u64) -> MapResult<Point3> {
+/// `scale` is the file's length-unit factor (mm per file unit); it
+/// multiplies every length-valued quantity so imported geometry is always
+/// millimetres.
+fn resolve_point(file: &StepFile, id: u64, referrer: u64, scale: f64) -> MapResult<Point3> {
     let rec = typed_record(file, id, "CARTESIAN_POINT", referrer)?;
     let [x, y, z] = triple(rec, 1, id)?;
-    Ok(Point3::new(x, y, z))
+    Ok(Point3::new(x * scale, y * scale, z * scale))
 }
 
 fn resolve_direction(file: &StepFile, id: u64, referrer: u64) -> MapResult<Vector3> {
@@ -487,12 +630,13 @@ fn resolve_direction(file: &StepFile, id: u64, referrer: u64) -> MapResult<Vecto
     Ok(Vector3::new(x, y, z))
 }
 
-/// `VECTOR(name, orientation, magnitude)` → direction scaled by magnitude.
-fn resolve_vector(file: &StepFile, id: u64, referrer: u64) -> MapResult<Vector3> {
+/// `VECTOR(name, orientation, magnitude)` → direction scaled by magnitude
+/// (a length measure, so the unit scale applies).
+fn resolve_vector(file: &StepFile, id: u64, referrer: u64, scale: f64) -> MapResult<Vector3> {
     let rec = typed_record(file, id, "VECTOR", referrer)?;
     let dir = resolve_direction(file, ref_attr(rec, 1, id)?, id)?;
     let magnitude = real_attr(rec, 2, id)?;
-    Ok(dir * magnitude)
+    Ok(dir * (magnitude * scale))
 }
 
 /// A resolved `AXIS2_PLACEMENT_3D`: location plus its z axis and optional
@@ -503,9 +647,9 @@ struct Placement {
     ref_dir: Option<Vector3>,
 }
 
-fn resolve_axis2(file: &StepFile, id: u64, referrer: u64) -> MapResult<Placement> {
+fn resolve_axis2(file: &StepFile, id: u64, referrer: u64, scale: f64) -> MapResult<Placement> {
     let rec = typed_record(file, id, "AXIS2_PLACEMENT_3D", referrer)?;
-    let location = resolve_point(file, ref_attr(rec, 1, id)?, id)?;
+    let location = resolve_point(file, ref_attr(rec, 1, id)?, id, scale)?;
     let axis = match attr(rec, 2, id)? {
         Value::Unset => Vector3::z(),
         Value::Ref(dir) => resolve_direction(file, *dir, id)?,
@@ -540,7 +684,7 @@ enum RawSurface {
     Nurbs(Box<NurbsSurface>),
 }
 
-fn resolve_surface(file: &StepFile, id: u64, referrer: u64) -> MapResult<RawSurface> {
+fn resolve_surface(file: &StepFile, id: u64, referrer: u64, scale: f64) -> MapResult<RawSurface> {
     let inst = instance(file, id, referrer)?;
     let Some(rec) = inst.as_simple() else {
         return Err(unsupported(
@@ -549,7 +693,7 @@ fn resolve_surface(file: &StepFile, id: u64, referrer: u64) -> MapResult<RawSurf
         ));
     };
     let placement = |index: usize| -> MapResult<Placement> {
-        resolve_axis2(file, ref_attr(rec, index, id)?, id)
+        resolve_axis2(file, ref_attr(rec, index, id)?, id, scale)
     };
     match rec.type_name.as_str() {
         "PLANE" => {
@@ -560,7 +704,7 @@ fn resolve_surface(file: &StepFile, id: u64, referrer: u64) -> MapResult<RawSurf
         }
         "CYLINDRICAL_SURFACE" => {
             let p = placement(1)?;
-            let radius = real_attr(rec, 2, id)?;
+            let radius = real_attr(rec, 2, id)? * scale;
             Ok(RawSurface::Analytic(
                 Surface3::cylinder(p.location, p.axis, radius)
                     .map_err(|e| geometry_error(id, &e))?,
@@ -568,7 +712,8 @@ fn resolve_surface(file: &StepFile, id: u64, referrer: u64) -> MapResult<RawSurf
         }
         "CONICAL_SURFACE" => {
             let p = placement(1)?;
-            let radius = real_attr(rec, 2, id)?;
+            let radius = real_attr(rec, 2, id)? * scale;
+            // semi_angle is a plane angle measure: no length scaling.
             let semi_angle = real_attr(rec, 3, id)?;
             Ok(RawSurface::Analytic(
                 Surface3::cone(p.location, p.axis, semi_angle, radius)
@@ -577,22 +722,22 @@ fn resolve_surface(file: &StepFile, id: u64, referrer: u64) -> MapResult<RawSurf
         }
         "SPHERICAL_SURFACE" => {
             let p = placement(1)?;
-            let radius = real_attr(rec, 2, id)?;
+            let radius = real_attr(rec, 2, id)? * scale;
             Ok(RawSurface::Analytic(
                 Surface3::sphere(p.location, p.axis, radius).map_err(|e| geometry_error(id, &e))?,
             ))
         }
         "TOROIDAL_SURFACE" => {
             let p = placement(1)?;
-            let major = real_attr(rec, 2, id)?;
-            let minor = real_attr(rec, 3, id)?;
+            let major = real_attr(rec, 2, id)? * scale;
+            let minor = real_attr(rec, 3, id)? * scale;
             Ok(RawSurface::Analytic(
                 Surface3::torus(p.location, p.axis, major, minor)
                     .map_err(|e| geometry_error(id, &e))?,
             ))
         }
         "B_SPLINE_SURFACE_WITH_KNOTS" => Ok(RawSurface::Nurbs(Box::new(resolve_bspline_surface(
-            file, rec, id,
+            file, rec, id, scale,
         )?))),
         other => Err(unsupported(id, format!("surface type {other}"))),
     }
@@ -604,7 +749,7 @@ enum RawCurve {
     Nurbs(Box<NurbsCurve>),
 }
 
-fn resolve_curve(file: &StepFile, id: u64, referrer: u64) -> MapResult<RawCurve> {
+fn resolve_curve(file: &StepFile, id: u64, referrer: u64, scale: f64) -> MapResult<RawCurve> {
     let inst = instance(file, id, referrer)?;
     let Some(rec) = inst.as_simple() else {
         return Err(unsupported(
@@ -614,23 +759,23 @@ fn resolve_curve(file: &StepFile, id: u64, referrer: u64) -> MapResult<RawCurve>
     };
     match rec.type_name.as_str() {
         "LINE" => {
-            let origin = resolve_point(file, ref_attr(rec, 1, id)?, id)?;
-            let dir = resolve_vector(file, ref_attr(rec, 2, id)?, id)?;
+            let origin = resolve_point(file, ref_attr(rec, 1, id)?, id, scale)?;
+            let dir = resolve_vector(file, ref_attr(rec, 2, id)?, id, scale)?;
             Ok(RawCurve::Analytic(
                 Curve3::line(origin, dir).map_err(|e| geometry_error(id, &e))?,
             ))
         }
         "CIRCLE" => {
-            let p = resolve_axis2(file, ref_attr(rec, 1, id)?, id)?;
-            let radius = real_attr(rec, 2, id)?;
+            let p = resolve_axis2(file, ref_attr(rec, 1, id)?, id, scale)?;
+            let radius = real_attr(rec, 2, id)? * scale;
             Ok(RawCurve::Analytic(
                 Curve3::circle(p.location, p.axis, radius).map_err(|e| geometry_error(id, &e))?,
             ))
         }
         "ELLIPSE" => {
-            let p = resolve_axis2(file, ref_attr(rec, 1, id)?, id)?;
-            let semi_1 = real_attr(rec, 2, id)?;
-            let semi_2 = real_attr(rec, 3, id)?;
+            let p = resolve_axis2(file, ref_attr(rec, 1, id)?, id, scale)?;
+            let semi_1 = real_attr(rec, 2, id)? * scale;
+            let semi_2 = real_attr(rec, 3, id)? * scale;
             let axis_norm = p.axis.norm();
             if axis_norm == 0.0 || !axis_norm.is_finite() {
                 return Err(invalid(id, "ELLIPSE placement axis is degenerate"));
@@ -651,7 +796,7 @@ fn resolve_curve(file: &StepFile, id: u64, referrer: u64) -> MapResult<RawCurve>
             ))
         }
         "B_SPLINE_CURVE_WITH_KNOTS" => Ok(RawCurve::Nurbs(Box::new(resolve_bspline_curve(
-            file, rec, id,
+            file, rec, id, scale,
         )?))),
         other => Err(unsupported(id, format!("curve type {other}"))),
     }
@@ -694,11 +839,16 @@ fn knot_vector(
 
 /// `B_SPLINE_CURVE_WITH_KNOTS(name, degree, control_points, form, closed,
 /// self_intersect, multiplicities, knots, knot_spec)`.
-fn resolve_bspline_curve(file: &StepFile, rec: &SimpleRecord, id: u64) -> MapResult<NurbsCurve> {
+fn resolve_bspline_curve(
+    file: &StepFile,
+    rec: &SimpleRecord,
+    id: u64,
+    scale: f64,
+) -> MapResult<NurbsCurve> {
     let degree = int_attr(rec, 1, id)?;
     let control_points = ref_list(rec, 2, id)?
         .into_iter()
-        .map(|p| resolve_point(file, p, id))
+        .map(|p| resolve_point(file, p, id, scale))
         .collect::<MapResult<Vec<_>>>()?;
     let multiplicities = int_list(rec, 6, id)?;
     let knots = real_list(rec, 7, id)?;
@@ -713,6 +863,7 @@ fn resolve_bspline_surface(
     file: &StepFile,
     rec: &SimpleRecord,
     id: u64,
+    scale: f64,
 ) -> MapResult<NurbsSurface> {
     let u_degree = int_attr(rec, 1, id)?;
     let v_degree = int_attr(rec, 2, id)?;
@@ -728,7 +879,7 @@ fn resolve_bspline_surface(
                 let point = cell
                     .as_ref_id()
                     .ok_or_else(|| invalid(id, "control grid cell is not a reference"))?;
-                resolve_point(file, point, id)
+                resolve_point(file, point, id, scale)
             })
             .collect::<MapResult<Vec<_>>>()?;
         grid.push(points);
@@ -939,6 +1090,8 @@ struct SolidBuilder<'a> {
     file: &'a StepFile,
     store: &'a mut TopologyStore,
     geo: &'a mut GeometryStore,
+    /// Length-unit factor (mm per file unit) applied to all geometry.
+    scale: f64,
     created: Created,
     /// `VERTEX_POINT` #id → mapped vertex (shared between edges).
     vertices: HashMap<u64, EntityId<Vertex>>,
@@ -991,7 +1144,7 @@ impl SolidBuilder<'_> {
 
         // Surface first: an unmappable surface (NURBS) is the more
         // fundamental finding than any bound-level problem.
-        let surface = match resolve_surface(self.file, surface_ref, face_ref)? {
+        let surface = match resolve_surface(self.file, surface_ref, face_ref, self.scale)? {
             RawSurface::Analytic(surface) => surface,
             RawSurface::Nurbs(_) => {
                 return Err(unsupported(
@@ -1123,7 +1276,7 @@ impl SolidBuilder<'_> {
         let start = self.store.vertex(v_start).expect("just created").point;
         let end = self.store.vertex(v_end).expect("just created").point;
 
-        let curve = match resolve_curve(self.file, geometry_ref, edge_ref)? {
+        let curve = match resolve_curve(self.file, geometry_ref, edge_ref, self.scale)? {
             RawCurve::Analytic(curve) => curve,
             RawCurve::Nurbs(_) => {
                 return Err(unsupported(
@@ -1155,7 +1308,12 @@ impl SolidBuilder<'_> {
             return Ok(vertex);
         }
         let rec = typed_record(self.file, vertex_ref, "VERTEX_POINT", referrer)?;
-        let point = resolve_point(self.file, ref_attr(rec, 1, vertex_ref)?, vertex_ref)?;
+        let point = resolve_point(
+            self.file,
+            ref_attr(rec, 1, vertex_ref)?,
+            vertex_ref,
+            self.scale,
+        )?;
         let vertex = self.store.create_vertex(point, SYSTEM_RESOLUTION);
         self.created.vertices.push(vertex);
         self.vertices.insert(vertex_ref, vertex);
@@ -1185,6 +1343,8 @@ fn nurbs_segments(control_count: usize) -> usize {
 struct FallbackMesher<'a> {
     file: &'a StepFile,
     options: &'a TessellationOptions,
+    /// Length-unit factor (mm per file unit) applied to all geometry.
+    scale: f64,
     diagnostics: &'a mut Vec<Diagnostic>,
     /// `EDGE_CURVE` #id → its polyline from start vertex to end vertex.
     /// Shared between adjacent faces so junctions weld watertight.
@@ -1250,7 +1410,7 @@ impl FallbackMesher<'_> {
         let surface_ref = ref_attr(rec, 2, face_ref)?;
         let same_sense = bool_attr(rec, 3, face_ref)?;
 
-        match resolve_surface(self.file, surface_ref, face_ref)? {
+        match resolve_surface(self.file, surface_ref, face_ref, self.scale)? {
             RawSurface::Analytic(surface @ Surface3::Plane { .. }) => {
                 self.mesh_planar_face(mesh, face_ref, &bounds, &surface, same_sense)
             }
@@ -1444,12 +1604,17 @@ impl FallbackMesher<'_> {
 
         let vertex_point = |vertex_ref: u64| -> MapResult<Point3> {
             let vrec = typed_record(self.file, vertex_ref, "VERTEX_POINT", edge_ref)?;
-            resolve_point(self.file, ref_attr(vrec, 1, vertex_ref)?, vertex_ref)
+            resolve_point(
+                self.file,
+                ref_attr(vrec, 1, vertex_ref)?,
+                vertex_ref,
+                self.scale,
+            )
         };
         let start = vertex_point(start_ref)?;
         let end = vertex_point(end_ref)?;
 
-        let points = match resolve_curve(self.file, geometry_ref, edge_ref)? {
+        let points = match resolve_curve(self.file, geometry_ref, edge_ref, self.scale)? {
             RawCurve::Analytic(curve) => {
                 let trimmed = trim_curve(&curve, same_sense, start, end, closed, edge_ref)?;
                 let segments = match trimmed.curve {
@@ -1623,13 +1788,22 @@ fn map_file(
     options: &StepReadOptions,
 ) -> StepImport {
     let mut diagnostics = Vec::new();
+    let length_scale = resolve_length_scale(file, &mut diagnostics);
     let mut solids = Vec::new();
     for inst in &file.data {
         let Some(rec) = inst.entity.part("MANIFOLD_SOLID_BREP") else {
             continue;
         };
         let name = name_attr(rec);
-        let outcome = map_solid(file, store, geo, options, inst.id, rec, &mut diagnostics);
+        let outcome = map_solid(
+            file,
+            store,
+            geo,
+            options,
+            length_scale,
+            inst,
+            &mut diagnostics,
+        );
         solids.push(ImportedSolid {
             step_id: inst.id,
             name,
@@ -1646,6 +1820,7 @@ fn map_file(
     StepImport {
         solids,
         diagnostics,
+        length_scale,
     }
 }
 
@@ -1654,10 +1829,15 @@ fn map_solid(
     store: &mut TopologyStore,
     geo: &mut GeometryStore,
     options: &StepReadOptions,
-    msb_id: u64,
-    rec: &SimpleRecord,
+    scale: f64,
+    inst: &Instance,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> SolidOutcome {
+    let msb_id = inst.id;
+    let rec = inst
+        .entity
+        .part("MANIFOLD_SOLID_BREP")
+        .expect("caller selected MANIFOLD_SOLID_BREP instances");
     let shell_ref = match ref_attr(rec, 1, msb_id) {
         Ok(shell_ref) => shell_ref,
         Err(e) => {
@@ -1671,6 +1851,7 @@ fn map_solid(
         file,
         store,
         geo,
+        scale,
         created: Created::default(),
         vertices: HashMap::new(),
         edges: HashMap::new(),
@@ -1707,6 +1888,7 @@ fn map_solid(
     let mut mesher = FallbackMesher {
         file,
         options: &options.tessellation,
+        scale,
         diagnostics,
         polylines: HashMap::new(),
     };
@@ -2246,6 +2428,171 @@ mod tests {
         assert!(store.check(b).is_empty());
     }
 
+    // ---- length units (of-83h) ----
+
+    /// Wrap a DATA body in an envelope that declares a length unit through
+    /// a `GLOBAL_UNIT_ASSIGNED_CONTEXT`. `units` must define instance
+    /// `#900` as the length unit (support entities may use `#904`–`#919`).
+    fn wrap_with_units(data: &str, units: &str) -> String {
+        format!(
+            "ISO-10303-21;\nHEADER;\nFILE_SCHEMA(('CONFIG_CONTROL_DESIGN'));\nENDSEC;\n\
+             DATA;\n{data}\n{units}\n\
+             #901 = ( NAMED_UNIT(*) PLANE_ANGLE_UNIT() SI_UNIT($,.RADIAN.) );\n\
+             #902 = ( NAMED_UNIT(*) SI_UNIT($,.STERADIAN.) SOLID_ANGLE_UNIT() );\n\
+             #903 = ( GEOMETRIC_REPRESENTATION_CONTEXT(3) \
+             GLOBAL_UNIT_ASSIGNED_CONTEXT((#900,#901,#902)) \
+             REPRESENTATION_CONTEXT('Context #1','3D Context') );\n\
+             ENDSEC;\nEND-ISO-10303-21;\n"
+        )
+    }
+
+    /// Import a radius-2 sphere declared in the given length unit and
+    /// return (import report, sphere surface radius, seam vertex points).
+    fn import_unit_sphere(units: &str) -> (StepImport, f64, Vec<Point3>) {
+        let (store, geo, report) = import(&wrap_with_units(&sphere_step_at(1, 2.0), units));
+        let body = brep_body(&report.solids[0].outcome);
+        assert!(store.check(body).is_empty());
+        assert_edges_interpolate(&store, &geo, body);
+        let face = store.faces_of_body(body)[0];
+        let Surface3::Sphere { radius, .. } = geo
+            .surface(store.face(face).unwrap().surface.unwrap())
+            .unwrap()
+        else {
+            panic!("expected a sphere surface");
+        };
+        let mut vertices = Vec::new();
+        for edge_id in store.edges_of_face(face) {
+            let edge = store.edge(edge_id).unwrap();
+            vertices.push(store.vertex(edge.start_vertex).unwrap().point);
+            vertices.push(store.vertex(edge.end_vertex).unwrap().point);
+        }
+        (report, *radius, vertices)
+    }
+
+    #[test]
+    fn metre_length_unit_scales_geometry_into_millimetres() {
+        let (report, radius, vertices) =
+            import_unit_sphere("#900 = ( LENGTH_UNIT() NAMED_UNIT(*) SI_UNIT($,.METRE.) );");
+        no_error_diagnostics(&report);
+        assert_eq!(report.length_scale, 1000.0);
+        assert!((radius - 2000.0).abs() < 1e-9, "radius {radius}");
+        for v in &vertices {
+            assert!(
+                (v.coords.norm() - 2000.0).abs() < 1e-9,
+                "pole vertex {v} not scaled"
+            );
+        }
+    }
+
+    #[test]
+    fn si_prefix_scales_geometry() {
+        let (report, radius, _) =
+            import_unit_sphere("#900 = ( LENGTH_UNIT() NAMED_UNIT(*) SI_UNIT(.CENTI.,.METRE.) );");
+        no_error_diagnostics(&report);
+        assert_eq!(report.length_scale, 10.0);
+        assert!((radius - 20.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn conversion_based_inch_unit_scales_geometry() {
+        // CATIA-style inch: 2.54 of a centimetre unit that is itself not
+        // listed in the unit context (only reachable through the measure).
+        let (report, radius, _) = import_unit_sphere(
+            "#900 = (CONVERSION_BASED_UNIT('INCH',#905) LENGTH_UNIT() NAMED_UNIT(#904));\n\
+             #904 = DIMENSIONAL_EXPONENTS(1.0,0.0,0.0,0.0,0.0,0.0,0.0);\n\
+             #905 = LENGTH_MEASURE_WITH_UNIT(LENGTH_MEASURE(2.54),#906);\n\
+             #906 = ( LENGTH_UNIT() NAMED_UNIT(*) SI_UNIT(.CENTI.,.METRE.) );",
+        );
+        no_error_diagnostics(&report);
+        assert!((report.length_scale - 25.4).abs() < 1e-12);
+        assert!((radius - 50.8).abs() < 1e-9);
+    }
+
+    #[test]
+    fn millimetre_length_unit_imports_verbatim_and_silent() {
+        let (report, radius, _) =
+            import_unit_sphere("#900 = ( LENGTH_UNIT() NAMED_UNIT(*) SI_UNIT(.MILLI.,.METRE.) );");
+        assert_eq!(report.length_scale, 1.0);
+        assert!((radius - 2.0).abs() < 1e-12);
+        assert!(
+            report.diagnostics.is_empty(),
+            "mm files must import without unit chatter: {:?}",
+            report.diagnostics
+        );
+    }
+
+    #[test]
+    fn no_unit_context_imports_verbatim() {
+        let (_, _, report) = import(&wrap(&sphere_step_at(1, 2.0)));
+        assert_eq!(report.length_scale, 1.0);
+    }
+
+    #[test]
+    fn uninterpretable_length_unit_warns_and_imports_verbatim() {
+        let (report, radius, _) =
+            import_unit_sphere("#900 = ( LENGTH_UNIT() NAMED_UNIT(*) SI_UNIT($,.FURLONG.) );");
+        assert_eq!(report.length_scale, 1.0);
+        assert!((radius - 2.0).abs() < 1e-12, "must import verbatim");
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|d| d.severity == Severity::Warning
+                    && d.message.contains("cannot interpret declared LENGTH_UNIT")),
+            "expected an uninterpretable-unit warning: {:?}",
+            report.diagnostics
+        );
+    }
+
+    #[test]
+    fn conflicting_length_units_warn_and_first_wins() {
+        // A second context declaring millimetres appears before the
+        // metre-declaring #903 context, so millimetres (scale 1) wins.
+        let (report, radius, _) = import_unit_sphere(
+            "#906 = ( LENGTH_UNIT() NAMED_UNIT(*) SI_UNIT(.MILLI.,.METRE.) );\n\
+             #907 = ( GEOMETRIC_REPRESENTATION_CONTEXT(3) \
+             GLOBAL_UNIT_ASSIGNED_CONTEXT((#906)) \
+             REPRESENTATION_CONTEXT('Context #2','3D Context') );\n\
+             #900 = ( LENGTH_UNIT() NAMED_UNIT(*) SI_UNIT($,.METRE.) );",
+        );
+        assert_eq!(report.length_scale, 1.0);
+        assert!((radius - 2.0).abs() < 1e-12);
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|d| d.severity == Severity::Warning
+                    && d.message.contains("conflicting length units")),
+            "expected a conflicting-units warning: {:?}",
+            report.diagnostics
+        );
+    }
+
+    #[test]
+    fn metre_unit_scales_mesh_fallback_too() {
+        // A NURBS block forces the tessellated fallback; its mesh must be
+        // scaled the same way as exact imports.
+        let data_mm = nurbs_block_step(2.0, 3.0, 4.0);
+        let with_metre = wrap_with_units(
+            &data_mm
+                [data_mm.find("DATA;\n").unwrap() + 6..data_mm.find("\nENDSEC;\nEND-ISO").unwrap()],
+            "#900 = ( LENGTH_UNIT() NAMED_UNIT(*) SI_UNIT($,.METRE.) );",
+        );
+        let (_, _, report) = import(&with_metre);
+        assert_eq!(report.length_scale, 1000.0);
+        let SolidOutcome::Mesh { mesh, .. } = &report.solids[0].outcome else {
+            panic!(
+                "expected mesh fallback, got {:?}; diagnostics: {:?}",
+                report.solids[0].outcome, report.diagnostics
+            );
+        };
+        let volume = signed_volume(mesh);
+        assert!(
+            (volume - 24.0e9).abs() / 24.0e9 < 1e-9,
+            "fallback volume {volume} not scaled into mm"
+        );
+    }
+
     // ---- entity-coverage: geometry resolvers ----
 
     fn parse_fixture(data: &str) -> StepFile {
@@ -2266,7 +2613,7 @@ mod tests {
              #9 = PLANE('', #4);",
         );
         let center = Point3::new(1.0, 2.0, 3.0);
-        match resolve_surface(&file, 5, 0).unwrap() {
+        match resolve_surface(&file, 5, 0, 1.0).unwrap() {
             RawSurface::Analytic(Surface3::Sphere {
                 center: c, radius, ..
             }) => {
@@ -2275,7 +2622,7 @@ mod tests {
             }
             _ => panic!("expected a sphere"),
         }
-        match resolve_surface(&file, 6, 0).unwrap() {
+        match resolve_surface(&file, 6, 0, 1.0).unwrap() {
             RawSurface::Analytic(Surface3::Torus {
                 major_radius,
                 minor_radius,
@@ -2286,7 +2633,7 @@ mod tests {
             }
             _ => panic!("expected a torus"),
         }
-        match resolve_surface(&file, 7, 0).unwrap() {
+        match resolve_surface(&file, 7, 0, 1.0).unwrap() {
             RawSurface::Analytic(Surface3::Cone {
                 half_angle, radius, ..
             }) => {
@@ -2296,11 +2643,11 @@ mod tests {
             _ => panic!("expected a cone"),
         }
         assert!(matches!(
-            resolve_surface(&file, 8, 0).unwrap(),
+            resolve_surface(&file, 8, 0, 1.0).unwrap(),
             RawSurface::Analytic(Surface3::Cylinder { .. })
         ));
         assert!(matches!(
-            resolve_surface(&file, 9, 0).unwrap(),
+            resolve_surface(&file, 9, 0, 1.0).unwrap(),
             RawSurface::Analytic(Surface3::Plane { .. })
         ));
     }
@@ -2311,7 +2658,7 @@ mod tests {
             "#1 = CARTESIAN_POINT('', (0., 0., 0.));
              #2 = AXIS2_PLACEMENT_3D('', #1, $, $);",
         );
-        let placement = resolve_axis2(&file, 2, 0).unwrap();
+        let placement = resolve_axis2(&file, 2, 0, 1.0).unwrap();
         assert!((placement.axis - Vector3::z()).norm() < 1e-12);
         assert!(placement.ref_dir.is_none());
     }
@@ -2327,7 +2674,7 @@ mod tests {
              #4 = AXIS2_PLACEMENT_3D('', #1, #2, #3);
              #5 = ELLIPSE('', #4, 1.0, 2.0);",
         );
-        match resolve_curve(&file, 5, 0).unwrap() {
+        match resolve_curve(&file, 5, 0, 1.0).unwrap() {
             RawCurve::Analytic(
                 curve @ Curve3::Ellipse {
                     major_radius,
@@ -2355,7 +2702,7 @@ mod tests {
              #4 = B_SPLINE_CURVE_WITH_KNOTS('', 2, (#1, #2, #3), .UNSPECIFIED., .F., .F., \
                   (3, 3), (0., 1.), .UNSPECIFIED.);",
         );
-        let RawCurve::Nurbs(curve) = resolve_curve(&file, 4, 0).unwrap() else {
+        let RawCurve::Nurbs(curve) = resolve_curve(&file, 4, 0, 1.0).unwrap() else {
             panic!("expected a NURBS curve");
         };
         assert_eq!(curve.degree(), 2);
@@ -2374,7 +2721,7 @@ mod tests {
              #5 = B_SPLINE_SURFACE_WITH_KNOTS('', 1, 1, ((#1, #2), (#3, #4)), .UNSPECIFIED., \
                   .F., .F., .F., (2, 2), (2, 2), (0., 1.), (0., 1.), .UNSPECIFIED.);",
         );
-        let RawSurface::Nurbs(surface) = resolve_surface(&file, 5, 0).unwrap() else {
+        let RawSurface::Nurbs(surface) = resolve_surface(&file, 5, 0, 1.0).unwrap() else {
             panic!("expected a NURBS surface");
         };
         assert_eq!(surface.degree_u(), 1);

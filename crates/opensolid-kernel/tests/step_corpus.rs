@@ -31,8 +31,9 @@
 //! Bugs filed from this suite (first run, 2026-07-12):
 //! - of-1dd: parser stack overflow on ~500-deep nested aggregates — a 1KB
 //!   crafted file aborts the process.
-//! - of-83h: reader ignores declared length units; metre and millimetre
-//!   files import identical geometry (1000× scale error for one of them).
+//! - of-83h (fixed): reader ignored declared length units; metre and
+//!   millimetre files imported identical geometry. The reader now scales
+//!   coordinates into millimetres from the GLOBAL_UNIT_ASSIGNED_CONTEXT.
 //! - of-as6 (fixed): `tessellate_body` ignored `FaceSense::Negative`, so
 //!   planar boolean outputs (L-shape subtract) meshed with inward-wound
 //!   tool faces and failed the manifold check even though
@@ -718,13 +719,11 @@ mod adversarial {
         );
     }
 
-    /// of-83h: the reader never looks at the GLOBAL_UNIT_ASSIGNED_CONTEXT.
-    /// The same part written in metres and in millimetres re-imports with
-    /// identical coordinates — one of them is silently 1000× off. Once
-    /// units are interpreted (kernel convention: millimetres), the metre
-    /// file's volume must come back 1e9 times the millimetre file's.
+    /// of-83h (fixed): the reader resolves the GLOBAL_UNIT_ASSIGNED_CONTEXT
+    /// length unit and scales coordinates into the kernel convention
+    /// (millimetres), so the metre file's volume comes back 1e9 times the
+    /// millimetre file's.
     #[test]
-    #[ignore = "of-83h: reader ignores declared length units"]
     fn declared_length_unit_should_scale_geometry() {
         let mut store = TopologyStore::new();
         let mut geo = GeometryStore::new();
