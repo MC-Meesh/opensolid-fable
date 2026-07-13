@@ -12,6 +12,7 @@
 
 pub mod bounded;
 pub mod exact;
+pub mod step;
 
 use bounded::{BoundedShape, flatten_mesh};
 use exact::{ExactPrim, ExactRep, ExactSpec};
@@ -373,6 +374,23 @@ impl WasmShape {
         }
     }
 
+    /// Serialize the shape to STEP AP203 text (a complete Part 21 file).
+    ///
+    /// Shapes with an exact B-Rep representation — a supported primitive
+    /// chain, or a boolean built with exact booleans on — export analytic
+    /// surfaces. Everything else (smooth blends, rounded boxes, sweeps)
+    /// exports a faceted-but-valid B-Rep recovered from the SDF at the
+    /// given `accuracy` (target chordal deviation, same knob as
+    /// `meshAdaptive`; omitted or invalid falls back to 0.5% of the
+    /// shape's extent — the exact path ignores it).
+    ///
+    /// Throws a string error when the shape cannot produce a valid solid
+    /// (e.g. an empty boolean result).
+    #[wasm_bindgen(js_name = exportStep)]
+    pub fn export_step(&self, accuracy: Option<f64>) -> Result<String, String> {
+        step::export_step(&self.inner, self.exact.as_ref(), accuracy).map(|e| e.text)
+    }
+
     /// Mesh the shape adaptively to a target `accuracy`: the maximum
     /// chordal deviation of the mesh from the exact surface, in model
     /// units. The octree refines near curvature and CSG feature edges
@@ -729,6 +747,27 @@ mod tests {
         }
         assert!(!part.is_exact(), "mode off: no exact claim");
         assert_valid(&part.mesh(24, None));
+    }
+
+    /// STEP export picks its path per shape: exact boolean results emit
+    /// analytic surfaces, SDF-only shapes emit a faceted body, and both
+    /// are complete Part 21 files.
+    #[test]
+    fn export_step_serves_exact_and_faceted_paths() {
+        let _mode = exact_mode_on();
+        let part = WasmShape::sphere(1.0).subtract(&WasmShape::cylinder(0.4, 2.0));
+        assert!(part.is_exact());
+        let text = part.export_step(None).expect("exact export");
+        assert!(text.starts_with("ISO-10303-21;"));
+        assert!(text.contains("SPHERICAL_SURFACE"), "analytic surfaces");
+
+        let organic = WasmShape::rounded_box(0.6, 0.4, 0.5, 0.1);
+        let text = organic.export_step(Some(0.08)).expect("faceted export");
+        assert!(text.starts_with("ISO-10303-21;"));
+        assert!(
+            !text.contains("SPHERICAL_SURFACE") && text.contains("PLANE"),
+            "organic shapes export as faceted planar geometry"
+        );
     }
 
     /// With the toggle off (the default), booleans carry no exact

@@ -39,6 +39,14 @@ const DEFAULT_ACCURACY = 0.01;
 const EDIT_DEBOUNCE_MS = 400;
 const TOAST_MS = 3500;
 
+function downloadBlob(blob, filename) {
+  const link = document.createElement('a');
+  link.href = URL.createObjectURL(blob);
+  link.download = filename;
+  link.click();
+  URL.revokeObjectURL(link.href);
+}
+
 function meshShape(shape, accuracy) {
   const data = shape.meshAdaptive(accuracy);
   const positions = data.positions;
@@ -659,12 +667,31 @@ export default function App() {
       return;
     }
     const buffer = buildBinaryStl(current.positions, current.indices);
-    const blob = new Blob([buffer], { type: 'model/stl' });
-    const link = document.createElement('a');
-    link.href = URL.createObjectURL(blob);
-    link.download = 'opensolid.stl';
-    link.click();
-    URL.revokeObjectURL(link.href);
+    downloadBlob(new Blob([buffer], { type: 'model/stl' }), 'opensolid.stl');
+  }, []);
+
+  // STEP export serializes the displayed shape itself (not its mesh):
+  // exact B-Rep chains emit analytic surfaces, everything else emits a
+  // faceted body recovered from the SDF at the current accuracy.
+  const downloadStep = useCallback(() => {
+    const display = displayRef.current;
+    const shape = display.mode === 'pruned' ? display.shape : shapeRef.current;
+    if (display.mode === 'empty' || !shape) {
+      setError('Nothing to export yet: run a script that produces a shape.');
+      return;
+    }
+    if (typeof shape.exportStep !== 'function') {
+      setError('STEP export needs a rebuilt WASM package: run `npm run wasm`.');
+      return;
+    }
+    let text;
+    try {
+      text = shape.exportStep(accuracyRef.current);
+    } catch (err) {
+      setError(String(err));
+      return;
+    }
+    downloadBlob(new Blob([text], { type: 'application/step' }), 'model.step');
   }, []);
 
   // ---- extrude / revolve workflow -----------------------------------------
@@ -895,6 +922,7 @@ export default function App() {
           onExactBooleansChange={handleExactBooleansChange}
           onRun={runNow}
           onDownloadStl={downloadStl}
+          onDownloadStep={downloadStep}
           disabled={!wasmReady}
         />
       </div>

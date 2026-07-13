@@ -31,6 +31,7 @@ use opensolid_kernel::brep::topology::Body;
 use opensolid_kernel::brep::transform::transform_body;
 use opensolid_kernel::brep::{BooleanOp, BooleanOutput, GeometryStore, TopologyStore, primitives};
 use opensolid_kernel::hybrid::{self, HybridBody, HybridOptions, HybridPath};
+use opensolid_kernel::io::step::write::{StepWriteOptions, write_step};
 
 /// Global exact-boolean mode, flipped by the playground toggle. Read at
 /// boolean and mesh time so flipping it re-routes without rebuilding
@@ -187,6 +188,26 @@ impl ExactRep {
         match self {
             ExactRep::Spec(_) => None,
             ExactRep::Boolean(b) => Some(&b.mesh),
+        }
+    }
+
+    /// Serialize the exact B-Rep to STEP AP203 text. `None` when the exact
+    /// representation cannot be written — a spec whose primitive has no
+    /// exact B-Rep constructor (e.g. a spindle torus), or a body the AP203
+    /// writer rejects — in which case the caller falls back to the faceted
+    /// path, mirroring how booleans fall back to SDF meshing.
+    pub fn to_step(&self, options: &StepWriteOptions) -> Option<String> {
+        match self {
+            ExactRep::Spec(spec) => {
+                let mut store = TopologyStore::new();
+                let mut geo = GeometryStore::new();
+                let body = spec.materialize(&mut store, &mut geo).ok()?;
+                write_step(&store, &geo, &[body], options).ok()
+            }
+            ExactRep::Boolean(b) => {
+                let out = b.out.borrow();
+                write_step(&out.store, &out.geo, &[out.body], options).ok()
+            }
         }
     }
 }

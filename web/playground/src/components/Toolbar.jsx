@@ -27,8 +27,8 @@ function sliderToAccuracy(value) {
 }
 
 /**
- * Run / STL buttons plus meshing controls. Display toggles (wireframe,
- * views) live in the viewport's MainToolbar.
+ * Run / STL / STEP buttons plus meshing controls. Display toggles
+ * (wireframe, views) live in the viewport's MainToolbar.
  *
  * The accuracy slider sets the adaptive mesher's target: maximum chordal
  * deviation from the exact surface, in model units. It reports every
@@ -48,6 +48,7 @@ export default function Toolbar({
   onExactBooleansChange,
   onRun,
   onDownloadStl,
+  onDownloadStep,
   disabled,
 }) {
   return (
@@ -57,6 +58,14 @@ export default function Toolbar({
       </button>
       <button className="secondary" onClick={onDownloadStl} disabled={disabled}>
         Download STL
+      </button>
+      <button
+        className="secondary"
+        onClick={onDownloadStep}
+        disabled={disabled}
+        title="Export STEP (AP203). Exact B-Rep models export analytic surfaces; organic shapes export as faceted geometry."
+      >
+        Download STEP
       </button>
       <label>
         Accuracy
