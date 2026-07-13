@@ -65,6 +65,35 @@
 //! - the inclusion–exclusion identity
 //!   `vol(A) + vol(B) == vol(A∪B) + vol(A∩B)` holds,
 //! - results are invariant under rigid rotation of both operands.
+//!
+//! Sections (6)-(8) are the sphere/torus campaign (of-7ld.3), written
+//! BEFORE those surfaces are enabled in the exact pipeline (the of-7ld
+//! promotion policy). Every test there starts `#[ignore]`d: `Chart::new`
+//! still rejects `Surface3::Sphere`/`Torus` (of-7ld.4 lifts that gate),
+//! and several cases additionally need the of-7ld.2 SSI extension
+//! (sphere-sphere, cylinder-sphere, torus-torus, general plane-torus).
+//! This suite going green is the promotion gate for sphere/torus in
+//! `boolean()`. Run with `cargo test --test boolean_stress -- --ignored`.
+//!
+//! Bugs filed from the campaign's first run (2026-07-12, `Chart::new`
+//! gate lifted locally):
+//! - of-7ld.5: every plane-sphere boolean — even the plain cap bite —
+//!   fails classification ("could not find an interior sample point for
+//!   a face region"): the closed sphere face's uv cover polygon has only
+//!   the seam meridian for boundary and collapses at the pole rows.
+//! - of-7ld.6: a sphere face's broad-phase box is built from its
+//!   boundary samples — the seam meridian alone — so it is flat along
+//!   the seam-plane normal and misses shallow-overlap clashes entirely
+//!   (near-tangent sphere pairs skip SSI and go straight to
+//!   classification; silent-wrong-result risk once of-7ld.5 is fixed).
+//! - of-7ld.7: every torus boolean whose SSI succeeds (axis-perpendicular
+//!   and axis-containing plane cuts) dies in imprinting: the full-wrap
+//!   imprint circles on the doubly-periodic chart are rejected as "an
+//!   imprint chain ends in a face interior without closing".
+//!
+//! With the gate lifted, the four structured-rejection tests (tangency
+//! and sub-tolerance guards) already pass; all other campaign tests fail
+//! on of-7ld.5/6/7 or on SSI pairs pending the of-7ld.2 merge.
 
 use nalgebra::{Rotation3, Unit};
 use opensolid_brep::boolean::{intersect, subtract, unite};
@@ -79,7 +108,7 @@ use opensolid_core::mesh::TriangleMesh;
 use opensolid_core::tolerance::ToleranceContext;
 use opensolid_core::types::{BoundingBox3, Point3, Vector3};
 use opensolid_kernel::{MeshOptions, MeshSdf, mass_properties, mesh_sdf_indexed};
-use std::f64::consts::PI;
+use std::f64::consts::{FRAC_PI_2, PI};
 
 fn tol() -> ToleranceContext {
     ToleranceContext::default()
@@ -92,6 +121,54 @@ fn tol() -> ToleranceContext {
 const CYL_VOLUME_RTOL: f64 = 5e-3;
 /// Pure plane/plane results tessellate exactly; only fp accumulation.
 const PLANAR_VOLUME_RTOL: f64 = 1e-9;
+/// Spheres and tori discretize BOTH parameter directions (a cylinder only
+/// one): ~96 segments around and ~48 across lose ≈1.5e-3 of the volume.
+/// The same 0.5% budget as cylinders still covers it with margin.
+const CURVED_VOLUME_RTOL: f64 = 5e-3;
+
+// ---------------------------------------------------------------------
+// Closed-form volumes for sphere/torus configurations (of-7ld.3).
+// ---------------------------------------------------------------------
+
+fn sphere_volume(r: f64) -> f64 {
+    4.0 / 3.0 * PI * r * r * r
+}
+
+/// Spherical cap of height `h` (measured along the axis from the rim
+/// plane to the surface) cut from a sphere of radius `r`.
+fn spherical_cap_volume(r: f64, h: f64) -> f64 {
+    PI * h * h * (3.0 * r - h) / 3.0
+}
+
+/// Lens shared by two overlapping spheres whose centers are `d` apart:
+/// the two caps on either side of the radical plane.
+fn sphere_lens_volume(r1: f64, r2: f64, d: f64) -> f64 {
+    let x = (d * d - r2 * r2 + r1 * r1) / (2.0 * d);
+    spherical_cap_volume(r1, r1 - x) + spherical_cap_volume(r2, r2 - (d - x))
+}
+
+fn torus_volume(major: f64, minor: f64) -> f64 {
+    2.0 * PI * PI * major * minor * minor
+}
+
+/// Volume of the part of a torus (axis +Z, centered at z = 0) below the
+/// plane `z = c`, for `|c| <= minor`. The cross-section at height z is an
+/// annulus of area 4π·major·√(minor² − z²), so the volume is
+/// 4π·major·∫√(minor² − z²) dz over [-minor, c].
+fn torus_below_plane_volume(major: f64, minor: f64, c: f64) -> f64 {
+    let r = minor;
+    let c = c.clamp(-r, r);
+    let integral =
+        (r * r / 2.0) * ((c / r).asin() + FRAC_PI_2) + (c / 2.0) * (r * r - c * c).sqrt();
+    4.0 * PI * major * integral
+}
+
+/// Area of the lens shared by two circles of equal radius `r` whose
+/// centers are `d < 2r` apart. Revolved about an axis (Pappus) it gives
+/// exact torus-torus intersection volumes.
+fn circle_lens_area(r: f64, d: f64) -> f64 {
+    2.0 * r * r * (d / (2.0 * r)).acos() - (d / 2.0) * (4.0 * r * r - d * d).sqrt()
+}
 
 /// check() must be clean and the tessellation closed-manifold; returns the
 /// mesh for further measurement.
@@ -290,6 +367,159 @@ impl Scene {
             ],
         );
 
+        body
+    }
+
+    /// Sphere from the primitive builder (poles on ±Z, seam meridian
+    /// through +X), translated so its center lands at `center`.
+    fn sphere(&mut self, center: Point3, radius: f64) -> EntityId<Body> {
+        let body =
+            primitives::sphere(&mut self.store, &mut self.geo, radius).expect("valid radius");
+        translate_body(
+            &mut self.store,
+            &mut self.geo,
+            body,
+            center - Point3::origin(),
+        )
+        .expect("finite offset");
+        body
+    }
+
+    /// Torus about the +Z axis (seams meeting on the +X outer equator),
+    /// translated so its center lands at `center`.
+    fn torus(&mut self, center: Point3, major: f64, minor: f64) -> EntityId<Body> {
+        let body =
+            primitives::torus(&mut self.store, &mut self.geo, major, minor).expect("valid radii");
+        translate_body(
+            &mut self.store,
+            &mut self.geo,
+            body,
+            center - Point3::origin(),
+        )
+        .expect("finite offset");
+        body
+    }
+
+    /// Sphere with an arbitrary pole axis. Mirrors `primitives::sphere`,
+    /// but the seam meridian is an equal-radii `Curve3::Ellipse` with an
+    /// explicit frame, because `Curve3::Circle` derives its angular
+    /// reference from `plane_basis` of its own axis, which is not
+    /// rotation-equivariant (the same reason [`Scene::cylinder`] builds
+    /// its frame directly). With ellipse axis `-e_v` and `major_dir =
+    /// e_u`, the implied minor direction is `(-e_v) × e_u = axis`, so
+    /// `point(t) = center + r(cos t·e_u + sin t·axis)` — the curve
+    /// parameter is exactly the sphere latitude.
+    fn sphere_with_axis(&mut self, center: Point3, axis: Vector3, radius: f64) -> EntityId<Body> {
+        let axis = Unit::new_normalize(axis).into_inner();
+        let (e_u, e_v) = plane_basis(&axis);
+        let meridian = Curve3::Ellipse {
+            center,
+            axis: -e_v,
+            major_dir: e_u,
+            major_radius: radius,
+            minor_radius: radius,
+        };
+        let surface = Surface3::sphere(center, axis, radius).expect("valid sphere");
+
+        let body = self.store.create_body(BodyType::Solid);
+        let shell = self
+            .store
+            .create_shell(body, true, ShellOrientation::Outward);
+        let v_south = self
+            .store
+            .create_vertex(center - axis * radius, SYSTEM_RESOLUTION);
+        let v_north = self
+            .store
+            .create_vertex(center + axis * radius, SYSTEM_RESOLUTION);
+        let e_seam = {
+            let curve = self.geo.add_curve(meridian);
+            self.store.create_edge_with_curve(
+                v_south,
+                v_north,
+                SYSTEM_RESOLUTION,
+                curve,
+                -FRAC_PI_2,
+                FRAC_PI_2,
+            )
+        };
+        let face = self.store.create_face(shell, FaceSense::Positive);
+        self.store
+            .faces
+            .get_mut(face)
+            .expect("just created")
+            .surface = Some(self.geo.add_surface(surface));
+        self.store.create_loop(
+            face,
+            LoopType::Outer,
+            &[(e_seam, FinSense::Forward), (e_seam, FinSense::Reversed)],
+        );
+        body
+    }
+
+    /// Torus with an arbitrary axis. The major seam is a `Curve3::circle`
+    /// about `axis` — consistent with the boolean chart by construction,
+    /// since both derive their reference direction from
+    /// `plane_basis(axis)` — and the minor (tube) seam is an equal-radii
+    /// ellipse in the `(e_u, axis)` plane, for the same reason as
+    /// [`Scene::sphere_with_axis`].
+    fn torus_with_axis(
+        &mut self,
+        center: Point3,
+        axis: Vector3,
+        major: f64,
+        minor: f64,
+    ) -> EntityId<Body> {
+        let axis = Unit::new_normalize(axis).into_inner();
+        let (e_u, e_v) = plane_basis(&axis);
+        let surface = Surface3::torus(center, axis, major, minor).expect("valid torus");
+        let outer = major + minor;
+        let major_circle = Curve3::circle(center, axis, outer).expect("valid circle");
+        let minor_circle = Curve3::Ellipse {
+            center: center + e_u * major,
+            axis: -e_v,
+            major_dir: e_u,
+            major_radius: minor,
+            minor_radius: minor,
+        };
+
+        let body = self.store.create_body(BodyType::Solid);
+        let shell = self
+            .store
+            .create_shell(body, true, ShellOrientation::Outward);
+        self.store
+            .shells
+            .get_mut(shell)
+            .expect("just created")
+            .genus = 1;
+        let v0 = self
+            .store
+            .create_vertex(center + e_u * outer, SYSTEM_RESOLUTION);
+        let e_major = {
+            let curve = self.geo.add_curve(major_circle);
+            self.store
+                .create_edge_with_curve(v0, v0, SYSTEM_RESOLUTION, curve, 0.0, 2.0 * PI)
+        };
+        let e_minor = {
+            let curve = self.geo.add_curve(minor_circle);
+            self.store
+                .create_edge_with_curve(v0, v0, SYSTEM_RESOLUTION, curve, 0.0, 2.0 * PI)
+        };
+        let face = self.store.create_face(shell, FaceSense::Positive);
+        self.store
+            .faces
+            .get_mut(face)
+            .expect("just created")
+            .surface = Some(self.geo.add_surface(surface));
+        self.store.create_loop(
+            face,
+            LoopType::Outer,
+            &[
+                (e_major, FinSense::Forward),
+                (e_minor, FinSense::Forward),
+                (e_major, FinSense::Reversed),
+                (e_minor, FinSense::Reversed),
+            ],
+        );
         body
     }
 
@@ -974,6 +1204,986 @@ fn block_pair_identity_at_scale_0_001() {
 #[test]
 fn block_pair_identity_at_scale_1000() {
     scaled_block_pair_identity(1000.0);
+}
+
+// =====================================================================
+// (6) Sphere operands (of-7ld.3 campaign)
+// =====================================================================
+
+/// Sphere dipping a cap of depth `h` into the slab's top face; the
+/// removed material is a spherical cap. The cap region on the sphere
+/// contains the south pole — polar trimming is exercised on every run.
+fn sphere_cap_bite(scale: f64) {
+    let context = format!("slab minus sphere cap at {scale}× scale");
+    let s = scale;
+    let (r, h) = (1.0 * s, 0.6 * s);
+    let mut scene = Scene::new();
+    let slab = scene.block([0.0, 0.0, 0.0], [6.0 * s, 6.0 * s, 2.0 * s]);
+    let ball = scene.sphere(Point3::new(3.0 * s, 3.0 * s, 2.0 * s + (r - h)), r);
+
+    let diff = scene
+        .subtract(slab, ball)
+        .unwrap_or_else(|e| panic!("{context}: subtract failed: {e:?}"));
+    let counts = diff.store.euler_counts(diff.body);
+    assert_eq!(counts.genus, 0, "{context}: cap bite must not create genus");
+    assert_eq!(diff.shell_count(), 1, "{context}: single shell expected");
+    let vol = volume(&diff, &context);
+    let cap = spherical_cap_volume(r, h);
+    assert_close(vol, 72.0 * s * s * s - cap, CURVED_VOLUME_RTOL, &context);
+
+    let inter = scene
+        .intersect(slab, ball)
+        .unwrap_or_else(|e| panic!("{context}: intersect failed: {e:?}"));
+    let vol_inter = volume(&inter, &format!("{context}: intersection"));
+    assert_close(
+        vol_inter,
+        cap,
+        CURVED_VOLUME_RTOL,
+        &format!("{context}: intersection vs analytic cap"),
+    );
+}
+
+#[test]
+#[ignore = "of-7ld.4 gate; lifted, fails on of-7ld.5: sphere region interior sampling"]
+fn sphere_cap_bite_scale_1() {
+    sphere_cap_bite(1.0);
+}
+
+#[test]
+#[ignore = "of-7ld.4 gate; lifted, fails on of-7ld.5: sphere region interior sampling"]
+fn sphere_cap_bite_scale_0_001() {
+    sphere_cap_bite(0.001);
+}
+
+#[test]
+#[ignore = "of-7ld.4 gate; lifted, fails on of-7ld.5: sphere region interior sampling"]
+fn sphere_cap_bite_scale_1000() {
+    sphere_cap_bite(1000.0);
+}
+
+/// Sphere poking out of BOTH slab faces: the intersection is an
+/// equatorial band whose trimmed sphere face has two boundary circles,
+/// each wrapping the full `u` period (the sphere analog of the of-ipt.4
+/// full-wrap cylinder band), and the difference is a genus-1 through
+/// hole with lens-shaped mouths.
+#[test]
+#[ignore = "of-7ld.4 gate; lifted, fails on of-7ld.5: sphere region interior sampling"]
+fn sphere_band_through_slab() {
+    let context = "sphere through 2-thick slab (band + lens through-hole)";
+    let r = 1.5;
+    let mut scene = Scene::new();
+    let slab = scene.block([0.0, 0.0, 0.0], [6.0, 6.0, 2.0]);
+    let ball = scene.sphere(Point3::new(3.0, 3.0, 1.0), r);
+
+    let band = spherical_band_volume_r15();
+    let inter = scene
+        .intersect(slab, ball)
+        .unwrap_or_else(|e| panic!("{context}: intersect failed: {e:?}"));
+    let counts = inter.store.euler_counts(inter.body);
+    assert_eq!(counts.genus, 0, "{context}: band is a genus-0 solid");
+    let vol_inter = volume(&inter, &format!("{context}: intersection"));
+    assert_close(
+        vol_inter,
+        band,
+        CURVED_VOLUME_RTOL,
+        &format!("{context}: band volume"),
+    );
+
+    let diff = scene
+        .subtract(slab, ball)
+        .unwrap_or_else(|e| panic!("{context}: subtract failed: {e:?}"));
+    let counts = diff.store.euler_counts(diff.body);
+    assert_eq!(counts.genus, 1, "{context}: through hole must give genus 1");
+    let vol_diff = volume(&diff, &format!("{context}: difference"));
+    assert_close(
+        vol_diff,
+        72.0 - band,
+        CURVED_VOLUME_RTOL,
+        &format!("{context}: difference volume"),
+    );
+}
+
+/// Band volume for the r = 1.5 sphere centered mid-slab (z ∈ [0, 2]):
+/// the sphere minus the two caps of depth r − 1 poking out either face.
+fn spherical_band_volume_r15() -> f64 {
+    sphere_volume(1.5) - 2.0 * spherical_cap_volume(1.5, 0.5)
+}
+
+/// Sphere centered exactly on a block corner: the intersection is one
+/// sphere octant bounded by three mutually orthogonal imprint arcs
+/// meeting in pairwise junctions — an imprint NETWORK, not a single
+/// chain — and the octant contains the sphere's south pole.
+#[test]
+#[ignore = "of-7ld.4 gate; lifted, fails on of-7ld.5: sphere region interior sampling"]
+fn sphere_octant_on_block_corner() {
+    let context = "sphere centered on block corner (octant intersection)";
+    let r = 0.8;
+    let mut scene = Scene::new();
+    let cube = scene.block([0.0, 0.0, 0.0], [2.0, 2.0, 2.0]);
+    let ball = scene.sphere(Point3::new(2.0, 2.0, 2.0), r);
+
+    let octant = sphere_volume(r) / 8.0;
+    let inter = scene
+        .intersect(cube, ball)
+        .unwrap_or_else(|e| panic!("{context}: intersect failed: {e:?}"));
+    let vol_inter = volume(&inter, &format!("{context}: intersection"));
+    assert_close(
+        vol_inter,
+        octant,
+        CURVED_VOLUME_RTOL,
+        &format!("{context}: octant volume"),
+    );
+
+    let union = scene
+        .unite(cube, ball)
+        .unwrap_or_else(|e| panic!("{context}: unite failed: {e:?}"));
+    let diff = scene
+        .subtract(cube, ball)
+        .unwrap_or_else(|e| panic!("{context}: subtract failed: {e:?}"));
+    let vol_union = volume(&union, &format!("{context}: union"));
+    let vol_diff = volume(&diff, &format!("{context}: difference"));
+    assert_close(
+        vol_union + vol_inter,
+        8.0 + sphere_volume(r),
+        CURVED_VOLUME_RTOL,
+        &format!("{context}: inclusion–exclusion identity"),
+    );
+    assert_close(
+        vol_diff,
+        8.0 - octant,
+        CURVED_VOLUME_RTOL,
+        &format!("{context}: difference identity"),
+    );
+}
+
+/// Block face plane through BOTH poles: the imprint is the x = 0
+/// meridian circle, which passes through the two pole vertices of the
+/// seam edge — an imprint threaded through existing topology at the
+/// exact points where longitude is undefined.
+#[test]
+#[ignore = "of-7ld.4 gate; lifted, fails on of-7ld.5: sphere region interior sampling"]
+fn hemisphere_imprint_through_poles() {
+    let context = "half-space block ∩ sphere: meridian imprint through both poles";
+    let r = 1.0;
+    let mut scene = Scene::new();
+    let block = scene.block([0.0, -4.0, -4.0], [4.0, 4.0, 4.0]);
+    let ball = scene.sphere(Point3::origin(), r);
+
+    let inter = scene
+        .intersect(block, ball)
+        .unwrap_or_else(|e| panic!("{context}: intersect failed: {e:?}"));
+    let vol = volume(&inter, context);
+    assert_close(vol, sphere_volume(r) / 2.0, CURVED_VOLUME_RTOL, context);
+}
+
+/// Cap about the +X direction: the imprint circle crosses the sphere's
+/// seam meridian (u = 0) twice, so the trimmed regions must share the
+/// seam edge correctly.
+#[test]
+#[ignore = "of-7ld.4 gate; lifted, fails on of-7ld.5: sphere region interior sampling"]
+fn sphere_side_cap_crosses_seam() {
+    let context = "block bites +X cap: imprint crosses the seam meridian";
+    let (r, h) = (1.0, 0.7);
+    let mut scene = Scene::new();
+    let block = scene.block([r - h, -3.0, -3.0], [3.0, 3.0, 3.0]);
+    let ball = scene.sphere(Point3::origin(), r);
+
+    let cap = spherical_cap_volume(r, h);
+    let inter = scene
+        .intersect(block, ball)
+        .unwrap_or_else(|e| panic!("{context}: intersect failed: {e:?}"));
+    let vol_inter = volume(&inter, &format!("{context}: intersection"));
+    assert_close(vol_inter, cap, CURVED_VOLUME_RTOL, context);
+
+    let diff = scene
+        .subtract(ball, block)
+        .unwrap_or_else(|e| panic!("{context}: subtract failed: {e:?}"));
+    let counts = diff.store.euler_counts(diff.body);
+    assert_eq!(counts.genus, 0, "{context}: capped sphere stays genus 0");
+    let vol_diff = volume(&diff, &format!("{context}: difference"));
+    assert_close(
+        vol_diff,
+        sphere_volume(r) - cap,
+        CURVED_VOLUME_RTOL,
+        &format!("{context}: difference volume"),
+    );
+}
+
+/// The +X cap bite under seeded random rigid rotations of the BLOCK
+/// about the sphere center: the configuration is congruent (the sphere
+/// is rotation-symmetric), so every volume must match the closed form —
+/// while the imprint circle sweeps across the seam and poles at generic
+/// angles.
+#[test]
+#[ignore = "of-7ld.4 gate; lifted, fails on of-7ld.5: sphere region interior sampling"]
+fn rotated_block_cap_bite_volume_invariance() {
+    let mut rng = Rng::new(0x5F3E_7E11);
+    let (r, h) = (1.0, 0.6);
+    let expected = sphere_volume(r) - spherical_cap_volume(r, h);
+    for case in 0..4 {
+        let axis = Unit::new_normalize(Vector3::new(
+            rng.range(-1.0, 1.0),
+            rng.range(-1.0, 1.0),
+            rng.range(-1.0, 1.0),
+        ));
+        let angle = rng.range(0.2, 1.3);
+        let context = format!("case {case}: cap bite, block rotated {angle:.3} rad about {axis:?}");
+        let mut scene = Scene::new();
+        let block = scene.block([r - h, -3.0, -3.0], [3.0, 3.0, 3.0]);
+        let rot = Rotation3::from_axis_angle(&axis, angle);
+        scene.rotate(block, &rot, &Point3::origin());
+        let ball = scene.sphere(Point3::origin(), r);
+
+        let diff = scene
+            .subtract(ball, block)
+            .unwrap_or_else(|e| panic!("{context}: subtract failed: {e:?}"));
+        let vol = volume(&diff, &context);
+        assert_close(vol, expected, CURVED_VOLUME_RTOL, &context);
+    }
+}
+
+/// Seeded random face-cap configurations: a sphere dips depth `h` into
+/// one random face of a random cube, clear of every other face. The
+/// intersection has the exact cap closed form, and the three-way volume
+/// identities must hold.
+#[test]
+#[ignore = "of-7ld.4 gate; lifted, fails on of-7ld.5: sphere region interior sampling"]
+fn random_sphere_face_caps_identity() {
+    let mut rng = Rng::new(0x0F1_CA9);
+    for case in 0..8 {
+        let a = rng.range(2.5, 3.5);
+        let r = rng.range(0.4, 0.8);
+        let h = rng.range(0.15, r - 0.15);
+        let axis_k = rng.pick(3);
+        let hi = rng.pick(2) == 1;
+        let mut center = [0.0f64; 3];
+        for (k, c) in center.iter_mut().enumerate() {
+            *c = if k == axis_k {
+                if hi { a + (r - h) } else { -(r - h) }
+            } else {
+                rng.range(r + 0.2, a - r - 0.2)
+            };
+        }
+        let context =
+            format!("case {case}: cube [0,{a:.3}]³, sphere r={r:.3} h={h:.3} at {center:?}");
+        let mut scene = Scene::new();
+        let cube = scene.block([0.0, 0.0, 0.0], [a, a, a]);
+        let ball = scene.sphere(Point3::new(center[0], center[1], center[2]), r);
+
+        let cap = spherical_cap_volume(r, h);
+        let inter = scene
+            .intersect(cube, ball)
+            .unwrap_or_else(|e| panic!("{context}: intersect failed: {e:?}"));
+        let union = scene
+            .unite(cube, ball)
+            .unwrap_or_else(|e| panic!("{context}: unite failed: {e:?}"));
+        let diff = scene
+            .subtract(cube, ball)
+            .unwrap_or_else(|e| panic!("{context}: subtract failed: {e:?}"));
+        let vol_inter = volume(&inter, &format!("{context}: intersection"));
+        let vol_union = volume(&union, &format!("{context}: union"));
+        let vol_diff = volume(&diff, &format!("{context}: difference"));
+        let vol_cube = a * a * a;
+        assert_close(
+            vol_inter,
+            cap,
+            CURVED_VOLUME_RTOL,
+            &format!("{context}: intersection vs analytic cap"),
+        );
+        assert_close(
+            vol_union + vol_inter,
+            vol_cube + sphere_volume(r),
+            CURVED_VOLUME_RTOL,
+            &format!("{context}: inclusion–exclusion identity"),
+        );
+        assert_close(
+            vol_diff,
+            vol_cube - cap,
+            CURVED_VOLUME_RTOL,
+            &format!("{context}: difference identity"),
+        );
+    }
+}
+
+/// Canonical cap-bite configuration versus the same configuration
+/// rigidly rotated — the sphere rebuilt with the rotated pole axis via
+/// [`Scene::sphere_with_axis`], the block rotated in place. Both frames
+/// must reproduce the closed form.
+#[test]
+#[ignore = "of-7ld.4 gate; lifted, fails on of-7ld.5: sphere region interior sampling"]
+fn rotated_frame_sphere_cap_congruence() {
+    let (r, h) = (1.0, 0.6);
+    let sphere_center = Point3::new(3.0, 3.0, 2.0 + (r - h));
+    let expected = 72.0 - spherical_cap_volume(r, h);
+    let rot = Rotation3::from_axis_angle(&Unit::new_normalize(Vector3::new(1.0, 2.0, 3.0)), 0.7);
+    let pivot = Point3::new(1.0, 1.0, 1.0);
+
+    for rotated in [false, true] {
+        let context = format!("slab minus sphere cap, rotated frame: {rotated}");
+        let mut scene = Scene::new();
+        let slab = scene.block([0.0, 0.0, 0.0], [6.0, 6.0, 2.0]);
+        let ball = if rotated {
+            scene.rotate(slab, &rot, &pivot);
+            let center = pivot + rot * (sphere_center - pivot);
+            scene.sphere_with_axis(center, rot * Vector3::z(), r)
+        } else {
+            scene.sphere(sphere_center, r)
+        };
+        let diff = scene
+            .subtract(slab, ball)
+            .unwrap_or_else(|e| panic!("{context}: subtract failed: {e:?}"));
+        let vol = volume(&diff, &context);
+        assert_close(vol, expected, CURVED_VOLUME_RTOL, &context);
+    }
+}
+
+/// Coaxial cylinder drilled through a sphere: the remainder is the
+/// classic napkin ring, volume (4π/3)(r² − a²)^{3/2} independent of the
+/// imprint details, genus 1.
+#[test]
+#[ignore = "of-7ld.4 gate + of-7ld.2 cylinder-sphere SSI (in MQ)"]
+fn napkin_ring_coaxial_cylinder_drills_sphere() {
+    let context = "sphere minus coaxial through-cylinder (napkin ring)";
+    let (r, a) = (1.0, 0.5);
+    let mut scene = Scene::new();
+    let ball = scene.sphere(Point3::origin(), r);
+    let tool = scene.cylinder(Point3::new(0.0, 0.0, -2.0), Vector3::z(), a, 4.0);
+
+    let out = scene
+        .subtract(ball, tool)
+        .unwrap_or_else(|e| panic!("{context}: subtract failed: {e:?}"));
+    let counts = out.store.euler_counts(out.body);
+    assert_eq!(counts.genus, 1, "{context}: drilled sphere must be genus 1");
+    let vol = volume(&out, context);
+    let expected = 4.0 / 3.0 * PI * (r * r - a * a).powf(1.5);
+    assert_close(vol, expected, CYL_VOLUME_RTOL, context);
+}
+
+/// Cylinder drilled through a sphere OFF-center (still a full pierce):
+/// no elementary closed form, so assert validity, genus, and the volume
+/// identities among the three boolean results.
+#[test]
+#[ignore = "of-7ld.4 gate + of-7ld.2 cylinder-sphere SSI (in MQ)"]
+fn offset_cylinder_drills_sphere_identity() {
+    let context = "sphere minus offset through-cylinder";
+    let (r, a, off) = (1.0, 0.4, 0.45);
+    let mut scene = Scene::new();
+    let ball = scene.sphere(Point3::origin(), r);
+    let tool = scene.cylinder(Point3::new(off, 0.0, -2.0), Vector3::z(), a, 4.0);
+
+    let diff = scene
+        .subtract(ball, tool)
+        .unwrap_or_else(|e| panic!("{context}: subtract failed: {e:?}"));
+    let counts = diff.store.euler_counts(diff.body);
+    assert_eq!(counts.genus, 1, "{context}: through hole must give genus 1");
+    let inter = scene
+        .intersect(ball, tool)
+        .unwrap_or_else(|e| panic!("{context}: intersect failed: {e:?}"));
+    let vol_diff = volume(&diff, &format!("{context}: difference"));
+    let vol_inter = volume(&inter, &format!("{context}: intersection"));
+    assert_close(
+        vol_diff + vol_inter,
+        sphere_volume(r),
+        CYL_VOLUME_RTOL,
+        &format!("{context}: difference + intersection vs sphere volume"),
+    );
+}
+
+/// Two overlapping spheres: the intersection lens has an exact closed
+/// form (two caps against the radical plane), checked together with the
+/// inclusion–exclusion identity for equal and unequal radii.
+#[test]
+#[ignore = "of-7ld.4 gate + of-7ld.2 sphere-sphere SSI (in MQ)"]
+fn sphere_pair_lens_identities() {
+    for (r1, r2, d) in [(1.0, 1.0, 1.2), (1.0, 0.6, 0.9), (0.8, 0.8, 1.4)] {
+        let context = format!("sphere pair r1={r1} r2={r2} d={d}");
+        let mut scene = Scene::new();
+        let s1 = scene.sphere(Point3::origin(), r1);
+        let s2 = scene.sphere(Point3::new(d, 0.0, 0.0), r2);
+
+        let lens = sphere_lens_volume(r1, r2, d);
+        let inter = scene
+            .intersect(s1, s2)
+            .unwrap_or_else(|e| panic!("{context}: intersect failed: {e:?}"));
+        let union = scene
+            .unite(s1, s2)
+            .unwrap_or_else(|e| panic!("{context}: unite failed: {e:?}"));
+        let diff = scene
+            .subtract(s1, s2)
+            .unwrap_or_else(|e| panic!("{context}: subtract failed: {e:?}"));
+        let vol_inter = volume(&inter, &format!("{context}: intersection"));
+        let vol_union = volume(&union, &format!("{context}: union"));
+        let vol_diff = volume(&diff, &format!("{context}: difference"));
+        assert_close(
+            vol_inter,
+            lens,
+            CURVED_VOLUME_RTOL,
+            &format!("{context}: lens volume"),
+        );
+        assert_close(
+            vol_union + vol_inter,
+            sphere_volume(r1) + sphere_volume(r2),
+            CURVED_VOLUME_RTOL,
+            &format!("{context}: inclusion–exclusion identity"),
+        );
+        assert_close(
+            vol_diff,
+            sphere_volume(r1) - lens,
+            CURVED_VOLUME_RTOL,
+            &format!("{context}: difference identity"),
+        );
+    }
+}
+
+/// Seeded random transversal sphere pairs: centers along a random
+/// direction, separation strictly between the internal and external
+/// tangency distances with margin. Lens closed form + identities.
+#[test]
+#[ignore = "of-7ld.4 gate + of-7ld.2 sphere-sphere SSI (in MQ)"]
+fn random_sphere_pairs_identity() {
+    let mut rng = Rng::new(0x2_5EED_BA11);
+    for case in 0..8 {
+        let r1 = rng.range(0.5, 1.2);
+        let r2 = rng.range(0.5, 1.2);
+        let d = rng.range((r1 - r2).abs() + 0.2, r1 + r2 - 0.15);
+        let dir = Vector3::new(
+            rng.range(-1.0, 1.0),
+            rng.range(-1.0, 1.0),
+            rng.range(-1.0, 1.0),
+        )
+        .normalize();
+        let context = format!("case {case}: spheres r1={r1:.3} r2={r2:.3} d={d:.3} dir={dir:?}");
+        let mut scene = Scene::new();
+        let s1 = scene.sphere(Point3::origin(), r1);
+        let s2 = scene.sphere(Point3::origin() + dir * d, r2);
+
+        let lens = sphere_lens_volume(r1, r2, d);
+        let inter = scene
+            .intersect(s1, s2)
+            .unwrap_or_else(|e| panic!("{context}: intersect failed: {e:?}"));
+        let diff = scene
+            .subtract(s1, s2)
+            .unwrap_or_else(|e| panic!("{context}: subtract failed: {e:?}"));
+        let vol_inter = volume(&inter, &format!("{context}: intersection"));
+        let vol_diff = volume(&diff, &format!("{context}: difference"));
+        assert_close(
+            vol_inter,
+            lens,
+            CURVED_VOLUME_RTOL,
+            &format!("{context}: lens volume"),
+        );
+        assert_close(
+            vol_diff,
+            sphere_volume(r1) - lens,
+            CURVED_VOLUME_RTOL,
+            &format!("{context}: difference identity"),
+        );
+    }
+}
+
+/// Nearly-tangent external sphere pair: a razor-thin lens. The
+/// configuration is still formally transversal (clearance from tangency
+/// far above linear tolerance), so it must produce a valid solid; the
+/// volume check is a loose window because slivers tessellate coarsely.
+#[test]
+#[ignore = "of-7ld.4 gate; lifted, of-7ld.6 broad-phase miss; then needs of-7ld.2 sphere-sphere SSI"]
+fn sphere_pair_near_tangent_lens() {
+    for eps in [1e-3, 1e-4] {
+        let context = format!("near-tangent sphere pair, overlap {eps:.0e}");
+        let d = 2.0 - eps;
+        let mut scene = Scene::new();
+        let s1 = scene.sphere(Point3::origin(), 1.0);
+        let s2 = scene.sphere(Point3::new(d, 0.0, 0.0), 1.0);
+        let inter = scene
+            .intersect(s1, s2)
+            .unwrap_or_else(|e| panic!("{context}: intersect failed: {e:?}"));
+        let vol = volume(&inter, &context);
+        let lens = sphere_lens_volume(1.0, 1.0, d);
+        assert!(
+            vol > 0.2 * lens && vol < 5.0 * lens,
+            "{context}: sliver lens volume {vol} outside ({:.3e}, {:.3e})",
+            0.2 * lens,
+            5.0 * lens
+        );
+    }
+}
+
+/// Sub-tolerance external tangency of two spheres: a structured
+/// NotImplemented/Degenerate rejection is acceptable under the
+/// transversal MVP contract; a panic or an invalid "success" is a bug.
+#[test]
+#[ignore = "of-7ld.4: passes with the chart gate lifted — un-ignore at promotion"]
+fn sphere_pair_sub_tolerance_tangency() {
+    let context = "sphere pair 1e-7 inside external tangency";
+    let d = 2.0 - 1e-7;
+    let mut scene = Scene::new();
+    let s1 = scene.sphere(Point3::origin(), 1.0);
+    let s2 = scene.sphere(Point3::new(d, 0.0, 0.0), 1.0);
+    match scene.unite(s1, s2) {
+        Ok(out) => {
+            let vol = volume(&out, context);
+            assert_close(vol, 2.0 * sphere_volume(1.0), CURVED_VOLUME_RTOL, context);
+        }
+        Err(CoreError::NotImplemented { .. }) | Err(CoreError::Degenerate { .. }) => {}
+        Err(other) => panic!("{context}: unexpected error kind: {other:?}"),
+    }
+}
+
+// =====================================================================
+// (7) Torus operands (of-7ld.3 campaign)
+// =====================================================================
+
+/// Torus sunk tube-deep into a slab, its center 0.2 below the top face:
+/// the plane cuts every tube cross-section, so the intersection is a
+/// full genus-1 ring and both boolean volumes have the exact
+/// torus-below-plane closed form.
+fn torus_sunk_in_slab(scale: f64) {
+    let context = format!("torus sunk in slab at {scale}× scale");
+    let s = scale;
+    let (major, minor, drop) = (2.0 * s, 0.5 * s, 0.2 * s);
+    let mut scene = Scene::new();
+    let slab = scene.block([-6.0 * s, -6.0 * s, -4.0 * s], [6.0 * s, 6.0 * s, 0.0]);
+    let ring = scene.torus(Point3::new(0.0, 0.0, -drop), major, minor);
+
+    // Plane z = 0 sits `drop` above the tube center plane.
+    let below = torus_below_plane_volume(major, minor, drop);
+    let slab_vol = 12.0 * 12.0 * 4.0 * s * s * s;
+
+    let inter = scene
+        .intersect(slab, ring)
+        .unwrap_or_else(|e| panic!("{context}: intersect failed: {e:?}"));
+    let counts = inter.store.euler_counts(inter.body);
+    assert_eq!(counts.genus, 1, "{context}: submerged part is a full ring");
+    let vol_inter = volume(&inter, &format!("{context}: intersection"));
+    assert_close(
+        vol_inter,
+        below,
+        CURVED_VOLUME_RTOL,
+        &format!("{context}: intersection vs torus-below-plane"),
+    );
+
+    let diff = scene
+        .subtract(slab, ring)
+        .unwrap_or_else(|e| panic!("{context}: subtract failed: {e:?}"));
+    let counts = diff.store.euler_counts(diff.body);
+    assert_eq!(counts.genus, 0, "{context}: ring groove must not add genus");
+    let vol_diff = volume(&diff, &format!("{context}: difference"));
+    assert_close(
+        vol_diff,
+        slab_vol - below,
+        CURVED_VOLUME_RTOL,
+        &format!("{context}: difference volume"),
+    );
+
+    let union = scene
+        .unite(slab, ring)
+        .unwrap_or_else(|e| panic!("{context}: unite failed: {e:?}"));
+    let counts = union.store.euler_counts(union.body);
+    assert_eq!(counts.genus, 0, "{context}: ridge ring must not add genus");
+    let vol_union = volume(&union, &format!("{context}: union"));
+    assert_close(
+        vol_union,
+        slab_vol + torus_volume(major, minor) - below,
+        CURVED_VOLUME_RTOL,
+        &format!("{context}: union volume"),
+    );
+}
+
+#[test]
+#[ignore = "of-7ld.4 gate; lifted, fails on of-7ld.7: torus imprint chains never close"]
+fn torus_sunk_in_slab_scale_1() {
+    torus_sunk_in_slab(1.0);
+}
+
+#[test]
+#[ignore = "of-7ld.4 gate; lifted, fails on of-7ld.7: torus imprint chains never close"]
+fn torus_sunk_in_slab_scale_0_001() {
+    torus_sunk_in_slab(0.001);
+}
+
+#[test]
+#[ignore = "of-7ld.4 gate; lifted, fails on of-7ld.7: torus imprint chains never close"]
+fn torus_sunk_in_slab_scale_1000() {
+    torus_sunk_in_slab(1000.0);
+}
+
+/// Half torus by an axis-containing plane (x = 0, avoiding the seams at
+/// +X): the imprints are the two tube cross-section circles at u = ±π/2,
+/// each crossing the major seam edge transversally. The union grows a
+/// half-ring arch on the block — a genuine handle, genus 1.
+#[test]
+#[ignore = "of-7ld.4 gate; lifted, fails on of-7ld.7: torus imprint chains never close"]
+fn half_torus_by_axis_plane() {
+    let context = "torus halved by the axis-containing plane x = 0";
+    let (major, minor) = (2.0, 0.5);
+    let mut scene = Scene::new();
+    let block = scene.block([-6.0, -6.0, -2.0], [0.0, 6.0, 2.0]);
+    let ring = scene.torus(Point3::origin(), major, minor);
+
+    let half = torus_volume(major, minor) / 2.0;
+    let inter = scene
+        .intersect(block, ring)
+        .unwrap_or_else(|e| panic!("{context}: intersect failed: {e:?}"));
+    let counts = inter.store.euler_counts(inter.body);
+    assert_eq!(counts.genus, 0, "{context}: half ring is genus 0");
+    let vol_inter = volume(&inter, &format!("{context}: intersection"));
+    assert_close(vol_inter, half, CURVED_VOLUME_RTOL, context);
+
+    let diff = scene
+        .subtract(ring, block)
+        .unwrap_or_else(|e| panic!("{context}: subtract failed: {e:?}"));
+    let vol_diff = volume(&diff, &format!("{context}: difference"));
+    assert_close(
+        vol_diff,
+        half,
+        CURVED_VOLUME_RTOL,
+        &format!("{context}: difference volume"),
+    );
+
+    let union = scene
+        .unite(block, ring)
+        .unwrap_or_else(|e| panic!("{context}: unite failed: {e:?}"));
+    let counts = union.store.euler_counts(union.body);
+    assert_eq!(counts.genus, 1, "{context}: arch handle must give genus 1");
+    let vol_union = volume(&union, &format!("{context}: union"));
+    assert_close(
+        vol_union,
+        12.0 * 12.0 * 4.0 / 2.0 + half,
+        CURVED_VOLUME_RTOL,
+        &format!("{context}: union volume"),
+    );
+}
+
+/// Canonical sunk-torus configuration versus the same configuration
+/// rigidly rotated — the torus rebuilt about the rotated axis via
+/// [`Scene::torus_with_axis`] (its two seams land per `plane_basis` of
+/// the rotated axis, exactly as the boolean chart will). Both frames
+/// must reproduce the closed form.
+#[test]
+#[ignore = "of-7ld.4 gate; lifted, fails on of-7ld.7: torus imprint chains never close"]
+fn rotated_frame_torus_sunk_congruence() {
+    let (major, minor, drop) = (2.0, 0.5, 0.2);
+    let torus_center = Point3::new(0.0, 0.0, -drop);
+    let below = torus_below_plane_volume(major, minor, drop);
+    let expected = 12.0 * 12.0 * 4.0 - below;
+    let rot = Rotation3::from_axis_angle(&Unit::new_normalize(Vector3::new(2.0, -1.0, 1.0)), 0.9);
+    let pivot = Point3::new(1.0, 1.0, 1.0);
+
+    for rotated in [false, true] {
+        let context = format!("slab minus sunk torus, rotated frame: {rotated}");
+        let mut scene = Scene::new();
+        let slab = scene.block([-6.0, -6.0, -4.0], [6.0, 6.0, 0.0]);
+        let ring = if rotated {
+            scene.rotate(slab, &rot, &pivot);
+            let center = pivot + rot * (torus_center - pivot);
+            scene.torus_with_axis(center, rot * Vector3::z(), major, minor)
+        } else {
+            scene.torus(torus_center, major, minor)
+        };
+        let diff = scene
+            .subtract(slab, ring)
+            .unwrap_or_else(|e| panic!("{context}: subtract failed: {e:?}"));
+        let vol = volume(&diff, &context);
+        assert_close(vol, expected, CURVED_VOLUME_RTOL, &context);
+    }
+}
+
+/// Block notch through the FULL tube cross-section over a small angular
+/// span: the subtraction severs the ring into a C — genus drops 1 → 0.
+/// The block's side faces are off-axis planes parallel to the torus
+/// axis, whose torus sections are general quartics (marched SSI).
+#[test]
+#[ignore = "of-7ld.4 gate + of-7ld.2 marched plane-torus SSI (in MQ); then likely of-7ld.7"]
+fn block_severs_torus_tube() {
+    let context = "block notch severing the torus tube";
+    let (major, minor) = (2.0, 0.5);
+    let mut scene = Scene::new();
+    let ring = scene.torus(Point3::origin(), major, minor);
+    let tool = scene.block([1.3, -0.35, -1.0], [2.7, 0.35, 1.0]);
+
+    let diff = scene
+        .subtract(ring, tool)
+        .unwrap_or_else(|e| panic!("{context}: subtract failed: {e:?}"));
+    let counts = diff.store.euler_counts(diff.body);
+    assert_eq!(counts.genus, 0, "{context}: severed ring must be genus 0");
+    let inter = scene
+        .intersect(ring, tool)
+        .unwrap_or_else(|e| panic!("{context}: intersect failed: {e:?}"));
+    let vol_diff = volume(&diff, &format!("{context}: difference"));
+    let vol_inter = volume(&inter, &format!("{context}: intersection"));
+    assert_close(
+        vol_diff + vol_inter,
+        torus_volume(major, minor),
+        CURVED_VOLUME_RTOL,
+        &format!("{context}: difference + intersection vs torus volume"),
+    );
+}
+
+/// Block notch into the OUTER wall only (never reaching the tube's
+/// inner half): the ring survives, genus stays 1. The bite is centered
+/// on the +X outer equator, crossing BOTH torus seams.
+#[test]
+#[ignore = "of-7ld.4 gate + of-7ld.2 marched plane-torus SSI (in MQ); then likely of-7ld.7"]
+fn block_notches_torus_outer_wall() {
+    let context = "block notch in the torus outer wall across both seams";
+    let (major, minor) = (2.0, 0.5);
+    let mut scene = Scene::new();
+    let ring = scene.torus(Point3::origin(), major, minor);
+    let tool = scene.block([2.1, -0.35, -1.0], [2.7, 0.35, 1.0]);
+
+    let diff = scene
+        .subtract(ring, tool)
+        .unwrap_or_else(|e| panic!("{context}: subtract failed: {e:?}"));
+    let counts = diff.store.euler_counts(diff.body);
+    assert_eq!(counts.genus, 1, "{context}: notched ring must stay genus 1");
+    let inter = scene
+        .intersect(ring, tool)
+        .unwrap_or_else(|e| panic!("{context}: intersect failed: {e:?}"));
+    let vol_diff = volume(&diff, &format!("{context}: difference"));
+    let vol_inter = volume(&inter, &format!("{context}: intersection"));
+    assert_close(
+        vol_diff + vol_inter,
+        torus_volume(major, minor),
+        CURVED_VOLUME_RTOL,
+        &format!("{context}: difference + intersection vs torus volume"),
+    );
+}
+
+/// Two congruent coaxial tori shifted along their common axis: the tube
+/// cross-sections are equal circles offset by the shift, so the
+/// intersection is the revolved circle-circle lens (Pappus about the
+/// common centroid radius R) — an exact closed form — and a full ring.
+#[test]
+#[ignore = "of-7ld.4 gate + of-7ld.2 torus-torus SSI (in MQ); then likely of-7ld.7"]
+fn coaxial_tori_axial_shift_lens() {
+    let context = "coaxial tori shifted 0.6 along the axis";
+    let (major, minor, shift) = (2.0, 0.5, 0.6);
+    let mut scene = Scene::new();
+    let t1 = scene.torus(Point3::origin(), major, minor);
+    let t2 = scene.torus(Point3::new(0.0, 0.0, shift), major, minor);
+
+    let lens = 2.0 * PI * major * circle_lens_area(minor, shift);
+    let inter = scene
+        .intersect(t1, t2)
+        .unwrap_or_else(|e| panic!("{context}: intersect failed: {e:?}"));
+    let counts = inter.store.euler_counts(inter.body);
+    assert_eq!(counts.genus, 1, "{context}: lens ring is genus 1");
+    let vol_inter = volume(&inter, &format!("{context}: intersection"));
+    assert_close(vol_inter, lens, CURVED_VOLUME_RTOL, context);
+
+    let union = scene
+        .unite(t1, t2)
+        .unwrap_or_else(|e| panic!("{context}: unite failed: {e:?}"));
+    let counts = union.store.euler_counts(union.body);
+    assert_eq!(counts.genus, 1, "{context}: merged rings stay genus 1");
+    let vol_union = volume(&union, &format!("{context}: union"));
+    assert_close(
+        vol_union + vol_inter,
+        2.0 * torus_volume(major, minor),
+        CURVED_VOLUME_RTOL,
+        &format!("{context}: inclusion–exclusion identity"),
+    );
+}
+
+/// Two same-plane tori with different major radii (same tube radius):
+/// the cross-sections are equal circles offset radially, so Pappus about
+/// the lens centroid radius (R1 + R2)/2 gives the exact intersection.
+#[test]
+#[ignore = "of-7ld.4 gate + of-7ld.2 torus-torus SSI (in MQ); then likely of-7ld.7"]
+fn coplanar_tori_major_shift_lens() {
+    let context = "coplanar tori, major radii 2.0 and 2.6";
+    let (r1, r2, minor) = (2.0, 2.6, 0.5);
+    let mut scene = Scene::new();
+    let t1 = scene.torus(Point3::origin(), r1, minor);
+    let t2 = scene.torus(Point3::origin(), r2, minor);
+
+    let lens = 2.0 * PI * ((r1 + r2) / 2.0) * circle_lens_area(minor, r2 - r1);
+    let inter = scene
+        .intersect(t1, t2)
+        .unwrap_or_else(|e| panic!("{context}: intersect failed: {e:?}"));
+    let vol_inter = volume(&inter, &format!("{context}: intersection"));
+    assert_close(vol_inter, lens, CURVED_VOLUME_RTOL, context);
+
+    let diff = scene
+        .subtract(t1, t2)
+        .unwrap_or_else(|e| panic!("{context}: subtract failed: {e:?}"));
+    let vol_diff = volume(&diff, &format!("{context}: difference"));
+    assert_close(
+        vol_diff,
+        torus_volume(r1, minor) - lens,
+        CURVED_VOLUME_RTOL,
+        &format!("{context}: difference identity"),
+    );
+}
+
+/// Perpendicular-axis tori built so the second tube loops around the
+/// first one's centerline at constant clearance, overlapping it by 0.1:
+/// genuinely doubly-curved transversal contact with no closed form —
+/// assert validity and the pairwise volume identity.
+#[test]
+#[ignore = "of-7ld.4 gate + of-7ld.2 torus-torus SSI (in MQ); then likely of-7ld.7"]
+fn perpendicular_tori_identity() {
+    let context = "perpendicular tori, tube-around-tube overlap";
+    let mut scene = Scene::new();
+    // T2's centerline (radius 1 about (0,2,0) in the x = 0 plane) keeps
+    // distance exactly 1 from T1's centerline; tube radii 0.7 + 0.4
+    // overlap that channel by 0.1.
+    let t1 = scene.torus(Point3::origin(), 2.0, 0.7);
+    let t2 = scene.torus_with_axis(Point3::new(0.0, 2.0, 0.0), Vector3::x(), 1.0, 0.4);
+
+    let diff = scene
+        .subtract(t1, t2)
+        .unwrap_or_else(|e| panic!("{context}: subtract failed: {e:?}"));
+    let inter = scene
+        .intersect(t1, t2)
+        .unwrap_or_else(|e| panic!("{context}: intersect failed: {e:?}"));
+    let vol_diff = volume(&diff, &format!("{context}: difference"));
+    let vol_inter = volume(&inter, &format!("{context}: intersection"));
+    assert_close(
+        vol_diff + vol_inter,
+        torus_volume(2.0, 0.7),
+        CURVED_VOLUME_RTOL,
+        &format!("{context}: difference + intersection vs T1 volume"),
+    );
+}
+
+/// The same construction at EXACT channel tangency (tube radii sum to
+/// the centerline clearance): the surfaces touch along a whole curve
+/// without crossing. Structured rejection is acceptable; a panic or an
+/// invalid success is a bug.
+#[test]
+#[ignore = "of-7ld.4: passes with the chart gate lifted — un-ignore at promotion"]
+fn perpendicular_tori_channel_tangency() {
+    let context = "perpendicular tori tangent along the channel curve";
+    let mut scene = Scene::new();
+    let t1 = scene.torus(Point3::origin(), 2.0, 0.6);
+    let t2 = scene.torus_with_axis(Point3::new(0.0, 2.0, 0.0), Vector3::x(), 1.0, 0.4);
+    match scene.unite(t1, t2) {
+        Ok(out) => {
+            let vol = volume(&out, context);
+            assert_close(
+                vol,
+                torus_volume(2.0, 0.6) + torus_volume(1.0, 0.4),
+                CURVED_VOLUME_RTOL,
+                context,
+            );
+        }
+        Err(CoreError::NotImplemented { .. }) | Err(CoreError::Degenerate { .. }) => {}
+        Err(other) => panic!("{context}: unexpected error kind: {other:?}"),
+    }
+}
+
+// =====================================================================
+// (8) Sphere/torus near-tangency and SDF round-trips (of-7ld.3)
+// =====================================================================
+
+/// Sphere dipping a razor-thin cap into a slab face — formally
+/// transversal (clearance far above linear tolerance) so it must
+/// succeed; slivers tessellate coarsely, so the volume check is a
+/// window, and validity is the real assertion.
+#[test]
+#[ignore = "of-7ld.4 gate; lifted, fails on of-7ld.5: sphere region interior sampling"]
+fn plane_grazes_sphere_tiny_caps() {
+    for h in [1e-3, 1e-4] {
+        let context = format!("sphere dips {h:.0e} into the slab top");
+        let r = 1.0;
+        let mut scene = Scene::new();
+        let slab = scene.block([-4.0, -4.0, -4.0], [4.0, 4.0, 0.0]);
+        let ball = scene.sphere(Point3::new(0.0, 0.0, r - h), r);
+        let inter = scene
+            .intersect(slab, ball)
+            .unwrap_or_else(|e| panic!("{context}: intersect failed: {e:?}"));
+        let vol = volume(&inter, &context);
+        let cap = spherical_cap_volume(r, h);
+        assert!(
+            vol > 0.2 * cap && vol < 5.0 * cap,
+            "{context}: sliver cap volume {vol} outside ({:.3e}, {:.3e})",
+            0.2 * cap,
+            5.0 * cap
+        );
+    }
+}
+
+/// Sphere clearing the slab top by less than the linear tolerance:
+/// sub-tolerance contact. Structured rejection or a valid, untouched
+/// result are both acceptable; a panic or invalid success is a bug.
+#[test]
+#[ignore = "of-7ld.4: passes with the chart gate lifted — un-ignore at promotion"]
+fn plane_grazes_sphere_sub_tolerance() {
+    let context = "sphere dips 1e-7 into the slab top";
+    let r = 1.0;
+    let mut scene = Scene::new();
+    let slab = scene.block([-4.0, -4.0, -4.0], [4.0, 4.0, 0.0]);
+    let ball = scene.sphere(Point3::new(0.0, 0.0, r - 1e-7), r);
+    match scene.subtract(slab, ball) {
+        Ok(out) => {
+            let vol = volume(&out, context);
+            assert_close(vol, 8.0 * 8.0 * 4.0, CURVED_VOLUME_RTOL, context);
+        }
+        Err(CoreError::NotImplemented { .. }) | Err(CoreError::Degenerate { .. }) => {}
+        Err(other) => panic!("{context}: unexpected error kind: {other:?}"),
+    }
+}
+
+/// Boolean output → tessellate → MeshSdf → dual-contour re-mesh volume
+/// agreement, for a sphere cap subtraction.
+#[test]
+#[ignore = "of-7ld.4 gate; lifted, fails on of-7ld.5: sphere region interior sampling"]
+fn round_trip_slab_minus_sphere_cap() {
+    let mut scene = Scene::new();
+    let slab = scene.block([0.0, 0.0, 0.0], [4.0, 4.0, 2.0]);
+    let ball = scene.sphere(Point3::new(2.0, 2.0, 2.4), 1.0);
+    let out = scene.subtract(slab, ball).expect("cap subtract");
+    round_trip_volume(&out, "round-trip: slab minus sphere cap");
+}
+
+/// The same SDF round-trip for a slab ∪ sunk torus (curved ridge ring).
+#[test]
+#[ignore = "of-7ld.4 gate; lifted, fails on of-7ld.7: torus imprint chains never close"]
+fn round_trip_slab_union_torus() {
+    let mut scene = Scene::new();
+    let slab = scene.block([-4.0, -4.0, -4.0], [4.0, 4.0, 0.0]);
+    let ring = scene.torus(Point3::new(0.0, 0.0, -0.2), 2.0, 0.5);
+    let out = scene.unite(slab, ring).expect("sunk torus union");
+    round_trip_volume(&out, "round-trip: slab union sunk torus");
+}
+
+/// Tangential sphere/torus contacts must never panic: every outcome is
+/// either a fully valid solid or a structured error.
+#[test]
+#[ignore = "of-7ld.4: passes with the chart gate lifted — un-ignore at promotion"]
+fn no_panics_on_sphere_torus_tangencies() {
+    let mut scene = Scene::new();
+    let ball = scene.sphere(Point3::origin(), 1.0);
+    let pole_block = scene.block([-2.0, -2.0, 1.0], [2.0, 2.0, 3.0]);
+    let corner_cube = scene.block([0.0, 0.0, 0.0], [2.0, 2.0, 2.0]);
+    let corner_ball = scene.sphere(Point3::new(3.0, 2.0, 2.0), 1.0);
+    let ring = scene.torus(Point3::origin(), 2.0, 0.5);
+    let top_block = scene.block([-4.0, -4.0, 0.5], [4.0, 4.0, 3.0]);
+    let cases: Vec<(&str, CoreResult<BooleanOutput>)> = vec![
+        (
+            "block face tangent at the sphere's north pole",
+            scene.unite(ball, pole_block),
+        ),
+        (
+            "sphere tangent to a block face at one point",
+            scene.unite(corner_cube, corner_ball),
+        ),
+        (
+            "block face tangent along the torus top circle",
+            scene.unite(ring, top_block),
+        ),
+    ];
+    for (name, result) in cases {
+        match result {
+            Ok(out) => {
+                assert_valid(&out, name);
+            }
+            Err(e) => {
+                let _ = format!("{name}: rejected with {e:?}");
+            }
+        }
+    }
 }
 
 // =====================================================================
