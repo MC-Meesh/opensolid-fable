@@ -38,6 +38,18 @@ impl<A: Sdf, B: Sdf> Sdf for Union<A, B> {
     fn eval_interval(&self, b: &BoundingBox3) -> Interval {
         self.a.eval_interval(b).min(&self.b.eval_interval(b))
     }
+
+    // A child is active if it wins the min within `tol`.
+    fn branches(&self, p: &Point3, tol: f64, out: &mut Vec<(f64, Vector3)>) {
+        let fa = self.a.eval(p);
+        let fb = self.b.eval(p);
+        if fa <= fb + tol {
+            self.a.branches(p, tol, out);
+        }
+        if fb <= fa + tol {
+            self.b.branches(p, tol, out);
+        }
+    }
 }
 
 /// `max(a, b)`. Preserves 1-Lipschitz; underestimates distance near corners
@@ -63,6 +75,18 @@ impl<A: Sdf, B: Sdf> Sdf for Intersection<A, B> {
     // Pointwise max propagates exactly: no widening beyond the children's.
     fn eval_interval(&self, b: &BoundingBox3) -> Interval {
         self.a.eval_interval(b).max(&self.b.eval_interval(b))
+    }
+
+    // A child is active if it wins the max within `tol`.
+    fn branches(&self, p: &Point3, tol: f64, out: &mut Vec<(f64, Vector3)>) {
+        let fa = self.a.eval(p);
+        let fb = self.b.eval(p);
+        if fa >= fb - tol {
+            self.a.branches(p, tol, out);
+        }
+        if fb >= fa - tol {
+            self.b.branches(p, tol, out);
+        }
     }
 }
 
@@ -90,6 +114,25 @@ impl<A: Sdf, B: Sdf> Sdf for Subtraction<A, B> {
     // max(a, -b): negation and pointwise max both propagate exactly.
     fn eval_interval(&self, b: &BoundingBox3) -> Interval {
         self.a.eval_interval(b).max(&(-self.b.eval_interval(b)))
+    }
+
+    // `b` enters negated, so its branches are negated too (value and
+    // gradient): the branch surfaces are unchanged but oriented outward for
+    // the subtracted solid, matching `grad`.
+    fn branches(&self, p: &Point3, tol: f64, out: &mut Vec<(f64, Vector3)>) {
+        let fa = self.a.eval(p);
+        let nb = -self.b.eval(p);
+        if fa >= nb - tol {
+            self.a.branches(p, tol, out);
+        }
+        if nb >= fa - tol {
+            let start = out.len();
+            self.b.branches(p, tol, out);
+            for branch in &mut out[start..] {
+                branch.0 = -branch.0;
+                branch.1 = -branch.1;
+            }
+        }
     }
 }
 

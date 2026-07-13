@@ -59,6 +59,12 @@ impl Sdf for Shape {
     fn eval_interval(&self, b: &BoundingBox3) -> Interval {
         self.0.eval_interval(b)
     }
+
+    // Must forward: the default would collapse the CSG tree's branch
+    // decomposition into a single kinked branch.
+    fn branches(&self, p: &Point3, tol: f64, out: &mut Vec<(f64, Vector3)>) {
+        self.0.branches(p, tol, out)
+    }
 }
 
 #[cfg(test)]

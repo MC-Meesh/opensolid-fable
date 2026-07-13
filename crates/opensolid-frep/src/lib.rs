@@ -35,6 +35,11 @@
 //!   [`mesh_sdf_indexed`]) and adaptive-octree dual contouring with QEF sharp
 //!   features ([`mesh_sdf_adaptive`]). Both produce watertight, manifold
 //!   meshes.
+//! - **Refinement** ([`refine`]): post-meshing pass ([`refine_mesh`]) that
+//!   snaps feature vertices onto the analytic CSG intersection curves (via
+//!   [`Sdf::branches`](primitives::Sdf::branches)) and regularizes the
+//!   triangulation with feature-aware tangential smoothing, Delaunay edge
+//!   flips, and sliver collapse.
 //!
 //! This crate is the robust fast path of the hybrid kernel; the exact B-Rep
 //! side lives in `opensolid-brep`, and `opensolid-kernel` bridges the two.
@@ -47,6 +52,7 @@ pub mod mesh_adaptive;
 pub mod ops;
 pub mod primitives;
 pub mod profile;
+pub mod refine;
 pub mod shape;
 #[cfg(test)]
 pub(crate) mod test_util;
@@ -56,5 +62,6 @@ pub use mesh::{MeshOptions, Triangle, TriangleMesh, mesh_sdf, mesh_sdf_indexed};
 pub use mesh_adaptive::{AdaptiveMeshOptions, mesh_sdf_adaptive, mesh_sdf_adaptive_indexed};
 pub use ops::{Offset, Rounded, SdfOpsExt, Shell};
 pub use profile::{Extrude, Profile2D, Revolve};
+pub use refine::{RefineOptions, refine_mesh};
 pub use shape::Shape;
 pub use transform::{AnisotropicScale, SdfTransformExt, Transformed, UniformScale};

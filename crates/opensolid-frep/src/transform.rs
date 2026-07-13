@@ -48,6 +48,15 @@ impl<S: Sdf> Sdf for Transformed<S> {
         });
         self.sdf.eval_interval(&BoundingBox3::from_points(corners))
     }
+
+    // Isometries preserve values; gradients rotate forward, as in `grad`.
+    fn branches(&self, p: &Point3, tol: f64, out: &mut Vec<(f64, Vector3)>) {
+        let start = out.len();
+        self.sdf.branches(&(self.inverse * p), tol, out);
+        for branch in &mut out[start..] {
+            branch.1 = self.inverse.inverse_transform_vector(&branch.1);
+        }
+    }
 }
 
 /// An SDF scaled uniformly about the origin by `factor > 0`:
@@ -101,6 +110,20 @@ impl<S: Sdf> Sdf for UniformScale<S> {
         );
         let i = self.sdf.eval_interval(&inner);
         Interval::new(i.lo * self.factor, i.hi * self.factor)
+    }
+
+    // Values scale by `factor` (so the activity tolerance shrinks going
+    // in); gradients are unchanged, as in `grad`.
+    fn branches(&self, p: &Point3, tol: f64, out: &mut Vec<(f64, Vector3)>) {
+        let start = out.len();
+        self.sdf.branches(
+            &Point3::from(p.coords / self.factor),
+            tol / self.factor,
+            out,
+        );
+        for branch in &mut out[start..] {
+            branch.0 *= self.factor;
+        }
     }
 }
 
@@ -172,6 +195,23 @@ impl<S: Sdf> Sdf for AnisotropicScale<S> {
         let inner = BoundingBox3::new(self.to_inner(&b.min), self.to_inner(&b.max));
         let i = self.sdf.eval_interval(&inner);
         Interval::new(i.lo * self.min_factor, i.hi * self.min_factor)
+    }
+
+    // Values scale by `min_factor`; gradients map through k · Aᵀ, as in
+    // `grad`.
+    fn branches(&self, p: &Point3, tol: f64, out: &mut Vec<(f64, Vector3)>) {
+        let start = out.len();
+        self.sdf
+            .branches(&self.to_inner(p), tol / self.min_factor, out);
+        for branch in &mut out[start..] {
+            branch.0 *= self.min_factor;
+            let g = branch.1;
+            branch.1 = Vector3::new(
+                g.x / self.factors.x,
+                g.y / self.factors.y,
+                g.z / self.factors.z,
+            ) * self.min_factor;
+        }
     }
 }
 

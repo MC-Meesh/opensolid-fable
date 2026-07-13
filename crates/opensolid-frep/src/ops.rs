@@ -73,6 +73,15 @@ impl<S: Sdf> Sdf for Offset<S> {
         let i = self.sdf.eval_interval(b);
         Interval::new(i.lo - self.distance, i.hi - self.distance)
     }
+
+    // A constant shift distributes over min/max, so it applies per branch.
+    fn branches(&self, p: &Point3, tol: f64, out: &mut Vec<(f64, Vector3)>) {
+        let start = out.len();
+        self.sdf.branches(p, tol, out);
+        for branch in &mut out[start..] {
+            branch.0 -= self.distance;
+        }
+    }
 }
 
 /// A hollow shell of total wall width `thickness`, centered on the surface
@@ -163,6 +172,15 @@ impl<S: Sdf> Sdf for Rounded<S> {
     fn eval_interval(&self, b: &BoundingBox3) -> Interval {
         let i = self.sdf.eval_interval(b);
         Interval::new(i.lo - self.radius, i.hi - self.radius)
+    }
+
+    // A constant shift distributes over min/max, so it applies per branch.
+    fn branches(&self, p: &Point3, tol: f64, out: &mut Vec<(f64, Vector3)>) {
+        let start = out.len();
+        self.sdf.branches(p, tol, out);
+        for branch in &mut out[start..] {
+            branch.0 -= self.radius;
+        }
     }
 }
 

@@ -12,9 +12,6 @@ const noop = () => {};
 function render(overrides = {}) {
   return renderToString(
     <Toolbar
-      accuracy={0.01}
-      onAccuracyChange={noop}
-      onAccuracyCommit={noop}
       exactBooleans={false}
       onExactBooleansChange={noop}
       onRun={noop}
@@ -27,14 +24,19 @@ function render(overrides = {}) {
 }
 
 describe('Toolbar', () => {
-  it('renders run, STL, STEP, accuracy, and the exact-booleans toggle', () => {
+  it('renders run, STL, STEP, and the exact-booleans toggle', () => {
     const html = render();
     expect(html).toContain('Run');
     expect(html).toContain('Download STL');
     expect(html).toContain('Download STEP');
-    expect(html).toContain('Accuracy');
     expect(html).toContain('Exact booleans');
     expect(html).toMatch(/type="checkbox"(?![^>]*checked)/);
+  });
+
+  it('has no accuracy slider: meshing precision is a fixed default', () => {
+    const html = render();
+    expect(html).not.toContain('Accuracy');
+    expect(html).not.toContain('type="range"');
   });
 
   it('explains faceted export of organic shapes in the STEP tooltip', () => {
@@ -55,7 +57,7 @@ describe('Toolbar', () => {
   it('disables all controls before WASM is ready', () => {
     const html = render({ disabled: true });
     const disabledCount = (html.match(/disabled/g) ?? []).length;
-    // Run, STL, STEP, accuracy slider, exact-booleans checkbox.
-    expect(disabledCount).toBe(5);
+    // Run, STL, STEP, exact-booleans checkbox.
+    expect(disabledCount).toBe(4);
   });
 });

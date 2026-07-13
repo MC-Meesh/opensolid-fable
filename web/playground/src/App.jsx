@@ -34,8 +34,11 @@ import { isFacePlane } from './lib/sketch/profile.js';
 
 // Adaptive meshing target: maximum chordal deviation from the exact
 // surface, in model units. The octree refines near curvature and CSG
-// feature edges and stays coarse on flat regions.
-const DEFAULT_ACCURACY = 0.01;
+// feature edges and stays coarse on flat regions. Fixed at a high-precision
+// default (no user knob): the mesher's feature snapping and remeshing keep
+// this both crisp and fast, and scripts needing another target can call
+// the wasm meshAdaptive(accuracy) API directly.
+const MESH_ACCURACY = 0.005;
 const EDIT_DEBOUNCE_MS = 400;
 const TOAST_MS = 3500;
 
@@ -47,7 +50,7 @@ function downloadBlob(blob, filename) {
   URL.revokeObjectURL(link.href);
 }
 
-function meshShape(shape, accuracy) {
+function meshShape(shape, accuracy = MESH_ACCURACY) {
   const data = shape.meshAdaptive(accuracy);
   const positions = data.positions;
   const normals = data.normals;
@@ -66,7 +69,6 @@ export default function App() {
   // WasmContext) — App only reads status and the bound API classes.
   const { status: wasmStatus, error: wasmError, api: wasm, ready: wasmReady, retry: retryWasm } = useWasm();
   const [error, setError] = useState(null);
-  const [accuracy, setAccuracy] = useState(DEFAULT_ACCURACY);
   const [exactBooleans, setExactBooleans] = useState(false);
   const [wireframe, setWireframe] = useState(false);
   const [mesh, setMesh] = useState(null);
@@ -128,7 +130,6 @@ export default function App() {
   // pruned-display recompute carry the generation they were issued for, and
   // results from superseded generations are dropped instead of rendered.
   const generationRef = useRef(0);
-  const accuracyRef = useRef(DEFAULT_ACCURACY);
   const exactBooleansRef = useRef(false);
   const shapeRef = useRef(null);
   const tracedRef = useRef(null);
@@ -168,7 +169,7 @@ export default function App() {
     const shape = display.mode === 'pruned' ? display.shape : shapeRef.current;
     if (!shape) return;
     setError(null);
-    const acc = accuracyRef.current;
+    const acc = MESH_ACCURACY;
     const started = performance.now();
     let data;
     try {
@@ -252,8 +253,7 @@ export default function App() {
       if (restored && restored.shape) {
         setSelectedNode(restored);
         try {
-          const acc = accuracyRef.current;
-          setSelectedMesh(meshShape(restored.shape, acc));
+          setSelectedMesh(meshShape(restored.shape));
           setSelectedPivot(shapePivot(restored.shape));
         } catch {
           clearSelection();
@@ -384,8 +384,7 @@ export default function App() {
       selectedPathRef.current = pathTo(root, node.id);
       if (node.shape) {
         try {
-          const acc = accuracyRef.current;
-          setSelectedMesh(meshShape(node.shape, acc));
+          setSelectedMesh(meshShape(node.shape));
           setSelectedPivot(shapePivot(node.shape));
         } catch {
           clearSelection();
@@ -722,7 +721,7 @@ export default function App() {
     }
     let text;
     try {
-      text = shape.exportStep(accuracyRef.current);
+      text = shape.exportStep(MESH_ACCURACY);
     } catch (err) {
       setError(String(err));
       return;
@@ -785,7 +784,7 @@ export default function App() {
     let shape = null;
     try {
       shape = buildSweepShape(wasm.WasmShape, wasm.WasmProfile2D, sweep);
-      setPreviewMesh(meshShape(shape, accuracyRef.current));
+      setPreviewMesh(meshShape(shape));
       setSweepError(null);
     } catch (err) {
       setPreviewMesh(null);
@@ -878,17 +877,6 @@ export default function App() {
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [clearSelection, sweep, cancelSweep, sketchOpen, handleDeleteSelected]);
 
-  const handleAccuracyChange = useCallback((value) => {
-    accuracyRef.current = value;
-    setAccuracy(value);
-  }, []);
-
-  const handleAccuracyCommit = useCallback(() => {
-    // The re-tessellated mesh renumbers triangles; face states are stale.
-    setHoverFace(null);
-    remesh();
-  }, [remesh]);
-
   // Exact booleans rebuild shapes, not just meshes: re-run the script.
   const handleExactBooleansChange = useCallback(
     (enabled) => {
@@ -946,9 +934,6 @@ export default function App() {
         </ErrorBoundary>
         {error && <pre className="error">{error}</pre>}
         <Toolbar
-          accuracy={accuracy}
-          onAccuracyChange={handleAccuracyChange}
-          onAccuracyCommit={handleAccuracyCommit}
           exactBooleans={exactBooleans}
           onExactBooleansChange={handleExactBooleansChange}
           onRun={runNow}

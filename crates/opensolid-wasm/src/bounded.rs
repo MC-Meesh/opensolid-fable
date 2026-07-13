@@ -11,6 +11,7 @@ use opensolid_core::types::{BoundingBox3, Point3, Transform3, Vector3};
 use opensolid_frep::mesh::{MeshOptions, mesh_sdf_indexed};
 use opensolid_frep::mesh_adaptive::{AdaptiveMeshOptions, mesh_sdf_adaptive_indexed};
 use opensolid_frep::primitives::{Box3, Capsule, Cylinder, RoundedBox, Sdf, Sphere, Torus};
+use opensolid_frep::refine::{RefineOptions, refine_mesh};
 use opensolid_frep::{Extrude, Profile2D, Revolve, SdfTransformExt, Shape};
 
 /// Depth bounds for accuracy-driven adaptive meshing: the ceiling keeps the
@@ -307,6 +308,11 @@ impl BoundedShape {
     /// accuracies below about `extent / 2^9` degrade gracefully instead of
     /// exploding the cell budget. Non-finite or non-positive accuracies
     /// fall back to 0.5% of the meshed extent.
+    ///
+    /// The raw dual-contouring output is refined before returning
+    /// ([`refine_mesh`]): vertices on sharp CSG edges are snapped onto the
+    /// analytic intersection curves (no scalloping), and a feature-aware
+    /// smoothing/flip pass regularizes the triangulation.
     pub fn mesh_adaptive(&self, accuracy: f64, bound: Option<f64>) -> TriangleMesh {
         let bounds = match bound {
             Some(b) => symmetric_bounds(b, b, b),
@@ -325,14 +331,17 @@ impl BoundedShape {
             .ceil()
             .clamp(ADAPTIVE_MIN_DEPTH as f64, ADAPTIVE_MAX_DEPTH as f64)
             as u32;
-        mesh_sdf_adaptive_indexed(
+        let mut mesh = mesh_sdf_adaptive_indexed(
             &self.shape,
             &AdaptiveMeshOptions {
                 bounds,
                 max_depth,
                 accuracy: Some(accuracy),
             },
-        )
+        );
+        let cell = extent / (1u64 << max_depth) as f64;
+        refine_mesh(&self.shape, &mut mesh, &RefineOptions::for_cell(cell));
+        mesh
     }
 
     /// Auto-derived meshing bounds: the tracked box padded so the surface
@@ -456,6 +465,29 @@ mod tests {
                 "vertex {p:?} deviates beyond target"
             );
         }
+    }
+
+    /// The bead's headline acceptance (of-5fl.10): the rim of the cylinder
+    /// hole in the default playground scene must come out as a clean
+    /// circle, not a sawtooth. After the refine pass, the crease vertices
+    /// where the hole meets the flat bottom face sit *exactly* (1e-9) on
+    /// the analytic circle x² + z² = 0.28² at y = -0.55.
+    #[test]
+    fn mesh_adaptive_default_scene_rim_is_exact() {
+        let part = default_playground_scene();
+        let mesh = part.mesh_adaptive(0.005, None);
+        assert!(mesh.is_closed_manifold());
+        let exact = mesh
+            .positions
+            .iter()
+            .filter(|p| {
+                let radial = (p.x * p.x + p.z * p.z).sqrt();
+                (radial - 0.28).abs() < 1e-9 && (p.y + 0.55).abs() < 1e-9
+            })
+            .count();
+        // The rim crosses hundreds of finest cells at this accuracy; a
+        // healthy snap lands a vertex per crease cell.
+        assert!(exact > 50, "only {exact} vertices exactly on the hole rim");
     }
 
     /// Garbage accuracies must not panic: they fall back to a sane default.

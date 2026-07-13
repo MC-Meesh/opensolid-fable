@@ -36,6 +36,23 @@ pub trait Sdf: Send + Sync {
         let r = 0.5 * b.extents().norm();
         Interval::new(d - r, d + r)
     }
+
+    /// The smooth field branches active at `p`: `(value, gradient)` of every
+    /// leaf field that wins — or could win, within `tol` — the `min`/`max`
+    /// combinators between it and the root. A sharp CSG feature (edge,
+    /// corner) is exactly the locus where several branches are zero at once,
+    /// so meshing uses the active branches to project vertices onto the
+    /// *analytic* intersection of the adjoining surfaces instead of the
+    /// kinked composite field.
+    ///
+    /// The default treats the whole field as one smooth branch, which is
+    /// correct for primitives and smooth blends. Sharp CSG combinators
+    /// recurse into every child within `tol` of winning (negating through
+    /// subtraction); wrappers forward, mapping points, values, and gradients
+    /// exactly as their `eval`/`grad` do.
+    fn branches(&self, p: &Point3, _tol: f64, out: &mut Vec<(f64, Vector3)>) {
+        out.push((self.eval(p), self.grad(p)));
+    }
 }
 
 impl<T: Sdf + ?Sized> Sdf for &T {
@@ -49,6 +66,10 @@ impl<T: Sdf + ?Sized> Sdf for &T {
 
     fn eval_interval(&self, b: &BoundingBox3) -> Interval {
         (**self).eval_interval(b)
+    }
+
+    fn branches(&self, p: &Point3, tol: f64, out: &mut Vec<(f64, Vector3)>) {
+        (**self).branches(p, tol, out)
     }
 }
 
@@ -64,6 +85,10 @@ impl<T: Sdf + ?Sized> Sdf for Box<T> {
     fn eval_interval(&self, b: &BoundingBox3) -> Interval {
         (**self).eval_interval(b)
     }
+
+    fn branches(&self, p: &Point3, tol: f64, out: &mut Vec<(f64, Vector3)>) {
+        (**self).branches(p, tol, out)
+    }
 }
 
 impl<T: Sdf + ?Sized> Sdf for std::sync::Arc<T> {
@@ -77,6 +102,10 @@ impl<T: Sdf + ?Sized> Sdf for std::sync::Arc<T> {
 
     fn eval_interval(&self, b: &BoundingBox3) -> Interval {
         (**self).eval_interval(b)
+    }
+
+    fn branches(&self, p: &Point3, tol: f64, out: &mut Vec<(f64, Vector3)>) {
+        (**self).branches(p, tol, out)
     }
 }
 
