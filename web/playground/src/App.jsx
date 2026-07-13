@@ -58,6 +58,7 @@ export default function App() {
   const { status: wasmStatus, error: wasmError, api: wasm, ready: wasmReady, retry: retryWasm } = useWasm();
   const [error, setError] = useState(null);
   const [resolution, setResolution] = useState(DEFAULT_RESOLUTION);
+  const [exactBooleans, setExactBooleans] = useState(false);
   const [wireframe, setWireframe] = useState(false);
   const [mesh, setMesh] = useState(null);
   const [stats, setStats] = useState(null);
@@ -112,6 +113,7 @@ export default function App() {
   const scriptRef = useRef(DEFAULT_SCRIPT);
   const graphRef = useRef(graph);
   const resolutionRef = useRef(DEFAULT_RESOLUTION);
+  const exactBooleansRef = useRef(false);
   const shapeRef = useRef(null);
   const tracedRef = useRef(null);
   const meshRef = useRef(null);
@@ -187,6 +189,7 @@ export default function App() {
       triangles: indices.length / 3,
       vertices: positions.length / 3,
       resolution: res,
+      exact: Boolean(shape.isExact?.()),
       elapsedMs,
     });
   }, []);
@@ -195,6 +198,9 @@ export default function App() {
     const api = wasmRef.current;
     if (!api) return;
     setError(null);
+    // Route booleans through the kernel's exact B-Rep pipeline when the
+    // toggle is on (optional-chained: older pkg builds lack the export).
+    api.WasmShape.setExactBooleans?.(exactBooleansRef.current);
     let traced;
     try {
       traced = runTracedScript(scriptRef.current, api.WasmShape, api.WasmProfile2D);
@@ -810,6 +816,16 @@ export default function App() {
     remesh();
   }, [remesh]);
 
+  // Exact booleans rebuild shapes, not just meshes: re-run the script.
+  const handleExactBooleansChange = useCallback(
+    (enabled) => {
+      exactBooleansRef.current = enabled;
+      setExactBooleans(enabled);
+      runNow();
+    },
+    [runNow]
+  );
+
   const handleProfileChange = useCallback((profile) => {
     profileRef.current = profile;
     setProfileClosed(Boolean(profile?.closed));
@@ -860,6 +876,8 @@ export default function App() {
           resolution={resolution}
           onResolutionChange={handleResolutionChange}
           onResolutionCommit={handleResolutionCommit}
+          exactBooleans={exactBooleans}
+          onExactBooleansChange={handleExactBooleansChange}
           onRun={runNow}
           onDownloadStl={downloadStl}
           disabled={!wasmReady}

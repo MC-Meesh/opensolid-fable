@@ -11,10 +11,14 @@
 //! assumptions (the frep crate has no rayon dependency).
 
 pub mod bounded;
+pub mod exact;
 
 use bounded::{BoundedShape, flatten_mesh};
+use exact::{ExactPrim, ExactRep, ExactSpec};
 use opensolid_core::types::{Point3, Vector3};
 use opensolid_frep::Profile2D;
+use opensolid_kernel::brep::BooleanOp;
+use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 
 /// Closed 2D profile builder for [`WasmShape::extrude`] and
@@ -107,20 +111,66 @@ pub struct MeshData {
 
 /// Runtime-composable SDF shape. Methods never mutate: each returns a new
 /// shape, so intermediate shapes can be reused freely from JS.
+///
+/// Shapes within the kernel's exact coverage (sphere/box/cylinder/torus,
+/// rigid transforms, uniform scale, sharp booleans) also carry an exact
+/// B-Rep companion ([`exact`]). With `setExactBooleans(true)`, booleans
+/// try the kernel's exact pipeline first and `mesh()` serves the
+/// validated analytic tessellation; anything outside exact coverage
+/// falls back to the SDF path unchanged.
 #[wasm_bindgen]
-pub struct WasmShape(BoundedShape);
+pub struct WasmShape {
+    inner: BoundedShape,
+    exact: Option<ExactRep>,
+}
+
+impl WasmShape {
+    fn sdf_only(inner: BoundedShape) -> WasmShape {
+        WasmShape { inner, exact: None }
+    }
+
+    fn with_prim(inner: BoundedShape, prim: ExactPrim) -> WasmShape {
+        WasmShape {
+            inner,
+            exact: Some(ExactRep::Spec(ExactSpec::new(prim))),
+        }
+    }
+
+    /// The exact spec transformed by `f`, if this shape is still a
+    /// (transformed) primitive; boolean results drop exactness under
+    /// transforms (their store-backed body is shared — future work).
+    fn map_spec(&self, f: impl FnOnce(&ExactSpec) -> Option<ExactSpec>) -> Option<ExactRep> {
+        match self.exact.as_ref()? {
+            ExactRep::Spec(spec) => f(spec).map(ExactRep::Spec),
+            ExactRep::Boolean(_) => None,
+        }
+    }
+
+    /// Try the exact pipeline for a sharp boolean; `None` leaves the SDF
+    /// composition standing alone, exactly as with the toggle off.
+    fn try_exact_boolean(&self, other: &WasmShape, op: BooleanOp) -> Option<ExactRep> {
+        if !exact::exact_enabled() {
+            return None;
+        }
+        let (a, b) = (self.exact.as_ref()?, other.exact.as_ref()?);
+        exact::exact_boolean(op, a, b).map(|out| ExactRep::Boolean(Rc::new(out)))
+    }
+}
 
 #[wasm_bindgen]
 impl WasmShape {
     /// Sphere of the given radius, centered at the origin.
     pub fn sphere(radius: f64) -> WasmShape {
-        WasmShape(BoundedShape::sphere(radius))
+        WasmShape::with_prim(BoundedShape::sphere(radius), ExactPrim::Sphere { radius })
     }
 
     /// Axis-aligned box with half-extents `(hx, hy, hz)`, centered at the
     /// origin.
     pub fn box3(hx: f64, hy: f64, hz: f64) -> WasmShape {
-        WasmShape(BoundedShape::box3(hx, hy, hz))
+        WasmShape::with_prim(
+            BoundedShape::box3(hx, hy, hz),
+            ExactPrim::Block { hx, hy, hz },
+        )
     }
 
     /// Box with rounded edges: outer half-extents `(hx, hy, hz)` including
@@ -128,23 +178,35 @@ impl WasmShape {
     /// centered at the origin.
     #[wasm_bindgen(js_name = roundedBox)]
     pub fn rounded_box(hx: f64, hy: f64, hz: f64, radius: f64) -> WasmShape {
-        WasmShape(BoundedShape::rounded_box(hx, hy, hz, radius))
+        WasmShape::sdf_only(BoundedShape::rounded_box(hx, hy, hz, radius))
     }
 
     /// Cylinder along the y axis: radius in the xz plane, y ∈ ±half_height.
     pub fn cylinder(radius: f64, half_height: f64) -> WasmShape {
-        WasmShape(BoundedShape::cylinder(radius, half_height))
+        WasmShape::with_prim(
+            BoundedShape::cylinder(radius, half_height),
+            ExactPrim::Cylinder {
+                radius,
+                half_height,
+            },
+        )
     }
 
     /// Torus with its ring in the xz plane, centered at the origin.
     pub fn torus(major_radius: f64, minor_radius: f64) -> WasmShape {
-        WasmShape(BoundedShape::torus(major_radius, minor_radius))
+        WasmShape::with_prim(
+            BoundedShape::torus(major_radius, minor_radius),
+            ExactPrim::Torus {
+                major: major_radius,
+                minor: minor_radius,
+            },
+        )
     }
 
     /// Capsule (sphere-swept segment) from `(x1,y1,z1)` to `(x2,y2,z2)`.
     #[allow(clippy::too_many_arguments)]
     pub fn capsule(x1: f64, y1: f64, z1: f64, x2: f64, y2: f64, z2: f64, radius: f64) -> WasmShape {
-        WasmShape(BoundedShape::capsule(
+        WasmShape::sdf_only(BoundedShape::capsule(
             Point3::new(x1, y1, z1),
             Point3::new(x2, y2, z2),
             radius,
@@ -156,7 +218,7 @@ impl WasmShape {
     pub fn extrude(profile: &WasmProfile2D, height: f64) -> Result<WasmShape, String> {
         let p = profile.build()?;
         BoundedShape::extrude(p, height)
-            .map(WasmShape)
+            .map(WasmShape::sdf_only)
             .map_err(|e| e.to_string())
     }
 
@@ -167,13 +229,17 @@ impl WasmShape {
     pub fn revolve(profile: &WasmProfile2D, angle_degrees: f64) -> Result<WasmShape, String> {
         let p = profile.build()?;
         BoundedShape::revolve(p, angle_degrees.to_radians())
-            .map(WasmShape)
+            .map(WasmShape::sdf_only)
             .map_err(|e| e.to_string())
     }
 
     /// This shape moved by `(x, y, z)`.
     pub fn translate(&self, x: f64, y: f64, z: f64) -> WasmShape {
-        WasmShape(self.0.translate(Vector3::new(x, y, z)))
+        let offset = Vector3::new(x, y, z);
+        WasmShape {
+            inner: self.inner.translate(offset),
+            exact: self.map_spec(|s| Some(s.translated(offset))),
+        }
     }
 
     /// This shape rotated about the origin by `angle` radians around the
@@ -186,7 +252,10 @@ impl WasmShape {
         } else {
             Vector3::zeros()
         };
-        WasmShape(self.0.rotate(axis_angle))
+        WasmShape {
+            inner: self.inner.rotate(axis_angle),
+            exact: self.map_spec(|s| Some(s.rotated(axis_angle))),
+        }
     }
 
     /// This shape scaled per-axis about the origin (each factor `> 0`).
@@ -194,41 +263,55 @@ impl WasmShape {
     /// exact distance, so smooth-blend radii applied afterwards are
     /// distorted; prefer `uniformScale` when the factors are equal.
     pub fn scale(&self, sx: f64, sy: f64, sz: f64) -> Result<WasmShape, String> {
-        self.0
+        self.inner
             .scale(Vector3::new(sx, sy, sz))
-            .map(WasmShape)
+            .map(WasmShape::sdf_only)
             .map_err(|e| e.to_string())
     }
 
     /// This shape scaled uniformly about the origin (`factor > 0`).
     #[wasm_bindgen(js_name = uniformScale)]
     pub fn uniform_scale(&self, factor: f64) -> Result<WasmShape, String> {
-        self.0
+        let inner = self
+            .inner
             .uniform_scale(factor)
-            .map(WasmShape)
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        Ok(WasmShape {
+            inner,
+            exact: self.map_spec(|s| s.uniform_scaled(factor)),
+        })
     }
 
     /// Boolean union with `other`.
     pub fn union(&self, other: &WasmShape) -> WasmShape {
-        WasmShape(self.0.union(&other.0))
+        WasmShape {
+            exact: self.try_exact_boolean(other, BooleanOp::Unite),
+            inner: self.inner.union(&other.inner),
+        }
     }
 
     /// Boolean intersection with `other`.
     pub fn intersect(&self, other: &WasmShape) -> WasmShape {
-        WasmShape(self.0.intersect(&other.0))
+        WasmShape {
+            exact: self.try_exact_boolean(other, BooleanOp::Intersect),
+            inner: self.inner.intersect(&other.inner),
+        }
     }
 
     /// Boolean subtraction of `other` from this shape.
     pub fn subtract(&self, other: &WasmShape) -> WasmShape {
-        WasmShape(self.0.subtract(&other.0))
+        WasmShape {
+            exact: self.try_exact_boolean(other, BooleanOp::Subtract),
+            inner: self.inner.subtract(&other.inner),
+        }
     }
 
     /// Smooth (filleted) union with `other`. Omitting `radius` picks 10% of
-    /// the combined bounding box's largest extent.
+    /// the combined bounding box's largest extent. Organic: SDF-only, no
+    /// exact companion.
     #[wasm_bindgen(js_name = smoothUnion)]
     pub fn smooth_union(&self, other: &WasmShape, radius: Option<f64>) -> WasmShape {
-        WasmShape(self.0.smooth_union(&other.0, radius))
+        WasmShape::sdf_only(self.inner.smooth_union(&other.inner, radius))
     }
 
     /// Signed distance from `(x, y, z)` to the surface: negative inside,
@@ -236,24 +319,53 @@ impl WasmShape {
     /// not an exact Euclidean distance, but the sign and zero set stay
     /// correct, so nearest-surface queries can compare magnitudes.
     pub fn distance(&self, x: f64, y: f64, z: f64) -> f64 {
-        self.0.distance(Point3::new(x, y, z))
+        self.inner.distance(Point3::new(x, y, z))
     }
 
     /// Conservative axis-aligned bounding box of the surface as
     /// `[min_x, min_y, min_z, max_x, max_y, max_z]` (useful for camera
     /// framing).
     pub fn bounds(&self) -> Vec<f64> {
-        let b = &self.0.bounds;
+        let b = &self.inner.bounds;
         vec![b.min.x, b.min.y, b.min.z, b.max.x, b.max.y, b.max.z]
     }
 
-    /// Mesh the shape on a `resolution`³ dual-contouring grid. With `bound`
-    /// set, the grid covers the explicit cube `[-bound, bound]³` (the surface
-    /// must lie strictly inside it); otherwise bounds are derived from the
-    /// shape's tracked bounding box with padding.
+    /// Enable or disable the exact B-Rep boolean path globally (the
+    /// playground toggle). Off by default; flipping it re-routes booleans
+    /// and meshing without rebuilding existing shapes.
+    #[wasm_bindgen(js_name = setExactBooleans)]
+    pub fn set_exact_booleans(enabled: bool) {
+        exact::set_exact_enabled(enabled);
+    }
+
+    /// Whether `mesh()` will serve a validated exact B-Rep tessellation
+    /// (this shape is an exact boolean result and the mode is on).
+    #[wasm_bindgen(js_name = isExact)]
+    pub fn is_exact(&self) -> bool {
+        exact::exact_enabled()
+            && self
+                .exact
+                .as_ref()
+                .is_some_and(|rep| rep.exact_mesh().is_some())
+    }
+
+    /// Mesh the shape. Exact boolean results (see `isExact`) serve their
+    /// validated analytic tessellation, which ignores `resolution` — it is
+    /// already crisp at any zoom. Otherwise: dual-contouring on a
+    /// `resolution`³ grid. With `bound` set, the grid covers the explicit
+    /// cube `[-bound, bound]³` (the surface must lie strictly inside it);
+    /// otherwise bounds are derived from the shape's tracked bounding box
+    /// with padding.
     pub fn mesh(&self, resolution: u32, bound: Option<f64>) -> MeshData {
-        let mesh = self.0.mesh(resolution as usize, bound);
-        let flat = flatten_mesh(&mesh);
+        let exact_mesh = if exact::exact_enabled() {
+            self.exact.as_ref().and_then(|rep| rep.exact_mesh())
+        } else {
+            None
+        };
+        let flat = match exact_mesh {
+            Some(mesh) => flatten_mesh(mesh),
+            None => flatten_mesh(&self.inner.mesh(resolution as usize, bound)),
+        };
         MeshData {
             positions: flat.positions,
             normals: flat.normals,
@@ -456,5 +568,113 @@ mod tests {
         let plate = WasmShape::extrude(&closed_square(), 0.3).expect("valid extrude");
         let hole = WasmShape::cylinder(0.2, 1.0).translate(0.5, 0.15, 0.5);
         assert_valid(&plate.subtract(&hole).mesh(40, None));
+    }
+
+    /// Serialize tests that flip the global exact-boolean mode, and
+    /// restore "off" when done (even on panic).
+    fn exact_mode_on() -> impl Drop {
+        use std::sync::{Mutex, MutexGuard, PoisonError};
+        static LOCK: Mutex<()> = Mutex::new(());
+        struct Guard(#[allow(dead_code)] MutexGuard<'static, ()>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                WasmShape::set_exact_booleans(false);
+            }
+        }
+        let guard = LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        WasmShape::set_exact_booleans(true);
+        Guard(guard)
+    }
+
+    /// With the toggle on, a sharp boolean of exact primitives serves the
+    /// kernel's analytic tessellation: far fewer vertices than any SDF
+    /// grid, and unchanged by the resolution knob.
+    #[test]
+    fn exact_boolean_serves_analytic_mesh() {
+        let _mode = exact_mode_on();
+        let part = WasmShape::box3(1.0, 0.4, 1.0).subtract(&WasmShape::cylinder(0.4, 1.0));
+        assert!(part.is_exact());
+
+        let coarse = part.mesh(16, None);
+        let fine = part.mesh(128, None);
+        assert_valid(&coarse);
+        assert_eq!(
+            coarse.positions, fine.positions,
+            "exact mesh must ignore the SDF resolution knob"
+        );
+
+        let sdf_verts = WasmShape::box3(1.0, 0.4, 1.0)
+            .subtract(&WasmShape::cylinder(0.4, 1.0))
+            .inner
+            .mesh(128, None)
+            .positions
+            .len();
+        assert!(
+            coarse.positions.len() / 3 < sdf_verts,
+            "analytic tessellation should be leaner than a 128-grid SDF mesh"
+        );
+    }
+
+    /// Transformed primitives stay in exact reach; organic ops and shapes
+    /// without exact support fall back to the SDF path.
+    #[test]
+    fn exact_coverage_boundaries() {
+        let _mode = exact_mode_on();
+
+        // Rigid transforms and uniform scale keep the spec exact: the
+        // sphere bites a shallow cap out of the moved box's top face.
+        let moved = WasmShape::box3(1.0, 1.0, 1.0)
+            .rotate(0.0, 1.0, 0.0, 0.3)
+            .uniform_scale(2.0)
+            .expect("valid factor")
+            .translate(3.0, 0.0, 0.0);
+        let bitten = moved.subtract(&WasmShape::sphere(0.8).translate(3.0, 2.5, 0.0));
+        assert!(bitten.is_exact());
+        assert_valid(&bitten.mesh(24, None));
+
+        // Anisotropic scale, organic blends, and unsupported primitives
+        // drop to SDF-only — booleans still mesh, just not exactly.
+        let squashed = WasmShape::box3(1.0, 1.0, 1.0)
+            .scale(1.0, 0.5, 1.0)
+            .expect("valid factors");
+        assert!(!squashed.subtract(&WasmShape::sphere(0.8)).is_exact());
+        let blended = WasmShape::box3(1.0, 1.0, 1.0).smooth_union(&WasmShape::sphere(0.8), None);
+        assert!(!blended.is_exact());
+        let rounded = WasmShape::rounded_box(1.0, 1.0, 1.0, 0.2);
+        assert!(!rounded.union(&WasmShape::sphere(0.5)).is_exact());
+        assert_valid(&rounded.union(&WasmShape::sphere(0.5)).mesh(24, None));
+    }
+
+    /// Flipping the toggle off reverts meshing to the SDF path without
+    /// rebuilding shapes; primitives alone never claim exactness.
+    #[test]
+    fn exact_mode_toggle_reroutes_meshing() {
+        let part;
+        {
+            let _mode = exact_mode_on();
+            part = WasmShape::box3(1.0, 1.0, 1.0)
+                .subtract(&WasmShape::box3(0.5, 0.5, 0.5).translate(1.0, 1.0, 1.0));
+            assert!(part.is_exact());
+            assert!(!WasmShape::sphere(1.0).is_exact());
+            let exact_mesh = part.mesh(64, None);
+            let sdf_mesh_len = part.inner.mesh(64, None).positions.len() * 3;
+            assert_ne!(exact_mesh.positions.len(), sdf_mesh_len);
+        }
+        assert!(!part.is_exact(), "mode off: no exact claim");
+        assert_valid(&part.mesh(24, None));
+    }
+
+    /// With the toggle off (the default), booleans carry no exact
+    /// companion at all — the mode is checked before any store is built.
+    #[test]
+    fn default_mode_stays_pure_sdf() {
+        // Hold the mode lock (with the flag on, then force it off) so no
+        // concurrently running exact test can flip it mid-assertion.
+        let _mode = exact_mode_on();
+        WasmShape::set_exact_booleans(false);
+        let part = WasmShape::box3(1.0, 0.4, 1.0).subtract(&WasmShape::cylinder(0.4, 1.0));
+        assert!(part.exact.is_none(), "toggle off: no exact pipeline work");
+        assert!(!part.is_exact());
+        assert_valid(&part.mesh(24, None));
     }
 }

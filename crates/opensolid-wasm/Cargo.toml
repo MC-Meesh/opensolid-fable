@@ -11,9 +11,8 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 opensolid-core = { path = "../opensolid-core" }
 opensolid-frep = { path = "../opensolid-frep" }
-wasm-bindgen = "0.2"
-
-[dev-dependencies]
-# Native-only acceptance tests: the hybrid kernel result must feed the
-# playground mesh path (of-ipt.3). Not part of the wasm32 artifact.
+# Exact B-Rep boolean path for the playground (of-4eh.17). Pulls
+# opensolid-brep transitively; size cost measured in the bead's design
+# note (~+340 KB pre-wasm-opt).
 opensolid-kernel = { path = "../opensolid-kernel" }
+wasm-bindgen = "0.2"

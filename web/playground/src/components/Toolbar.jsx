@@ -16,11 +16,17 @@ const COMMIT_KEYS = new Set([
  * The resolution slider reports every movement through `onResolutionChange`
  * (live label update) but only fires `onResolutionCommit` when the drag or
  * keyboard adjustment finishes, since committing triggers a remesh.
+ *
+ * The exact-booleans toggle routes sharp booleans through the kernel's
+ * exact B-Rep pipeline (validated, F-Rep fallback); flipping it re-runs
+ * the script, so it reports through `onExactBooleansChange`.
  */
 export default function Toolbar({
   resolution,
   onResolutionChange,
   onResolutionCommit,
+  exactBooleans,
+  onExactBooleansChange,
   onRun,
   onDownloadStl,
   disabled,
@@ -49,6 +55,15 @@ export default function Toolbar({
           }}
         />
         <span className="resolution-value">{resolution}</span>
+      </label>
+      <label className="exact-booleans" title="Sharp booleans of spheres, boxes, cylinders and tori use the kernel's exact B-Rep pipeline; anything it can't prove correct falls back to SDF meshing.">
+        <input
+          type="checkbox"
+          checked={exactBooleans}
+          disabled={disabled}
+          onChange={(event) => onExactBooleansChange(event.target.checked)}
+        />
+        Exact booleans
       </label>
     </div>
   );

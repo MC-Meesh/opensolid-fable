@@ -327,6 +327,7 @@ header p { margin: 2px 0 0; font-size: 12px; color: var(--muted); }
 }
 .toolbar label { display: flex; align-items: center; gap: 6px; }
 .toolbar input[type="range"] { width: 110px; accent-color: var(--accent); }
+.toolbar input[type="checkbox"] { accent-color: var(--accent); }
 .toolbar .resolution-value {
   min-width: 3ch;
   font-variant-numeric: tabular-nums;
