@@ -94,6 +94,16 @@
 //! With the gate lifted, the four structured-rejection tests (tangency
 //! and sub-tolerance guards) already pass; all other campaign tests fail
 //! on of-7ld.5/6/7 or on SSI pairs pending the of-7ld.2 merge.
+//!
+//! Update (of-7ld.5 fix): pole closure rows are now embedded explicitly
+//! (`CoverEmbedder`), sphere seams split wrapping imprint rings, sphere
+//! ray hits and curved-region mesh refinement are wired, and 12 of the
+//! sphere-campaign tests pass with the gate lifted (each annotated
+//! "passes with the chart gate lifted"). The rest fail on the sibling
+//! bugs their `#[ignore]` messages name: of-7ld.6 (broad-phase box),
+//! of-43n (imprints crossing the seam level without/beyond a single
+//! wrap), of-rb4 (imprints through pole vertices), and the marched
+//! cylinder-sphere SSI not yet wired into `boolean()`.
 
 use nalgebra::{Rotation3, Unit};
 use opensolid_brep::boolean::{intersect, subtract, unite};
@@ -1244,19 +1254,19 @@ fn sphere_cap_bite(scale: f64) {
 }
 
 #[test]
-#[ignore = "of-7ld.4 gate; lifted, fails on of-7ld.5: sphere region interior sampling"]
+#[ignore = "of-7ld.4 gate: passes with the chart gate lifted (of-7ld.5 fixed) — un-ignore at promotion"]
 fn sphere_cap_bite_scale_1() {
     sphere_cap_bite(1.0);
 }
 
 #[test]
-#[ignore = "of-7ld.4 gate; lifted, fails on of-7ld.5: sphere region interior sampling"]
+#[ignore = "of-7ld.4 gate: passes with the chart gate lifted (of-7ld.5 fixed) — un-ignore at promotion"]
 fn sphere_cap_bite_scale_0_001() {
     sphere_cap_bite(0.001);
 }
 
 #[test]
-#[ignore = "of-7ld.4 gate; lifted, fails on of-7ld.5: sphere region interior sampling"]
+#[ignore = "of-7ld.4 gate: passes with the chart gate lifted (of-7ld.5 fixed) — un-ignore at promotion"]
 fn sphere_cap_bite_scale_1000() {
     sphere_cap_bite(1000.0);
 }
@@ -1267,7 +1277,7 @@ fn sphere_cap_bite_scale_1000() {
 /// full-wrap cylinder band), and the difference is a genus-1 through
 /// hole with lens-shaped mouths.
 #[test]
-#[ignore = "of-7ld.4 gate; lifted, fails on of-7ld.5: sphere region interior sampling"]
+#[ignore = "of-7ld.4 gate: passes with the chart gate lifted (of-7ld.5 fixed) — un-ignore at promotion"]
 fn sphere_band_through_slab() {
     let context = "sphere through 2-thick slab (band + lens through-hole)";
     let r = 1.5;
@@ -1314,7 +1324,7 @@ fn spherical_band_volume_r15() -> f64 {
 /// meeting in pairwise junctions — an imprint NETWORK, not a single
 /// chain — and the octant contains the sphere's south pole.
 #[test]
-#[ignore = "of-7ld.4 gate; lifted, fails on of-7ld.5: sphere region interior sampling"]
+#[ignore = "of-7ld.4 gate; lifted, fails on of-rb4: imprints through pole vertices"]
 fn sphere_octant_on_block_corner() {
     let context = "sphere centered on block corner (octant intersection)";
     let r = 0.8;
@@ -1361,7 +1371,7 @@ fn sphere_octant_on_block_corner() {
 /// seam edge — an imprint threaded through existing topology at the
 /// exact points where longitude is undefined.
 #[test]
-#[ignore = "of-7ld.4 gate; lifted, fails on of-7ld.5: sphere region interior sampling"]
+#[ignore = "of-7ld.4 gate; lifted, fails on of-rb4: imprints through pole vertices"]
 fn hemisphere_imprint_through_poles() {
     let context = "half-space block ∩ sphere: meridian imprint through both poles";
     let r = 1.0;
@@ -1380,7 +1390,7 @@ fn hemisphere_imprint_through_poles() {
 /// seam meridian (u = 0) twice, so the trimmed regions must share the
 /// seam edge correctly.
 #[test]
-#[ignore = "of-7ld.4 gate; lifted, fails on of-7ld.5: sphere region interior sampling"]
+#[ignore = "of-7ld.4 gate; lifted, fails on of-43n: seam-crossing ring never split (winding 0)"]
 fn sphere_side_cap_crosses_seam() {
     let context = "block bites +X cap: imprint crosses the seam meridian";
     let (r, h) = (1.0, 0.7);
@@ -1415,7 +1425,7 @@ fn sphere_side_cap_crosses_seam() {
 /// while the imprint circle sweeps across the seam and poles at generic
 /// angles.
 #[test]
-#[ignore = "of-7ld.4 gate; lifted, fails on of-7ld.5: sphere region interior sampling"]
+#[ignore = "of-7ld.4 gate; lifted, fails on of-43n: non-monotonic imprint crosses the seam level more than once"]
 fn rotated_block_cap_bite_volume_invariance() {
     let mut rng = Rng::new(0x5F3E_7E11);
     let (r, h) = (1.0, 0.6);
@@ -1447,7 +1457,7 @@ fn rotated_block_cap_bite_volume_invariance() {
 /// intersection has the exact cap closed form, and the three-way volume
 /// identities must hold.
 #[test]
-#[ignore = "of-7ld.4 gate; lifted, fails on of-7ld.5: sphere region interior sampling"]
+#[ignore = "of-7ld.4 gate; lifted, fails on of-7ld.6: broad-phase box misses the clash"]
 fn random_sphere_face_caps_identity() {
     let mut rng = Rng::new(0x0F1_CA9);
     for case in 0..8 {
@@ -1510,7 +1520,7 @@ fn random_sphere_face_caps_identity() {
 /// [`Scene::sphere_with_axis`], the block rotated in place. Both frames
 /// must reproduce the closed form.
 #[test]
-#[ignore = "of-7ld.4 gate; lifted, fails on of-7ld.5: sphere region interior sampling"]
+#[ignore = "of-7ld.4 gate: passes with the chart gate lifted (of-7ld.5 fixed) — un-ignore at promotion"]
 fn rotated_frame_sphere_cap_congruence() {
     let (r, h) = (1.0, 0.6);
     let sphere_center = Point3::new(3.0, 3.0, 2.0 + (r - h));
@@ -1541,7 +1551,7 @@ fn rotated_frame_sphere_cap_congruence() {
 /// classic napkin ring, volume (4π/3)(r² − a²)^{3/2} independent of the
 /// imprint details, genus 1.
 #[test]
-#[ignore = "of-7ld.4 gate + of-7ld.2 cylinder-sphere SSI (in MQ)"]
+#[ignore = "of-7ld.4 gate: passes with the chart gate lifted (of-7ld.5 fixed) — un-ignore at promotion"]
 fn napkin_ring_coaxial_cylinder_drills_sphere() {
     let context = "sphere minus coaxial through-cylinder (napkin ring)";
     let (r, a) = (1.0, 0.5);
@@ -1563,7 +1573,7 @@ fn napkin_ring_coaxial_cylinder_drills_sphere() {
 /// no elementary closed form, so assert validity, genus, and the volume
 /// identities among the three boolean results.
 #[test]
-#[ignore = "of-7ld.4 gate + of-7ld.2 cylinder-sphere SSI (in MQ)"]
+#[ignore = "of-7ld.4 gate; lifted, needs marched cylinder-sphere SSI wired into the boolean pipeline (of-7ld.2 follow-up)"]
 fn offset_cylinder_drills_sphere_identity() {
     let context = "sphere minus offset through-cylinder";
     let (r, a, off) = (1.0, 0.4, 0.45);
@@ -1593,7 +1603,7 @@ fn offset_cylinder_drills_sphere_identity() {
 /// form (two caps against the radical plane), checked together with the
 /// inclusion–exclusion identity for equal and unequal radii.
 #[test]
-#[ignore = "of-7ld.4 gate + of-7ld.2 sphere-sphere SSI (in MQ)"]
+#[ignore = "of-7ld.4 gate; lifted, fails on of-43n: lens circle crosses both seams without wrapping"]
 fn sphere_pair_lens_identities() {
     for (r1, r2, d) in [(1.0, 1.0, 1.2), (1.0, 0.6, 0.9), (0.8, 0.8, 1.4)] {
         let context = format!("sphere pair r1={r1} r2={r2} d={d}");
@@ -1639,7 +1649,7 @@ fn sphere_pair_lens_identities() {
 /// direction, separation strictly between the internal and external
 /// tangency distances with margin. Lens closed form + identities.
 #[test]
-#[ignore = "of-7ld.4 gate + of-7ld.2 sphere-sphere SSI (in MQ)"]
+#[ignore = "of-7ld.4 gate; lifted, fails on of-7ld.6: broad-phase box misses some clashes"]
 fn random_sphere_pairs_identity() {
     let mut rng = Rng::new(0x2_5EED_BA11);
     for case in 0..8 {
@@ -2082,7 +2092,7 @@ fn perpendicular_tori_channel_tangency() {
 /// succeed; slivers tessellate coarsely, so the volume check is a
 /// window, and validity is the real assertion.
 #[test]
-#[ignore = "of-7ld.4 gate; lifted, fails on of-7ld.5: sphere region interior sampling"]
+#[ignore = "of-7ld.4 gate: passes with the chart gate lifted (of-7ld.5 fixed) — un-ignore at promotion"]
 fn plane_grazes_sphere_tiny_caps() {
     for h in [1e-3, 1e-4] {
         let context = format!("sphere dips {h:.0e} into the slab top");
@@ -2128,7 +2138,7 @@ fn plane_grazes_sphere_sub_tolerance() {
 /// Boolean output → tessellate → MeshSdf → dual-contour re-mesh volume
 /// agreement, for a sphere cap subtraction.
 #[test]
-#[ignore = "of-7ld.4 gate; lifted, fails on of-7ld.5: sphere region interior sampling"]
+#[ignore = "of-7ld.4 gate: passes with the chart gate lifted (of-7ld.5 fixed) — un-ignore at promotion"]
 fn round_trip_slab_minus_sphere_cap() {
     let mut scene = Scene::new();
     let slab = scene.block([0.0, 0.0, 0.0], [4.0, 4.0, 2.0]);

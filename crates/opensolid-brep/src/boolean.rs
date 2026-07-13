@@ -441,7 +441,9 @@ impl Chart {
     /// chart machinery below fully supports them.
     fn new(surface: &Surface3) -> CoreResult<Self> {
         match surface {
-            // TEMP-GATE-LIFT
+            Surface3::Sphere { .. } => Err(CoreError::NotImplemented {
+                feature: "boolean parameter chart for spheres",
+            }),
             Surface3::Torus { .. } => Err(CoreError::NotImplemented {
                 feature: "boolean parameter chart for tori",
             }),
@@ -4880,6 +4882,230 @@ mod tests {
             (p - expected).norm() < 1e-9,
             "seam vertex off the exact curve by {:.3e}",
             (p - expected).norm()
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Sphere pole closure (of-7ld.5)
+    // -----------------------------------------------------------------
+
+    fn unit_sphere_chart() -> Chart {
+        Chart::build(&Surface3::sphere(Point3::origin(), Vector3::z(), 1.0).expect("valid"))
+            .expect("sphere charts build")
+    }
+
+    /// 3D samples of the `u = 0` seam meridian of the unit sphere, south
+    /// pole to north pole inclusive (`n + 1` points).
+    fn seam_samples(n: usize) -> Vec<Point3> {
+        (0..=n)
+            .map(|i| {
+                let v = -FRAC_PI_2 + PI * i as f64 / n as f64;
+                Point3::new(v.cos(), 0.0, v.sin())
+            })
+            .collect()
+    }
+
+    /// Embed a walk with a [`CoverEmbedder`] and return the cover.
+    fn embed_points(chart: &Chart, points: &[Point3], ccw: bool) -> Vec<CoverPoint> {
+        let mut emb = CoverEmbedder::new(chart, ccw);
+        let mut out = Vec::new();
+        for p in points {
+            emb.push(*p, &mut out);
+        }
+        out
+    }
+
+    /// The sphere face's stored loop walk: up the seam, back down it
+    /// (each traversal dropping its final point, as `append_directed`
+    /// does when concatenating loop edges).
+    fn seam_only_loop_walk() -> Vec<Point3> {
+        let pts = seam_samples(48);
+        let mut walk: Vec<Point3> = pts[..pts.len() - 1].to_vec();
+        walk.extend(pts[1..].iter().rev());
+        walk
+    }
+
+    #[test]
+    fn pole_v_flags_poles_only_on_sphere_charts() {
+        let chart = unit_sphere_chart();
+        assert_eq!(chart.pole_v(&Point3::new(0.0, 0.0, 1.0)), Some(FRAC_PI_2));
+        assert_eq!(chart.pole_v(&Point3::new(0.0, 0.0, -1.0)), Some(-FRAC_PI_2));
+        assert_eq!(chart.pole_v(&Point3::new(1.0, 0.0, 0.0)), None);
+        let wall = wall_poly(1.0, 0.0, 1.0);
+        assert_eq!(wall.chart.pole_v(&Point3::new(0.0, 0.0, 1.0)), None);
+    }
+
+    #[test]
+    fn seam_only_sphere_loop_covers_the_full_rectangle() {
+        // A closed sphere face's only boundary is the seam meridian: its
+        // cover polygon is two coincident vertical traversals unless the
+        // pole closure rows are embedded explicitly — the of-7ld.5
+        // zero-area collapse that broke every plane-sphere boolean.
+        let chart = unit_sphere_chart();
+        let cover = embed_points(&chart, &seam_only_loop_walk(), true);
+        let area = shoelace(&cover);
+        assert!(
+            (area - TWO_PI * PI).abs() < 1e-6,
+            "CCW cover must have the full 2π·π rectangle area, got {area}"
+        );
+        // Pole rows never affect even-odd containment (horizontal
+        // segments), so any latitude/longitude interior probe must land
+        // inside the cover.
+        let fp = FaceRegionPoly {
+            chart,
+            loops: vec![cover],
+        };
+        for (u, v) in [(0.1, 0.0), (PI, 1.2), (TWO_PI - 0.1, -1.4)] {
+            assert!(
+                fp.contains(fp.localize((u, v))),
+                "({u}, {v}) must be inside the full-sphere cover"
+            );
+        }
+    }
+
+    #[test]
+    fn seam_only_sphere_loop_cover_orients_by_winding() {
+        // Stored loops of a face whose outward side opposes the surface
+        // normal (a dimple) wind CW in the chart; the pole rows must flip
+        // with them so the cover polygon stays a simple rectangle.
+        let chart = unit_sphere_chart();
+        let cover = embed_points(&chart, &seam_only_loop_walk(), false);
+        let area = shoelace(&cover);
+        assert!(
+            (area + TWO_PI * PI).abs() < 1e-6,
+            "CW cover must have area -2π·π, got {area}"
+        );
+    }
+
+    #[test]
+    fn pole_row_sweeps_exactly_the_interior_meridians() {
+        // Walk up the u = π meridian, over the north pole, down the
+        // u = 0 meridian (a straight pole crossing): CCW keeps the face
+        // interior left of the walk, so the north row runs from the
+        // arrival meridian toward -u and must stop at u = 0, not at the
+        // nearest-unwrap pick of ±π.
+        let chart = unit_sphere_chart();
+        let up: Vec<Point3> = (0..=24)
+            .map(|i| {
+                let v = -FRAC_PI_2 + PI * i as f64 / 24.0;
+                Point3::new(-v.cos(), 0.0, v.sin())
+            })
+            .collect();
+        let down: Vec<Point3> = (1..=24)
+            .map(|i| {
+                let v = FRAC_PI_2 - PI * i as f64 / 24.0;
+                Point3::new(v.cos(), 0.0, v.sin())
+            })
+            .collect();
+        let mut walk = up;
+        walk.extend(down);
+        let cover = embed_points(&chart, &walk, true);
+        let north = Point3::new(0.0, 0.0, 1.0);
+        let row: Vec<f64> = cover
+            .iter()
+            .filter(|(_, p)| (p - north).norm() < 1e-12)
+            .map(|((u, _), _)| *u)
+            .collect();
+        assert_eq!(row.len(), 2, "pole must carry arrival and departure");
+        assert!(
+            (row[0] - PI).abs() < 1e-9 && row[1].abs() < 1e-9,
+            "north row must run π → 0 (interior meridians), got {row:?}"
+        );
+    }
+
+    #[test]
+    fn region_interior_point_found_on_full_sphere_cover() {
+        // The exact of-7ld.5 failure: with the collapsed cover no region
+        // interior sample existed for a closed sphere face.
+        let chart = unit_sphere_chart();
+        let cover = embed_points(&chart, &seam_only_loop_walk(), true);
+        let cycle = Cycle {
+            darts: vec![(0, true)],
+            area: shoelace(&cover),
+            dart_offsets: vec![0],
+            poly: cover,
+        };
+        let region = Region {
+            cycles: vec![cycle],
+        };
+        let p = region_interior_point(&chart, &region)
+            .expect("full-sphere region must yield an interior sample");
+        assert!(
+            (p.coords.norm() - 1.0).abs() < 1e-9,
+            "sample must lie on the sphere, |p| = {}",
+            p.coords.norm()
+        );
+    }
+
+    #[test]
+    fn embed_cycle_vertex_offsets_skip_pole_row_points() {
+        // Seam split one sample above the south pole (the tiny-cap graze
+        // shape): the dart after the pole junction starts at the split
+        // vertex, and its recorded cycle vertex must be that split point
+        // — not the pole-row departure point emitted just before it,
+        // which sits half a latitude range away and made
+        // `match_chain_to_cycle` reject valid seam chords.
+        let chart = unit_sphere_chart();
+        let pts = seam_samples(48);
+        let v_x = -FRAC_PI_2 + PI / 48.0;
+        let a0 = Atom {
+            points: pts[..2].to_vec(), // south pole → split
+            closed: false,
+        };
+        let a1 = Atom {
+            points: pts[1..].to_vec(), // split → north pole
+            closed: false,
+        };
+        let atoms = [a0, a1];
+        let walk = seam_only_loop_walk();
+        let fp = FaceRegionPoly {
+            loops: vec![embed_points(&chart, &walk, true)],
+            chart,
+        };
+        let cycle = embed_cycle(
+            &fp,
+            &atoms,
+            vec![(0, true), (1, true), (1, false), (0, false)],
+        );
+        assert!(
+            (cycle.area - TWO_PI * PI).abs() < 1e-6,
+            "split seam cycle still covers the rectangle, got {}",
+            cycle.area
+        );
+        assert_eq!(cycle.dart_offsets.len(), 4);
+        // Dart 1 starts at the split vertex on the up-seam copy, dart 3
+        // on the down-seam copy — one period apart at latitude v_x.
+        let uv1 = cycle.poly[cycle.dart_offsets[1]].0;
+        let uv3 = cycle.poly[cycle.dart_offsets[3]].0;
+        assert!(
+            (uv1.1 - v_x).abs() < 1e-9 && (uv3.1 - v_x).abs() < 1e-9,
+            "dart vertices must sit at the split latitude, got {uv1:?} / {uv3:?}"
+        );
+        assert!(
+            ((uv1.0 - uv3.0).abs() - TWO_PI).abs() < 1e-9,
+            "the split vertex appears on both seam copies, got {uv1:?} / {uv3:?}"
+        );
+    }
+
+    #[test]
+    fn seam_crossing_found_for_wrapping_sphere_cap_ring() {
+        // A latitude cap circle wraps the sphere's u period once, so the
+        // seam split machinery must cut it (and later the seam edge) at
+        // the seam meridian — the sphere analog of the cylinder ring
+        // case, enabled by the full-rectangle cover (of-7ld.5).
+        let chart = unit_sphere_chart();
+        let fp = FaceRegionPoly {
+            loops: vec![embed_points(&chart, &seam_only_loop_walk(), true)],
+            chart,
+        };
+        let v0: f64 = -0.4;
+        let curve = Curve3::circle(Point3::new(0.0, 0.0, v0.sin()), Vector3::z(), v0.cos())
+            .expect("valid cap circle");
+        let points = ring_samples(&curve);
+        let p = seam_crossing(&fp, &curve, &points).expect("cap ring wraps the period");
+        assert!(
+            (p - Point3::new(v0.cos(), 0.0, v0.sin())).norm() < 1e-9,
+            "seam vertex must sit on the u = 0 meridian at the cap latitude, got {p:?}"
         );
     }
 
