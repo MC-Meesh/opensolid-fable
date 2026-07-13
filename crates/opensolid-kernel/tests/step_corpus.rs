@@ -698,13 +698,11 @@ mod adversarial {
         assert_eq!(file.len(), 1);
     }
 
-    /// of-1dd: parse_value recursion has no depth limit; ~500 levels
-    /// overflow a 2MB test-thread stack and ABORT the process (which is
-    /// why this cannot run un-ignored: a stack overflow is not a
-    /// catchable panic). Un-ignore once the parser returns a structured
-    /// StepError for absurd nesting.
+    /// of-1dd (fixed): parse_value recursion used to have no depth limit;
+    /// ~500 levels overflowed a 2MB test-thread stack and ABORTED the
+    /// process. The parser now rejects absurd nesting with a structured
+    /// [`StepError`] instead of recursing to death.
     #[test]
-    #[ignore = "of-1dd: parser stack overflow on deeply nested aggregates"]
     fn deeply_nested_aggregates_must_not_crash_the_process() {
         let depth = 100_000;
         let source = envelope(&format!(

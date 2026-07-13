@@ -273,8 +273,8 @@ now a hard gate; it is also the sixth rung of the hybrid ladder above.
 **Stress-suite-first promotion.** A new surface class does not enter the exact
 boolean pipeline until its randomized stress suite (rotations, scales, volume
 identities, round-trips) is green. Until then it routes through the F-Rep
-fallback, which already works. This is the hard rule for the in-progress
-sphere/torus work (bead of-7ld).
+fallback, which already works. This is the rule that carried spheres and tori
+into the exact pipeline (bead of-7ld) and still gates cones.
 
 **Runtime validation gate.** Correctness is not assumed at build time — it is
 re-checked at *run* time. Every accepted exact result passes `check()` and a
@@ -289,7 +289,7 @@ bounds, and the Euler–Poincaré relation `V − E + F − R = 2(S − H)`
 (`crates/opensolid-brep/src/euler.rs:103`). Bugs found in the field become new
 checker rules, so the same class of error cannot silently return `Ok` twice.
 
-**Every function is tested.** 686 tests pass across the Rust workspace
+**Every function is tested.** 913 tests pass across the Rust workspace
 (`cargo test --workspace`), plus the playground's vitest suite. CI runs `fmt`,
 `clippy -D warnings`, `build`, and `test` on every push
 (`.github/workflows/ci.yml`).
@@ -302,17 +302,25 @@ checker rules, so the same class of error cannot silently return `Ok` twice.
 |---|---|---|
 | Planes | ✅ today | ✅ |
 | Cylinders | ✅ today | ✅ |
-| Spheres / tori | 🚧 in progress (of-7ld) | ✅ |
+| Spheres / tori | ✅ today (of-7ld) | ✅ |
 | Cones | 🚧 (SSI partial) | ✅ |
 | Coincident / tangent contacts | rejected → fallback | ✅ |
 | Organic blends, offsets, shells | — | ✅ |
+| STEP (AP203) read/write | ✅ today (of-3qy) | mesh fallback on read |
 
-The exact analytic pipeline covers **plane + cylinder** faces today
-(`Chart::new`, `crates/opensolid-brep/src/boolean.rs:411`). Spheres and tori are
-in progress under the stress-suite-first policy (bead of-7ld). **STEP (AP203)
-interchange** is in progress (bead of-3qy). Meanwhile the F-Rep fallback covers
-**everything** — any pair of valid inputs produces a watertight result, because
-`min`/`max` on distance fields cannot fail.
+The exact analytic pipeline covers **plane, cylinder, sphere, and torus**
+faces today: the sphere/torus stress campaign (bead of-7ld) promoted both
+classes through the stress-suite-first policy, and marched SSI curves carry
+the oblique plane–torus and torus–torus configurations. **STEP (AP203)
+interchange** shipped (bead of-3qy): analytic parts round-trip through
+`write_step`/`read_step` as exact B-Reps — byte-identical on re-export for
+primitive-derived geometry — with a welded-mesh fallback for files the kernel
+cannot yet represent exactly, unit scaling from the file's declared length
+unit, and cross-feature integration tests chaining STEP with exact booleans,
+hybrid booleans, and sweeps
+(`crates/opensolid-kernel/tests/integration_e2e.rs`). Meanwhile the F-Rep
+fallback covers **everything** — any pair of valid inputs produces a
+watertight result, because `min`/`max` on distance fields cannot fail.
 
 See `ROADMAP.md` for the epic-level plan; the beads tracker (`bd ready`) is the
 source of truth for task state.
@@ -325,7 +333,7 @@ source of truth for task state.
 
 ```sh
 cargo build            # build the workspace
-cargo test             # run all 686 tests
+cargo test             # run all 913 tests
 cargo clippy -- -D warnings
 ```
 
