@@ -72,7 +72,7 @@
 //! `Chart::new` rejected `Surface3::Sphere`/`Torus`; of-7ld.4 lifted
 //! that gate after the of-7ld.5/6/7 fixes, and the tests that pass are
 //! now live. The still-`#[ignore]`d remainder name their open blockers
-//! (of-rb4, of-yet, of-2ql). Run those with
+//! (of-rb4, of-yet). Run those with
 //! `cargo test --test boolean_stress -- --ignored`.
 //!
 //! Bugs filed from the campaign's first run (2026-07-12, `Chart::new`
@@ -136,6 +136,14 @@
 //! past imprinting but still miss volume/manifold checks on of-2ql's
 //! refinement-lattice slivers — their `#[ignore]` messages now name
 //! of-2ql.
+//!
+//! Update (of-2ql fix): interior lattice points that land exactly on a
+//! triangulation edge (pitch-aligned boundary sampling makes seed-chord
+//! diagonals pass through staggered lattice points) are inserted with a
+//! proper edge split instead of a corner split that minted negative uv
+//! slivers and left secant triangles through the cylinder wall. The
+//! napkin-ring test is live; the remaining `#[ignore]`d tests name
+//! of-rb4 and of-yet.
 
 use nalgebra::{Rotation3, Unit};
 use opensolid_brep::boolean::{intersect, subtract, unite};
@@ -1576,7 +1584,6 @@ fn rotated_frame_sphere_cap_congruence() {
 /// classic napkin ring, volume (4π/3)(r² − a²)^{3/2} independent of the
 /// imprint details, genus 1.
 #[test]
-#[ignore = "of-2ql: valid genus-1 solid but volume off 1.1e-2 relative (allowed 5e-3)"]
 fn napkin_ring_coaxial_cylinder_drills_sphere() {
     let context = "sphere minus coaxial through-cylinder (napkin ring)";
     let (r, a) = (1.0, 0.5);

@@ -3629,6 +3629,48 @@ impl FlipMesh {
         self.legalize(stack, verts, constraints);
     }
 
+    /// Insert vertex `np`, known to lie on the interior edge `k` of triangle
+    /// `t` (shared with a neighbor), splitting both triangles into four.
+    /// The edge must not be a constraint and must have a neighbor; the
+    /// caller checks both.
+    fn insert_on_edge(
+        &mut self,
+        t: usize,
+        k: usize,
+        np: usize,
+        verts: &[(f64, f64)],
+        constraints: &std::collections::HashSet<(usize, usize)>,
+    ) {
+        let n = self.adj[t][k];
+        debug_assert_ne!(n, NO_TRI, "insert_on_edge requires an interior edge");
+        let u = self.tris[t][k];
+        let w = self.tris[t][(k + 1) % 3];
+        let c = self.tris[t][(k + 2) % 3];
+        let j = self.edge_index(n, u, w).expect("neighbor shares the edge");
+        let q = self.tris[n][(j + 2) % 3];
+        // Outer neighbors of the quad u-w-c / w-u-q around edge (u,w).
+        let a_wc = self.adj[t][(k + 1) % 3];
+        let a_cu = self.adj[t][(k + 2) % 3];
+        let b_uq = self.adj[n][(j + 1) % 3];
+        let b_qw = self.adj[n][(j + 2) % 3];
+        let t2 = self.tris.len();
+        let n2 = t2 + 1;
+        // t := [u, np, c], t2 := [np, w, c], n := [w, np, q], n2 := [np, u, q]
+        self.tris[t] = [u, np, c];
+        self.adj[t] = [n2, t2, a_cu];
+        self.tris.push([np, w, c]);
+        self.adj.push([n, a_wc, t]);
+        self.tris[n] = [w, np, q];
+        self.adj[n] = [t2, n2, b_qw];
+        self.tris.push([np, u, q]);
+        self.adj.push([t, b_uq, n]);
+        self.relink(a_wc, w, c, t2);
+        self.relink(b_uq, u, q, n2);
+        // a_cu still borders (c,u) on t; b_qw still borders (q,w) on n.
+        let stack = vec![(t, 2), (t2, 1), (n, 2), (n2, 1)];
+        self.legalize(stack, verts, constraints);
+    }
+
     /// Flip edge `(t, k)` if it is a non-constraint edge that violates the
     /// Delaunay criterion and the flip keeps both triangles valid. Returns
     /// the four quad edges to recheck, or `None` if no flip happened.
@@ -3885,19 +3927,74 @@ fn refine_curved_region(
             if !clear {
                 continue;
             }
-            // Locate the containing triangle (linear scan; all slots live).
+            // Locate the containing triangle (linear scan; all slots live),
+            // distinguishing STRICT containment (every edge orientation
+            // clearly positive) from an on-edge landing — not the inclusive
+            // point-in-triangle test. The boundary is sampled on the same
+            // pitch the lattice uses, so long seed chords can have rational
+            // slopes in lattice units and then pass EXACTLY through
+            // staggered lattice points (e.g. a 53-column/53-row diagonal
+            // contains every half-integer point of x + y = 53). Splitting a
+            // triangle at a point on one of its edges mints a sliver whose
+            // orientation is fp noise; when negative it can never flip
+            // (flip_edge's orientation guards) and poisons every later
+            // insertion along the same chord, leaving long secant triangles
+            // through the surface (of-2ql: napkin-ring wall volume off 1%).
+            // Strictly interior points split their host into three as
+            // before; on-edge points split the edge's two triangles into
+            // four; anything else is skipped.
             let np = all_uv.len();
             let target = uv;
-            let host = (0..mesh.tris.len()).find(|&t| {
+            let eps_area = 1e-9 * step_u * step_v;
+            // (triangle, edge landed on) — edge 3 means strictly inside.
+            let mut found: Option<(usize, usize)> = None;
+            for t in 0..mesh.tris.len() {
                 let [a, b, c] = mesh.tris[t];
-                point_in_triangle(target, all_uv[a], all_uv[b], all_uv[c])
-            });
-            let Some(host) = host else {
-                continue; // numerically outside; simply skip this point
+                let o = [
+                    orient2d(all_uv[a], all_uv[b], target),
+                    orient2d(all_uv[b], all_uv[c], target),
+                    orient2d(all_uv[c], all_uv[a], target),
+                ];
+                if o[0] > eps_area && o[1] > eps_area && o[2] > eps_area {
+                    found = Some((t, 3));
+                    break;
+                }
+                if let Some(k) = (0..3).find(|&k| {
+                    o[k].abs() <= eps_area && o[(k + 1) % 3] > eps_area && o[(k + 2) % 3] > eps_area
+                }) {
+                    found = Some((t, k));
+                    break;
+                }
+            }
+            let Some((host, k)) = found else {
+                continue; // numerically outside every triangle; skip
             };
+            if k == 3 {
+                all_uv.push(uv);
+                all_p.push(chart_point(chart, uv));
+                mesh.insert_in_triangle(host, np, all_uv, &constraints);
+                continue;
+            }
+            // On-edge: split the edge — but only an interior edge with a
+            // proper (non-degenerate) neighbor. Constraint edges must never
+            // be subdivided (boundary welding depends on them staying
+            // bit-identical) and splitting a degenerate neighbor would mint
+            // the very slivers this path exists to avoid.
+            let (ea, eb) = (mesh.tris[host][k], mesh.tris[host][(k + 1) % 3]);
+            if constraints.contains(&(ea.min(eb), ea.max(eb))) {
+                continue;
+            }
+            let n = mesh.adj[host][k];
+            if n == NO_TRI {
+                continue;
+            }
+            let [na, nb, nc] = mesh.tris[n];
+            if orient2d(all_uv[na], all_uv[nb], all_uv[nc]) <= eps_area {
+                continue;
+            }
             all_uv.push(uv);
             all_p.push(chart_point(chart, uv));
-            mesh.insert_in_triangle(host, np, all_uv, &constraints);
+            mesh.insert_on_edge(host, k, np, all_uv, &constraints);
         }
     }
 
@@ -5827,6 +5924,86 @@ mod tests {
             map.matches(&Point3::new(0.1 * tol, 0.0, 0.0)),
             vec![1, 2],
             "in-tolerance values nearest first"
+        );
+    }
+
+    /// of-2ql regression: FlipMesh::insert_on_edge splits both triangles of
+    /// an interior edge into four valid CCW triangles with consistent
+    /// adjacency and unchanged total area.
+    #[test]
+    fn flip_mesh_insert_on_edge_splits_quad_cleanly() {
+        // Unit square as two triangles sharing the diagonal (0,0)-(1,1).
+        let mut verts: Vec<(f64, f64)> = vec![(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)];
+        let seed = [[0, 1, 2], [0, 2, 3]];
+        let mut mesh = FlipMesh::from_tris(&seed, &verts);
+        // Constrain the outer boundary so legalization cannot flip it.
+        let constraints: std::collections::HashSet<(usize, usize)> =
+            [(0, 1), (1, 2), (2, 3), (0, 3)].into_iter().collect();
+        let t = 0;
+        let k = mesh.edge_index(0, 0, 2).expect("diagonal edge");
+        assert_ne!(mesh.adj[t][k], NO_TRI, "diagonal must be interior");
+        verts.push((0.5, 0.5)); // exactly on the diagonal
+        mesh.insert_on_edge(t, k, 4, &verts, &constraints);
+
+        assert_eq!(mesh.tris.len(), 4);
+        let mut area = 0.0;
+        for (ti, tri) in mesh.tris.iter().enumerate() {
+            let o = orient2d(verts[tri[0]], verts[tri[1]], verts[tri[2]]);
+            assert!(o > 0.0, "triangle {ti} {tri:?} not CCW (orient {o})");
+            area += 0.5 * o;
+            // Adjacency must be mutual.
+            for e in 0..3 {
+                let n = mesh.adj[ti][e];
+                if n != NO_TRI {
+                    let (a, b) = (tri[e], tri[(e + 1) % 3]);
+                    let back = mesh
+                        .edge_index(n, a, b)
+                        .unwrap_or_else(|| panic!("neighbor {n} misses edge ({a},{b})"));
+                    assert_eq!(mesh.adj[n][back], ti, "adjacency not mutual");
+                }
+            }
+        }
+        assert!((area - 1.0).abs() < 1e-12, "area changed: {area}");
+        // Every triangle uses the inserted vertex.
+        assert!(mesh.tris.iter().all(|t| t.contains(&4)));
+    }
+
+    /// of-2ql regression: sphere minus coaxial through-cylinder (napkin
+    /// ring). The wall and band boundary polylines are sampled on the same
+    /// angular pitch as the refinement lattice, so seed-chord diagonals pass
+    /// exactly through staggered lattice points; splitting there used to
+    /// mint negative uv slivers that blocked legalization and left secant
+    /// triangles cutting ~radius deep through the cylinder wall (volume off
+    /// 1.1e-2 relative). With on-edge insertion the tessellated volume must
+    /// sit within the stress-suite budget of the closed form and the chordal
+    /// deviation must stay near the one-pitch sag scale.
+    #[test]
+    fn napkin_ring_tessellation_volume_and_deviation() {
+        let (mut store, mut geo) = stores();
+        let ball = primitives::sphere(&mut store, &mut geo, 1.0).expect("valid sphere");
+        let tool = primitives::cylinder(&mut store, &mut geo, 0.5, 4.0).expect("valid cylinder");
+        let out = subtract(&store, &geo, ball, tool, &tol()).unwrap();
+        assert_valid(&out, "napkin ring");
+
+        let (mesh, deviation) = out.tessellate_measured().unwrap();
+        assert!(
+            deviation < 5e-3,
+            "napkin ring chordal deviation {deviation:.3e} — secant triangles are back"
+        );
+        let mut volume = 0.0;
+        for tri in &mesh.indices {
+            let (a, b, c) = (
+                mesh.positions[tri[0]],
+                mesh.positions[tri[1]],
+                mesh.positions[tri[2]],
+            );
+            volume += a.coords.dot(&b.coords.cross(&c.coords)) / 6.0;
+        }
+        let expected = 4.0 / 3.0 * PI * (1.0f64 - 0.25).powf(1.5);
+        let rel = ((volume - expected) / expected).abs();
+        assert!(
+            rel <= 5e-3,
+            "napkin ring volume {volume} vs {expected} — {rel:.3e} relative"
         );
     }
 
