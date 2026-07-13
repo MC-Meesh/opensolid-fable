@@ -460,7 +460,23 @@ pub fn intersect_nurbs(
     b: &NurbsSurface,
     tol: &ToleranceContext,
 ) -> CoreResult<Vec<MarchedCurve>> {
-    let domains = [a.domain_u(), a.domain_v(), b.domain_u(), b.domain_v()];
+    march_boxed(
+        a,
+        b,
+        [a.domain_u(), a.domain_v(), b.domain_u(), b.domain_v()],
+        tol,
+    )
+}
+
+/// Shared marching driver: grid-seed over `domains[0..2]` of `a`, refine
+/// against `b`, and trace within the given parameter boxes (which must be
+/// finite — unbounded primitive directions are clipped by the callers).
+fn march_boxed<A: MarchSurface, B: MarchSurface>(
+    a: &A,
+    b: &B,
+    domains: [(f64, f64); 4],
+    tol: &ToleranceContext,
+) -> CoreResult<Vec<MarchedCurve>> {
     let gap_tol = tol.linear.max(opensolid_core::SYSTEM_RESOLUTION);
 
     // Oriented-distance samples of A's parameter grid against B. Nodes
@@ -584,6 +600,181 @@ pub fn intersect_nurbs(
         curves.push(curve);
     }
     Ok(curves)
+}
+
+/// Bounding sphere `(center, radius)` of a compact primitive; `None` for
+/// the unbounded ones (plane, cylinder, cone).
+fn bounding_sphere(s: &Surface3) -> Option<(Point3, f64)> {
+    match *s {
+        Surface3::Sphere { center, radius, .. } => Some((center, radius)),
+        Surface3::Torus {
+            center,
+            major_radius,
+            minor_radius,
+            ..
+        } => Some((center, major_radius + minor_radius)),
+        _ => None,
+    }
+}
+
+/// Parameter box for an unbounded primitive clipped to where it can meet a
+/// partner bounded by `(center, radius)`: any intersection point lies
+/// inside the partner's bounding sphere, so the infinite directions are
+/// cut to that reach (slightly padded so seeding never sits exactly on a
+/// box edge).
+fn clipped_domains(
+    s: &Surface3,
+    partner: (Point3, f64),
+    tol: &ToleranceContext,
+) -> [(f64, f64); 2] {
+    let (center, radius) = partner;
+    let reach = 1.05 * radius + tol.linear;
+    match s {
+        Surface3::Plane { origin, normal } => {
+            let (e_u, e_v) = plane_basis(normal);
+            let d = center - origin;
+            let (cu, cv) = (e_u.dot(&d), e_v.dot(&d));
+            [(cu - reach, cu + reach), (cv - reach, cv + reach)]
+        }
+        Surface3::Cylinder { origin, axis, .. } => {
+            let t = axis.dot(&(center - origin));
+            [(0.0, TWO_PI), (t - reach, t + reach)]
+        }
+        // Compact primitives keep their natural (finite) domains.
+        _ => [s.domain_u(), s.domain_v()],
+    }
+}
+
+/// Swap the per-surface parameter preimages of marched curves, for results
+/// traced with the argument order reversed.
+fn swap_params(curves: Vec<MarchedCurve>) -> Vec<MarchedCurve> {
+    curves
+        .into_iter()
+        .map(|mut c| {
+            std::mem::swap(&mut c.params_a, &mut c.params_b);
+            c
+        })
+        .collect()
+}
+
+/// March `a` against `b` (grid-seeding over `a`, which must have finite
+/// domains), converting the tracer's runtime tangency detection into the
+/// structured `NotImplemented` of the transversal MVP.
+fn march_primitives(
+    a: &Surface3,
+    b: &Surface3,
+    tol: &ToleranceContext,
+) -> CoreResult<Vec<MarchedCurve>> {
+    let bounds = bounding_sphere(a).expect("marched SSI grids over a compact primitive");
+    let [bu, bv] = clipped_domains(b, bounds, tol);
+    let domains = [a.domain_u(), a.domain_v(), bu, bv];
+    match march_boxed(a, b, domains, tol) {
+        Err(CoreError::Degenerate { .. }) => Err(CoreError::NotImplemented {
+            feature: "marched primitive SSI across a tangential contact or \
+                      parameterization singularity (transversal MVP)",
+        }),
+        other => other,
+    }
+}
+
+/// Marched intersection curves of two analytic primitives whose general
+/// configuration has no closed form among the [`crate::curve::Curve3`]
+/// variants. Supported pairs (either argument order):
+///
+/// - cylinder-sphere (general quartic)
+/// - plane-torus (general oblique quartic / spiric sections)
+/// - cylinder-torus, sphere-torus, torus-torus (degree 8 in general)
+///
+/// Special configurations of these pairs that *do* have closed forms
+/// (coaxial arrangements, tangencies) are classified exactly by
+/// [`super::intersect`]; this entry point marches whatever it is given and
+/// is the fallback when that returns `NotImplemented` for a general
+/// position. All other pairs are rejected: plane/sphere/cylinder
+/// combinations always have conic closed forms in [`super::intersect`],
+/// and cones are out of the MVP entirely.
+///
+/// **Representation choice (cylinder-sphere)**: the general cylinder-sphere
+/// curve admits a closed-form parameterization by cylinder angle — on the
+/// cylinder `(r cos u, r sin u, z)` the sphere equation gives
+/// `z(u) = z_c ± √(R² − |…|²)` — but that is not expressible with the
+/// current `Curve3` variants and needs branch stitching where the two `z`
+/// roots merge. Marching reuses the NURBS SSI infrastructure, yields the
+/// same dense-polyline representation, and passes the same residual
+/// acceptance, so the MVP marches this pair too; a dedicated analytic
+/// quartic curve type is a later hardening pass.
+///
+/// Vertices lie on both surfaces within `tol.linear` (the marching gap
+/// tolerance). Curves are transversal by construction. Periodic parameter
+/// directions are traced over one period `[0, 2π]` with hard seam bounds,
+/// exactly like the clamped-NURBS seam in [`intersect_nurbs`]: a closed
+/// curve crossing a seam comes back as open polyline(s) ending on it.
+///
+/// # Errors
+/// [`CoreError::NotImplemented`] for unsupported pairs, for tangential
+/// contact detected while marching (including sphere-pole singularities on
+/// the trace), and for the plane-torus Villarceau configuration (a plane
+/// through the center at `sin θ = r/R` is bitangent, so its circles carry
+/// two tangent points each).
+pub fn intersect_marched(
+    a: &Surface3,
+    b: &Surface3,
+    tol: &ToleranceContext,
+) -> CoreResult<Vec<MarchedCurve>> {
+    use Surface3::*;
+    match (a, b) {
+        // Canonical orders: grid over the compact primitive (the torus when
+        // both are compact — unlike the sphere it has no parameterization
+        // poles for seeds to land on).
+        (Sphere { .. }, Cylinder { .. })
+        | (Torus { .. }, Plane { .. } | Cylinder { .. } | Sphere { .. } | Torus { .. }) => {
+            if let (Torus { .. }, Plane { .. }) = (a, b) {
+                villarceau_check(b, a, tol)?;
+            }
+            march_primitives(a, b, tol)
+        }
+        // Swapped orders re-enter canonically and swap the preimages back.
+        (Cylinder { .. }, Sphere { .. })
+        | (Plane { .. } | Cylinder { .. } | Sphere { .. }, Torus { .. }) => {
+            Ok(swap_params(intersect_marched(b, a, tol)?))
+        }
+        _ => Err(CoreError::NotImplemented {
+            feature: "marched SSI for this surface pair (plane/sphere/cylinder \
+                      combinations have closed forms in ssi::intersect; cones \
+                      are unsupported)",
+        }),
+    }
+}
+
+/// Reject the Villarceau configuration: a plane through the torus center
+/// inclined at exactly `sin θ = minor/major` is bitangent to the torus, so
+/// each of its two circles passes through two tangent points — outside the
+/// transversal MVP, and a trap for the tracer's stepwise tangency check.
+fn villarceau_check(plane: &Surface3, torus: &Surface3, tol: &ToleranceContext) -> CoreResult<()> {
+    let (
+        Surface3::Plane { origin, normal },
+        &Surface3::Torus {
+            center,
+            axis,
+            major_radius,
+            minor_radius,
+        },
+    ) = (plane, torus)
+    else {
+        unreachable!("dispatched on Plane/Torus")
+    };
+    let cos_t = normal.dot(&axis).abs().min(1.0);
+    let sin_t = (1.0 - cos_t * cos_t).sqrt();
+    let through_center = tol.approx_zero(normal.dot(&(center - origin)));
+    let angular = tol
+        .angular
+        .max(opensolid_core::tolerance::ANGULAR_RESOLUTION);
+    if through_center && (sin_t - minor_radius / major_radius).abs() <= angular {
+        return Err(CoreError::NotImplemented {
+            feature: "plane-torus Villarceau section (bitangent plane through \
+                      the center at sin θ = minor/major)",
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -871,5 +1062,285 @@ mod tests {
                 "loop vertex off the level surface: {p:?}"
             );
         }
+    }
+
+    // ── marched primitive pairs (intersect_marched) ────────────────────
+
+    /// Residual bound for marched vertices: the corrector converges the
+    /// surface gap to `tol.linear` (1e-6 default), with a little headroom.
+    const MARCH_RESID: f64 = 5e-6;
+
+    /// Geometric residual of `p` against the primitive's locus: ~0 iff on it.
+    fn primitive_residual(s: &Surface3, p: &Point3) -> f64 {
+        match *s {
+            Surface3::Plane { origin, normal } => normal.dot(&(p - origin)).abs(),
+            Surface3::Sphere { center, radius, .. } => ((p - center).norm() - radius).abs(),
+            Surface3::Cylinder {
+                origin,
+                axis,
+                radius,
+            } => {
+                let d = p - origin;
+                ((d - axis * axis.dot(&d)).norm() - radius).abs()
+            }
+            Surface3::Torus {
+                center,
+                axis,
+                major_radius,
+                minor_radius,
+            } => {
+                let d = p - center;
+                let h = axis.dot(&d);
+                let rho = (d - axis * h).norm();
+                ((rho - major_radius).hypot(h) - minor_radius).abs()
+            }
+            Surface3::Cone { .. } => unreachable!("no cone marched tests"),
+        }
+    }
+
+    /// The bead-level acceptance: every vertex of every curve satisfies
+    /// the implicit residual bound on both surfaces, and its parameter
+    /// preimages reproduce it on each surface.
+    fn assert_marched_on_both(curves: &[MarchedCurve], a: &Surface3, b: &Surface3) {
+        assert!(!curves.is_empty(), "expected intersection curves");
+        let total: usize = curves.iter().map(|c| c.points.len()).sum();
+        assert!(total >= 30, "polylines too sparse: {total} vertices in all");
+        for (ci, curve) in curves.iter().enumerate() {
+            for (k, p) in curve.points.iter().enumerate() {
+                let (ra, rb) = (primitive_residual(a, p), primitive_residual(b, p));
+                assert!(ra <= MARCH_RESID, "curve {ci} vertex {k} off A by {ra:e}");
+                assert!(rb <= MARCH_RESID, "curve {ci} vertex {k} off B by {rb:e}");
+                let (ua, va) = curve.params_a[k];
+                let (ub, vb) = curve.params_b[k];
+                assert!(
+                    (a.point(ua, va) - p).norm() <= MARCH_RESID,
+                    "curve {ci} vertex {k}: params_a do not reproduce the vertex"
+                );
+                assert!(
+                    (b.point(ub, vb) - p).norm() <= MARCH_RESID,
+                    "curve {ci} vertex {k}: params_b do not reproduce the vertex"
+                );
+            }
+        }
+    }
+
+    /// Assert a parameter track covers the full `[0, 2π)` period with no
+    /// gap larger than `max_gap` (seam-to-seam traces of a loop around a
+    /// periodic direction).
+    fn assert_full_period(track: impl Iterator<Item = f64>, max_gap: f64) {
+        let mut values: Vec<f64> = track.collect();
+        values.sort_by(f64::total_cmp);
+        let first = values[0];
+        let last = values[values.len() - 1];
+        let wrap = (first + TWO_PI - last).max(0.0);
+        let interior = values.windows(2).map(|w| w[1] - w[0]).fold(0.0, f64::max);
+        assert!(
+            interior.max(wrap) <= max_gap,
+            "period coverage gap {:.3} exceeds {max_gap}",
+            interior.max(wrap)
+        );
+    }
+
+    fn torus3(center: Point3, major: f64, minor: f64) -> Surface3 {
+        Surface3::Torus {
+            center,
+            axis: Vector3::z(),
+            major_radius: major,
+            minor_radius: minor,
+        }
+    }
+
+    #[test]
+    fn marched_cylinder_sphere_general_closed_loop() {
+        let cyl = Surface3::Cylinder {
+            origin: Point3::origin(),
+            axis: Vector3::z(),
+            radius: 1.0,
+        };
+        let sph = Surface3::Sphere {
+            center: Point3::new(0.0, -1.2, 0.0),
+            axis: Vector3::z(),
+            radius: 0.8,
+        };
+        let curves = intersect_marched(&cyl, &sph, &default_tol()).unwrap();
+        assert_eq!(curves.len(), 1, "one puncture loop expected");
+        assert!(curves[0].closed, "interior loop must close");
+        assert_marched_on_both(&curves, &cyl, &sph);
+        // The quartic's z-extent: z² = -1.8 - 2.4 y over y ∈ [-1, -0.75].
+        let z_max = 0.6_f64.sqrt();
+        let reached = curves[0]
+            .points
+            .iter()
+            .map(|p| p.z.abs())
+            .fold(0.0, f64::max);
+        assert!(
+            reached <= z_max + 1e-4,
+            "curve exceeds the analytic z bound"
+        );
+        assert!(reached >= 0.9 * z_max, "curve misses most of its z extent");
+    }
+
+    #[test]
+    fn marched_plane_torus_oblique_spiric_rings() {
+        // Plane z = 0.5 - tan(5°)·x: an oblique (non-Villarceau) section,
+        // two nested rings that each encircle the torus axis.
+        let tilt = 5.0_f64.to_radians();
+        let plane = Surface3::Plane {
+            origin: Point3::new(0.0, 0.0, 0.5),
+            normal: Vector3::new(tilt.sin(), 0.0, tilt.cos()),
+        };
+        let torus = torus3(Point3::origin(), 3.0, 1.0);
+        let curves = intersect_marched(&torus, &plane, &default_tol()).unwrap();
+        assert_eq!(curves.len(), 2, "outer and inner spiric rings");
+        assert_marched_on_both(&curves, &torus, &plane);
+        // Each ring wraps the (seam-bounded) torus angle u fully.
+        for curve in &curves {
+            assert_full_period(curve.params_a.iter().map(|&(u, _)| u), 0.3);
+        }
+    }
+
+    #[test]
+    fn marched_cylinder_torus_drilled_tube() {
+        // A thin vertical cylinder drilled through the top and bottom of
+        // the tube at u = π/2: one loop where it enters, one where it
+        // exits, each encircling the cylinder.
+        let torus = torus3(Point3::origin(), 3.0, 1.0);
+        let cyl = Surface3::Cylinder {
+            origin: Point3::new(0.0, 3.0, 0.0),
+            axis: Vector3::z(),
+            radius: 0.5,
+        };
+        let curves = intersect_marched(&torus, &cyl, &default_tol()).unwrap();
+        assert_eq!(curves.len(), 2, "entry and exit loops");
+        assert_marched_on_both(&curves, &torus, &cyl);
+        let mut mean_z: Vec<f64> = curves
+            .iter()
+            .map(|c| c.points.iter().map(|p| p.z).sum::<f64>() / c.points.len() as f64)
+            .collect();
+        mean_z.sort_by(f64::total_cmp);
+        assert!(
+            mean_z[0] < -0.8 && mean_z[1] > 0.8,
+            "loops on top and bottom"
+        );
+        for curve in &curves {
+            assert_full_period(curve.params_b.iter().map(|&(u, _)| u), 0.3);
+        }
+    }
+
+    #[test]
+    fn marched_sphere_torus_general_tube_rings() {
+        // Sphere centered on the tube centerline, wider than the tube:
+        // two rings around the tube, one on each side of the center.
+        let torus = torus3(Point3::origin(), 3.0, 1.0);
+        let sph = Surface3::Sphere {
+            center: Point3::new(0.0, 3.0, 0.0),
+            axis: Vector3::z(),
+            radius: 1.5,
+        };
+        let curves = intersect_marched(&torus, &sph, &default_tol()).unwrap();
+        assert_marched_on_both(&curves, &torus, &sph);
+        // Fragmentation at the torus v-seam and the sphere u-seam is
+        // allowed (each cut is a domain boundary), but grouping fragments
+        // by ring — the two rings sit on either side of u = π/2 — must
+        // recover full tube-angle coverage for both.
+        let (left, right): (Vec<&MarchedCurve>, Vec<&MarchedCurve>) = curves
+            .iter()
+            .partition(|c| c.params_a[0].0 < std::f64::consts::FRAC_PI_2);
+        assert!(
+            !left.is_empty() && !right.is_empty(),
+            "expected rings on both sides of u = π/2"
+        );
+        for ring in [left, right] {
+            assert_full_period(
+                ring.iter().flat_map(|c| c.params_a.iter().map(|&(_, v)| v)),
+                0.3,
+            );
+        }
+    }
+
+    #[test]
+    fn marched_torus_torus_offset_pair() {
+        // Parallel but non-coaxial axes with unequal tubes: an irreducible
+        // degree-8 configuration in general position.
+        let a = torus3(Point3::origin(), 3.0, 1.0);
+        let b = torus3(Point3::new(0.4, 0.0, 0.0), 3.0, 0.8);
+        let curves = intersect_marched(&a, &b, &default_tol()).unwrap();
+        assert_marched_on_both(&curves, &a, &b);
+        // The y = 0 meridian crossings at x = 3.65, z = ±√0.5775 must be
+        // reached by some traced vertex.
+        for target_z in [0.5775_f64.sqrt(), -(0.5775_f64.sqrt())] {
+            let target = Point3::new(3.65, 0.0, target_z);
+            let nearest = curves
+                .iter()
+                .flat_map(|c| c.points.iter())
+                .map(|p| (p - target).norm())
+                .fold(f64::INFINITY, f64::min);
+            assert!(
+                nearest < 0.15,
+                "no vertex near the analytic crossing {target:?} (nearest {nearest:.3})"
+            );
+        }
+    }
+
+    #[test]
+    fn marched_villarceau_plane_rejected() {
+        // Plane through the center at sin θ = r/R is bitangent: its two
+        // Villarceau circles each carry two tangent points.
+        let torus = torus3(Point3::origin(), 3.0, 1.0);
+        let sin_t = 1.0 / 3.0;
+        let plane = Surface3::Plane {
+            origin: Point3::origin(),
+            normal: Vector3::new(sin_t, 0.0, (1.0 - sin_t * sin_t).sqrt()),
+        };
+        for (a, b) in [(&torus, &plane), (&plane, &torus)] {
+            let result = intersect_marched(a, b, &default_tol());
+            assert!(
+                matches!(result, Err(CoreError::NotImplemented { .. })),
+                "expected NotImplemented, got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn marched_tangential_contact_rejected() {
+        // Concentric kissing tubes (majors 2 and 4, tubes 1): tangent along
+        // the circle rho = 3 — detected while seeding, reported as the
+        // structured NotImplemented of the transversal MVP.
+        let a = torus3(Point3::origin(), 2.0, 1.0);
+        let b = torus3(Point3::origin(), 4.0, 1.0);
+        let result = intersect_marched(&a, &b, &default_tol());
+        assert!(
+            matches!(result, Err(CoreError::NotImplemented { .. })),
+            "expected NotImplemented, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn marched_disjoint_pair_is_empty() {
+        // Small sphere floating inside the tube: no surface contact.
+        let torus = torus3(Point3::origin(), 3.0, 1.0);
+        let sph = Surface3::Sphere {
+            center: Point3::new(0.0, 3.0, 0.0),
+            axis: Vector3::z(),
+            radius: 0.4,
+        };
+        let curves = intersect_marched(&torus, &sph, &default_tol()).unwrap();
+        assert!(curves.is_empty());
+    }
+
+    #[test]
+    fn marched_closed_form_pairs_rejected() {
+        let s1 = Surface3::Sphere {
+            center: Point3::origin(),
+            axis: Vector3::z(),
+            radius: 1.0,
+        };
+        let s2 = Surface3::Sphere {
+            center: Point3::new(1.5, 0.0, 0.0),
+            axis: Vector3::z(),
+            radius: 1.0,
+        };
+        let result = intersect_marched(&s1, &s2, &default_tol());
+        assert!(matches!(result, Err(CoreError::NotImplemented { .. })));
     }
 }

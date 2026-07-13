@@ -10,12 +10,18 @@
 //!
 //! Coverage is the analytic MVP: plane against every primitive where the
 //! result is expressible with the current [`Curve3`] variants (lines,
-//! circles, ellipses), plus the equal-radius cylinder-cylinder special
-//! cases (parallel axes → line pair, intersecting axes → ellipse pair).
-//! Configurations whose intersection needs conics or quartics we cannot
+//! circles, ellipses), the equal-radius cylinder-cylinder special
+//! cases (parallel axes → line pair, intersecting axes → ellipse pair),
+//! sphere-sphere in full, and every *coaxial* sphere/torus arrangement —
+//! cylinder-sphere with the center on the axis, sphere-torus with the
+//! center on the torus axis, coaxial cylinder-torus and torus-torus — via
+//! their shared meridian profile (circles of latitude about the common
+//! axis). Configurations whose intersection needs curves we cannot
 //! represent yet (plane-cone parabolas/hyperbolas, oblique plane-torus,
-//! skew or unequal-radius cylinder pairs, quadric-quadric in general)
+//! skew or unequal-radius cylinder pairs, off-axis sphere/torus quartics)
 //! return [`CoreError::NotImplemented`] — never a misleading `Empty`.
+//! The sphere/torus pairs' general positions march instead: see
+//! [`super::intersect_marched`].
 //!
 //! All classification comparisons (parallelism, tangency, coincidence) go
 //! through the caller's [`ToleranceContext`], per the kernel tolerance
@@ -25,7 +31,7 @@ use crate::curve::Curve3;
 use crate::surface::Surface3;
 use opensolid_core::error::{CoreError, CoreResult};
 use opensolid_core::tolerance::{ANGULAR_RESOLUTION, ToleranceContext};
-use opensolid_core::types::Point3;
+use opensolid_core::types::{Point3, Vector3};
 
 /// How two surfaces meet along an intersection curve.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,9 +110,16 @@ pub fn intersect(
         (Plane { .. }, Torus { .. }) => plane_torus(a, b, tol),
         (Torus { .. }, Plane { .. }) => plane_torus(b, a, tol),
         (Cylinder { .. }, Cylinder { .. }) => cylinder_cylinder(a, b, tol),
+        (Sphere { .. }, Sphere { .. }) => Ok(sphere_sphere(a, b, tol)),
+        (Cylinder { .. }, Sphere { .. }) => cylinder_sphere(a, b, tol),
+        (Sphere { .. }, Cylinder { .. }) => cylinder_sphere(b, a, tol),
+        (Sphere { .. }, Torus { .. }) => sphere_torus(a, b, tol),
+        (Torus { .. }, Sphere { .. }) => sphere_torus(b, a, tol),
+        (Cylinder { .. }, Torus { .. }) => cylinder_torus(a, b, tol),
+        (Torus { .. }, Cylinder { .. }) => cylinder_torus(b, a, tol),
+        (Torus { .. }, Torus { .. }) => torus_torus(a, b, tol),
         _ => Err(CoreError::NotImplemented {
-            feature: "analytic SSI for this surface pair (only plane-X and \
-                      cylinder-cylinder cases are implemented)",
+            feature: "analytic SSI for cone pairs other than plane-cone",
         }),
     }
 }
@@ -422,7 +435,8 @@ fn plane_torus(
 
     Err(CoreError::NotImplemented {
         feature: "plane-torus sections other than axis-perpendicular and \
-                  axis-containing planes (general sections are quartics)",
+                  axis-containing planes (general sections are quartics; \
+                  use ssi::intersect_marched)",
     })
 }
 
@@ -526,6 +540,370 @@ fn cylinder_cylinder(
             minor_radius: radius,
         },
     ]))
+}
+
+/// A point of the meridian half-plane shared by coaxial surfaces of
+/// revolution: `rho` is the distance from the axis, `h` the height along
+/// it (both from a common reference origin on the axis).
+#[derive(Debug, Clone, Copy)]
+struct Profile {
+    rho: f64,
+    h: f64,
+}
+
+/// Sweep the intersection of two meridian profile circles about the common
+/// axis (through `origin`, unit direction `axis`).
+///
+/// Coaxial surfaces of revolution meet where their profiles meet, and each
+/// profile crossing sweeps to a full circle of latitude. A profile
+/// tangency means the surface normals (the profile normals, rotated about
+/// the axis) agree along the swept circle — a tangential curve — or a
+/// single tangent point when the contact lies on the axis itself (sphere
+/// profiles). Identical profile circles are the coincident surface pair.
+///
+/// A profile crossing mirrored to `rho < 0` is the same 3D locus as its
+/// `rho > 0` sibling (the half-plane sweeps through the full plane), so
+/// only positive-`rho` crossings emit circles.
+fn coaxial_profiles(
+    origin: &Point3,
+    axis: &Vector3,
+    c1: Profile,
+    r1: f64,
+    c2: Profile,
+    r2: f64,
+    tol: &ToleranceContext,
+) -> SurfaceIntersection {
+    let (drho, dh) = (c2.rho - c1.rho, c2.h - c1.h);
+    let d = drho.hypot(dh);
+    if tol.approx_zero(d) {
+        return if tol.approx_eq(r1, r2) {
+            SurfaceIntersection::Coincident
+        } else {
+            SurfaceIntersection::Empty
+        };
+    }
+    // Unit direction between the profile centers and its in-plane normal;
+    // `a` is the (signed) distance from c1 to the radical line along `e`.
+    let e = (drho / d, dh / d);
+    let n = (-e.1, e.0);
+    let a = (d * d + r1 * r1 - r2 * r2) / (2.0 * d);
+
+    if tol.approx_eq(d, r1 + r2) || tol.approx_eq(d, (r1 - r2).abs()) {
+        let p = Profile {
+            rho: c1.rho + e.0 * a,
+            h: c1.h + e.1 * a,
+        };
+        return if tol.approx_zero(p.rho) {
+            SurfaceIntersection::TangentPoint(origin + axis * p.h)
+        } else {
+            SurfaceIntersection::tangential(Curve3::Circle {
+                center: origin + axis * p.h,
+                axis: *axis,
+                radius: p.rho,
+            })
+        };
+    }
+    if d > r1 + r2 || d < (r1 - r2).abs() {
+        return SurfaceIntersection::Empty;
+    }
+
+    let half = (r1 * r1 - a * a).sqrt();
+    let circles = [1.0, -1.0]
+        .into_iter()
+        .filter_map(|s| {
+            let rho = c1.rho + e.0 * a + n.0 * half * s;
+            let h = c1.h + e.1 * a + n.1 * half * s;
+            (rho > 0.0).then_some(Curve3::Circle {
+                center: origin + axis * h,
+                axis: *axis,
+                radius: rho,
+            })
+        })
+        .collect();
+    SurfaceIntersection::transversal(circles)
+}
+
+fn sphere_sphere(a: &Surface3, b: &Surface3, tol: &ToleranceContext) -> SurfaceIntersection {
+    let (
+        &Surface3::Sphere {
+            center: c1,
+            radius: r1,
+            ..
+        },
+        &Surface3::Sphere {
+            center: c2,
+            radius: r2,
+            ..
+        },
+    ) = (a, b)
+    else {
+        unreachable!("dispatched on Sphere/Sphere")
+    };
+
+    let offset = c2 - c1;
+    let d = offset.norm();
+    if tol.approx_zero(d) {
+        // Concentric: the same locus or nested with no contact.
+        return if tol.approx_eq(r1, r2) {
+            SurfaceIntersection::Coincident
+        } else {
+            SurfaceIntersection::Empty
+        };
+    }
+    // Both profiles sit on the center line: crossings mirror to a single
+    // circle, tangencies land on the axis as tangent points.
+    coaxial_profiles(
+        &c1,
+        &(offset / d),
+        Profile { rho: 0.0, h: 0.0 },
+        r1,
+        Profile { rho: 0.0, h: d },
+        r2,
+        tol,
+    )
+}
+
+fn cylinder_sphere(
+    cylinder: &Surface3,
+    sphere: &Surface3,
+    tol: &ToleranceContext,
+) -> CoreResult<SurfaceIntersection> {
+    let (
+        &Surface3::Cylinder {
+            origin,
+            axis,
+            radius: r,
+        },
+        &Surface3::Sphere {
+            center,
+            radius: big_r,
+            ..
+        },
+    ) = (cylinder, sphere)
+    else {
+        unreachable!("dispatched on Cylinder/Sphere")
+    };
+
+    let m = center - origin;
+    let foot = origin + axis * axis.dot(&m);
+    let perp = center - foot;
+    let d = perp.norm();
+
+    if tol.approx_zero(d) {
+        // Center on the axis: latitude circles of the cylinder.
+        return Ok(if tol.approx_eq(big_r, r) {
+            // Inscribed sphere: touches along its equator.
+            SurfaceIntersection::tangential(Curve3::Circle {
+                center: foot,
+                axis,
+                radius: r,
+            })
+        } else if big_r < r {
+            SurfaceIntersection::Empty
+        } else {
+            let h = (big_r * big_r - r * r).sqrt();
+            SurfaceIntersection::transversal(vec![
+                Curve3::Circle {
+                    center: foot + axis * h,
+                    axis,
+                    radius: r,
+                },
+                Curve3::Circle {
+                    center: foot - axis * h,
+                    axis,
+                    radius: r,
+                },
+            ])
+        });
+    }
+
+    // Off-axis center: the closest wall point to the center (the only
+    // possible isolated contact) sits at radius r toward it.
+    let near = foot + (perp / d) * r;
+    if tol.approx_eq(d, r + big_r) {
+        // Sphere touches the near wall from outside.
+        return Ok(SurfaceIntersection::TangentPoint(near));
+    }
+    if d > r + big_r {
+        return Ok(SurfaceIntersection::Empty);
+    }
+    if r >= big_r {
+        if tol.approx_eq(d, r - big_r) {
+            // Sphere touches the near wall from inside the cylinder.
+            return Ok(SurfaceIntersection::TangentPoint(near));
+        }
+        if d < r - big_r {
+            // Sphere floats inside the cylinder without contact.
+            return Ok(SurfaceIntersection::Empty);
+        }
+    } else if tol.approx_eq(d, big_r - r) {
+        // The far wall is tangent from inside the sphere while the near
+        // wall is crossed transversally (Viviani-type singular quartic):
+        // the curve has a self-intersection at the tangent point.
+        return Err(CoreError::NotImplemented {
+            feature: "cylinder-sphere intersection with far-wall tangential \
+                      contact (Viviani-type singular quartic)",
+        });
+    }
+    Err(CoreError::NotImplemented {
+        feature: "cylinder-sphere general quartic intersection (no conic \
+                  closed form; use ssi::intersect_marched)",
+    })
+}
+
+fn sphere_torus(
+    sphere: &Surface3,
+    torus: &Surface3,
+    tol: &ToleranceContext,
+) -> CoreResult<SurfaceIntersection> {
+    let (
+        &Surface3::Sphere {
+            center: sc,
+            radius: sr,
+            ..
+        },
+        &Surface3::Torus {
+            center,
+            axis,
+            major_radius,
+            minor_radius,
+        },
+    ) = (sphere, torus)
+    else {
+        unreachable!("dispatched on Sphere/Torus")
+    };
+
+    let m = sc - center;
+    let h = axis.dot(&m);
+    if !tol.vector_approx_zero(&(m - axis * h)) {
+        return Err(CoreError::NotImplemented {
+            feature: "sphere-torus intersection with the center off the torus \
+                      axis (general quartic; use ssi::intersect_marched)",
+        });
+    }
+    // Shared meridian: the torus tube circle against the sphere profile.
+    Ok(coaxial_profiles(
+        &center,
+        &axis,
+        Profile {
+            rho: major_radius,
+            h: 0.0,
+        },
+        minor_radius,
+        Profile { rho: 0.0, h },
+        sr,
+        tol,
+    ))
+}
+
+fn cylinder_torus(
+    cylinder: &Surface3,
+    torus: &Surface3,
+    tol: &ToleranceContext,
+) -> CoreResult<SurfaceIntersection> {
+    let (
+        &Surface3::Cylinder {
+            origin,
+            axis: cyl_axis,
+            radius: r_c,
+        },
+        &Surface3::Torus {
+            center,
+            axis,
+            major_radius,
+            minor_radius,
+        },
+    ) = (cylinder, torus)
+    else {
+        unreachable!("dispatched on Cylinder/Torus")
+    };
+
+    let m = center - origin;
+    let coaxial = tol.vectors_parallel(&cyl_axis, &axis)
+        && tol.vector_approx_zero(&(m - cyl_axis * cyl_axis.dot(&m)));
+    if !coaxial {
+        return Err(CoreError::NotImplemented {
+            feature: "cylinder-torus intersection with non-coaxial axes \
+                      (degree-8 curve in general; use ssi::intersect_marched)",
+        });
+    }
+
+    // Shared meridian: the vertical line rho = r_c against the tube circle.
+    let gap = r_c - major_radius;
+    Ok(if tol.approx_eq(gap.abs(), minor_radius) {
+        // r_c = R ± r: tangent along the outer/inner equator.
+        SurfaceIntersection::tangential(Curve3::Circle {
+            center,
+            axis,
+            radius: r_c,
+        })
+    } else if gap.abs() > minor_radius {
+        SurfaceIntersection::Empty
+    } else {
+        let h = (minor_radius * minor_radius - gap * gap).sqrt();
+        SurfaceIntersection::transversal(vec![
+            Curve3::Circle {
+                center: center + axis * h,
+                axis,
+                radius: r_c,
+            },
+            Curve3::Circle {
+                center: center - axis * h,
+                axis,
+                radius: r_c,
+            },
+        ])
+    })
+}
+
+fn torus_torus(
+    a: &Surface3,
+    b: &Surface3,
+    tol: &ToleranceContext,
+) -> CoreResult<SurfaceIntersection> {
+    let (
+        &Surface3::Torus {
+            center: c1,
+            axis: a1,
+            major_radius: big_r1,
+            minor_radius: r1,
+        },
+        &Surface3::Torus {
+            center: c2,
+            axis: a2,
+            major_radius: big_r2,
+            minor_radius: r2,
+        },
+    ) = (a, b)
+    else {
+        unreachable!("dispatched on Torus/Torus")
+    };
+
+    let m = c2 - c1;
+    let z0 = a1.dot(&m);
+    let coaxial = tol.vectors_parallel(&a1, &a2) && tol.vector_approx_zero(&(m - a1 * z0));
+    if !coaxial {
+        return Err(CoreError::NotImplemented {
+            feature: "torus-torus intersection with non-coaxial axes \
+                      (degree-8 curve in general; use ssi::intersect_marched)",
+        });
+    }
+
+    // Shared meridian: tube circle against tube circle. A torus is
+    // symmetric under flipping its axis, so an antiparallel a2 changes
+    // nothing about the profile.
+    Ok(coaxial_profiles(
+        &c1,
+        &a1,
+        Profile {
+            rho: big_r1,
+            h: 0.0,
+        },
+        r1,
+        Profile { rho: big_r2, h: z0 },
+        r2,
+        tol,
+    ))
 }
 
 /// Midpoint of two points (avoids pulling nalgebra into scope here).
@@ -1052,11 +1430,426 @@ mod tests {
         assert!(matches!(result, Err(CoreError::NotImplemented { .. })));
     }
 
+    // ── sphere-sphere ──────────────────────────────────────────────────
+
+    fn sphere_at(center: Point3, radius: f64) -> Surface3 {
+        Surface3::Sphere {
+            center,
+            axis: Vector3::z(),
+            radius,
+        }
+    }
+
+    #[test]
+    fn spheres_transversal_circle() {
+        let a = unit_sphere_at_origin(2.0);
+        let b = sphere_at(Point3::new(3.0, 0.0, 0.0), 2.0);
+        let curves = expect_curves(&a, &b, 1);
+        assert_eq!(curves[0].kind, IntersectionKind::Transversal);
+        let Curve3::Circle {
+            center,
+            axis,
+            radius,
+        } = &curves[0].curve
+        else {
+            panic!("expected a circle, got {:?}", curves[0].curve);
+        };
+        assert!((center - Point3::new(1.5, 0.0, 0.0)).norm() < EPS);
+        assert!(axis.cross(&Vector3::x()).norm() < EPS);
+        assert!((radius - 1.75_f64.sqrt()).abs() < EPS);
+    }
+
+    #[test]
+    fn spheres_generic_offset_circle() {
+        let a = sphere_at(Point3::new(1.0, -2.0, 0.5), 2.5);
+        let b = sphere_at(Point3::new(2.0, 0.0, -1.0), 1.8);
+        let curves = expect_curves(&a, &b, 1);
+        assert_eq!(curves[0].kind, IntersectionKind::Transversal);
+    }
+
+    #[test]
+    fn spheres_external_tangent_point() {
+        let a = unit_sphere_at_origin(2.0);
+        let b = sphere_at(Point3::new(5.0, 0.0, 0.0), 3.0);
+        let expected = SurfaceIntersection::TangentPoint(Point3::new(2.0, 0.0, 0.0));
+        assert_eq!(intersect(&a, &b, &tol()).unwrap(), expected);
+        assert_eq!(intersect(&b, &a, &tol()).unwrap(), expected);
+    }
+
+    #[test]
+    fn spheres_internal_tangent_point() {
+        let a = unit_sphere_at_origin(3.0);
+        let b = sphere_at(Point3::new(2.0, 0.0, 0.0), 1.0);
+        let result = intersect(&a, &b, &tol()).unwrap();
+        let SurfaceIntersection::TangentPoint(p) = result else {
+            panic!("expected a tangent point, got {result:?}");
+        };
+        assert!((p - Point3::new(3.0, 0.0, 0.0)).norm() < EPS);
+    }
+
+    #[test]
+    fn spheres_disjoint_and_nested_empty() {
+        let a = unit_sphere_at_origin(2.0);
+        let apart = sphere_at(Point3::new(10.0, 0.0, 0.0), 3.0);
+        assert_eq!(
+            intersect(&a, &apart, &tol()).unwrap(),
+            SurfaceIntersection::Empty
+        );
+        let nested = sphere_at(Point3::new(0.5, 0.0, 0.0), 0.5);
+        assert_eq!(
+            intersect(&a, &nested, &tol()).unwrap(),
+            SurfaceIntersection::Empty
+        );
+        let concentric = unit_sphere_at_origin(1.0);
+        assert_eq!(
+            intersect(&a, &concentric, &tol()).unwrap(),
+            SurfaceIntersection::Empty
+        );
+    }
+
+    #[test]
+    fn spheres_coincident() {
+        let a = unit_sphere_at_origin(2.0);
+        // Same locus regardless of the pole axis.
+        let b = Surface3::Sphere {
+            center: Point3::origin(),
+            axis: Vector3::x(),
+            radius: 2.0,
+        };
+        assert_eq!(
+            intersect(&a, &b, &tol()).unwrap(),
+            SurfaceIntersection::Coincident
+        );
+    }
+
+    // ── cylinder-sphere ────────────────────────────────────────────────
+
+    #[test]
+    fn cylinder_sphere_coaxial_two_circles() {
+        let cyl = cylinder_z(1.0);
+        let sph = unit_sphere_at_origin(2.0);
+        let curves = expect_curves(&cyl, &sph, 2);
+        let h = 3.0_f64.sqrt();
+        let mut heights: Vec<f64> = curves
+            .iter()
+            .map(|ic| {
+                assert_eq!(ic.kind, IntersectionKind::Transversal);
+                let Curve3::Circle { center, radius, .. } = ic.curve else {
+                    panic!("expected circles, got {:?}", ic.curve);
+                };
+                assert!((radius - 1.0).abs() < EPS);
+                center.z
+            })
+            .collect();
+        heights.sort_by(f64::total_cmp);
+        assert!((heights[0] + h).abs() < EPS && (heights[1] - h).abs() < EPS);
+    }
+
+    #[test]
+    fn cylinder_sphere_inscribed_tangent_circle() {
+        let curves = expect_curves(&cylinder_z(1.5), &unit_sphere_at_origin(1.5), 1);
+        assert_eq!(curves[0].kind, IntersectionKind::Tangential);
+        let Curve3::Circle { center, radius, .. } = curves[0].curve else {
+            panic!("expected a circle, got {:?}", curves[0].curve);
+        };
+        assert!(center.coords.norm() < EPS);
+        assert!((radius - 1.5).abs() < EPS);
+    }
+
+    #[test]
+    fn cylinder_sphere_small_coaxial_empty() {
+        let result = intersect(&cylinder_z(1.0), &unit_sphere_at_origin(0.5), &tol()).unwrap();
+        assert_eq!(result, SurfaceIntersection::Empty);
+    }
+
+    #[test]
+    fn cylinder_sphere_external_tangent_point() {
+        let cyl = cylinder_z(1.0);
+        let sph = sphere_at(Point3::new(3.0, 0.0, 0.0), 2.0);
+        let expected = SurfaceIntersection::TangentPoint(Point3::new(1.0, 0.0, 0.0));
+        assert_eq!(intersect(&cyl, &sph, &tol()).unwrap(), expected);
+        assert_eq!(intersect(&sph, &cyl, &tol()).unwrap(), expected);
+    }
+
+    #[test]
+    fn cylinder_sphere_internal_tangent_point() {
+        // Sphere inside the wide cylinder, touching the near wall.
+        let cyl = cylinder_z(3.0);
+        let sph = sphere_at(Point3::new(2.0, 0.0, 0.0), 1.0);
+        let result = intersect(&cyl, &sph, &tol()).unwrap();
+        let SurfaceIntersection::TangentPoint(p) = result else {
+            panic!("expected a tangent point, got {result:?}");
+        };
+        assert!((p - Point3::new(3.0, 0.0, 0.0)).norm() < EPS);
+    }
+
+    #[test]
+    fn cylinder_sphere_far_wall_tangency_not_implemented() {
+        // Viviani configuration: d = R − r, the sphere grazes the far wall
+        // while crossing the near one — singular quartic.
+        let cyl = cylinder_z(1.0);
+        let sph = sphere_at(Point3::new(1.0, 0.0, 0.0), 2.0);
+        let result = intersect(&cyl, &sph, &tol());
+        assert!(matches!(result, Err(CoreError::NotImplemented { .. })));
+    }
+
+    #[test]
+    fn cylinder_sphere_general_quartic_not_implemented() {
+        let cyl = cylinder_z(1.0);
+        let sph = sphere_at(Point3::new(1.2, 0.0, 0.0), 0.8);
+        let result = intersect(&cyl, &sph, &tol());
+        assert!(matches!(result, Err(CoreError::NotImplemented { .. })));
+    }
+
+    #[test]
+    fn cylinder_sphere_offset_disjoint_empty() {
+        let result = intersect(
+            &cylinder_z(1.0),
+            &sphere_at(Point3::new(5.0, 0.0, 0.0), 1.0),
+            &tol(),
+        )
+        .unwrap();
+        assert_eq!(result, SurfaceIntersection::Empty);
+    }
+
+    // ── sphere-torus ───────────────────────────────────────────────────
+
+    #[test]
+    fn sphere_torus_concentric_two_circles() {
+        let sph = unit_sphere_at_origin(3.0);
+        let tor = torus_z(3.0, 1.0);
+        let curves = expect_curves(&sph, &tor, 2);
+        // Meridian: tube circle (3, 0) r 1 against sphere profile radius 3
+        // from the center → crossings at rho = 17/6, |h| = √35/6.
+        for ic in &curves {
+            assert_eq!(ic.kind, IntersectionKind::Transversal);
+            let Curve3::Circle { center, radius, .. } = ic.curve else {
+                panic!("expected circles, got {:?}", ic.curve);
+            };
+            assert!((radius - 17.0 / 6.0).abs() < EPS);
+            assert!((center.z.abs() - 35.0_f64.sqrt() / 6.0).abs() < EPS);
+        }
+    }
+
+    #[test]
+    fn sphere_torus_outer_equator_tangent_circle() {
+        let curves = expect_curves(&unit_sphere_at_origin(4.0), &torus_z(3.0, 1.0), 1);
+        assert_eq!(curves[0].kind, IntersectionKind::Tangential);
+        let Curve3::Circle { center, radius, .. } = curves[0].curve else {
+            panic!("expected a circle, got {:?}", curves[0].curve);
+        };
+        assert!(center.coords.norm() < EPS);
+        assert!((radius - 4.0).abs() < EPS);
+    }
+
+    #[test]
+    fn sphere_torus_inner_equator_tangent_circle() {
+        let curves = expect_curves(&unit_sphere_at_origin(2.0), &torus_z(3.0, 1.0), 1);
+        assert_eq!(curves[0].kind, IntersectionKind::Tangential);
+        let Curve3::Circle { radius, .. } = curves[0].curve else {
+            panic!("expected a circle, got {:?}", curves[0].curve);
+        };
+        assert!((radius - 2.0).abs() < EPS);
+    }
+
+    #[test]
+    fn sphere_torus_on_axis_above_center() {
+        // Center lifted along the axis: two circles of unequal radius.
+        let sph = sphere_at(Point3::new(0.0, 0.0, 1.0), 2.5);
+        let curves = expect_curves(&sph, &torus_z(3.0, 1.0), 2);
+        for ic in &curves {
+            assert_eq!(ic.kind, IntersectionKind::Transversal);
+        }
+    }
+
+    #[test]
+    fn sphere_torus_small_concentric_empty() {
+        let result = intersect(&unit_sphere_at_origin(1.0), &torus_z(3.0, 1.0), &tol()).unwrap();
+        assert_eq!(result, SurfaceIntersection::Empty);
+    }
+
+    #[test]
+    fn sphere_torus_off_axis_not_implemented() {
+        let sph = sphere_at(Point3::new(0.5, 0.0, 0.0), 2.0);
+        let result = intersect(&sph, &torus_z(3.0, 1.0), &tol());
+        assert!(matches!(result, Err(CoreError::NotImplemented { .. })));
+    }
+
+    // ── cylinder-torus ─────────────────────────────────────────────────
+
+    #[test]
+    fn cylinder_torus_coaxial_through_tube_center() {
+        let curves = expect_curves(&cylinder_z(3.0), &torus_z(3.0, 1.0), 2);
+        let mut heights: Vec<f64> = curves
+            .iter()
+            .map(|ic| {
+                assert_eq!(ic.kind, IntersectionKind::Transversal);
+                let Curve3::Circle { center, radius, .. } = ic.curve else {
+                    panic!("expected circles, got {:?}", ic.curve);
+                };
+                assert!((radius - 3.0).abs() < EPS);
+                center.z
+            })
+            .collect();
+        heights.sort_by(f64::total_cmp);
+        assert!((heights[0] + 1.0).abs() < EPS && (heights[1] - 1.0).abs() < EPS);
+    }
+
+    #[test]
+    fn cylinder_torus_coaxial_generic_two_circles() {
+        let curves = expect_curves(&cylinder_z(3.5), &torus_z(3.0, 1.0), 2);
+        let h = 0.75_f64.sqrt();
+        for ic in &curves {
+            let Curve3::Circle { center, radius, .. } = ic.curve else {
+                panic!("expected circles, got {:?}", ic.curve);
+            };
+            assert!((radius - 3.5).abs() < EPS);
+            assert!((center.z.abs() - h).abs() < EPS);
+        }
+    }
+
+    #[test]
+    fn cylinder_torus_equator_tangent_circles() {
+        for (r_c, expected_radius) in [(4.0, 4.0), (2.0, 2.0)] {
+            let curves = expect_curves(&cylinder_z(r_c), &torus_z(3.0, 1.0), 1);
+            assert_eq!(curves[0].kind, IntersectionKind::Tangential);
+            let Curve3::Circle { center, radius, .. } = curves[0].curve else {
+                panic!("expected a circle, got {:?}", curves[0].curve);
+            };
+            assert!(center.coords.norm() < EPS);
+            assert!((radius - expected_radius).abs() < EPS);
+        }
+    }
+
+    #[test]
+    fn cylinder_torus_coaxial_empty() {
+        let result = intersect(&cylinder_z(4.5), &torus_z(3.0, 1.0), &tol()).unwrap();
+        assert_eq!(result, SurfaceIntersection::Empty);
+        let result = intersect(&cylinder_z(1.5), &torus_z(3.0, 1.0), &tol()).unwrap();
+        assert_eq!(result, SurfaceIntersection::Empty);
+    }
+
+    #[test]
+    fn cylinder_torus_non_coaxial_not_implemented() {
+        let offset = cylinder(Point3::new(0.5, 0.0, 0.0), Vector3::z(), 3.0);
+        assert!(matches!(
+            intersect(&offset, &torus_z(3.0, 1.0), &tol()),
+            Err(CoreError::NotImplemented { .. })
+        ));
+        let tilted = cylinder(Point3::origin(), Vector3::x(), 3.0);
+        assert!(matches!(
+            intersect(&tilted, &torus_z(3.0, 1.0), &tol()),
+            Err(CoreError::NotImplemented { .. })
+        ));
+    }
+
+    // ── torus-torus ────────────────────────────────────────────────────
+
+    fn torus_at(center: Point3, axis: Vector3, major: f64, minor: f64) -> Surface3 {
+        Surface3::Torus {
+            center,
+            axis: axis.normalize(),
+            major_radius: major,
+            minor_radius: minor,
+        }
+    }
+
+    #[test]
+    fn tori_coaxial_stacked_two_circles() {
+        let a = torus_z(3.0, 1.0);
+        let b = torus_at(Point3::new(0.0, 0.0, 1.0), Vector3::z(), 3.0, 1.0);
+        let curves = expect_curves(&a, &b, 2);
+        // Tube circles (3, 0) and (3, 1), both r = 1: crossings at
+        // h = 1/2, rho = 3 ± √3/2.
+        let mut radii: Vec<f64> = curves
+            .iter()
+            .map(|ic| {
+                assert_eq!(ic.kind, IntersectionKind::Transversal);
+                let Curve3::Circle { center, radius, .. } = ic.curve else {
+                    panic!("expected circles, got {:?}", ic.curve);
+                };
+                assert!((center.z - 0.5).abs() < EPS);
+                radius
+            })
+            .collect();
+        radii.sort_by(f64::total_cmp);
+        let half = 0.75_f64.sqrt();
+        assert!((radii[0] - (3.0 - half)).abs() < EPS);
+        assert!((radii[1] - (3.0 + half)).abs() < EPS);
+    }
+
+    #[test]
+    fn tori_stacked_kissing_tangent_circle() {
+        let a = torus_z(3.0, 1.0);
+        let b = torus_at(Point3::new(0.0, 0.0, 2.0), Vector3::z(), 3.0, 1.0);
+        let curves = expect_curves(&a, &b, 1);
+        assert_eq!(curves[0].kind, IntersectionKind::Tangential);
+        let Curve3::Circle { center, radius, .. } = curves[0].curve else {
+            panic!("expected a circle, got {:?}", curves[0].curve);
+        };
+        assert!((center - Point3::new(0.0, 0.0, 1.0)).norm() < EPS);
+        assert!((radius - 3.0).abs() < EPS);
+    }
+
+    #[test]
+    fn tori_concentric_kissing_tubes_tangent_circle() {
+        // Same plane, majors 2 and 4, tubes radius 1: they kiss at rho 3.
+        let a = torus_z(2.0, 1.0);
+        let b = torus_z(4.0, 1.0);
+        let curves = expect_curves(&a, &b, 1);
+        assert_eq!(curves[0].kind, IntersectionKind::Tangential);
+        let Curve3::Circle { center, radius, .. } = curves[0].curve else {
+            panic!("expected a circle, got {:?}", curves[0].curve);
+        };
+        assert!(center.coords.norm() < EPS);
+        assert!((radius - 3.0).abs() < EPS);
+    }
+
+    #[test]
+    fn tori_coaxial_far_apart_empty() {
+        let a = torus_z(3.0, 1.0);
+        let b = torus_at(Point3::new(0.0, 0.0, 3.0), Vector3::z(), 3.0, 1.0);
+        assert_eq!(
+            intersect(&a, &b, &tol()).unwrap(),
+            SurfaceIntersection::Empty
+        );
+        let nested = torus_z(3.0, 0.25);
+        assert_eq!(
+            intersect(&torus_z(3.0, 1.0), &nested, &tol()).unwrap(),
+            SurfaceIntersection::Empty
+        );
+    }
+
+    #[test]
+    fn tori_coincident_with_flipped_axis() {
+        let a = torus_z(3.0, 1.0);
+        let b = torus_at(Point3::origin(), -Vector3::z(), 3.0, 1.0);
+        assert_eq!(
+            intersect(&a, &b, &tol()).unwrap(),
+            SurfaceIntersection::Coincident
+        );
+    }
+
+    #[test]
+    fn tori_non_coaxial_not_implemented() {
+        let a = torus_z(3.0, 1.0);
+        let offset = torus_at(Point3::new(0.4, 0.0, 0.0), Vector3::z(), 3.0, 0.8);
+        assert!(matches!(
+            intersect(&a, &offset, &tol()),
+            Err(CoreError::NotImplemented { .. })
+        ));
+        let tilted = torus_at(Point3::origin(), Vector3::x(), 3.0, 1.0);
+        assert!(matches!(
+            intersect(&a, &tilted, &tol()),
+            Err(CoreError::NotImplemented { .. })
+        ));
+    }
+
     // ── dispatch ───────────────────────────────────────────────────────
 
     #[test]
     fn unsupported_pair_not_implemented() {
-        let a = unit_sphere_at_origin(1.0);
+        let a = cone_30deg();
         let b = unit_sphere_at_origin(2.0);
         let result = intersect(&a, &b, &tol());
         assert!(matches!(result, Err(CoreError::NotImplemented { .. })));
