@@ -91,6 +91,7 @@ function ToolButton({ icon, label, title, disabledReason, active, disabled, onCl
 export default function MainToolbar({
   disabled,
   sketchOpen,
+  sketchOnFace = false,
   onSketchToggle,
   canSweep,
   sweepDisabledReason,
@@ -108,7 +109,11 @@ export default function MainToolbar({
         <ToolButton
           icon="sketch"
           label={sketchOpen ? 'Exit Sketch' : 'Sketch'}
-          title="Open a 2D sketch on a standard plane"
+          title={
+            sketchOnFace && !sketchOpen
+              ? 'Open a 2D sketch on the picked face'
+              : 'Open a 2D sketch on a standard plane (or pick a flat face first)'
+          }
           disabledReason={notReady}
           active={sketchOpen}
           disabled={disabled}

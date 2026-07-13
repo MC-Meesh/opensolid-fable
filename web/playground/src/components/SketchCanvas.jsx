@@ -33,6 +33,9 @@ import {
 import { arcSweep, normalizeAngle } from '../lib/sketch/geom.js';
 import {
   extractProfile,
+  isFacePlane,
+  planeAxisLabels,
+  planeLabel,
   profileTo3D,
   segmentEnd2D,
   segmentStart2D,
@@ -101,12 +104,6 @@ const TOOLS = [
 ];
 
 const PLANES = ['XY', 'XZ', 'YZ'];
-/**
- * World-axis names of the sketch (u, v) axis lines, for the axis labels.
- * Matches planeToWorld: on YZ the horizontal axis line is world Z (u = -z)
- * and the vertical one is world Y.
- */
-const PLANE_AXES = { XY: ['X', 'Y'], XZ: ['X', 'Z'], YZ: ['Z', 'Y'] };
 
 /** Decade grid: minor step sized to stay >= 8 screen px. */
 function gridSteps(scale) {
@@ -1138,7 +1135,7 @@ export default forwardRef(function SketchCanvas(
     }
     // Axes through the origin.
     const [ox, oy] = worldToScreen(0, 0);
-    const [uName, vName] = PLANE_AXES[plane];
+    const [uName, vName] = planeAxisLabels(plane);
     lines.push(
       <line key="axis-u" className="axis-u" x1={0} y1={oy} x2={size.w} y2={oy} />,
       <line key="axis-v" className="axis-v" x1={ox} y1={0} x2={ox} y2={size.h} />,
@@ -1547,6 +1544,15 @@ export default forwardRef(function SketchCanvas(
         </div>
         <div className="group">
           <span className="group-label">Plane</span>
+          {isFacePlane(plane) && (
+            <button
+              className="tool-btn active"
+              disabled
+              title="Sketching on the picked face — pick a named plane to leave it"
+            >
+              Face
+            </button>
+          )}
           {PLANES.map((p) => (
             <button
               key={p}
@@ -1711,7 +1717,7 @@ export default forwardRef(function SketchCanvas(
           {profile.closed
             ? `Profile closed · ${profile.segments.length} segment${
                 profile.segments.length === 1 ? '' : 's'
-              } on ${plane} — ${
+              } on ${planeLabel(plane)} — ${
                 editing ? `Apply to ${editing.name}` : 'Extrude or Revolve it'
               }`
             : `Open profile: ${profile.reason}`}

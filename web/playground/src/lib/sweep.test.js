@@ -10,6 +10,7 @@ import {
 } from './sweep.js';
 import { serializeTree } from './sceneTree.js';
 import { planeNormal, planeToWorld } from './sketch/profile.js';
+import { facePlaneBasis } from './facePlane.js';
 
 // Minimal stand-ins recording construction, like sceneTree.test.js.
 class FakeShape {
@@ -233,6 +234,15 @@ function signedArea(verts) {
   return area / 2;
 }
 
+// A slanted picked-face plane (basis from facePlaneBasis, so u × v = n).
+const FACE_NORMAL = [2 / 7, 3 / 7, 6 / 7];
+const FACE_PLANE = {
+  origin: [3, -4, 5],
+  normal: FACE_NORMAL,
+  ...facePlaneBasis(FACE_NORMAL),
+  extent: 2,
+};
+
 describe('sweep plane mapping (WYSIWYG)', () => {
   const SKETCH_VERTS = [
     [0, 0],
@@ -243,7 +253,7 @@ describe('sweep plane mapping (WYSIWYG)', () => {
 
   it('extrude spans exactly planeToWorld(u, v) .. + height * normal', () => {
     const h = 2;
-    for (const plane of ['XY', 'XZ', 'YZ']) {
+    for (const plane of ['XY', 'XZ', 'YZ', FACE_PLANE]) {
       const ops = nativeSweepOps(profileToOps({ ...SQUARE, plane }), plane, 'extrude');
       const post = sweepPostOps(plane, 'extrude', h);
       // Every native prism edge, carried through the post-ops.
@@ -268,7 +278,7 @@ describe('sweep plane mapping (WYSIWYG)', () => {
   });
 
   it('revolve places the profile at planeToWorld and spins around the v axis', () => {
-    for (const plane of ['XY', 'XZ', 'YZ']) {
+    for (const plane of ['XY', 'XZ', 'YZ', FACE_PLANE]) {
       const ops = nativeSweepOps(profileToOps({ ...SQUARE, plane }), plane, 'revolve');
       const post = sweepPostOps(plane, 'revolve', 360);
       // The native start half-plane (theta = 0) lands on the sketch plane.
@@ -277,9 +287,11 @@ describe('sweep plane mapping (WYSIWYG)', () => {
           closeTo3(pt, planeToWorld(plane, p, q))
         );
       }
-      // The native revolve axis (world Y) maps onto the sketch v axis line.
-      const axis = applyPostOps([0, 1, 0], post);
-      const ev = planeToWorld(plane, 0, 1);
+      // The native revolve axis (world Y) maps onto the sketch v axis line
+      // (through the plane origin).
+      const origin = planeToWorld(plane, 0, 0);
+      const axis = applyPostOps([0, 1, 0], post).map((c, i) => c - origin[i]);
+      const ev = planeToWorld(plane, 0, 1).map((c, i) => c - origin[i]);
       const cross = Math.hypot(
         axis[1] * ev[2] - axis[2] * ev[1],
         axis[2] * ev[0] - axis[0] * ev[2],
@@ -327,15 +339,41 @@ describe('sweep plane mapping (WYSIWYG)', () => {
     expect(signedArea(opsVerts(mirrorOpsV(profileToOps(SQUARE))))).toBeGreaterThan(0);
   });
 
-  it('nativeSweepOps mirrors only extrusions on XZ/YZ', () => {
+  it('nativeSweepOps mirrors only extrusions on XZ/YZ and face planes', () => {
     const ops = profileToOps(SQUARE);
     expect(nativeSweepOps(ops, 'XY', 'extrude')).toBe(ops);
     expect(nativeSweepOps(ops, 'XZ', 'revolve')).toBe(ops);
     expect(nativeSweepOps(ops, 'YZ', 'revolve')).toBe(ops);
+    expect(nativeSweepOps(ops, FACE_PLANE, 'revolve')).toBe(ops);
+    expect(nativeSweepOps(ops, FACE_PLANE, 'extrude')).not.toBe(ops);
     const mirrored = nativeSweepOps(ops, 'XZ', 'extrude');
     expect(mirrored.start[0]).toBeCloseTo(0);
     expect(mirrored.start[1]).toBeCloseTo(0);
     expect(signedArea(opsVerts(mirrored))).toBeGreaterThan(0);
+  });
+
+  it('reverse extrudes span planeToWorld(u, v) .. + height * normal (h < 0)', () => {
+    const h = -2;
+    for (const plane of ['XY', 'XZ', 'YZ', FACE_PLANE]) {
+      const ops = nativeSweepOps(profileToOps({ ...SQUARE, plane }), plane, 'extrude');
+      const post = sweepPostOps(plane, 'extrude', h);
+      // The kernel is fed |h|; the sign lives entirely in the post-ops.
+      const edges = opsVerts(ops).map(([p, q]) => [
+        applyPostOps([p, 0, q], post),
+        applyPostOps([p, -h, q], post),
+      ]);
+      const n = planeNormal(plane);
+      for (const [u, v] of SKETCH_VERTS) {
+        const base = planeToWorld(plane, u, v);
+        const top = base.map((c, i) => c + h * n[i]);
+        const hit = edges.some(
+          ([a, b]) =>
+            (closeTo3(a, base) && closeTo3(b, top)) ||
+            (closeTo3(a, top) && closeTo3(b, base))
+        );
+        expect(hit, `${plane} vertex (${u}, ${v})`).toBe(true);
+      }
+    }
   });
 });
 
@@ -373,6 +411,40 @@ describe('buildSweepShape', () => {
     expect(shape.desc[0]).toBe('revolve');
     expect(shape.desc[2]).toBe(270);
   });
+
+  it('feeds the kernel |height| for reverse extrudes', () => {
+    const shape = buildSweepShape(FakeShape, FakeProfile, {
+      kind: 'extrude',
+      plane: 'XZ',
+      ops,
+      value: -2,
+    });
+    // XZ reverse: translate(0, -2, 0) around a positive-height extrude.
+    expect(shape.desc[0]).toBe('translate');
+    expect(shape.desc.slice(2)).toEqual([0, -2, 0]);
+    expect(shape.desc[1][0]).toBe('extrude');
+    expect(shape.desc[1][2]).toBe(2);
+  });
+
+  it('orients a face-plane extrude with rotate + translate to the origin', () => {
+    const plane = {
+      origin: [3, -4, 5],
+      normal: [2 / 7, 3 / 7, 6 / 7],
+      ...facePlaneBasis([2 / 7, 3 / 7, 6 / 7]),
+      extent: 2,
+    };
+    const shape = buildSweepShape(FakeShape, FakeProfile, {
+      kind: 'extrude',
+      plane,
+      ops,
+      value: 2,
+    });
+    expect(shape.desc[0]).toBe('translate');
+    expect(shape.desc.slice(2)).toEqual(plane.origin);
+    expect(shape.desc[1][0]).toBe('rotate');
+    expect(shape.desc[1][1][0]).toBe('extrude');
+    expect(shape.desc[1][1][2]).toBe(2);
+  });
 });
 
 describe('sweepTreeNode', () => {
@@ -409,6 +481,28 @@ describe('sweepTreeNode', () => {
     expect(serializeTree(node)).toContain(
       'return Shape.sphere(1).union(Shape.revolve(p1, 360));'
     );
+  });
+
+  it('serializes reverse extrudes with a positive height', () => {
+    const node = sweepTreeNode(null, {
+      kind: 'extrude',
+      plane: 'XZ',
+      ops,
+      value: -2,
+    });
+    const script = serializeTree(node);
+    expect(script).toContain('Shape.extrude(p1, 2).translate(0, -2, 0)');
+  });
+
+  it('serializes a face-plane sweep with rotate + translate wrappers', () => {
+    const node = sweepTreeNode(null, {
+      kind: 'extrude',
+      plane: FACE_PLANE,
+      ops,
+      value: 2,
+    });
+    const script = serializeTree(node);
+    expect(script).toMatch(/Shape\.extrude\(p1, 2\)\.rotate\(.+\)\.translate\(3, -4, 5\);/);
   });
 
   it('uses negative ids that cannot collide with traced nodes', () => {

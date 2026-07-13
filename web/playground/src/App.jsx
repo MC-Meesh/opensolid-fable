@@ -29,11 +29,14 @@ import {
   updateNumericArg,
 } from './lib/shapeGraph.js';
 import { buildSweepShape, opsBounds, profileToOps, sweepTreeNode } from './lib/sweep.js';
+import { detectFacePlane } from './lib/facePlane.js';
+import { isFacePlane } from './lib/sketch/profile.js';
 
 const DEFAULT_RESOLUTION = 64;
 const EDIT_DEBOUNCE_MS = 400;
 // Hover ghosts are transient; a coarse mesh keeps pointer moves cheap.
 const HOVER_RESOLUTION = 32;
+const TOAST_MS = 3500;
 
 function meshShape(shape, resolution) {
   const data = shape.mesh(resolution);
@@ -74,6 +77,12 @@ export default function App() {
   const [previewMesh, setPreviewMesh] = useState(null);
   const [hoverMesh, setHoverMesh] = useState(null);
   const [profileClosed, setProfileClosed] = useState(false);
+  // Face pick for sketch-on-face: the detectFacePlane result of the last
+  // click that hit the mesh (planar face plane, or the reason it isn't
+  // usable). Cleared on miss clicks and whenever the mesh is rebuilt, and
+  // consumed when a sketch opens on it.
+  const [pickedFace, setPickedFace] = useState(null);
+  const [toast, setToast] = useState(null);
   const profileRef = useRef(null);
   const viewportRef = useRef(null);
   const hoverCacheRef = useRef(new Map());
@@ -197,6 +206,8 @@ export default function App() {
     hoverCacheRef.current.clear();
     hoveredIdRef.current = null;
     setHoverMesh(null);
+    // The displayed mesh is rebuilt, so a picked face's triangles are stale.
+    setPickedFace(null);
     if (tracedRef.current) freeNodes(tracedRef.current.nodes);
     tracedRef.current = traced;
     setTree(traced.root);
@@ -323,13 +334,22 @@ export default function App() {
   );
 
   const handlePick = useCallback(
-    (point) => {
+    (point, faceIndex) => {
       const root = tracedRef.current?.root;
       if (!root) return;
       if (!point) {
         clearSelection();
+        setPickedFace(null);
         return;
       }
+      // Remember the clicked mesh face (independent of the body-selection
+      // toggle) so "Sketch" can open on it.
+      const displayed = meshRef.current;
+      setPickedFace(
+        displayed && faceIndex !== null
+          ? detectFacePlane(displayed.positions, displayed.indices, faceIndex)
+          : null
+      );
       const candidates = pickCandidates(root);
       const picked = pickNodeAt(candidates, point);
       if (picked) {
@@ -563,6 +583,10 @@ export default function App() {
       clearSelection();
       setSweep(null);
       setSweepError(null);
+      // A leftover face plane from a previous pick would be unrelated to
+      // this feature; fall back to a named plane (the profile is stored in
+      // the sweep's native frame, so the view plane is presentational).
+      setSketchPlane((p) => (isFacePlane(p) ? 'XY' : p));
       sketchCanvasRef.current?.loadProfile(node.profile);
       setEditingSketch({ nodeId: node.id, name: feature.name });
       setSketchOpen(true);
@@ -694,18 +718,45 @@ export default function App() {
     }
   }, [sweep, wasm]);
 
+  // SolidWorks entry gesture: with a face picked, Sketch opens ON that face
+  // (of-4eh.16). A curved face keeps the button honest with a toast instead
+  // of silently sketching on a facet.
   const handleSketchToggle = useCallback(() => {
+    if (!sketchOpen) {
+      if (pickedFace?.planar) {
+        setSketchPlane(pickedFace.plane);
+        setPickedFace(null);
+      } else {
+        if (pickedFace) {
+          setToast(
+            pickedFace.reason === 'face is curved'
+              ? 'Sketch on curved faces is not supported yet'
+              : `Cannot sketch on this face: ${pickedFace.reason}`
+          );
+          return;
+        }
+        // No face picked: never reopen on a stale face plane.
+        setSketchPlane((p) => (isFacePlane(p) ? 'XY' : p));
+      }
+    }
     setSweep(null);
     setSweepError(null);
     setEditingSketch(null);
     setSketchOpen((v) => !v);
-  }, []);
+  }, [sketchOpen, pickedFace]);
 
   // Leaving sketch mode without applying abandons a pending feature edit.
   const handleSketchExit = useCallback(() => {
     setEditingSketch(null);
     setSketchOpen(false);
   }, []);
+
+  // Transient toast (non-blocking notice, e.g. "curved face").
+  useEffect(() => {
+    if (!toast) return undefined;
+    const timer = setTimeout(() => setToast(null), TOAST_MS);
+    return () => clearTimeout(timer);
+  }, [toast]);
 
   // First successful WASM init runs the default script once.
   const bootedRef = useRef(false);
@@ -818,6 +869,7 @@ export default function App() {
         <MainToolbar
           disabled={!wasmReady}
           sketchOpen={sketchOpen}
+          sketchOnFace={Boolean(pickedFace?.planar)}
           onSketchToggle={handleSketchToggle}
           canSweep={sketchOpen && profileClosed && !sweep}
           sweepDisabledReason={
@@ -915,6 +967,7 @@ export default function App() {
             onApplyEdit={handleApplySketchEdit}
           />
         </ErrorBoundary>
+        {toast && <div className="toast">{toast}</div>}
         {stats && !sketchOpen && <StatusBar stats={stats} />}
         {(wasmStatus === 'idle' || wasmStatus === 'loading') && (
           <div className="loading">Loading WASM…</div>

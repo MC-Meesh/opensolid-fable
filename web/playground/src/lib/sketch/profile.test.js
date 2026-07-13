@@ -10,6 +10,9 @@ import {
 } from './model.js';
 import {
   extractProfile,
+  isFacePlane,
+  planeAxisLabels,
+  planeLabel,
   planeNormal,
   planeToWorld,
   profileTo3D,
@@ -17,6 +20,15 @@ import {
   segmentStart2D,
   worldToPlane,
 } from './profile.js';
+
+// A picked-face plane: orthonormal right-handed (u, v, normal) basis.
+const FACE = {
+  origin: [3, -4, 5],
+  normal: [0, 0, 1],
+  u: [0, 1, 0],
+  v: [-1, 0, 0],
+  extent: 2,
+};
 
 function triangle() {
   const s = createSketch();
@@ -254,5 +266,23 @@ describe('plane mapping', () => {
   it('profileTo3D passes through non-closed profiles', () => {
     const open = { closed: false, reason: 'nope' };
     expect(profileTo3D(open)).toBe(open);
+  });
+
+  it('face planes map through their own origin and basis', () => {
+    expect(planeToWorld(FACE, 1, 2)).toEqual([3 - 2, -4 + 1, 5]);
+    expect(worldToPlane(FACE, planeToWorld(FACE, 1.5, -2.5))).toEqual([1.5, -2.5]);
+    expect(planeNormal(FACE)).toEqual([0, 0, 1]);
+    // A defensive copy, not the plane's own array.
+    expect(planeNormal(FACE)).not.toBe(FACE.normal);
+  });
+
+  it('classifies and labels face planes', () => {
+    expect(isFacePlane(FACE)).toBe(true);
+    expect(isFacePlane('XY')).toBe(false);
+    expect(isFacePlane(null)).toBe(false);
+    expect(planeLabel(FACE)).toBe('Face');
+    expect(planeLabel('XZ')).toBe('XZ');
+    expect(planeAxisLabels(FACE)).toEqual(['U', 'V']);
+    expect(planeAxisLabels('YZ')).toEqual(['Z', 'Y']);
   });
 });

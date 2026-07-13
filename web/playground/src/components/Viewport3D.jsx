@@ -13,6 +13,7 @@ import {
   sketchViewFromCamera,
   sketchViewPose,
 } from '../lib/sketchView.js';
+import { isFacePlane } from '../lib/sketch/profile.js';
 
 // World convention: Y up, ground grid in the XZ plane, front view looks
 // along -Z. Standard view directions live in lib/views.js.
@@ -36,6 +37,15 @@ const SKETCH_PLANES = {
   XZ: { rotation: [-Math.PI / 2, 0, 0], color: 0x5fdf8a },
   YZ: { rotation: [0, Math.PI / 2, 0], color: 0xef6f6f },
 };
+
+const FACE_PLANE_COLOR = 0xf2a65a;
+
+/** A named plane the viewport knows, or a picked face plane; else null. */
+function validSketchPlane(plane) {
+  if (!plane) return null;
+  if (isFacePlane(plane)) return plane;
+  return SKETCH_PLANES[plane] ? plane : null;
+}
 
 const SKETCH_VIEW_ANIM_MS = 300;
 
@@ -325,7 +335,7 @@ const Viewport3D = forwardRef(function Viewport3D(
       );
       raycaster.setFromCamera(ndc, sceneRef.current?.sketchOrtho ? orthoCamera : camera);
       const hits = raycaster.intersectObject(meshObject);
-      return hits.length > 0 ? hits[0].point : null;
+      return hits.length > 0 ? hits[0] : null;
     }
 
     function onPointerDown(event) {
@@ -346,9 +356,10 @@ const Viewport3D = forwardRef(function Viewport3D(
 
       const cb = sceneRef.current?._onPick;
       if (!cb) return;
-      const p = castAt(event.clientX, event.clientY);
-      // A miss clicks empty space: deselect.
-      cb(p ? [p.x, p.y, p.z] : null);
+      const hit = castAt(event.clientX, event.clientY);
+      // A miss clicks empty space: deselect. The hit triangle index feeds
+      // face-plane detection for sketch-on-face.
+      cb(hit ? [hit.point.x, hit.point.y, hit.point.z] : null, hit?.faceIndex ?? null);
     }
 
     // Hover highlight: rAF-throttled raycast while no button is held.
@@ -370,8 +381,8 @@ const Viewport3D = forwardRef(function Viewport3D(
           cb(null);
           return;
         }
-        const p = castAt(hoverX, hoverY);
-        cb(p ? [p.x, p.y, p.z] : null);
+        const hit = castAt(hoverX, hoverY);
+        cb(hit ? [hit.point.x, hit.point.y, hit.point.z] : null);
       });
     }
 
@@ -614,7 +625,7 @@ const Viewport3D = forwardRef(function Viewport3D(
     const ctx = sceneRef.current;
     if (!ctx) return;
     const { camera, controls } = ctx;
-    ctx.activeSketchPlane = sketchPlane && SKETCH_PLANES[sketchPlane] ? sketchPlane : null;
+    ctx.activeSketchPlane = validSketchPlane(sketchPlane);
     if (ctx.activeSketchPlane) {
       if (!ctx.savedView) {
         ctx.savedView = {
@@ -666,29 +677,46 @@ const Viewport3D = forwardRef(function Viewport3D(
 
   useEffect(() => {
     const ctx = sceneRef.current;
-    if (!ctx || !sketchPlane) return undefined;
-    const spec = SKETCH_PLANES[sketchPlane];
-    if (!spec) return undefined;
+    if (!ctx || !validSketchPlane(sketchPlane)) return undefined;
+    const face = isFacePlane(sketchPlane) ? sketchPlane : null;
+    const spec = face ? null : SKETCH_PLANES[sketchPlane];
 
     const scene = ctx.meshObject.parent;
     const group = new THREE.Group();
-    group.rotation.set(...spec.rotation);
+    let size;
+    if (face) {
+      // PlaneGeometry lies in local XY with normal +Z, so mapping the local
+      // axes onto the face basis (u, v, n) lands the quad on the face.
+      group.quaternion.setFromRotationMatrix(
+        new THREE.Matrix4().makeBasis(
+          new THREE.Vector3(...face.u),
+          new THREE.Vector3(...face.v),
+          new THREE.Vector3(...face.normal)
+        )
+      );
+      group.position.set(...face.origin);
+      // Sized from the detected face region, with a floor for slivers.
+      size = Math.max(face.extent * 2.5, 1);
+    } else {
+      group.rotation.set(...spec.rotation);
 
-    // Size the indicator from the scene bounds so drawn geometry never
-    // outruns it; it is a visual aid, not a physical object.
-    const meshGeometry = ctx.meshObject.geometry;
-    if (!meshGeometry.boundingSphere) meshGeometry.computeBoundingSphere();
-    const sphere = meshGeometry.boundingSphere;
-    const hasBounds =
-      sphere && Number.isFinite(sphere.radius) && sphere.radius > 0;
-    const size = planeIndicatorSize(
-      hasBounds ? sphere.center.toArray() : [0, 0, 0],
-      hasBounds ? sphere.radius : 0
-    );
+      // Size the indicator from the scene bounds so drawn geometry never
+      // outruns it; it is a visual aid, not a physical object.
+      const meshGeometry = ctx.meshObject.geometry;
+      if (!meshGeometry.boundingSphere) meshGeometry.computeBoundingSphere();
+      const sphere = meshGeometry.boundingSphere;
+      const hasBounds =
+        sphere && Number.isFinite(sphere.radius) && sphere.radius > 0;
+      size = planeIndicatorSize(
+        hasBounds ? sphere.center.toArray() : [0, 0, 0],
+        hasBounds ? sphere.radius : 0
+      );
+    }
+    const color = face ? FACE_PLANE_COLOR : spec.color;
 
     const fillGeometry = new THREE.PlaneGeometry(size, size);
     const fillMaterial = new THREE.MeshBasicMaterial({
-      color: spec.color,
+      color,
       transparent: true,
       opacity: 0.12,
       side: THREE.DoubleSide,
@@ -698,7 +726,7 @@ const Viewport3D = forwardRef(function Viewport3D(
 
     const edgeGeometry = new THREE.EdgesGeometry(fillGeometry);
     const edgeMaterial = new THREE.LineBasicMaterial({
-      color: spec.color,
+      color,
       transparent: true,
       opacity: 0.6,
     });

@@ -4,7 +4,7 @@
 // orthographic camera. Kept free of three.js so it can be unit-tested in
 // isolation.
 
-import { planeToWorld, worldToPlane } from './sketch/profile.js';
+import { isFacePlane, planeToWorld, worldToPlane } from './sketch/profile.js';
 
 /**
  * Per-plane view poses. `normal` is the direction from the plane toward the
@@ -19,20 +19,25 @@ export const SKETCH_VIEW_POSES = {
 };
 
 /**
- * Camera pose looking orthogonally at a sketch plane (all planes pass through
- * the origin). The current orbit target is projected onto the plane so the
- * view stays centered on the region the user was looking at, and the camera
- * sits `dist` away along the plane normal.
+ * Camera pose looking orthogonally at a sketch plane. The current orbit
+ * target is projected onto the plane so the view stays centered on the
+ * region the user was looking at, and the camera sits `dist` away along the
+ * plane normal. Named planes pass through the origin with the poses above;
+ * a face plane passes through its own origin with its v axis as camera up.
  *
  * Returns { position, target, up } as [x, y, z] triples, or null for an
  * unknown plane.
  */
 export function sketchViewPose(plane, target, dist) {
-  const spec = SKETCH_VIEW_POSES[plane];
+  const spec = isFacePlane(plane)
+    ? { normal: plane.normal, up: plane.v, origin: plane.origin }
+    : SKETCH_VIEW_POSES[plane];
   if (!spec) return null;
   const n = spec.normal;
-  // Project the target onto the plane: t - (t . n) n.
-  const d = target[0] * n[0] + target[1] * n[1] + target[2] * n[2];
+  const o = spec.origin ?? [0, 0, 0];
+  // Project the target onto the plane: t - ((t - o) . n) n.
+  const d =
+    (target[0] - o[0]) * n[0] + (target[1] - o[1]) * n[1] + (target[2] - o[2]) * n[2];
   const projected = [
     target[0] - d * n[0],
     target[1] - d * n[1],
@@ -91,7 +96,7 @@ export function sketchViewFromCamera(plane, target, dist, fovDeg, viewportHeight
  * distance) whose world-to-screen transform equals the overlay view.
  */
 export function cameraFromSketchView(plane, view, fovDeg, viewportHeightPx) {
-  if (!SKETCH_VIEW_POSES[plane]) return null;
+  if (!isFacePlane(plane) && !SKETCH_VIEW_POSES[plane]) return null;
   const dist = sketchDistForPxPerUnit(view.scale, fovDeg, viewportHeightPx);
   const target = planeToWorld(plane, view.cx, view.cy);
   return { ...sketchViewPose(plane, target, dist), dist };

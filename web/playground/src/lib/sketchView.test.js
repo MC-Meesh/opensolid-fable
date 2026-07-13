@@ -63,6 +63,22 @@ describe('sketchViewPose', () => {
     expect(SKETCH_VIEW_POSES.XY.up).toEqual([0, 1, 0]);
   });
 
+  it('poses face planes normal-to through their own origin', () => {
+    // Face plane z = 5 (an XY-parallel face), origin off the world origin.
+    const face = {
+      origin: [1, 2, 5],
+      normal: [0, 0, 1],
+      u: [1, 0, 0],
+      v: [0, 1, 0],
+      extent: 2,
+    };
+    const pose = sketchViewPose(face, [4, -3, 9], 6);
+    // The target projects onto the face plane, not the world XY plane.
+    expect(pose.target).toEqual([4, -3, 5]);
+    expect(pose.position).toEqual([4, -3, 11]);
+    expect(pose.up).toEqual([0, 1, 0]); // the face's v axis
+  });
+
   it('camera direction is orthogonal to the plane for every plane', () => {
     for (const plane of Object.keys(SKETCH_VIEW_POSES)) {
       const pose = sketchViewPose(plane, [1.5, -2, 0.5], 4);
@@ -146,6 +162,24 @@ describe('px <-> world mapping (of-4eh.14)', () => {
       }
     }
     expect(cameraFromSketchView('AB', { cx: 0, cy: 0, scale: 1 }, FOV, HEIGHT)).toBeNull();
+  });
+
+  it('camera <-> overlay view round-trips on a face plane', () => {
+    const face = {
+      origin: [1, 2, 5],
+      normal: [0, 0, 1],
+      u: [1, 0, 0],
+      v: [0, 1, 0],
+      extent: 2,
+    };
+    const view = { cx: 2.5, cy: -1.25, scale: 90 };
+    const pose = cameraFromSketchView(face, view, FOV, HEIGHT);
+    expect(pose.target).toEqual(planeToWorld(face, view.cx, view.cy));
+    expect(pose.up).toEqual(face.v);
+    const back = sketchViewFromCamera(face, pose.target, pose.dist, FOV, HEIGHT);
+    expect(back.cx).toBeCloseTo(view.cx);
+    expect(back.cy).toBeCloseTo(view.cy);
+    expect(back.scale).toBeCloseTo(view.scale);
   });
 
   it('sketch (u, v) axes match the normal-to camera screen axes', () => {

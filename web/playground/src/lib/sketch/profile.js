@@ -26,17 +26,51 @@ import { entityRadius } from './model.js';
 const ARC_SAMPLES = 32;
 
 /**
- * Map sketch-plane (u, v) to world [x, y, z] for a named plane.
+ * A sketch plane is either a named plane ('XY' | 'XZ' | 'YZ', through the
+ * origin) or a face plane picked off a body: `{ origin, normal, u, v,
+ * extent }` with unit `u × v = normal` (see lib/facePlane.js).
+ */
+export function isFacePlane(plane) {
+  return typeof plane === 'object' && plane !== null;
+}
+
+/** Short display name of a sketch plane ('XY' … or 'Face'). */
+export function planeLabel(plane) {
+  return isFacePlane(plane) ? 'Face' : plane;
+}
+
+/**
+ * Axis names for the sketch (u, v) axis lines. Named planes label the world
+ * axes they map to (on YZ the horizontal axis line is world Z since u = -z);
+ * face planes have no world-axis identity, so they read U/V.
+ */
+export function planeAxisLabels(plane) {
+  if (isFacePlane(plane)) return ['U', 'V'];
+  return { XY: ['X', 'Y'], XZ: ['X', 'Z'], YZ: ['Z', 'Y'] }[plane];
+}
+
+/**
+ * Map sketch-plane (u, v) to world [x, y, z].
  *
- * The (u, v) basis of each plane is chosen to match the normal-to sketch
- * camera (SKETCH_VIEW_POSES in lib/sketchView.js): u runs along screen-right
- * and v along screen-up of that camera, and e_u × e_v equals the plane
- * normal. That makes the 2D overlay WYSIWYG — geometry drawn at (u, v)
- * projects to the exact same spot the 3D camera shows planeToWorld(u, v).
- * Concretely: the top view (XZ) has +Z running down-screen, so v = -z; the
- * right view (YZ) has +Y up and +Z running left, so u = -z, v = y.
+ * The (u, v) basis of each named plane is chosen to match the normal-to
+ * sketch camera (SKETCH_VIEW_POSES in lib/sketchView.js): u runs along
+ * screen-right and v along screen-up of that camera, and e_u × e_v equals
+ * the plane normal. That makes the 2D overlay WYSIWYG — geometry drawn at
+ * (u, v) projects to the exact same spot the 3D camera shows
+ * planeToWorld(u, v). Concretely: the top view (XZ) has +Z running
+ * down-screen, so v = -z; the right view (YZ) has +Y up and +Z running
+ * left, so u = -z, v = y. Face planes carry their own (origin, u, v) basis
+ * built to the same convention.
  */
 export function planeToWorld(plane, u, v) {
+  if (isFacePlane(plane)) {
+    const { origin, u: eu, v: ev } = plane;
+    return [
+      origin[0] + u * eu[0] + v * ev[0],
+      origin[1] + u * eu[1] + v * ev[1],
+      origin[2] + u * eu[2] + v * ev[2],
+    ];
+  }
   switch (plane) {
     case 'XY':
       return [u, v, 0];
@@ -51,6 +85,14 @@ export function planeToWorld(plane, u, v) {
 
 /** Inverse of `planeToWorld` for points on the plane: world -> [u, v]. */
 export function worldToPlane(plane, [x, y, z]) {
+  if (isFacePlane(plane)) {
+    const { origin, u: eu, v: ev } = plane;
+    const d = [x - origin[0], y - origin[1], z - origin[2]];
+    return [
+      d[0] * eu[0] + d[1] * eu[1] + d[2] * eu[2],
+      d[0] * ev[0] + d[1] * ev[1] + d[2] * ev[2],
+    ];
+  }
   switch (plane) {
     case 'XY':
       return [x, y];
@@ -63,8 +105,9 @@ export function worldToPlane(plane, [x, y, z]) {
   }
 }
 
-/** Unit normal of a named sketch plane. */
+/** Unit normal of a sketch plane. */
 export function planeNormal(plane) {
+  if (isFacePlane(plane)) return [...plane.normal];
   switch (plane) {
     case 'XY':
       return [0, 0, 1];

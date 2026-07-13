@@ -18,7 +18,8 @@
 // stand-in Shape/Profile classes (same pattern as sceneTree.js).
 
 import { arcSweep } from './sketch/geom.js';
-import { segmentEnd2D, segmentStart2D } from './sketch/profile.js';
+import { isFacePlane, segmentEnd2D, segmentStart2D } from './sketch/profile.js';
+import { axisAngleFromBasis } from './facePlane.js';
 
 /**
  * Convert a closed extracted profile (`extractProfile` output) into profile
@@ -61,14 +62,26 @@ export function mirrorOpsV(ops) {
 
 /**
  * Profile ops in the kernel's native sweep frame for the given plane and
- * sweep kind. Extrude on XZ/YZ needs the mirror (those frames map sketch v /
- * u to -z); revolve feeds (radius, height) directly for every plane.
+ * sweep kind. Extrude on XZ/YZ and on face planes needs the mirror (the
+ * kernel's native (u, v) -> (x, z) mapping is left-handed relative to the
+ * +Y sweep direction, and those targets are reached by pure rotations);
+ * revolve feeds (radius, height) directly for every plane.
  */
 export function nativeSweepOps(ops, plane, kind) {
-  if (kind === 'extrude' && (plane === 'XZ' || plane === 'YZ')) {
+  if (kind === 'extrude' && (plane === 'XZ' || plane === 'YZ' || isFacePlane(plane))) {
     return mirrorOpsV(ops);
   }
   return ops;
+}
+
+/** Face-plane post-ops: `rotate` from the axis-angle of the given basis
+ * columns (skipped for the identity), then `translate` by `offset`. */
+function facePostOps(cols, offset) {
+  const posts = [];
+  const rotation = axisAngleFromBasis(...cols);
+  if (rotation) posts.push({ op: 'rotate', args: [...rotation.axis, rotation.angle] });
+  if (offset.some((c) => c !== 0)) posts.push({ op: 'translate', args: offset });
+  return posts;
 }
 
 /**
@@ -76,30 +89,57 @@ export function nativeSweepOps(ops, plane, kind) {
  * plane: `[{ op: 'rotate'|'translate', args }]`, paired with
  * `nativeSweepOps` for the same plane and kind.
  *
- * Extrude goes along the plane's +normal starting at the plane; revolve
- * spins around the sketch's v axis with the profile's u as radius.
+ * Extrude goes along the plane's normal starting at the plane — a negative
+ * `param` extrudes the same |param| in the -normal direction (the kernel
+ * only sweeps +Y, so the sign lives entirely in the post translate; pair
+ * with |param| as the sweep argument). Revolve spins around the sketch's v
+ * axis with the profile's u as radius.
  */
 export function sweepPostOps(plane, kind, param) {
   if (kind === 'extrude') {
+    if (isFacePlane(plane)) {
+      // Mirrored ops sit at native (u, 0, -v); the rotation with columns
+      // (u, n, -v) carries that to u·e_u + v·e_v and the +Y sweep onto the
+      // face normal. det = -e_u · (n × e_v) = e_u · e_u = 1.
+      const { origin, normal: n, u, v } = plane;
+      const back = Math.min(param, 0);
+      return facePostOps(
+        [u, n, [-v[0], -v[1], -v[2]]],
+        [origin[0] + back * n[0], origin[1] + back * n[1], origin[2] + back * n[2]]
+      );
+    }
     switch (plane) {
       case 'XZ':
         // Mirrored ops already sit at (x, z) = planeToWorld(u, v); the
-        // native sweep along +Y is the plane normal.
-        return [];
+        // native sweep along +Y is the plane normal. A reverse extrude
+        // just drops the span from y ∈ [0, |param|] to [param, 0].
+        return param < 0 ? [{ op: 'translate', args: [0, param, 0] }] : [];
       case 'XY':
+        // After the rotation the solid spans z ∈ [-|param|, 0] — already
+        // the reverse extrude; the forward one shifts up by the height.
         return [
           { op: 'rotate', args: [1, 0, 0, -Math.PI / 2] },
-          { op: 'translate', args: [0, 0, param] },
+          ...(param > 0 ? [{ op: 'translate', args: [0, 0, param] }] : []),
         ];
       case 'YZ':
         // 120° about (1, 1, -1): x -> -z, native sweep +Y -> +X (the plane
         // normal), z -> -y; with mirrored ops this lands (u, v) on (y, -z).
-        return [{ op: 'rotate', args: [1, 1, -1, (2 * Math.PI) / 3] }];
+        return [
+          { op: 'rotate', args: [1, 1, -1, (2 * Math.PI) / 3] },
+          ...(param < 0 ? [{ op: 'translate', args: [param, 0, 0] }] : []),
+        ];
       default:
         throw new Error(`unknown sketch plane: ${plane}`);
     }
   }
   if (kind === 'revolve') {
+    if (isFacePlane(plane)) {
+      // Native revolve puts the profile on the +X half-plane around Y; the
+      // rotation with columns (u, v, n) carries (radius, height) onto
+      // (e_u, e_v) and the axis onto the sketch v axis through the origin.
+      const { origin, normal: n, u, v } = plane;
+      return facePostOps([u, v, n], [...origin]);
+    }
     switch (plane) {
       case 'XY':
         // Native frame: profile (u, v) -> (radius, y), around the Y axis.
@@ -117,10 +157,17 @@ export function sweepPostOps(plane, kind, param) {
   throw new Error(`unknown sweep kind: ${kind}`);
 }
 
+/** The kernel-facing sweep argument: extrude heights carry their direction
+ * in the post-ops (the kernel requires height > 0); revolve angles pass
+ * through. */
+function sweepArg(kind, value) {
+  return kind === 'extrude' ? Math.abs(value) : value;
+}
+
 /**
  * Build the swept, plane-oriented shape for `{ kind, plane, ops, value }`
- * (extrude height or revolve angle in degrees). Frees the profile and every
- * intermediate shape; the caller owns the returned shape.
+ * (signed extrude height or revolve angle in degrees). Frees the profile
+ * and every intermediate shape; the caller owns the returned shape.
  */
 export function buildSweepShape(ShapeClass, ProfileClass, sweep) {
   const { kind, plane, value } = sweep;
@@ -130,7 +177,7 @@ export function buildSweepShape(ShapeClass, ProfileClass, sweep) {
   try {
     for (const seg of ops.segs) profile.arcTo(seg.x, seg.y, seg.bulge);
     profile.close();
-    shape = ShapeClass[kind](profile, value);
+    shape = ShapeClass[kind](profile, sweepArg(kind, value));
   } finally {
     profile.free?.();
   }
@@ -155,7 +202,7 @@ export function sweepTreeNode(root, sweep) {
   let node = {
     id: id--,
     op: kind,
-    args: [value],
+    args: [sweepArg(kind, value)],
     children: [],
     profile: { start: [...ops.start], segs: ops.segs.map((s) => ({ ...s })) },
   };
