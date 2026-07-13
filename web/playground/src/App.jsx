@@ -13,7 +13,7 @@ import PropertyPanel from './components/PropertyPanel.jsx';
 import SketchCanvas from './components/SketchCanvas.jsx';
 import SweepPanel from './components/SweepPanel.jsx';
 import { DEFAULT_SCRIPT } from './lib/defaultScript.js';
-import { freeNodes, nodeLabel, runTracedScript, serializeTree } from './lib/sceneTree.js';
+import { freeNodes, nodeLabel, runTracedScript, scriptHeader, serializeTree } from './lib/sceneTree.js';
 import { buildBinaryStl } from './lib/stl.js';
 import { pickCandidates, pickNodeAt } from './lib/picking.js';
 import { applyTranslate, applyRotate, applyScale, pathTo, nodeAt, replaceById } from './lib/transformEdit.js';
@@ -228,6 +228,13 @@ export default function App() {
     setGraph(next);
   }, []);
 
+  // Tree-based GUI edits regenerate the whole script; keep the leading
+  // comment block (the API-reference header) so it survives every edit.
+  const serializeWithHeader = useCallback(
+    (root) => serializeTree(root, { header: scriptHeader(scriptRef.current) }),
+    []
+  );
+
   // Script -> GUI: re-parse and re-evaluate, debounced behind keystrokes.
   const handleScriptChange = useCallback(
     (source) => {
@@ -372,12 +379,12 @@ export default function App() {
       return;
     }
     clearSelection();
-    const script = serializeTree(result.root);
+    const script = serializeWithHeader(result.root);
     scriptRef.current = script;
     editorRef.current?.setDoc(script);
     commitGraph();
     evaluateScript();
-  }, [selectedNode, clearSelection, commitGraph, evaluateScript]);
+  }, [selectedNode, clearSelection, serializeWithHeader, commitGraph, evaluateScript]);
 
   const handleTransform = useCallback(
     (event) => {
@@ -398,13 +405,13 @@ export default function App() {
       }
 
       selectedPathRef.current = path;
-      const script = serializeTree(newRoot);
+      const script = serializeWithHeader(newRoot);
       scriptRef.current = script;
       editorRef.current?.setDoc(script);
       commitGraph();
       evaluateScript();
     },
-    [selectedNode, commitGraph, evaluateScript]
+    [selectedNode, serializeWithHeader, commitGraph, evaluateScript]
   );
 
   // Property panel edits: mutate the traced tree, then push the serialized
@@ -417,7 +424,7 @@ export default function App() {
       }
       if (result.root === tracedRef.current?.root) return;
       selectedPathRef.current = pathTo(result.root, nodeId) ?? selectedPathRef.current;
-      const script = serializeTree(result.root);
+      const script = serializeWithHeader(result.root);
       scriptRef.current = script;
       editorRef.current?.setDoc(script);
       commitGraph();
@@ -524,7 +531,7 @@ export default function App() {
   const commitRoot = useCallback(
     (newRoot) => {
       selectedPathRef.current = null;
-      const script = serializeTree(newRoot);
+      const script = serializeWithHeader(newRoot);
       scriptRef.current = script;
       editorRef.current?.setDoc(script);
       commitGraph();
@@ -659,14 +666,14 @@ export default function App() {
   // path the gizmo uses.
   const applySweep = useCallback(() => {
     if (!sweep) return;
-    const script = serializeTree(sweepTreeNode(tracedRef.current?.root ?? null, sweep));
+    const script = serializeWithHeader(sweepTreeNode(tracedRef.current?.root ?? null, sweep));
     scriptRef.current = script;
     editorRef.current?.setDoc(script);
     setSweep(null);
     setSweepError(null);
     commitGraph();
     evaluateScript();
-  }, [sweep, commitGraph, evaluateScript]);
+  }, [sweep, serializeWithHeader, commitGraph, evaluateScript]);
 
   // Live preview: remesh the pending sweep whenever its parameters change.
   useEffect(() => {

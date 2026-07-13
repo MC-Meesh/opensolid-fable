@@ -12,10 +12,15 @@ export const DEFAULT_SCRIPT = `// Build a shape with the OpenSolid API and retur
 //   p.lineTo(x, y)  p.arcTo(x, y, bulge)  p.close()
 //   Shape.extrude(p, height)            profile (x,y)->(x,z), swept along +y
 //   Shape.revolve(p, angleDegrees)      around the y axis, x is the radius
-// Operations (each returns a new shape):
+// Transforms (each returns a new shape):
 //   .translate(x, y, z)
+//   .rotate(ax, ay, az, angleRad)       about axis (ax,ay,az) through origin
+//   .scale(sx, sy, sz)                  per-axis, factors > 0
+//   .uniformScale(factor)               factor > 0
+// Booleans (each returns a new shape):
 //   .union(other)  .intersect(other)  .subtract(other)
-//   .smoothUnion(other, radius?)
+//   .smoothUnion(other, radius?)        blended union; radius defaults to
+//                                       10% of the combined bounds
 
 const body = Shape.roundedBox(1.0, 0.55, 0.8, 0.15);
 const bump = Shape.sphere(0.55).translate(0, 0.65, 0);

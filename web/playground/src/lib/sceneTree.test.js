@@ -4,6 +4,7 @@ import {
   freeNodes,
   nodeLabel,
   runTracedScript,
+  scriptHeader,
   serializeTree,
 } from './sceneTree.js';
 
@@ -223,7 +224,17 @@ describe('nodeLabel', () => {
 });
 
 describe('serializeTree', () => {
-  it('inlines single-use chains', () => {
+  it('inlines single-use primitive and transform chains', () => {
+    const { root } = runTracedScript(
+      'return Shape.sphere(0.55).translate(0, 0.65, 0).rotate(0, 1, 0, 0.5).uniformScale(2);',
+      FakeShape
+    );
+    expect(serializeTree(root)).toBe(
+      'return Shape.sphere(0.55).translate(0, 0.65, 0).rotate(0, 1, 0, 0.5).uniformScale(2);\n'
+    );
+  });
+
+  it('hoists every boolean step into a readable const binding', () => {
     const { root } = runTracedScript(
       `const body = Shape.roundedBox(1, 0.55, 0.8, 0.15);
        const bump = Shape.sphere(0.55).translate(0, 0.65, 0);
@@ -231,10 +242,33 @@ describe('serializeTree', () => {
       FakeShape
     );
     expect(serializeTree(root)).toBe(
-      'return Shape.roundedBox(1, 0.55, 0.8, 0.15)' +
-        '.smoothUnion(Shape.sphere(0.55).translate(0, 0.65, 0), 0.25)' +
-        '.subtract(Shape.cylinder(0.28, 2));\n'
+      'const s1 = Shape.roundedBox(1, 0.55, 0.8, 0.15)' +
+        '.smoothUnion(Shape.sphere(0.55).translate(0, 0.65, 0), 0.25);\n' +
+        'return s1.subtract(Shape.cylinder(0.28, 2));\n'
     );
+  });
+
+  it('keeps one statement per feature as GUI unions accumulate', () => {
+    const { root } = runTracedScript(
+      `return Shape.box3(1, 1, 1)
+         .union(Shape.sphere(0.5))
+         .union(Shape.torus(0.6, 0.2))
+         .union(Shape.cylinder(0.3, 0.6));`,
+      FakeShape
+    );
+    expect(serializeTree(root)).toBe(
+      'const s1 = Shape.box3(1, 1, 1).union(Shape.sphere(0.5));\n' +
+        'const s2 = s1.union(Shape.torus(0.6, 0.2));\n' +
+        'return s2.union(Shape.cylinder(0.3, 0.6));\n'
+    );
+  });
+
+  it('prepends the given header with a blank separator line', () => {
+    const { root } = runTracedScript('return Shape.sphere(1);', FakeShape);
+    expect(serializeTree(root, { header: '// API docs\n' })).toBe(
+      '// API docs\n\nreturn Shape.sphere(1);\n'
+    );
+    expect(serializeTree(root, { header: '' })).toBe('return Shape.sphere(1);\n');
   });
 
   it('hoists shared subtrees into const bindings', () => {
@@ -264,6 +298,39 @@ describe('serializeTree', () => {
     expect(skeleton(second.root)).toEqual(skeleton(first.root));
     // Sharing is preserved, not duplicated: same node count both times.
     expect(second.nodes).toHaveLength(first.nodes.length);
+  });
+});
+
+describe('scriptHeader', () => {
+  it('extracts the leading // comment block, trimming trailing blanks', () => {
+    const source = '// line one\n//   line two\n\nconst a = Shape.sphere(1);\n';
+    expect(scriptHeader(source)).toBe('// line one\n//   line two\n');
+  });
+
+  it('returns "" when the script does not start with a comment', () => {
+    expect(scriptHeader('const a = Shape.sphere(1);\n// trailing\n')).toBe('');
+    expect(scriptHeader('')).toBe('');
+    expect(scriptHeader('\n\n')).toBe('');
+  });
+
+  it('spans multi-line /* */ blocks and mixed comment styles', () => {
+    const source = '/* multi\n   line */\n// more\nreturn Shape.sphere(1);\n';
+    expect(scriptHeader(source)).toBe('/* multi\n   line */\n// more\n');
+  });
+
+  it('keeps interior blank lines but stops at the first code line', () => {
+    const source = '// a\n\n// b\nreturn Shape.sphere(1); // inline\n// after\n';
+    expect(scriptHeader(source)).toBe('// a\n\n// b\n');
+  });
+
+  it('round-trips through serializeTree GUI regeneration', () => {
+    const { root } = runTracedScript('return Shape.sphere(1);', FakeShape);
+    const header = '// the API reference header\n';
+    const script = serializeTree(root, { header });
+    // A later GUI edit re-extracts the same header from the current script.
+    expect(scriptHeader(script)).toBe(header);
+    const again = runTracedScript(script, FakeShape);
+    expect(serializeTree(again.root, { header: scriptHeader(script) })).toBe(script);
   });
 });
 

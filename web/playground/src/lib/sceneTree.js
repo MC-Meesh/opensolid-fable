@@ -6,7 +6,9 @@
 //                     Shape wrapper that records every operation as a node
 //                     while delegating to the real Shape class.
 //   model -> script : serializeTree() emits a canonical script for any tree,
-//                     hoisting shared subtrees into `const` bindings.
+//                     one readable statement per feature (shared subtrees and
+//                     boolean steps become `const` bindings), optionally
+//                     keeping the script's leading comment header.
 //
 // Kept free of React and WASM imports so it can be unit-tested with a
 // stand-in Shape class (same pattern as runScript.js).
@@ -217,14 +219,49 @@ export function freeNodes(nodes) {
 }
 
 /**
+ * The leading comment block of a script — the run of `//` lines, `/* ... *​/`
+ * blocks, and blank lines at the top, up to the first line of code — with
+ * trailing blank lines trimmed, ending in a single newline. Returns '' when
+ * the script does not start with a comment. Lets canonical re-serialization
+ * carry the API-reference header (and any user preamble) across GUI edits.
+ */
+export function scriptHeader(source) {
+  const lines = source.split('\n');
+  let end = 0;
+  let inBlock = false;
+  for (const line of lines) {
+    const text = line.trim();
+    if (inBlock) {
+      end += 1;
+      if (text.includes('*/')) inBlock = false;
+      continue;
+    }
+    if (text === '' || text.startsWith('//')) {
+      end += 1;
+    } else if (text.startsWith('/*')) {
+      end += 1;
+      if (!text.includes('*/')) inBlock = true;
+    } else {
+      break;
+    }
+  }
+  while (end > 0 && lines[end - 1].trim() === '') end -= 1;
+  if (end === 0) return '';
+  return `${lines.slice(0, end).join('\n')}\n`;
+}
+
+/**
  * Emit a canonical script for the tree rooted at `root`.
  *
- * Single-use nodes are inlined into their parent expression; nodes referenced
- * more than once are hoisted into `const s<N> = ...;` bindings so the DAG
- * structure survives a round trip through the script. Sweep nodes emit their
- * profile as `const p<N> = new Profile(...)` builder statements first.
+ * Every boolean (two-child) operation and every node referenced more than
+ * once is hoisted into a `const s<N> = ...;` binding, so the emitted script
+ * is a readable statement-per-feature program (and the DAG structure
+ * survives a round trip); single-use primitives and transform chains stay
+ * inline. Sweep nodes emit their profile as `const p<N> = new Profile(...)`
+ * builder statements first. `header` (see `scriptHeader`) is prepended with
+ * a blank separator line when given.
  */
-export function serializeTree(root) {
+export function serializeTree(root, { header = '' } = {}) {
   const refs = new Map();
   const countRefs = (node) => {
     const seen = (refs.get(node.id) ?? 0) + 1;
@@ -268,7 +305,7 @@ export function serializeTree(root) {
       const rest = args.length > 0 ? `, ${args.join(', ')}` : '';
       text = `${exprOf(receiver)}.${node.op}(${exprOf(other)}${rest})`;
     }
-    if (node !== root && refs.get(node.id) > 1) {
+    if (node !== root && (refs.get(node.id) > 1 || node.children.length === 2)) {
       const name = `s${names.size + 1}`;
       names.set(node.id, name);
       lines.push(`const ${name} = ${text};`);
@@ -278,5 +315,6 @@ export function serializeTree(root) {
   };
 
   lines.push(`return ${exprOf(root)};`);
-  return `${lines.join('\n')}\n`;
+  const body = `${lines.join('\n')}\n`;
+  return header ? `${header}\n${body}` : body;
 }

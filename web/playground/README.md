@@ -148,7 +148,9 @@ Constructors (all centered at the origin; y is up):
 | `Shape.capsule(x1,y1,z1, x2,y2,z2, r)` | sphere-swept segment |
 
 Operations (immutable — each returns a new shape, operands stay usable):
-`.translate(x, y, z)`, `.union(s)`, `.intersect(s)`, `.subtract(s)`,
+`.translate(x, y, z)`, `.rotate(ax, ay, az, angleRad)` (about the axis
+through the origin), `.scale(sx, sy, sz)` / `.uniformScale(f)` (factors
+`> 0`, about the origin), `.union(s)`, `.intersect(s)`, `.subtract(s)`,
 `.smoothUnion(s, radius?)` (default radius: 10% of the combined bounding
 box's largest extent).
 
@@ -163,5 +165,8 @@ truth for script ↔ GUI sync: `runTracedScript()` executes the script with a
 tracing `Shape` wrapper that records every operation as a node (so loops,
 variables and helper functions all work — no static parsing), and
 `serializeTree()` emits a canonical script back from any tree, hoisting
-shared subtrees into `const` bindings. GUI features (property editing,
-gizmos, bidirectional sync) should read and write this model.
+shared subtrees and every boolean step into `const` bindings so the emitted
+program stays one readable statement per feature. GUI features (property
+editing, gizmos, bidirectional sync) read and write this model; when they
+regenerate the script they pass the leading comment block (`scriptHeader()`)
+back through, so the API-reference header survives every GUI edit.
