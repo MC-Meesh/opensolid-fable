@@ -72,7 +72,7 @@
 //! `Chart::new` rejected `Surface3::Sphere`/`Torus`; of-7ld.4 lifted
 //! that gate after the of-7ld.5/6/7 fixes, and the tests that pass are
 //! now live. The still-`#[ignore]`d remainder name their open blockers
-//! (of-rb4, of-yet). Run those with
+//! (of-2ql, of-yet). Run those with
 //! `cargo test --test boolean_stress -- --ignored`.
 //!
 //! Bugs filed from the campaign's first run (2026-07-12, `Chart::new`
@@ -142,8 +142,18 @@
 //! diagonals pass through staggered lattice points) are inserted with a
 //! proper edge split instead of a corner split that minted negative uv
 //! slivers and left secant triangles through the cylinder wall. The
-//! napkin-ring test is live; the remaining `#[ignore]`d tests name
-//! of-rb4 and of-yet.
+//! napkin-ring test is live; three residual-sliver tests still name
+//! of-2ql.
+//!
+//! Update (of-rb4 fix): imprints threaded through sphere pole vertices
+//! are split at the poles (their endpoints snapped to the exact pole
+//! points), chains terminate at pole junctions and anchor to the pole
+//! vertex by 3D coincidence, a chain closing on a single boundary vertex
+//! splits off a pinched outer cycle instead of a hole that touches it,
+//! and cycles starting at a pole embed their pole row from the true
+//! arrival meridian. `hemisphere_imprint_through_poles` and
+//! `sphere_octant_on_block_corner` are live; 8 remain `#[ignore]`d
+//! (of-2ql residual slivers ×3, of-yet ×5).
 
 use nalgebra::{Rotation3, Unit};
 use opensolid_brep::boolean::{intersect, subtract, unite};
@@ -1360,7 +1370,6 @@ fn spherical_band_volume_r15() -> f64 {
 /// meeting in pairwise junctions — an imprint NETWORK, not a single
 /// chain — and the octant contains the sphere's south pole.
 #[test]
-#[ignore = "of-rb4: imprints through pole vertices break region topology"]
 fn sphere_octant_on_block_corner() {
     let context = "sphere centered on block corner (octant intersection)";
     let r = 0.8;
@@ -1407,7 +1416,6 @@ fn sphere_octant_on_block_corner() {
 /// seam edge — an imprint threaded through existing topology at the
 /// exact points where longitude is undefined.
 #[test]
-#[ignore = "of-rb4: imprints through pole vertices break region topology"]
 fn hemisphere_imprint_through_poles() {
     let context = "half-space block ∩ sphere: meridian imprint through both poles";
     let r = 1.0;

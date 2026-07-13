@@ -651,6 +651,21 @@ impl Chart {
         (d.dot(e_u).hypot(d.dot(e_v)) <= radius * POLE_REL_EPS)
             .then(|| std::f64::consts::FRAC_PI_2.copysign(d.dot(axis)))
     }
+
+    /// The chart's pole points `[south, north]` (`v = -π/2, +π/2`), where
+    /// the `u`-circle collapses to a point — only spheres have them.
+    fn pole_points(&self) -> Option<[Point3; 2]> {
+        let Chart::Sphere {
+            center,
+            axis,
+            radius,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        Some([center - axis * *radius, center + axis * *radius])
+    }
 }
 
 /// Relative floor (fraction of the sphere radius) on a point's distance
@@ -1428,9 +1443,48 @@ impl<'a> Pipeline<'a> {
     /// winding-0 ring straddling the seam crosses an even number of times
     /// and becomes that many chords (of-43n).
     fn collect_splits(&mut self) {
+        self.snap_imprint_endpoints_to_poles();
         let mut events: Vec<(CurveSource, Point3)> = Vec::new();
         let mut barriers: Vec<((SolidTag, usize), Point3)> = Vec::new();
         for (ii, imp) in self.imprints.iter().enumerate() {
+            // Pole crossings: an imprint threaded through a sphere pole of
+            // a host chart passes through an existing topology vertex (the
+            // seam edge's endpoint) and must be split there, so its pieces
+            // anchor at the pole vertex like any boundary-hitting imprint
+            // (of-rb4). The pole is checked against the exact curve; for
+            // open imprints it must also lie strictly inside the clipped
+            // run (endpoint poles are handled by the snapping pre-pass and
+            // need no split). Every pole an imprint touches — mid-run or
+            // at a snapped endpoint — is also a chain barrier on that host
+            // face: the pole is on the face boundary, so chains terminate
+            // there instead of fusing through the junction into a false
+            // interior ring.
+            for (s, f) in [(0usize, imp.face_a), (1usize, imp.face_b)] {
+                let chart = &self.face_polys[s][f].chart;
+                let Some(poles) = chart.pole_points() else {
+                    continue;
+                };
+                for pole in poles {
+                    if !imp.sampled.closed {
+                        let pts = &imp.sampled.points;
+                        if (pts[0] - pole).norm() <= self.snap * 4.0
+                            || (pts[pts.len() - 1] - pole).norm() <= self.snap * 4.0
+                        {
+                            barriers.push(((s, f), pole));
+                            continue;
+                        }
+                    }
+                    let t = imp.curve.project_point(&pole).t;
+                    if (imp.curve.point(t) - pole).norm() > self.snap * EDGE_MATCH_SNAP {
+                        continue;
+                    }
+                    if !imp.sampled.closed && !Self::interior_curve_param(imp, t, self.snap) {
+                        continue;
+                    }
+                    events.push((CurveSource::Imprint { index: ii }, pole));
+                    barriers.push(((s, f), pole));
+                }
+            }
             if !imp.sampled.closed {
                 for endpoint in [
                     imp.sampled.points[0],
@@ -1472,6 +1526,68 @@ impl<'a> Pipeline<'a> {
         }
         for (key, p) in barriers {
             self.seam_barriers.entry(key).or_default().push(p);
+        }
+    }
+
+    /// Canonicalize open imprints that terminate at a sphere pole of a
+    /// host chart: the clip bisection converges to the pole only to its
+    /// refinement precision (observed ~1e-8 off), which is wider than the
+    /// vertex weld snap — the resulting endpoint vertex would not merge
+    /// with the pole vertex the seam edge ends in. Snap such endpoints to
+    /// the exact pole point so chains anchor at the existing vertex
+    /// (of-rb4).
+    fn snap_imprint_endpoints_to_poles(&mut self) {
+        let band = self.snap * EDGE_MATCH_SNAP * 4.0;
+        for imp in &mut self.imprints {
+            if imp.sampled.closed {
+                continue;
+            }
+            for (s, f) in [(0usize, imp.face_a), (1usize, imp.face_b)] {
+                let Some(poles) = self.face_polys[s][f].chart.pole_points() else {
+                    continue;
+                };
+                let last = imp.sampled.points.len() - 1;
+                for i in [0, last] {
+                    for pole in poles {
+                        let d = (imp.sampled.points[i] - pole).norm();
+                        if d > 0.0 && d <= band {
+                            imp.sampled.points[i] = pole;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Is curve parameter `t` strictly inside the parameter range of an
+    /// open imprint's clipped run (not within snap of either end)? Used to
+    /// keep pole splits off run endpoints, which the snapping pre-pass
+    /// already canonicalizes.
+    fn interior_curve_param(imp: &Imprint, t: f64, snap: f64) -> bool {
+        let pts = &imp.sampled.points;
+        let t0 = imp.curve.project_point(&pts[0]).t;
+        let t1 = imp.curve.project_point(&pts[pts.len() - 1]).t;
+        // Margin: the snap length expressed as a curve-parameter step via
+        // the local speed (finite difference over one refinement step).
+        let dt = 1e-4;
+        let speed = (imp.curve.point(t + dt) - imp.curve.point(t)).norm() / dt;
+        let margin = (snap * 4.0) / speed.max(1e-12);
+        match imp.curve.period() {
+            Some(period) => {
+                let mut span = (t1 - t0).rem_euclid(period);
+                // Coincident endpoints mean the open run wraps the whole
+                // period (a ring cut open at a single point), not a
+                // zero-length run — sub-snap runs never survive clipping.
+                if span < margin {
+                    span = period;
+                }
+                let tp = (t - t0).rem_euclid(period);
+                tp > margin && tp < span - margin
+            }
+            None => {
+                let (lo, hi) = (t0.min(t1), t0.max(t1));
+                t > lo + margin && t < hi - margin
+            }
         }
     }
 
@@ -2206,6 +2322,11 @@ fn embed_walk(
     let mut poly: Vec<((f64, f64), Point3)> = Vec::new();
     let mut offsets = Vec::with_capacity(darts.len());
     let mut walk_pos: Option<Point3> = None;
+    // A walk that STARTS at a sphere pole has no arrival longitude yet:
+    // the embedder places the pole at a placeholder `u`. For cycles the
+    // true arrival longitude is the walk's final meridian (the implicit
+    // closure), so the placeholder is fixed up after the walk (of-rb4).
+    let mut initial_pole: Option<f64> = None;
     // Every cycle handed to this walk is intended CCW-in-chart
     // (`reconstruct` reverses flipped face loops before embedding, and
     // `apply_chain` builds region outers), so pole closure rows orient CCW.
@@ -2236,6 +2357,9 @@ fn embed_walk(
         };
         for (j, p) in pts[..take].iter().enumerate() {
             let first = poly.is_empty();
+            if first {
+                initial_pole = face_poly.chart.pole_v(p);
+            }
             emb.push(*p, &mut poly);
             if j == 0 {
                 // The dart's vertex is the point itself — when it leaves a
@@ -2266,6 +2390,52 @@ fn embed_walk(
         } else {
             pts[pts.len() - 1]
         });
+    }
+    // Fix up a cycle that started at a pole: the placeholder longitude at
+    // poly[0] becomes the true arrival longitude (the final meridian of
+    // the closing walk), and the departure end of the pole row — chosen
+    // relative to the placeholder — is re-derived from it, shifting the
+    // rest of the walk by the whole-period difference. Without this the
+    // pole row sweeps meridians outside the region whenever the arrival
+    // meridian is not the placeholder, and the cover polygon overlaps its
+    // neighbors (of-rb4). Chains (`keep_final`) have no closure: their
+    // start-pole longitude is only ever used for 3D-anchored matching.
+    if !keep_final && poly.len() >= 3 {
+        if let Some(vp) = initial_pole {
+            let row_end_is_pole = face_poly.chart.pole_v(&poly[1].1) == Some(vp);
+            let last_at_pole = face_poly.chart.pole_v(&poly[poly.len() - 1].1).is_some();
+            if row_end_is_pole && !last_at_pole {
+                let u_arr = poly[poly.len() - 1].0.0;
+                let u_out_old = poly[1].0.0;
+                // Same sweep rule as the embedder: CCW keeps the interior
+                // meridians left of the walk (north row toward -u, south
+                // row toward +u); a departure within POLE_TURN_EPS of the
+                // arrival is a doubling-back and sweeps the full period.
+                let toward_neg_u = vp > 0.0;
+                let turn = if toward_neg_u {
+                    (u_arr - u_out_old).rem_euclid(TWO_PI)
+                } else {
+                    (u_out_old - u_arr).rem_euclid(TWO_PI)
+                };
+                let turn = if turn < POLE_TURN_EPS || TWO_PI - turn < POLE_TURN_EPS {
+                    TWO_PI
+                } else {
+                    turn
+                };
+                let u_out_new = if toward_neg_u {
+                    u_arr - turn
+                } else {
+                    u_arr + turn
+                };
+                let delta = u_out_new - u_out_old;
+                poly[0].0.0 = u_arr;
+                if delta != 0.0 {
+                    for ((u, _), _) in poly[1..].iter_mut() {
+                        *u += delta;
+                    }
+                }
+            }
+        }
     }
     // Align the whole polyline into the face's cover window so cycles,
     // holes, and probes of one face are mutually comparable. Each periodic
@@ -2330,6 +2500,10 @@ fn reverse_chain(darts: &[(usize, bool)]) -> DartChain {
 /// uv embedding straddles the cover edge (of-43n). On the imprint's other
 /// host face the same points are face-interior and carry no barrier, so
 /// the ring correctly re-merges and applies as an interior ring there.
+/// Sphere poles an imprint touches are barriers for the same reason: the
+/// pole is an existing topology vertex on the face boundary, and merging
+/// through it would fuse pole-to-pole chords into a closed chain that
+/// `apply_chain` mistakes for an interior ring (of-rb4).
 fn merge_imprint_chains(
     atoms: &[Atom],
     ids: &[usize],
@@ -2414,11 +2588,19 @@ fn merge_imprint_chains(
 /// but slicing the host cycle at the wrong copies winds one piece CW.
 /// `apply_chain` disambiguates by trying candidates until the split
 /// yields two CCW pieces.
+///
+/// Chain endpoints at a sphere pole match a pole vertex by 3D
+/// coincidence instead of the uv metric — the vertex's stored uv is one
+/// arbitrary representative of a whole collapsed pole row (of-rb4). And
+/// a chain whose two ends coincide in 3D is a closed loop that may
+/// legitimately anchor twice at ONE vertex (an imprint network closing
+/// at a pole), so such chains may return pairs with `i == j`.
 fn match_chain_to_cycle(
     cycle: &Cycle,
     chain_poly: &[((f64, f64), Point3)],
     periods: (Option<f64>, Option<f64>),
     scale: (f64, f64),
+    chart: &Chart,
 ) -> Vec<(usize, usize)> {
     let (u_scale, v_scale) = scale;
     let (mut lo, mut hi) = (
@@ -2430,8 +2612,8 @@ fn match_chain_to_cycle(
         hi = (hi.0.max(*u), hi.1.max(*v));
     }
     let eps = ((hi.0 - lo.0) * u_scale + (hi.1 - lo.1) * v_scale).max(1e-12) * 1e-5;
-    let s_uv = chain_poly[0].0;
-    let e_uv = chain_poly[chain_poly.len() - 1].0;
+    let (s_uv, s_p) = chain_poly[0];
+    let (e_uv, e_p) = chain_poly[chain_poly.len() - 1];
     let axis_shifts = |period: Option<f64>| -> Vec<f64> {
         match period {
             Some(p) => vec![-p, 0.0, p],
@@ -2439,26 +2621,40 @@ fn match_chain_to_cycle(
         }
     };
     let (shifts_u, shifts_v) = (axis_shifts(periods.0), axis_shifts(periods.1));
-    let nearest = |uv: (f64, f64)| -> (usize, f64) {
+    let nearest = |uv: (f64, f64), p: &Point3| -> (usize, f64) {
         cycle
             .dart_offsets
             .iter()
             .enumerate()
             .map(|(k, &off)| {
-                let v = cycle.poly[off].0;
-                let d =
-                    (((v.0 - uv.0) * u_scale).powi(2) + ((v.1 - uv.1) * v_scale).powi(2)).sqrt();
+                let (vuv, vp) = cycle.poly[off];
+                // A vertex at a sphere pole is a whole pole row in uv: its
+                // stored longitude is one arbitrary representative, so the
+                // uv metric mis-ranks it. Endpoints at the same pole match
+                // it by 3D coincidence instead (of-rb4).
+                let d = match (chart.pole_v(p), chart.pole_v(&vp)) {
+                    (Some(a), Some(b)) if a == b => (p - vp).norm(),
+                    _ => (((vuv.0 - uv.0) * u_scale).powi(2) + ((vuv.1 - uv.1) * v_scale).powi(2))
+                        .sqrt(),
+                };
                 (k, d)
             })
             .min_by(|a, b| a.1.total_cmp(&b.1))
             .expect("cycle has darts")
     };
+    // A chain whose two ends coincide in 3D is a closed loop; anchored at
+    // a single boundary vertex it may legitimately match the same vertex
+    // twice (an imprint network closing at a pole, of-rb4).
+    let closed_chain = (s_p - e_p).norm() <= eps;
     let mut cands: Vec<(f64, usize, usize)> = Vec::new();
     for &su in &shifts_u {
         for &sv in &shifts_v {
-            let (i, di) = nearest((s_uv.0 + su, s_uv.1 + sv));
-            let (j, dj) = nearest((e_uv.0 + su, e_uv.1 + sv));
-            if di <= eps && dj <= eps && i != j && !cands.iter().any(|&(_, a, b)| (a, b) == (i, j))
+            let (i, di) = nearest((s_uv.0 + su, s_uv.1 + sv), &s_p);
+            let (j, dj) = nearest((e_uv.0 + su, e_uv.1 + sv), &e_p);
+            if di <= eps
+                && dj <= eps
+                && (i != j || closed_chain)
+                && !cands.iter().any(|&(_, a, b)| (a, b) == (i, j))
             {
                 cands.push((di + dj, i, j));
             }
@@ -2552,14 +2748,36 @@ fn apply_chain(
     // cannot decide either — a seam chord's endpoints coincide in 3D with
     // vertex copies on EVERY region bordering the seam at those points,
     // and on the two cover copies within one region (score ties at zero,
-    // of-43n). Splitting a CCW outer cycle with a transversal chord of its
-    // region yields two CCW pieces, so the first (region, vertex-pair)
-    // whose split comes out both-CCW is the geometric host; a wrong copy
-    // pair or a neighboring region slices a boundary complement instead
-    // and winds one piece CW. Falls back to the best-scoring match if no
-    // split is both-CCW (preserving the pre-of-43n behavior).
+    // of-43n); pole-anchored chords likewise tie on the pole vertex of
+    // every region touching that pole (of-rb4). Splitting a CCW outer
+    // cycle with a transversal chord of its region yields two CCW pieces,
+    // so the first (region, vertex-pair) whose split comes out both-CCW
+    // is the geometric host; a wrong copy pair or a neighboring region
+    // slices a boundary complement instead and winds one piece CW. Falls
+    // back to the best-scoring match if no split is both-CCW (preserving
+    // the pre-of-43n behavior).
     let split_at = |ri: usize, (vi, vj): (usize, usize)| {
         let outer = &regions[ri].cycles[0];
+        if vi == vj {
+            // The chain is a closed loop anchored at a single boundary
+            // vertex (an imprint network closing at a sphere pole,
+            // of-rb4). One side is the loop alone; the other is the
+            // outer cycle with the reversed loop spliced in at the
+            // shared vertex — one pinched cycle, NOT an outer + hole
+            // pair, whose vertex-touching ring would over-count R and
+            // break the shell's Euler characteristic.
+            let as_given = embed_cycle(face_poly, atoms, chain.clone());
+            let (loop_darts, loop_cycle) = if as_given.area >= 0.0 {
+                (chain.clone(), as_given)
+            } else {
+                let rev = reverse_chain(&chain);
+                let cy = embed_cycle(face_poly, atoms, rev.clone());
+                (rev, cy)
+            };
+            let mut pinched = reverse_chain(&loop_darts);
+            pinched.extend(cyclic_slice(&outer.darts, vi, vi));
+            return (loop_cycle, embed_cycle(face_poly, atoms, pinched));
+        }
         let mut darts_one = chain.clone();
         darts_one.extend(cyclic_slice(&outer.darts, vj, vi));
         let mut darts_two = reverse_chain(&chain);
@@ -2573,7 +2791,8 @@ fn apply_chain(
     let mut chosen: Option<(usize, Cycle, Cycle)> = None;
     'regions: for (ri, region) in regions.iter().enumerate() {
         for (ci, cycle) in region.cycles.iter().enumerate() {
-            let candidates = match_chain_to_cycle(cycle, &chain_poly, period, scale);
+            let candidates =
+                match_chain_to_cycle(cycle, &chain_poly, period, scale, &face_poly.chart);
             if candidates.is_empty() {
                 continue;
             }
@@ -4126,6 +4345,16 @@ mod tests {
         Chart::build(&Surface3::sphere(center, tilted_axis(), radius).unwrap()).unwrap()
     }
 
+    /// A chart without poles, for tests exercising the plain uv metric.
+    fn poleless_chart() -> Chart {
+        Chart::Plane {
+            origin: Point3::origin(),
+            e_u: Vector3::x(),
+            e_v: Vector3::y(),
+            normal: Vector3::z(),
+        }
+    }
+
     fn torus_chart(center: Point3, major: f64, minor: f64) -> Chart {
         Chart::build(&Surface3::torus(center, tilted_axis(), major, minor).unwrap()).unwrap()
     }
@@ -5404,6 +5633,203 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------
+    // Imprints through pole vertices (of-rb4)
+    // -----------------------------------------------------------------
+
+    /// 3D samples of the unit-sphere meridian at longitude `u`, from
+    /// latitude `v0` to `v1` inclusive (`n + 1` points).
+    fn meridian_arc(u: f64, v0: f64, v1: f64, n: usize) -> Vec<Point3> {
+        (0..=n)
+            .map(|i| {
+                let v = v0 + (v1 - v0) * i as f64 / n as f64;
+                Point3::new(v.cos() * u.cos(), v.cos() * u.sin(), v.sin())
+            })
+            .collect()
+    }
+
+    /// The unit sphere face's cover polygon (seam-only loop).
+    fn unit_sphere_poly() -> FaceRegionPoly {
+        let chart = unit_sphere_chart();
+        FaceRegionPoly {
+            loops: vec![embed_points(&chart, &seam_only_loop_walk(), true)],
+            chart,
+        }
+    }
+
+    #[test]
+    fn match_chain_anchors_pole_endpoints_by_3d_coincidence() {
+        // A pole-to-pole chord carries its own longitude, while the
+        // cycle's pole vertex is stored at one arbitrary representative
+        // of the collapsed pole row — the uv metric can never match
+        // them. The 3D pole test must.
+        let fp = unit_sphere_poly();
+        let atoms = [
+            Atom {
+                points: seam_samples(24),
+                closed: false,
+            },
+            Atom {
+                points: meridian_arc(FRAC_PI_2, -FRAC_PI_2, FRAC_PI_2, 24),
+                closed: false,
+            },
+        ];
+        let cycle = embed_cycle(&fp, &atoms, vec![(0, true), (0, false)]);
+        let (chain_poly, _) = embed_walk(&fp, &atoms, &[(1, true)], true);
+        let got = match_chain_to_cycle(
+            &cycle,
+            &chain_poly,
+            (Some(TWO_PI), None),
+            (1.0, 1.0),
+            &fp.chart,
+        );
+        assert_eq!(
+            got.first(),
+            Some(&(0, 1)),
+            "chord must anchor at the south (vertex 0) and north (vertex 1) poles"
+        );
+    }
+
+    #[test]
+    fn match_chain_allows_closed_loop_on_a_single_pole_vertex() {
+        // An imprint network that closes on itself AT a pole (the octant
+        // corner case) matches the same cycle vertex at both ends; the
+        // i != j guard must not reject it.
+        let fp = unit_sphere_poly();
+        let south = Point3::new(0.0, 0.0, -1.0);
+        let mut loop_pts = meridian_arc(FRAC_PI_2, -FRAC_PI_2, -0.3, 8);
+        loop_pts.extend(meridian_arc(PI, -0.3, -FRAC_PI_2, 8));
+        loop_pts.push(south);
+        let atoms = [
+            Atom {
+                points: seam_samples(24),
+                closed: false,
+            },
+            Atom {
+                points: loop_pts,
+                closed: false,
+            },
+        ];
+        let cycle = embed_cycle(&fp, &atoms, vec![(0, true), (0, false)]);
+        let (chain_poly, _) = embed_walk(&fp, &atoms, &[(1, true)], true);
+        let got = match_chain_to_cycle(
+            &cycle,
+            &chain_poly,
+            (Some(TWO_PI), None),
+            (1.0, 1.0),
+            &fp.chart,
+        );
+        assert_eq!(
+            got.first(),
+            Some(&(0, 0)),
+            "closed loop must anchor twice at the south pole vertex"
+        );
+    }
+
+    #[test]
+    fn imprint_chains_terminate_at_pole_junctions() {
+        // Two arcs sharing a pole endpoint: the pole is an existing
+        // topology vertex, fed to chain merging as a barrier point, so
+        // they stay separate chains; without the barrier the same
+        // junction is interior and they merge.
+        let atoms = [
+            Atom {
+                points: meridian_arc(0.0, -FRAC_PI_2, 0.0, 8),
+                closed: false,
+            },
+            Atom {
+                points: meridian_arc(FRAC_PI_2, -FRAC_PI_2, 0.0, 8),
+                closed: false,
+            },
+        ];
+        let snap = 1e-9;
+        let south = Point3::new(0.0, 0.0, -1.0);
+        let chains = merge_imprint_chains(&atoms, &[0, 1], snap, &[south]);
+        assert_eq!(chains.len(), 2, "pole junction must terminate both chains");
+        let chains = merge_imprint_chains(&atoms, &[0, 1], snap, &[]);
+        assert_eq!(chains.len(), 1, "interior junction must merge the chains");
+    }
+
+    #[test]
+    fn full_wrap_open_imprint_has_interior_poles() {
+        // A ring cut open at a single point (the clip splitting a closed
+        // imprint exactly at one pole) spans the whole period with
+        // coincident endpoints: parameters away from the cut — like the
+        // OTHER pole — are interior and must be split; the cut itself is
+        // not.
+        let curve = Curve3::circle(Point3::origin(), Vector3::x(), 1.0).expect("valid");
+        let north = Point3::new(0.0, 0.0, 1.0);
+        let south = Point3::new(0.0, 0.0, -1.0);
+        let t_n = curve.project_point(&north).t;
+        let points: Vec<Point3> = (0..=96)
+            .map(|i| curve.point(t_n + TWO_PI * i as f64 / 96.0))
+            .collect();
+        let imp = Imprint {
+            face_a: 0,
+            face_b: 0,
+            curve,
+            sampled: SampledCurve {
+                points,
+                closed: false,
+            },
+        };
+        let t_s = imp.curve.project_point(&south).t;
+        let snap = 1e-9;
+        assert!(
+            Pipeline::interior_curve_param(&imp, t_s, snap),
+            "the far pole lies mid-run and must be split"
+        );
+        assert!(
+            !Pipeline::interior_curve_param(&imp, t_n, snap),
+            "the cut point is the run boundary, not an interior split"
+        );
+    }
+
+    #[test]
+    fn embed_cycle_starting_at_pole_uses_arrival_meridian() {
+        // A region cycle whose first dart leaves a pole has no arrival
+        // longitude when the pole is embedded; the placeholder must be
+        // fixed up to the walk's closing meridian or the pole row sweeps
+        // meridians outside the region and the cover overlaps its
+        // neighbors. Band between the u = π/2 and u = 3π/2 meridians,
+        // walked up the 3π/2 side: rows must span exactly [π/2, 3π/2].
+        let fp = unit_sphere_poly();
+        let atoms = [
+            Atom {
+                points: meridian_arc(3.0 * FRAC_PI_2, -FRAC_PI_2, FRAC_PI_2, 24),
+                closed: false,
+            },
+            Atom {
+                points: meridian_arc(FRAC_PI_2, FRAC_PI_2, -FRAC_PI_2, 24),
+                closed: false,
+            },
+        ];
+        let cycle = embed_cycle(&fp, &atoms, vec![(0, true), (1, true)]);
+        assert!(
+            (cycle.area - PI * PI).abs() < 1e-6,
+            "band area must be π·π, got {}",
+            cycle.area
+        );
+        let (mut lo_u, mut hi_u) = (f64::INFINITY, f64::NEG_INFINITY);
+        for ((u, _), _) in &cycle.poly {
+            lo_u = lo_u.min(*u);
+            hi_u = hi_u.max(*u);
+        }
+        assert!(
+            (hi_u - lo_u - PI).abs() < 1e-6,
+            "cover must span exactly one π-wide band, got [{lo_u}, {hi_u}]"
+        );
+        // Even-odd containment: a meridian inside the band is in, one
+        // outside (which the unfixed placeholder row would swallow) out.
+        let mid = localize_to_window(&cycle.poly, (PI, 0.0), (Some(TWO_PI), None));
+        assert!(point_in_cycle(&cycle, mid), "u = π must be inside the band");
+        let out = localize_to_window(&cycle.poly, (0.1, 0.0), (Some(TWO_PI), None));
+        assert!(
+            !point_in_cycle(&cycle, out),
+            "u = 0.1 must be outside the band"
+        );
+    }
+
     #[test]
     fn seam_crossing_found_for_wrapping_sphere_cap_ring() {
         // A latitude cap circle wraps the sphere's u period once, so the
@@ -5638,7 +6064,13 @@ mod tests {
             poly,
         };
         let chain = [((FRAC_PI_2, TWO_PI), p), ((FRAC_PI_2, 2.0 * TWO_PI), p)];
-        let got = match_chain_to_cycle(&cycle, &chain, (Some(TWO_PI), Some(TWO_PI)), (2.5, 0.5));
+        let got = match_chain_to_cycle(
+            &cycle,
+            &chain,
+            (Some(TWO_PI), Some(TWO_PI)),
+            (2.5, 0.5),
+            &poleless_chart(),
+        );
         assert_eq!(
             got.first(),
             Some(&(1, 4)),
@@ -5702,7 +6134,13 @@ mod tests {
             poly,
         };
         let chain = [((0.005, 0.0), p), ((0.0, 999.995), p)];
-        let got = match_chain_to_cycle(&cycle, &chain, (None, None), (1000.0, 1.0));
+        let got = match_chain_to_cycle(
+            &cycle,
+            &chain,
+            (None, None),
+            (1000.0, 1.0),
+            &poleless_chart(),
+        );
         assert_eq!(
             got.first(),
             Some(&(1, 3)),
