@@ -131,6 +131,20 @@ export const OP_SPECS = {
     title: 'Uniform scale',
     groups: [{ label: 'Scale', fields: [factor(0, 'f')] }],
   },
+  taper: {
+    kind: 'transform',
+    title: 'Draft',
+    // Args: pull axis (0..2), neutral point (3..5), draft angle in degrees
+    // (6) — the kernel binding takes degrees for this feature.
+    groups: [
+      { label: 'Pull direction', fields: xyz(axis) },
+      { label: 'Neutral point', fields: xyz(coord, 3) },
+      {
+        label: 'Draft',
+        fields: [field(6, 'θ', { unit: '°', min: -89, max: 89, step: 0.5 })],
+      },
+    ],
+  },
   extrude: {
     kind: 'sweep',
     title: 'Extrude',

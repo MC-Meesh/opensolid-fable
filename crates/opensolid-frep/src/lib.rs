@@ -25,8 +25,8 @@
 //!   [`SmoothSubtraction`](blend::SmoothSubtraction) for organic fillets.
 //! - **Offset family** ([`ops`]): [`Offset`], [`Shell`], [`Rounded`],
 //!   chainable via [`SdfOpsExt`].
-//! - **Transforms** ([`transform`]): rigid [`Transformed`] plus
-//!   uniform/anisotropic scale.
+//! - **Transforms** ([`transform`]): rigid [`Transformed`], uniform/
+//!   anisotropic scale, and [`Taper`] (draft about a neutral plane).
 //! - **Profiles & sweeps** ([`profile`]): exact 2D [`Profile2D`] with
 //!   [`Extrude`] and [`Revolve`] into solids.
 //! - **Composition** ([`Shape`]): an `Arc<dyn Sdf>` handle for cheap runtime
@@ -66,4 +66,4 @@ pub use ops::{Offset, Rounded, SdfOpsExt, Shell};
 pub use profile::{Extrude, MAX_DRAFT, Profile2D, Revolve};
 pub use refine::{RefineOptions, refine_mesh};
 pub use shape::Shape;
-pub use transform::{AnisotropicScale, SdfTransformExt, Transformed, UniformScale};
+pub use transform::{AnisotropicScale, SdfTransformExt, Taper, Transformed, UniformScale};

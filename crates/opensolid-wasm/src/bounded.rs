@@ -6,6 +6,7 @@
 //! delegating wrapper.
 
 use opensolid_core::error::CoreResult;
+use opensolid_core::interval::Interval;
 use opensolid_core::mesh::TriangleMesh;
 use opensolid_core::types::{BoundingBox3, Point3, Transform3, Vector3};
 use opensolid_frep::mesh::{MeshOptions, mesh_sdf_indexed};
@@ -271,6 +272,42 @@ impl BoundedShape {
             bounds: BoundingBox3::new(
                 Point3::from(self.bounds.min.coords * factor),
                 Point3::from(self.bounds.max.coords * factor),
+            ),
+        })
+    }
+
+    /// Tapered (drafted) about the plane through `neutral_point` with normal
+    /// `pull`, by draft `angle` in radians. Sign-exact but not metric-exact
+    /// — see [`opensolid_frep::Taper`]. The tracked box is the AABB of the
+    /// tracked box's forward taper image, bounded with interval arithmetic
+    /// (conservative for any axis).
+    ///
+    /// # Errors
+    /// Propagates [`Taper::new`] validation (finite non-zero `pull`, finite
+    /// `neutral_point`, and `|angle| < π/2`).
+    pub fn taper(&self, pull: Vector3, neutral_point: Point3, angle: f64) -> CoreResult<Self> {
+        let shape = Shape::new(self.shape.clone().tapered(pull, neutral_point, angle)?);
+        // Recompute the (now-validated) parameters for the forward bounds map.
+        let axis = pull / pull.norm();
+        let neutral = axis.dot(&neutral_point.coords);
+        let rate = angle.tan();
+        let pt = Interval::point;
+        let b = &self.bounds;
+        let bx = Interval::new(b.min.x, b.max.x);
+        let by = Interval::new(b.min.y, b.max.y);
+        let bz = Interval::new(b.min.z, b.max.z);
+        // Forward map D(q) = k·q + (1 − k)·(axis·q)·axis, k = 1 + rate·(a − neutral).
+        let a = pt(axis.x) * bx + pt(axis.y) * by + pt(axis.z) * bz;
+        let k = pt(1.0) + pt(rate) * (a - pt(neutral));
+        let d = |bj: Interval, nj: f64| k * bj + (pt(1.0) - k) * a * pt(nj);
+        let dx = d(bx, axis.x);
+        let dy = d(by, axis.y);
+        let dz = d(bz, axis.z);
+        Ok(Self {
+            shape,
+            bounds: BoundingBox3::new(
+                Point3::new(dx.lo, dy.lo, dz.lo),
+                Point3::new(dx.hi, dy.hi, dz.hi),
             ),
         })
     }
@@ -854,6 +891,45 @@ mod tests {
         let mesh = s.mesh(RES, None);
         assert!(!mesh.is_empty());
         assert!(mesh.is_closed_manifold());
+    }
+
+    #[test]
+    fn taper_flares_bounds_and_meshes() {
+        // Draft a unit cube about y = 0 pulling along +Y: the +Y section
+        // widens to ±(1 + tan(0.25)) ≈ ±1.255, the −Y section pinches in.
+        let s = BoundedShape::box3(1.0, 1.0, 1.0)
+            .taper(Vector3::new(0.0, 1.0, 0.0), Point3::origin(), 0.25)
+            .expect("valid taper");
+        let flare = 1.0 + 0.25_f64.tan();
+        // The tracked box is a conservative (interval-arithmetic) superset of
+        // the flared solid: it must contain the true drafted extents.
+        assert!(s.bounds.min.x <= -flare + 1e-9 && s.bounds.max.x >= flare - 1e-9);
+        assert!(s.bounds.min.z <= -flare + 1e-9 && s.bounds.max.z >= flare - 1e-9);
+        assert!(s.bounds.min.y <= -1.0 + 1e-9 && s.bounds.max.y >= 1.0 - 1e-9);
+        assert!(s.bounds.min.x.is_finite() && s.bounds.max.y.is_finite());
+        // The flared wall is a real surface point; the pinched-in one too.
+        assert!(s.shape.eval(&Point3::new(flare, 1.0, 0.0)).abs() < 1e-9);
+        assert!(
+            s.shape
+                .eval(&Point3::new(1.0 - 0.25_f64.tan(), -1.0, 0.0))
+                .abs()
+                < 1e-9
+        );
+        assert_meshes_cleanly(&s);
+    }
+
+    #[test]
+    fn taper_rejects_bad_arguments() {
+        let s = BoundedShape::box3(1.0, 1.0, 1.0);
+        assert!(s.taper(Vector3::zeros(), Point3::origin(), 0.1).is_err());
+        assert!(
+            s.taper(
+                Vector3::new(0.0, 1.0, 0.0),
+                Point3::origin(),
+                std::f64::consts::FRAC_PI_2
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -364,6 +364,34 @@ impl WasmShape {
         })
     }
 
+    /// This shape tapered (drafted) about the plane through
+    /// `(nx, ny, nz)` with pull direction `(px, py, pz)`, by draft
+    /// `angle_degrees`. Side walls flare toward the pull direction above the
+    /// neutral plane and pinch below it — the mold-release draft about a
+    /// parting plane. The field stays sign- and surface-exact but is no
+    /// longer an exact distance, so blends applied afterward are distorted;
+    /// this is the F-Rep whole-body approximation of a face-selective draft.
+    #[allow(clippy::too_many_arguments)]
+    pub fn taper(
+        &self,
+        px: f64,
+        py: f64,
+        pz: f64,
+        nx: f64,
+        ny: f64,
+        nz: f64,
+        angle_degrees: f64,
+    ) -> Result<WasmShape, String> {
+        self.inner
+            .taper(
+                Vector3::new(px, py, pz),
+                Point3::new(nx, ny, nz),
+                angle_degrees.to_radians(),
+            )
+            .map(WasmShape::sdf_only)
+            .map_err(|e| e.to_string())
+    }
+
     /// Boolean union with `other`.
     pub fn union(&self, other: &WasmShape) -> WasmShape {
         WasmShape {
@@ -674,6 +702,28 @@ mod tests {
         let hole = WasmShape::cylinder(0.3, 2.0);
         let part = body.smooth_union(&bump, Some(0.25)).subtract(&hole);
         assert_valid(&part.mesh(48, None));
+    }
+
+    #[test]
+    fn taper_via_wasm_api() {
+        // Draft a box about the y = 0 plane pulling along +Y by 8°.
+        let drafted = WasmShape::box3(1.0, 1.0, 1.0)
+            .taper(0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 8.0)
+            .expect("valid taper");
+        assert_valid(&drafted.mesh(40, Some(1.6)));
+        // At mid-height y = 0.5 the +Y wall has flared out to x = k(0.5),
+        // so a point at x = 1 is now strictly inside; at y = −0.5 it pinches
+        // in past x = 1, leaving that point outside.
+        let tan8 = 8.0_f64.to_radians().tan();
+        assert!(drafted.distance(1.0 + 0.5 * tan8, 0.5, 0.0).abs() < 1e-6);
+        assert!(drafted.distance(1.0, 0.5, 0.0) < 0.0, "top not flared");
+        assert!(drafted.distance(1.0, -0.5, 0.0) > 0.0, "bottom not pinched");
+        // A draft at ±90° collapses the section and is rejected.
+        assert!(
+            WasmShape::box3(1.0, 1.0, 1.0)
+                .taper(0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 90.0)
+                .is_err()
+        );
     }
 
     #[test]

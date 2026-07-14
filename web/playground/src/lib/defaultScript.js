@@ -20,6 +20,9 @@ export const DEFAULT_SCRIPT = `// Build a shape with the OpenSolid API and retur
 //   .rotate(ax, ay, az, angleRad)       about axis (ax,ay,az) through origin
 //   .scale(sx, sy, sz)                  per-axis, factors > 0
 //   .uniformScale(factor)               factor > 0
+//   .taper(px,py,pz, nx,ny,nz, deg)     draft: tilt walls about the neutral
+//                                       plane through (nx,ny,nz) with pull
+//                                       axis (px,py,pz), by deg degrees
 // Booleans (each returns a new shape):
 //   .union(other)  .intersect(other)  .subtract(other)
 //   .smoothUnion(other, radius?)        blended union; radius defaults to
