@@ -463,6 +463,16 @@ impl WasmShape {
         self.inner.distance(Point3::new(x, y, z))
     }
 
+    /// Outward unit surface normal at `(x, y, z)` as `[nx, ny, nz]`, the
+    /// normalized field gradient. "Sketch on a curved face" reads this at
+    /// the picked hit point to build the tangent-plane sketch frame
+    /// (origin = pick point, normal = this vector).
+    #[wasm_bindgen(js_name = normalAt)]
+    pub fn normal_at(&self, x: f64, y: f64, z: f64) -> Vec<f64> {
+        let n = self.inner.surface_normal(Point3::new(x, y, z));
+        vec![n.x, n.y, n.z]
+    }
+
     /// Conservative axis-aligned bounding box of the surface as
     /// `[min_x, min_y, min_z, max_x, max_y, max_z]` (useful for camera
     /// framing).
@@ -813,6 +823,16 @@ mod tests {
             .subtract(&WasmShape::cylinder(0.4, 2.0))
             .validate(None);
         assert!(part.contains("\"valid\":true"), "{part}");
+    }
+
+    #[test]
+    fn normal_at_via_wasm_api() {
+        // Radial normal on the unit sphere, as [nx, ny, nz].
+        let s = WasmShape::sphere(1.0);
+        let n = s.normal_at(0.0, 0.0, 1.0);
+        assert!((n[0]).abs() < 1e-4);
+        assert!((n[1]).abs() < 1e-4);
+        assert!((n[2] - 1.0).abs() < 1e-4);
     }
 
     #[test]

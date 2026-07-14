@@ -388,6 +388,17 @@ impl BoundedShape {
         self.shape.eval(&point)
     }
 
+    /// Outward unit surface normal at `point`, the normalized field
+    /// gradient (F-Rep normals are exact where the field is smooth). On a
+    /// point off the surface it is still the field's ascent direction, so
+    /// "sketch on a curved face" can take the normal at the picked hit
+    /// point directly. Returns `+X` as a stable fallback where the gradient
+    /// vanishes (a flat interior, or a non-differentiable locus).
+    pub fn surface_normal(&self, point: Point3) -> Vector3 {
+        let g = opensolid_frep::eval::gradient(&self.shape, &point);
+        g.try_normalize(0.0).unwrap_or_else(Vector3::x)
+    }
+
     /// Mesh the shape on a `resolution`³ grid. With `bound` set, the grid
     /// covers the explicit cube `[-bound, bound]³`; otherwise bounds are
     /// auto-derived from the tracked bounding box (see [`Self::mesh_bounds`]).
@@ -730,6 +741,27 @@ mod tests {
         let inside_hole = Point3::new(0.0, 0.0, 0.0);
         assert!(part.distance(inside_hole) > 0.0);
         assert!(hole.distance(inside_hole) < 0.0);
+    }
+
+    #[test]
+    fn surface_normal_points_outward_and_follows_transforms() {
+        // Sphere normals are radial: the outward unit normal at a surface
+        // point equals that point (unit sphere).
+        let s = BoundedShape::sphere(1.0);
+        let n = s.surface_normal(Point3::new(0.0, 1.0, 0.0));
+        assert!((n - Vector3::new(0.0, 1.0, 0.0)).norm() < 1e-4);
+
+        // Off-surface points still report the ascent direction (radial).
+        let n2 = s.surface_normal(Point3::new(3.0, 0.0, 0.0));
+        assert!((n2 - Vector3::new(1.0, 0.0, 0.0)).norm() < 1e-4);
+
+        // A moved sphere's normal at its shifted north pole still points +Y.
+        let moved = s.translate(Vector3::new(5.0, 0.0, 0.0));
+        let n3 = moved.surface_normal(Point3::new(5.0, 1.0, 0.0));
+        assert!((n3 - Vector3::new(0.0, 1.0, 0.0)).norm() < 1e-4);
+
+        // Result is a unit vector.
+        assert!((n.norm() - 1.0).abs() < 1e-9);
     }
 
     #[test]

@@ -184,6 +184,18 @@ function sweepArg(kind, value) {
   return kind === 'extrude' ? Math.abs(value) : value;
 }
 
+/** The "from surface" backoff for an extrude: on a curved tangent-plane
+ * sketch (of-fsl.5) a boss must start below the tangent plane so it lands
+ * flush on the actual curved surface with no gap. `sweep.backoff` (only set
+ * for a curved face-plane boss) sinks the column's base that far along
+ * -normal; unioning with the body then clips it flush. 0 (no backoff)
+ * everywhere else, so blind/symmetric/through/toFace are unchanged. */
+function fromSurfaceBackoff(sweep) {
+  if (sweep.kind !== 'extrude' || !isFacePlane(sweep.plane)) return 0;
+  const backoff = sweep.backoff ?? 0;
+  return backoff > 0 ? backoff : 0;
+}
+
 /**
  * Resolve an extrude's end condition into the concrete pieces the shared
  * builders consume:
@@ -210,7 +222,20 @@ export function extrudePlan(sweep) {
   const origin = planeToWorld(sweep.plane, 0, 0);
 
   if (end === 'blind') {
-    return { param: value, height: Math.abs(value), draft, postExtra: [], clip: null };
+    // A curved "from surface" boss sinks its base `backoff` below the tangent
+    // plane (along -normal) and grows the column by the same amount, so it
+    // buries into the body and unions flush onto the actual curved surface
+    // with no gap, while the outward extent stays `value` (of-fsl.5).
+    // `backoff` is 0 for every ordinary blind extrude, leaving them exactly
+    // as before.
+    const backoff = fromSurfaceBackoff(sweep);
+    return {
+      param: value,
+      height: Math.abs(value) + backoff,
+      draft,
+      postExtra: backoff ? [{ op: 'translate', args: scale3(n, -backoff) }] : [],
+      clip: null,
+    };
   }
   if (end === 'symmetric' || end === 'through') {
     // Extrude forward, then slide back half the height so the span straddles

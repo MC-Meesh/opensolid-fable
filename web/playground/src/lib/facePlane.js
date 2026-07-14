@@ -211,10 +211,12 @@ function growFaceRegion(positions, indices, faceIndex, neighbors, offsetTol) {
   for (let k = 0; k < 3; k += 1) centroid[k] /= totalArea;
 
   const cosSpread = Math.cos((SPREAD_TOL_DEG * Math.PI) / 180);
+  let curved = false;
   for (const tri of accepted) {
     const n = normalize(triAreaNormal(positions, indices, tri));
     if (n && dot(n, normal) < cosSpread) {
-      return { planar: false, reason: 'face is curved', tris };
+      curved = true;
+      break;
     }
   }
 
@@ -229,12 +231,45 @@ function growFaceRegion(positions, indices, faceIndex, neighbors, offsetTol) {
     }
   }
 
+  // A curved region is no longer a dead end: it carries the seed triangle's
+  // local normal (the surface normal right under the cursor, a good fallback
+  // for the exact F-Rep gradient) plus a centroid and radius so callers can
+  // sketch on the tangent plane at the pick point (see `makeTangentPlane`).
+  if (curved) {
+    return {
+      planar: false,
+      curved: true,
+      reason: 'face is curved',
+      normal: seedNormal,
+      centroid,
+      extent,
+      tris,
+    };
+  }
+
   const { u, v } = facePlaneBasis(normal);
   return {
     planar: true,
     plane: { origin: centroid, normal, u, v, extent },
     tris,
   };
+}
+
+/**
+ * Build a tangent-plane sketch frame for "sketch on a curved face": a face
+ * plane `{ origin, normal, u, v, extent }` kissing the surface at the pick
+ * point. `origin` is the picked hit point, `normal` the outward surface
+ * normal there (from the F-Rep field gradient — the caller passes the exact
+ * value; a mesh-triangle normal is a fine fallback), `(u, v)` a right-handed
+ * basis with `u × v = normal` (same convention as `facePlaneBasis`), and
+ * `extent` the indicator/grid radius. Same shape a planar face yields, so it
+ * flows through the existing face-sketch and sweep machinery unchanged.
+ */
+export function makeTangentPlane(origin, normal, extent) {
+  const n = normalize(normal);
+  if (!n) throw new Error('tangent-plane normal is zero');
+  const { u, v } = facePlaneBasis(n);
+  return { origin: [origin[0], origin[1], origin[2]], normal: n, u, v, extent };
 }
 
 /**

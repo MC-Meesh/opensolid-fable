@@ -714,3 +714,94 @@ describe('opsBounds', () => {
     });
   });
 });
+
+describe('from-surface backoff (curved-face boss, of-fsl.5)', () => {
+  const ops = profileToOps(SQUARE);
+  const n = planeNormal(FACE_PLANE);
+  const SKETCH_VERTS = [
+    [0, 0],
+    [2, 0],
+    [2, 1],
+    [0, 1],
+  ];
+
+  it('sinks the column base backoff below the tangent plane, top unchanged', () => {
+    const h = 2;
+    const b = 0.5;
+    // Kernel spans native y ∈ [0, h + b]; carried through the post-ops each
+    // sketch point's base sits at planeToWorld - b*n and its outward face
+    // still at planeToWorld + h*n.
+    const native = nativeSweepOps(profileToOps({ ...SQUARE, plane: FACE_PLANE }), FACE_PLANE, 'extrude');
+    const post = sweepPostOps(FACE_PLANE, 'extrude', h, b);
+    const edges = opsVerts(native).map(([p, q]) => [
+      applyPostOps([p, 0, q], post),
+      applyPostOps([p, h + b, q], post),
+    ]);
+    for (const [u, v] of SKETCH_VERTS) {
+      const world = planeToWorld(FACE_PLANE, u, v);
+      const base = world.map((c, i) => c - b * n[i]);
+      const top = world.map((c, i) => c + h * n[i]);
+      const hit = edges.some(
+        ([a, c]) =>
+          (closeTo3(a, base) && closeTo3(c, top)) || (closeTo3(a, top) && closeTo3(c, base))
+      );
+      expect(hit, `vertex (${u}, ${v})`).toBe(true);
+    }
+  });
+
+  it('backoff defaults to 0: no change to a plain face-plane extrude', () => {
+    const withZero = sweepPostOps(FACE_PLANE, 'extrude', 2, 0);
+    const without = sweepPostOps(FACE_PLANE, 'extrude', 2);
+    expect(withZero).toEqual(without);
+  });
+
+  it('buildSweepShape feeds the kernel |height| + backoff and buries the base', () => {
+    const shape = buildSweepShape(FakeShape, FakeProfile, {
+      kind: 'extrude',
+      plane: FACE_PLANE,
+      ops,
+      value: 2,
+      backoff: 0.5,
+    });
+    // Outer wrapper is the translate to origin - backoff*n; inner is extrude
+    // with height 2 + 0.5.
+    expect(shape.desc[0]).toBe('translate');
+    const want = FACE_PLANE.origin.map((c, i) => c - 0.5 * n[i]);
+    expect(closeTo3(shape.desc.slice(2), want)).toBe(true);
+    expect(shape.desc[1][0]).toBe('rotate');
+    expect(shape.desc[1][1][0]).toBe('extrude');
+    expect(shape.desc[1][1][2]).toBeCloseTo(2.5, 12);
+  });
+
+  it('sweepTreeNode bakes height + backoff and unions with the body', () => {
+    const root = { id: 7, op: 'sphere', args: [1], children: [] };
+    const node = sweepTreeNode(root, {
+      kind: 'extrude',
+      plane: FACE_PLANE,
+      ops,
+      value: 2,
+      backoff: 0.5,
+    });
+    expect(node.op).toBe('union');
+    expect(node.children[0]).toBe(root);
+    // The extrude leaf carries the lengthened height (concrete geometry, no
+    // new op needed — serializes through the normal extrude path).
+    const script = serializeTree(node);
+    expect(script).toContain('Shape.extrude(p1, 2.5)');
+    expect(script).toContain('.union(');
+  });
+
+  it('ignores backoff on named planes and on revolve (face-plane extrude only)', () => {
+    expect(sweepPostOps('XY', 'extrude', 2, 0.5)).toEqual(sweepPostOps('XY', 'extrude', 2));
+    // Named-plane extrude routed through buildSweepShape keeps height = |value|.
+    const xy = buildSweepShape(FakeShape, FakeProfile, {
+      kind: 'extrude',
+      plane: 'XY',
+      ops,
+      value: 2,
+      backoff: 0.5,
+    });
+    // translate -> rotate -> extrude(height 2), backoff dropped for named planes.
+    expect(xy.desc[1][1][2]).toBe(2);
+  });
+});

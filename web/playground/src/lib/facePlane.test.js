@@ -4,6 +4,7 @@ import {
   createFaceRegionIndex,
   detectFacePlane,
   facePlaneBasis,
+  makeTangentPlane,
 } from './facePlane.js';
 
 const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
@@ -169,11 +170,17 @@ describe('detectFacePlane', () => {
     expect(closeTo3(front.plane.origin, [0.5, 0.5, 1])).toBe(true);
   });
 
-  it('rejects curved faces', () => {
+  it('flags curved faces as sketchable with a local normal and extent', () => {
     const { positions, indices } = curvedStrip(2, Math.PI / 2, 32);
     const result = detectFacePlane(positions, indices, 10);
     expect(result.planar).toBe(false);
-    expect(result.reason).toMatch(/curved|too small/);
+    expect(result.curved).toBe(true);
+    expect(result.reason).toBe('face is curved');
+    // The seed triangle's normal is radial on the cylinder (unit length).
+    expect(Math.hypot(...result.normal)).toBeCloseTo(1, 6);
+    expect(result.normal[1]).toBeCloseTo(0, 6); // no Y component
+    expect(result.extent).toBeGreaterThan(0);
+    expect(result.tris.length).toBeGreaterThan(3);
   });
 
   it('rejects regions too small to classify (a lone coarse facet)', () => {
@@ -203,6 +210,33 @@ describe('detectFacePlane', () => {
     expect(result.tris).toHaveLength(32);
     expect(result.tris).toContain(0);
     expect(result.tris).not.toContain(32);
+  });
+});
+
+describe('makeTangentPlane', () => {
+  it('builds a face-plane frame at the pick point with a right-handed basis', () => {
+    const plane = makeTangentPlane([1, 2, 3], [0, 0, 5], 0.7);
+    expect(closeTo3(plane.origin, [1, 2, 3])).toBe(true);
+    // Normal is normalized.
+    expect(closeTo3(plane.normal, [0, 0, 1])).toBe(true);
+    expect(plane.extent).toBe(0.7);
+    // u × v = normal, and both are unit and orthogonal to the normal.
+    expect(closeTo3(cross(plane.u, plane.v), plane.normal)).toBe(true);
+    expect(Math.hypot(...plane.u)).toBeCloseTo(1, 9);
+    expect(Math.hypot(...plane.v)).toBeCloseTo(1, 9);
+    expect(dot(plane.u, plane.normal)).toBeCloseTo(0, 9);
+    expect(dot(plane.v, plane.normal)).toBeCloseTo(0, 9);
+  });
+
+  it('copies the origin (no aliasing of the caller array)', () => {
+    const origin = [4, 5, 6];
+    const plane = makeTangentPlane(origin, [1, 0, 0], 1);
+    origin[0] = 99;
+    expect(plane.origin[0]).toBe(4);
+  });
+
+  it('throws on a zero normal', () => {
+    expect(() => makeTangentPlane([0, 0, 0], [0, 0, 0], 1)).toThrow(/normal is zero/);
   });
 });
 

@@ -23,7 +23,7 @@ import { buildFeatures, pruneTree, resolveKeys } from './lib/featureTree.js';
 import { PALETTE } from './lib/shapeGraph.js';
 import { addPrimitiveNode, assertStoreConsistency } from './lib/storeSync.js';
 import { buildSweepShape, opsBounds, profileToOps, sweepTreeNode } from './lib/sweep.js';
-import { createFaceRegionIndex } from './lib/facePlane.js';
+import { createFaceRegionIndex, makeTangentPlane } from './lib/facePlane.js';
 import { isFacePlane } from './lib/sketch/profile.js';
 import { faceRefFromPlane, planarRegionsOf, resolveRefs } from './lib/persistentRef.js';
 import { computeRebuildState } from './lib/rebuildState.js';
@@ -455,6 +455,22 @@ export default function App() {
     return faceRegionsRef.current.index;
   }, []);
 
+  // Exact outward surface normal at a world point, from the current body's
+  // F-Rep field gradient (WasmShape.normalAt). Falls back to `fallback` (the
+  // mesh-region normal) if the WASM build predates normalAt or the gradient
+  // is unusable, so curved-face sketching still works on a stale package.
+  const surfaceNormalAt = useCallback((point, fallback) => {
+    const shape = tracedRef.current?.root?.shape;
+    if (shape && typeof shape.normalAt === 'function') {
+      const n = shape.normalAt(...point);
+      if (n && n.length === 3 && Number.isFinite(n[0] + n[1] + n[2])) {
+        const len = Math.hypot(n[0], n[1], n[2]);
+        if (len > 1e-9) return [n[0] / len, n[1] / len, n[2] / len];
+      }
+    }
+    return fallback;
+  }, []);
+
   const handlePick = useCallback(
     (point, faceIndex) => {
       const root = tracedRef.current?.root;
@@ -478,7 +494,18 @@ export default function App() {
       }
       // Remember the clicked mesh face (independent of the body-selection
       // toggle) so "Sketch" can open on it and the viewport can tint it.
-      setPickedFace(region ? { ...region, meshKey: meshRef.current.key } : null);
+      // A curved face is no longer a dead end: derive a tangent-plane sketch
+      // frame at the pick point, its normal taken from the F-Rep field
+      // gradient (exact) with the mesh-region normal as a fallback (of-fsl.5).
+      let faceInfo = region ? { ...region, meshKey: meshRef.current.key } : null;
+      if (region?.curved && point) {
+        const normal = surfaceNormalAt(point, region.normal);
+        faceInfo = {
+          ...faceInfo,
+          plane: { ...makeTangentPlane(point, normal, region.extent), curved: true },
+        };
+      }
+      setPickedFace(faceInfo);
       const candidates = pickCandidates(root);
       const picked = pickNodeAt(candidates, point);
       if (picked) {
@@ -487,7 +514,7 @@ export default function App() {
         clearSelection();
       }
     },
-    [selectNode, clearSelection, faceRegions, sweep]
+    [selectNode, clearSelection, faceRegions, sweep, surfaceNormalAt]
   );
 
   // Hover highlight: resolve the pointer's triangle to its planar face
@@ -853,6 +880,12 @@ export default function App() {
       }
       const { min, max } = opsBounds(ops);
       const extent = Math.max(max[0] - min[0], max[1] - min[1]) || 1;
+      // On a curved (tangent-plane) sketch, a boss must dip below the surface
+      // to land flush with no gap: back its base off along -normal by ~half
+      // the footprint, which safely exceeds a convex face's drop below its
+      // tangent plane for the small bosses this targets. The kernel absorbs
+      // the buried part when the sweep unions with the body (of-fsl.5).
+      const fromSurface = kind === 'extrude' && isFacePlane(profile.plane) && profile.plane.curved;
       clearSelection();
       setSweepError(null);
       setSketchOpen(false);
@@ -870,6 +903,9 @@ export default function App() {
               draft: 0,
               reach: sceneReach(tracedRef.current?.root, extent),
               target: null,
+              // A curved tangent-plane boss buries its base to land flush
+              // on the surface (of-fsl.5); no-op for planar sketches.
+              ...(fromSurface ? { backoff: 0.5 * extent } : {}),
             }
           : { kind, plane: profile.plane, ops, value: 360, range: 360 }
       );
@@ -935,20 +971,17 @@ export default function App() {
   }, [sweep, wasm]);
 
   // SolidWorks entry gesture: with a face picked, Sketch opens ON that face
-  // (of-4eh.16). A curved face keeps the button honest with a toast instead
-  // of silently sketching on a facet.
+  // (of-4eh.16). A planar face sketches on its plane; a curved face sketches
+  // on the tangent plane at the pick point (of-fsl.5). Only faces that carry
+  // no usable plane (too small, degenerate) fall back to a toast.
   const handleSketchToggle = useCallback(() => {
     if (!sketchOpen) {
-      if (pickedFace?.planar) {
+      if (pickedFace?.plane) {
         setSketchPlane(pickedFace.plane);
         setPickedFace(null);
       } else {
         if (pickedFace) {
-          setToast(
-            pickedFace.reason === 'face is curved'
-              ? 'Sketch on curved faces is not supported yet'
-              : `Cannot sketch on this face: ${pickedFace.reason}`
-          );
+          setToast(`Cannot sketch on this face: ${pickedFace.reason}`);
           return;
         }
         // No face picked: never reopen on a stale face plane.
