@@ -33,15 +33,27 @@ function render(overrides = {}) {
 }
 
 describe('MainToolbar', () => {
-  it('renders the four workflow groups with labeled buttons', () => {
+  it('renders the workflow groups with labeled buttons', () => {
     const html = render();
     expect(html).toContain('Sketch');
     expect(html).toContain('Features');
     expect(html).toContain('View');
+    expect(html).toContain('Drawing');
     expect(html).toContain('Export');
     for (const label of ['Extrude', 'Revolve', 'Fit', 'Front', 'Top', 'Right', 'Iso', 'Wireframe', 'Section', 'STL', 'STEP']) {
       expect(html).toContain(label);
     }
+  });
+
+  it('makes sketch and drawing mutually exclusive', () => {
+    // Drawing open disables the Sketch button (Drawing itself becomes Exit).
+    const drawing = render({ drawingOpen: true });
+    expect(drawing).toMatch(/<button[^>]*disabled[^>]*aria-label="Sketch"/);
+    expect(drawing).toContain('Exit Drawing');
+    // Sketch open disables the Drawing button.
+    const sketch = render({ sketchOpen: true });
+    expect(sketch).toMatch(/<button[^>]*disabled[^>]*aria-label="Drawing"/);
+    expect(sketch).toContain('Exit Sketch');
   });
 
   it('explains faceted export of organic shapes in the STEP tooltip', () => {

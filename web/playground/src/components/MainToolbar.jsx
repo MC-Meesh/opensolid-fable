@@ -42,6 +42,12 @@ const Icons = {
       <path d="M8 8 V2.5 M5.5 5 L8 2.5 L10.5 5" />
     </svg>
   ),
+  drawing: (
+    <svg {...ICON}>
+      <rect x="2.5" y="2.5" width="11" height="11" rx="0.5" />
+      <path d="M4.5 4.5 h3 v3 h-3 Z M9 5 h2.5 M9 7 h2.5 M4.5 10 h7" />
+    </svg>
+  ),
   revolve: (
     <svg {...ICON}>
       <path d="M8 1.5 V14.5" strokeDasharray="2 1.6" />
@@ -143,6 +149,8 @@ export default function MainToolbar({
   sketchOpen,
   sketchOnFace = false,
   onSketchToggle,
+  drawingOpen,
+  onDrawingToggle,
   canSweep,
   sweepDisabledReason,
   onSweep,
@@ -192,9 +200,9 @@ export default function MainToolbar({
               ? 'Open a 2D sketch on the picked face'
               : 'Open a 2D sketch on a standard plane (or pick a flat face first)'
           }
-          disabledReason={notReady}
+          disabledReason={disabled ? notReady : 'Exit the drawing first'}
           active={sketchOpen}
-          disabled={disabled}
+          disabled={disabled || drawingOpen}
           onClick={onSketchToggle}
         />
       </div>
@@ -284,6 +292,19 @@ export default function MainToolbar({
           disabled={disabled}
           compact
           onClick={onSectionToggle}
+        />
+      </div>
+      <div className="tool-sep" />
+      <div className="tool-group" aria-label="Drawing">
+        <span className="tool-group-label">Drawing</span>
+        <ToolButton
+          icon="drawing"
+          label={drawingOpen ? 'Exit Drawing' : 'Drawing'}
+          title="Open a 2D orthographic drawing of the current body (front/top/right/iso)"
+          disabledReason={disabled ? notReady : 'Exit the sketch first'}
+          active={drawingOpen}
+          disabled={disabled || sketchOpen}
+          onClick={onDrawingToggle}
         />
       </div>
       <div className="tool-sep" />
