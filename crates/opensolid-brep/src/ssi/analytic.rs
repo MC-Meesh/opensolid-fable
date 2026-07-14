@@ -16,10 +16,13 @@
 //! cylinder-sphere with the center on the axis, sphere-torus with the
 //! center on the torus axis, coaxial cylinder-torus and torus-torus — via
 //! their shared meridian profile (circles of latitude about the common
-//! axis). Configurations whose intersection needs curves we cannot
-//! represent yet (plane-cone parabolas/hyperbolas, oblique plane-torus,
-//! skew or unequal-radius cylinder pairs, off-axis sphere/torus quartics)
-//! return [`CoreError::NotImplemented`] — never a misleading `Empty`.
+//! axis). Coaxial cone-cone joins them: two cones sharing an axis line meet
+//! in a single latitude circle where their profile rays cross (or a shared
+//! apex point, or coincide). Configurations whose intersection needs curves
+//! we cannot represent yet (plane-cone parabolas/hyperbolas, non-coaxial
+//! cone-cone quartics, oblique plane-torus, skew or unequal-radius cylinder
+//! pairs, off-axis sphere/torus quartics) return
+//! [`CoreError::NotImplemented`] — never a misleading `Empty`.
 //! The sphere/torus pairs' general positions march instead: see
 //! [`super::intersect_marched`].
 //!
@@ -118,8 +121,10 @@ pub fn intersect(
         (Cylinder { .. }, Torus { .. }) => cylinder_torus(a, b, tol),
         (Torus { .. }, Cylinder { .. }) => cylinder_torus(b, a, tol),
         (Torus { .. }, Torus { .. }) => torus_torus(a, b, tol),
+        (Cone { .. }, Cone { .. }) => cone_cone(a, b, tol),
         _ => Err(CoreError::NotImplemented {
-            feature: "analytic SSI for cone pairs other than plane-cone",
+            feature: "analytic SSI for cone pairs other than plane-cone \
+                      and coaxial cone-cone",
         }),
     }
 }
@@ -907,6 +912,97 @@ fn torus_torus(
     ))
 }
 
+/// Exact intersection of two cones sharing a common axis line.
+///
+/// In the meridian half-plane (distance `rho` from the axis, height `h`
+/// along it from cone 1's apex) each single-nappe cone is a ray from its
+/// apex, widening at its half-angle: `rho1(h) = tan α1 · h` for `h ≥ 0`, and
+/// `rho2(h) = tan α2 · dir2 · (h − z2)` valid on `dir2·(h − z2) ≥ 0`, where
+/// `dir2 = ±1` is cone 2's widening sense along the common axis and `z2` its
+/// apex height. Two distinct rays cross at most once, so a coaxial pair meets
+/// in at most a single circle of latitude — never the two circles a full
+/// double-cone quadric would give, since [`ray_surface_hits`](crate::boolean)
+/// fixes the physical cone as the single nappe. The crossing is always
+/// transversal (equal profile slopes are the parallel/coincident case, not a
+/// tangency); a crossing that lands on the axis is the cones' shared apex, a
+/// degenerate [`SurfaceIntersection::TangentPoint`].
+///
+/// Non-coaxial cone pairs (skew or parallel-but-offset axes) are quartics
+/// with no [`Curve3`] closed form and return [`CoreError::NotImplemented`];
+/// the boolean pipeline marches those (`ssi::intersect_marched_bounded`).
+fn cone_cone(
+    a: &Surface3,
+    b: &Surface3,
+    tol: &ToleranceContext,
+) -> CoreResult<SurfaceIntersection> {
+    let (
+        &Surface3::Cone {
+            origin: o1,
+            axis: a1,
+            half_angle: alpha1,
+            radius: r1,
+        },
+        &Surface3::Cone {
+            origin: o2,
+            axis: a2,
+            half_angle: alpha2,
+            radius: r2,
+        },
+    ) = (a, b)
+    else {
+        unreachable!("dispatched on Cone/Cone")
+    };
+
+    let apex1 = o1 - a1 * (r1 / alpha1.tan());
+    let apex2 = o2 - a2 * (r2 / alpha2.tan());
+
+    // Coaxial requires collinear axes: parallel directions and cone 2's apex
+    // on cone 1's axis line. Everything else is the general quartic.
+    let axis = a1;
+    let m = apex2 - apex1;
+    let z2 = axis.dot(&m);
+    if !tol.vectors_parallel(&a1, &a2) || !tol.vector_approx_zero(&(m - axis * z2)) {
+        return Err(CoreError::NotImplemented {
+            feature: "non-coaxial cone-cone intersection (general quartic; \
+                      use ssi::intersect_marched_bounded)",
+        });
+    }
+
+    let (t1, t2) = (alpha1.tan(), alpha2.tan());
+    let dir2 = if axis.dot(&a2) >= 0.0 { 1.0 } else { -1.0 };
+
+    // Solve rho1(h) = rho2(h):  h·(t1 − t2·dir2) = −t2·dir2·z2.
+    let denom = t1 - t2 * dir2;
+    if tol.approx_zero(denom) {
+        // Equal half-angle and widening sense: parallel profile rays. They
+        // coincide only when the apexes do, otherwise never meet.
+        return Ok(if tol.approx_zero(z2) {
+            SurfaceIntersection::Coincident
+        } else {
+            SurfaceIntersection::Empty
+        });
+    }
+    let h = -t2 * dir2 * z2 / denom;
+    let rho = t1 * h;
+
+    // The crossing must sit on both physical (single-nappe) rays.
+    if h < -tol.linear || dir2 * (h - z2) < -tol.linear {
+        return Ok(SurfaceIntersection::Empty);
+    }
+
+    let center = apex1 + axis * h;
+    Ok(if tol.approx_zero(rho) {
+        // On the axis: the cones touch only at their shared apex.
+        SurfaceIntersection::TangentPoint(center)
+    } else {
+        SurfaceIntersection::transversal(vec![Curve3::Circle {
+            center,
+            axis,
+            radius: rho,
+        }])
+    })
+}
+
 /// Midpoint of two points (avoids pulling nalgebra into scope here).
 fn na_center(a: &Point3, b: &Point3) -> Point3 {
     Point3::from((a.coords + b.coords) / 2.0)
@@ -1244,6 +1340,108 @@ mod tests {
         // Normal ⟂ axis gives a hyperbola (or generator pair) — out of MVP.
         let result = intersect(&plane_x(0.5), &cone_30deg(), &tol());
         assert!(matches!(result, Err(CoreError::NotImplemented { .. })));
+    }
+
+    // ── cone-cone (coaxial) ─────────────────────────────────────────────
+
+    /// `Surface3::Cone` from apex-agnostic fields, half-angle from a slope.
+    fn cone(origin: Point3, axis: Vector3, tan_half: f64, radius: f64) -> Surface3 {
+        Surface3::Cone {
+            origin,
+            axis: axis.normalize(),
+            half_angle: tan_half.atan(),
+            radius,
+        }
+    }
+
+    #[test]
+    fn cone_cone_opposed_single_circle() {
+        // A: r=2 at z=0, apex at z=3 (widens toward −z, slope 2/3).
+        // B: apex at z=1, r=2 at z=4 (widens toward +z, slope 2/3).
+        // Walls cross at z=2, ρ=2/3 — one transversal latitude circle.
+        let a = cone(Point3::new(0.0, 0.0, 0.0), -Vector3::z(), 2.0 / 3.0, 2.0);
+        let b = cone(Point3::new(0.0, 0.0, 1.0), Vector3::z(), 2.0 / 3.0, 0.0);
+        let curves = expect_curves(&a, &b, 1);
+        assert_eq!(curves[0].kind, IntersectionKind::Transversal);
+        let Curve3::Circle { center, radius, .. } = &curves[0].curve else {
+            panic!("expected a circle, got {:?}", curves[0].curve);
+        };
+        assert!((center - Point3::new(0.0, 0.0, 2.0)).norm() < EPS);
+        assert!((radius - 2.0 / 3.0).abs() < EPS);
+    }
+
+    #[test]
+    fn cone_cone_coincident() {
+        // Two frames on the same infinite cone (same apex/axis/half-angle).
+        let a = cone(Point3::new(0.0, 0.0, 0.0), -Vector3::z(), 2.0 / 3.0, 2.0);
+        let b = cone(
+            Point3::new(0.0, 0.0, 1.0),
+            -Vector3::z(),
+            2.0 / 3.0,
+            4.0 / 3.0,
+        );
+        assert_eq!(
+            intersect(&a, &b, &tol()).unwrap(),
+            SurfaceIntersection::Coincident
+        );
+    }
+
+    #[test]
+    fn cone_cone_shared_apex_tangent_point() {
+        // Nested cones sharing an apex and axis, different half-angles: they
+        // touch only at the apex.
+        let a = cone(Point3::origin(), Vector3::z(), FRAC_PI_6.tan(), 0.0);
+        let b = cone(Point3::origin(), Vector3::z(), 0.5, 0.0);
+        let SurfaceIntersection::TangentPoint(p) = intersect(&a, &b, &tol()).unwrap() else {
+            panic!("expected the shared apex as a tangent point");
+        };
+        assert!((p - Point3::origin()).norm() < EPS);
+    }
+
+    #[test]
+    fn cone_cone_parallel_walls_empty() {
+        // Equal half-angle and widening sense, apexes offset along the axis:
+        // parallel profile rays that never meet.
+        let a = cone(Point3::new(0.0, 0.0, 0.0), Vector3::z(), 0.5, 0.0);
+        let b = cone(Point3::new(0.0, 0.0, 1.0), Vector3::z(), 0.5, 0.0);
+        assert_eq!(
+            intersect(&a, &b, &tol()).unwrap(),
+            SurfaceIntersection::Empty
+        );
+    }
+
+    #[test]
+    fn cone_cone_apexes_pointing_apart_empty() {
+        // Nearby apexes widening away from each other: the wall crossing lands
+        // on neither physical (single) nappe.
+        let a = cone(Point3::new(0.0, 0.0, 0.0), Vector3::z(), 0.5, 0.0);
+        let b = cone(Point3::new(0.0, 0.0, -1.0), -Vector3::z(), 0.5, 0.0);
+        assert_eq!(
+            intersect(&a, &b, &tol()).unwrap(),
+            SurfaceIntersection::Empty
+        );
+    }
+
+    #[test]
+    fn cone_cone_non_coaxial_not_implemented() {
+        // Skew axes: the general quartic, marched by the boolean pipeline.
+        let a = cone(Point3::origin(), Vector3::z(), 0.5, 1.0);
+        let b = cone(Point3::new(0.0, 0.0, 1.0), Vector3::x(), 0.5, 1.0);
+        assert!(matches!(
+            intersect(&a, &b, &tol()),
+            Err(CoreError::NotImplemented { .. })
+        ));
+    }
+
+    #[test]
+    fn cone_cone_parallel_offset_axes_not_implemented() {
+        // Parallel axes but distinct axis lines — still the general quartic.
+        let a = cone(Point3::origin(), Vector3::z(), 0.5, 1.0);
+        let b = cone(Point3::new(3.0, 0.0, 0.0), Vector3::z(), 0.5, 1.0);
+        assert!(matches!(
+            intersect(&a, &b, &tol()),
+            Err(CoreError::NotImplemented { .. })
+        ));
     }
 
     // ── plane-torus ────────────────────────────────────────────────────
