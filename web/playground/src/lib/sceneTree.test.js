@@ -3,6 +3,7 @@ import {
   createTracer,
   freeNodes,
   nodeLabel,
+  profileSegStatement,
   runTracedScript,
   scriptHeader,
   serializeTree,
@@ -486,5 +487,25 @@ describe('sweep ops (extrude / revolve)', () => {
     expect(script).toContain('const s1 = Shape.extrude(p1, 2);');
     const again = runTracedScript(script, FakeShape, FakeProfile);
     expect(serializeTree(again.root)).toBe(script);
+  });
+});
+
+describe('profileSegStatement', () => {
+  it('emits lineTo for a bulge-0 segment', () => {
+    expect(profileSegStatement('p', { x: 1, y: 2, bulge: 0 })).toBe('p.lineTo(1, 2);');
+  });
+
+  it('emits arcTo for a bulged segment', () => {
+    expect(profileSegStatement('p', { x: 1, y: 2, bulge: 0.5 })).toBe('p.arcTo(1, 2, 0.5);');
+  });
+
+  it('emits ellipseArcTo naming the ellipse geometry', () => {
+    const seg = { kind: 'ellipse', x: -1, y: 0, cx: 0, cy: 0, rx: 2, ry: 1, rotation: 0, ccw: true };
+    expect(profileSegStatement('p', seg)).toBe('p.ellipseArcTo(-1, 0, 0, 0, 2, 1, 0, true);');
+  });
+
+  it('emits cubicTo with control points first', () => {
+    const seg = { kind: 'spline', x: 0, y: 1, c1x: 1, c1y: 2, c2x: 3, c2y: 4 };
+    expect(profileSegStatement('p', seg)).toBe('p.cubicTo(1, 2, 3, 4, 0, 1);');
   });
 });

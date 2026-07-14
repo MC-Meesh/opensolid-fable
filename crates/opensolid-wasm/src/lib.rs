@@ -18,22 +18,23 @@ use bounded::{BoundedShape, flatten_mesh};
 use exact::{ExactPrim, ExactRep, ExactSpec};
 use opensolid_core::mesh::TriangleMesh;
 use opensolid_core::types::{Point3, Vector3};
-use opensolid_frep::Profile2D;
+use opensolid_frep::{Profile2D, SegmentSpec};
 use opensolid_kernel::brep::BooleanOp;
 use opensolid_kernel::mass_properties;
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 
 /// Closed 2D profile builder for [`WasmShape::extrude`] and
-/// [`WasmShape::revolve`]: start at a point, chain `lineTo`/`arcTo`, then
-/// `close()`. Arcs use the DXF bulge convention: `bulge = tan(sweep / 4)`,
-/// positive sweeping counter-clockwise (`1` is a CCW semicircle).
+/// [`WasmShape::revolve`]: start at a point, chain `lineTo` / `arcTo` /
+/// `ellipseArcTo` / `cubicTo`, then `close()`. Circular arcs use the DXF
+/// bulge convention (`bulge = tan(sweep / 4)`, positive = counter-clockwise,
+/// `1` = CCW semicircle); elliptical arcs and cubic Béziers name their
+/// geometry directly.
 #[wasm_bindgen]
 pub struct WasmProfile2D {
-    points: Vec<[f64; 2]>,
-    /// Bulge of the segment leaving `points[i]`; `len == points.len() - 1`
-    /// until `close()` completes the loop.
-    bulges: Vec<f64>,
+    start: [f64; 2],
+    /// Typed segments in loop order; each ends where the next begins.
+    segs: Vec<SegmentSpec>,
     closed: bool,
 }
 
@@ -43,8 +44,8 @@ impl WasmProfile2D {
     #[wasm_bindgen(constructor)]
     pub fn new(x: f64, y: f64) -> WasmProfile2D {
         WasmProfile2D {
-            points: vec![[x, y]],
-            bulges: Vec::new(),
+            start: [x, y],
+            segs: Vec::new(),
             closed: false,
         }
     }
@@ -53,7 +54,9 @@ impl WasmProfile2D {
     /// `close()`.
     #[wasm_bindgen(js_name = lineTo)]
     pub fn line_to(&mut self, x: f64, y: f64) {
-        self.arc_to(x, y, 0.0);
+        if !self.closed {
+            self.segs.push(SegmentSpec::Line { to: [x, y] });
+        }
     }
 
     /// Circular arc from the current point to `(x, y)` with the given
@@ -62,8 +65,52 @@ impl WasmProfile2D {
     #[wasm_bindgen(js_name = arcTo)]
     pub fn arc_to(&mut self, x: f64, y: f64, bulge: f64) {
         if !self.closed {
-            self.points.push([x, y]);
-            self.bulges.push(bulge);
+            if bulge == 0.0 {
+                self.segs.push(SegmentSpec::Line { to: [x, y] });
+            } else {
+                self.segs.push(SegmentSpec::Arc { to: [x, y], bulge });
+            }
+        }
+    }
+
+    /// Elliptical arc from the current point to `(x, y)` on the ellipse
+    /// centered at `(cx, cy)` with semi-axes `rx`/`ry` and major axis at
+    /// `rotation` radians, traversed counter-clockwise when `ccw`. Ignored
+    /// after `close()`.
+    #[wasm_bindgen(js_name = ellipseArcTo)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn ellipse_arc_to(
+        &mut self,
+        x: f64,
+        y: f64,
+        cx: f64,
+        cy: f64,
+        rx: f64,
+        ry: f64,
+        rotation: f64,
+        ccw: bool,
+    ) {
+        if !self.closed {
+            self.segs.push(SegmentSpec::EllipseArc {
+                to: [x, y],
+                center: [cx, cy],
+                radius: [rx, ry],
+                rotation,
+                ccw,
+            });
+        }
+    }
+
+    /// Cubic Bézier from the current point to `(x, y)` with control points
+    /// `(c1x, c1y)` and `(c2x, c2y)`. Ignored after `close()`.
+    #[wasm_bindgen(js_name = cubicTo)]
+    pub fn cubic_to(&mut self, c1x: f64, c1y: f64, c2x: f64, c2y: f64, x: f64, y: f64) {
+        if !self.closed {
+            self.segs.push(SegmentSpec::Spline {
+                to: [x, y],
+                c1: [c1x, c1y],
+                c2: [c2x, c2y],
+            });
         }
     }
 
@@ -76,29 +123,34 @@ impl WasmProfile2D {
 }
 
 impl WasmProfile2D {
+    /// End point of the last queued segment, or the start if none.
+    fn current(&self) -> [f64; 2] {
+        self.segs.last().map_or(self.start, seg_end)
+    }
+
     /// Assemble the validated frep profile. Fails if the profile is not
-    /// closed or violates [`Profile2D::new`]'s constraints.
+    /// closed or violates [`Profile2D::from_segments`]'s constraints.
     fn build(&self) -> Result<Profile2D, String> {
         if !self.closed {
             return Err("profile must be closed before sweeping (call close())".into());
         }
-        let mut verts = self.points.clone();
-        let mut bulges = self.bulges.clone();
-        // Drop an explicit return to the start point; otherwise the
-        // implicit closing segment is a straight line (bulge 0).
-        let n = verts.len();
-        if n >= 2 {
-            let first = verts[0];
-            let last = verts[n - 1];
-            if (last[0] - first[0]).hypot(last[1] - first[1]) < 1e-9 {
-                verts.pop();
-            } else {
-                bulges.push(0.0);
-            }
-        } else {
-            bulges.push(0.0);
+        let mut segs = self.segs.clone();
+        // Close the loop: if the last segment does not already end at the
+        // start, add an implicit straight closing segment.
+        if (self.current()[0] - self.start[0]).hypot(self.current()[1] - self.start[1]) >= 1e-9 {
+            segs.push(SegmentSpec::Line { to: self.start });
         }
-        Profile2D::new(verts, bulges).map_err(|e| e.to_string())
+        Profile2D::from_segments(self.start, segs).map_err(|e| e.to_string())
+    }
+}
+
+/// End point of a queued segment spec.
+fn seg_end(spec: &SegmentSpec) -> [f64; 2] {
+    match *spec {
+        SegmentSpec::Line { to }
+        | SegmentSpec::Arc { to, .. }
+        | SegmentSpec::EllipseArc { to, .. }
+        | SegmentSpec::Spline { to, .. } => to,
     }
 }
 

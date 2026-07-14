@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  applyProfileSeg,
   buildSweepShape,
   mirrorOpsV,
   nativeSweepOps,
@@ -712,5 +713,50 @@ describe('opsBounds', () => {
       min: [0, 0],
       max: [2, 1],
     });
+  });
+});
+
+describe('applyProfileSeg', () => {
+  // Records every builder call so we can assert the forwarded arguments.
+  const recorder = () => {
+    const calls = [];
+    return {
+      calls,
+      arcTo: (...a) => calls.push(['arcTo', ...a]),
+      ellipseArcTo: (...a) => calls.push(['ellipseArcTo', ...a]),
+      cubicTo: (...a) => calls.push(['cubicTo', ...a]),
+    };
+  };
+
+  it('forwards line/arc snapshots through arcTo with their bulge', () => {
+    const p = recorder();
+    applyProfileSeg(p, { x: 1, y: 2, bulge: 0 });
+    applyProfileSeg(p, { x: 3, y: 4, bulge: 0.5 });
+    expect(p.calls).toEqual([
+      ['arcTo', 1, 2, 0],
+      ['arcTo', 3, 4, 0.5],
+    ]);
+  });
+
+  it('forwards ellipse segments to ellipseArcTo in builder order', () => {
+    const p = recorder();
+    applyProfileSeg(p, {
+      kind: 'ellipse',
+      x: -1,
+      y: 0,
+      cx: 0,
+      cy: 0,
+      rx: 2,
+      ry: 1,
+      rotation: 0.3,
+      ccw: true,
+    });
+    expect(p.calls).toEqual([['ellipseArcTo', -1, 0, 0, 0, 2, 1, 0.3, true]]);
+  });
+
+  it('forwards spline segments to cubicTo (control points first)', () => {
+    const p = recorder();
+    applyProfileSeg(p, { kind: 'spline', x: 0, y: 1, c1x: 1, c1y: 2, c2x: 3, c2y: 4 });
+    expect(p.calls).toEqual([['cubicTo', 1, 2, 3, 4, 0, 1]]);
   });
 });

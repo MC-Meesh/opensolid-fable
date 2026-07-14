@@ -25,6 +25,7 @@ import { addPrimitiveNode, assertStoreConsistency } from './lib/storeSync.js';
 import { buildSweepShape, opsBounds, profileToOps, sweepTreeNode } from './lib/sweep.js';
 import { createFaceRegionIndex } from './lib/facePlane.js';
 import { isFacePlane } from './lib/sketch/profile.js';
+import { opsHaveCurvedSegs } from './lib/sketch/fromOps.js';
 import { faceRefFromPlane, planarRegionsOf, resolveRefs } from './lib/persistentRef.js';
 import { computeRebuildState } from './lib/rebuildState.js';
 import {
@@ -751,6 +752,12 @@ export default function App() {
     (feature) => {
       const node = feature.node;
       if (!node?.profile) return;
+      if (opsHaveCurvedSegs(node.profile)) {
+        setSweepError(
+          'This sketch has ellipse/spline segments and cannot be edited on the canvas yet.'
+        );
+        return;
+      }
       clearSelection();
       setSweep(null);
       setSweepError(null);

@@ -30,8 +30,48 @@ use std::f64::consts::{FRAC_PI_2, PI, TAU};
 /// Chord length below which a segment is rejected as degenerate.
 const MIN_CHORD: f64 = 1e-9;
 
+/// Parametric samples used to seed the Newton closest-point search on
+/// ellipse arcs and splines (curves without a closed-form distance).
+const CURVE_SEEDS: usize = 24;
+/// Newton refinement steps applied to the best seed.
+const NEWTON_ITERS: usize = 12;
+
 fn invalid(argument: &'static str, reason: String) -> CoreError {
     CoreError::InvalidArgument { argument, reason }
+}
+
+fn dot2(a: [f64; 2], b: [f64; 2]) -> f64 {
+    a[0] * b[0] + a[1] * b[1]
+}
+
+fn sub2(a: [f64; 2], b: [f64; 2]) -> [f64; 2] {
+    [a[0] - b[0], a[1] - b[1]]
+}
+
+/// 2D cross product `a × b` (the z of the 3D cross of the lifted vectors).
+fn cross2(a: [f64; 2], b: [f64; 2]) -> f64 {
+    a[0] * b[1] - a[1] * b[0]
+}
+
+/// Real roots of `c2·t² + c1·t + c0` in ascending order (0, 1, or 2), with
+/// the linear and constant degeneracies handled.
+fn quadratic_roots(c2: f64, c1: f64, c0: f64) -> Vec<f64> {
+    if c2.abs() < 1e-300 {
+        if c1.abs() < 1e-300 {
+            return Vec::new();
+        }
+        return vec![-c0 / c1];
+    }
+    let disc = c1 * c1 - 4.0 * c2 * c0;
+    if disc < 0.0 {
+        return Vec::new();
+    }
+    let s = disc.sqrt();
+    let mut r = [(-c1 - s) / (2.0 * c2), (-c1 + s) / (2.0 * c2)];
+    if r[0] > r[1] {
+        r.swap(0, 1);
+    }
+    r.to_vec()
 }
 
 /// One boundary element of a profile, precomputed for fast queries.
@@ -53,10 +93,57 @@ enum Segment {
         /// Signed sweep in radians, `4·atan(bulge)`, in `(-2π, 2π)`.
         sweep: f64,
     },
+    /// Elliptical arc from `a` to `b`, parametrized in the ellipse's local
+    /// frame as `p(θ) = center + rx·cos θ·u + ry·sin θ·v` (with `u ⟂ v`
+    /// unit), swept from `theta0` through the signed `sweep`.
+    EllipseArc {
+        a: [f64; 2],
+        b: [f64; 2],
+        center: [f64; 2],
+        u: [f64; 2],
+        v: [f64; 2],
+        rx: f64,
+        ry: f64,
+        theta0: f64,
+        sweep: f64,
+    },
+    /// Cubic Bézier from `a` to `b` with control points `c1`, `c2`.
+    Spline {
+        a: [f64; 2],
+        b: [f64; 2],
+        c1: [f64; 2],
+        c2: [f64; 2],
+    },
 }
 
 fn dist2d(p: [f64; 2], q: [f64; 2]) -> f64 {
     (p[0] - q[0]).hypot(p[1] - q[1])
+}
+
+/// Cubic Bézier point at parameter `t ∈ [0, 1]`.
+fn bezier_point(a: [f64; 2], c1: [f64; 2], c2: [f64; 2], b: [f64; 2], t: f64) -> [f64; 2] {
+    let s = 1.0 - t;
+    let w0 = s * s * s;
+    let w1 = 3.0 * s * s * t;
+    let w2 = 3.0 * s * t * t;
+    let w3 = t * t * t;
+    [
+        w0 * a[0] + w1 * c1[0] + w2 * c2[0] + w3 * b[0],
+        w0 * a[1] + w1 * c1[1] + w2 * c2[1] + w3 * b[1],
+    ]
+}
+
+/// Cubic Bézier derivative `dp/dt` at `t`.
+fn bezier_deriv(a: [f64; 2], c1: [f64; 2], c2: [f64; 2], b: [f64; 2], t: f64) -> [f64; 2] {
+    let s = 1.0 - t;
+    // 3[(c1-a)s² + 2(c2-c1)st + (b-c2)t²]
+    let k0 = 3.0 * s * s;
+    let k1 = 6.0 * s * t;
+    let k2 = 3.0 * t * t;
+    [
+        k0 * (c1[0] - a[0]) + k1 * (c2[0] - c1[0]) + k2 * (b[0] - c2[0]),
+        k0 * (c1[1] - a[1]) + k1 * (c2[1] - c1[1]) + k2 * (b[1] - c2[1]),
+    ]
 }
 
 impl Segment {
@@ -85,6 +172,82 @@ impl Segment {
             start_angle: (a[1] - center[1]).atan2(a[0] - center[0]),
             sweep: 4.0 * bulge.atan(),
         }
+    }
+
+    /// Build an elliptical arc from `a` to `b` on the ellipse centered at
+    /// `center` with semi-axes `rx`/`ry` and major axis at angle `rotation`,
+    /// swept counter-clockwise (`ccw`) or clockwise between the endpoints'
+    /// local angles.
+    fn ellipse_arc(
+        a: [f64; 2],
+        b: [f64; 2],
+        center: [f64; 2],
+        rx: f64,
+        ry: f64,
+        rotation: f64,
+        ccw: bool,
+    ) -> Self {
+        let u = [rotation.cos(), rotation.sin()];
+        let v = [-rotation.sin(), rotation.cos()];
+        let theta0 = Self::ellipse_angle(center, u, v, rx, ry, a);
+        let theta1 = Self::ellipse_angle(center, u, v, rx, ry, b);
+        let sweep = if ccw {
+            (theta1 - theta0).rem_euclid(TAU)
+        } else {
+            -((theta0 - theta1).rem_euclid(TAU))
+        };
+        Segment::EllipseArc {
+            a,
+            b,
+            center,
+            u,
+            v,
+            rx,
+            ry,
+            theta0,
+            sweep,
+        }
+    }
+
+    /// Local-frame angle of point `p` on (or projected onto) the ellipse:
+    /// `atan2(t / ry, s / rx)` with `(s, t)` the coordinates of `p - center`
+    /// in the `(u, v)` basis.
+    fn ellipse_angle(
+        center: [f64; 2],
+        u: [f64; 2],
+        v: [f64; 2],
+        rx: f64,
+        ry: f64,
+        p: [f64; 2],
+    ) -> f64 {
+        let d = sub2(p, center);
+        (dot2(d, v) / ry).atan2(dot2(d, u) / rx)
+    }
+
+    /// Point on the ellipse at local angle `θ`.
+    fn ellipse_point(
+        center: [f64; 2],
+        u: [f64; 2],
+        v: [f64; 2],
+        rx: f64,
+        ry: f64,
+        theta: f64,
+    ) -> [f64; 2] {
+        let (cx, sx) = (theta.cos(), theta.sin());
+        [
+            center[0] + rx * cx * u[0] + ry * sx * v[0],
+            center[1] + rx * cx * u[1] + ry * sx * v[1],
+        ]
+    }
+
+    /// True if local angle `theta` lies on the swept range `[theta0, sweep]`.
+    fn angle_on_arc(theta0: f64, sweep: f64, theta: f64) -> bool {
+        let delta = if sweep >= 0.0 {
+            (theta - theta0).rem_euclid(TAU)
+        } else {
+            (theta0 - theta).rem_euclid(TAU)
+        };
+        delta <= sweep.abs()
     }
 
     /// Unsigned distance from `q` to the segment.
@@ -120,6 +283,354 @@ impl Segment {
                     dist2d(q, a).min(dist2d(q, b))
                 }
             }
+            Segment::EllipseArc {
+                a,
+                b,
+                center,
+                u,
+                v,
+                rx,
+                ry,
+                theta0,
+                sweep,
+            } => {
+                // Newton-minimize |p(θ) - q|² over the swept angular range,
+                // seeded from a coarse scan plus the geometric-angle guess.
+                let f = |theta: f64| {
+                    let p = Self::ellipse_point(center, u, v, rx, ry, theta);
+                    dot2(sub2(p, q), sub2(p, q))
+                };
+                let mut best_theta = theta0;
+                let mut best = f(theta0);
+                let seed_theta = Self::ellipse_angle(center, u, v, rx, ry, q);
+                for k in 0..=CURVE_SEEDS {
+                    let theta = theta0 + sweep * (k as f64 / CURVE_SEEDS as f64);
+                    let val = f(theta);
+                    if val < best {
+                        best = val;
+                        best_theta = theta;
+                    }
+                }
+                if Self::angle_on_arc(theta0, sweep, seed_theta) && f(seed_theta) < best {
+                    best_theta = seed_theta;
+                }
+                // Newton on g(θ) = (p - q)·p' = 0 (stationary distance).
+                let mut theta = best_theta;
+                for _ in 0..NEWTON_ITERS {
+                    let (cx, sx) = (theta.cos(), theta.sin());
+                    let p = [
+                        center[0] + rx * cx * u[0] + ry * sx * v[0],
+                        center[1] + rx * cx * u[1] + ry * sx * v[1],
+                    ];
+                    let dp = [
+                        -rx * sx * u[0] + ry * cx * v[0],
+                        -rx * sx * u[1] + ry * cx * v[1],
+                    ];
+                    let ddp = [
+                        -rx * cx * u[0] - ry * sx * v[0],
+                        -rx * cx * u[1] - ry * sx * v[1],
+                    ];
+                    let g = dot2(sub2(p, q), dp);
+                    let gp = dot2(dp, dp) + dot2(sub2(p, q), ddp);
+                    if gp.abs() < 1e-300 {
+                        break;
+                    }
+                    let step = g / gp;
+                    theta -= step;
+                    if step.abs() < 1e-15 {
+                        break;
+                    }
+                }
+                let interior = if Self::angle_on_arc(theta0, sweep, theta) {
+                    dist2d(Self::ellipse_point(center, u, v, rx, ry, theta), q)
+                } else {
+                    f64::INFINITY
+                };
+                interior.min(dist2d(q, a)).min(dist2d(q, b))
+            }
+            Segment::Spline { a, b, c1, c2 } => {
+                let f = |t: f64| {
+                    let p = bezier_point(a, c1, c2, b, t);
+                    dot2(sub2(p, q), sub2(p, q))
+                };
+                let mut best_t = 0.0;
+                let mut best = f(0.0);
+                for k in 1..=CURVE_SEEDS {
+                    let t = k as f64 / CURVE_SEEDS as f64;
+                    let val = f(t);
+                    if val < best {
+                        best = val;
+                        best_t = t;
+                    }
+                }
+                // Newton on g(t) = (p - q)·p' = 0, clamped to [0, 1].
+                let mut t = best_t;
+                for _ in 0..NEWTON_ITERS {
+                    let p = bezier_point(a, c1, c2, b, t);
+                    let dp = bezier_deriv(a, c1, c2, b, t);
+                    // p''(t) = 6[(1-t)(c2 - 2c1 + a) + t(b - 2c2 + c1)]
+                    let s = 1.0 - t;
+                    let ddp = [
+                        6.0 * (s * (c2[0] - 2.0 * c1[0] + a[0]) + t * (b[0] - 2.0 * c2[0] + c1[0])),
+                        6.0 * (s * (c2[1] - 2.0 * c1[1] + a[1]) + t * (b[1] - 2.0 * c2[1] + c1[1])),
+                    ];
+                    let g = dot2(sub2(p, q), dp);
+                    let gp = dot2(dp, dp) + dot2(sub2(p, q), ddp);
+                    if gp.abs() < 1e-300 {
+                        break;
+                    }
+                    let step = (g / gp).clamp(-0.5, 0.5);
+                    t = (t - step).clamp(0.0, 1.0);
+                    if step.abs() < 1e-15 {
+                        break;
+                    }
+                }
+                dist2d(bezier_point(a, c1, c2, b, t), q)
+                    .min(dist2d(q, a))
+                    .min(dist2d(q, b))
+            }
+        }
+    }
+
+    /// Parity correction for a curved segment: whether `q` lies in the
+    /// "lune" between the segment's curve and its straight chord `a → b`.
+    ///
+    /// The even-odd test over the chord polygon already counts each chord;
+    /// XOR-ing this lune parity per segment corrects the chord contribution
+    /// to the true curve contribution (see [`Profile2D::contains`]). Returns
+    /// `false` for straight segments (curve ≡ chord).
+    fn lune_parity(&self, q: [f64; 2]) -> bool {
+        match *self {
+            Segment::Line { .. } => false,
+            Segment::Arc {
+                a,
+                b,
+                bulge,
+                center,
+                radius,
+                ..
+            } => {
+                // Region between the arc and its chord: inside the circle
+                // and on the arc's side of the chord. σ = 0 (on the chord
+                // line) is broken with the same virtual +x/+y nudge the
+                // even-odd ray test applies implicitly.
+                if dist2d(q, center) < radius {
+                    let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+                    let cross = dx * (q[1] - a[1]) - dy * (q[0] - a[0]);
+                    let side = if cross != 0.0 {
+                        cross
+                    } else if dy != 0.0 {
+                        -dy
+                    } else {
+                        dx
+                    };
+                    side * bulge < 0.0
+                } else {
+                    false
+                }
+            }
+            Segment::EllipseArc {
+                a,
+                b,
+                center,
+                u,
+                v,
+                rx,
+                ry,
+                theta0,
+                sweep,
+            } => {
+                // Affine image of the circular case: inside the ellipse and
+                // on the arc's side of the chord. The arc's side is the side
+                // its midpoint falls on.
+                let d = sub2(q, center);
+                let (s, t) = (dot2(d, u) / rx, dot2(d, v) / ry);
+                if s * s + t * t >= 1.0 {
+                    return false;
+                }
+                let mid = Self::ellipse_point(center, u, v, rx, ry, theta0 + 0.5 * sweep);
+                let chord = sub2(b, a);
+                let mid_side = cross2(chord, sub2(mid, a));
+                let cross = cross2(chord, sub2(q, a));
+                let side = if cross != 0.0 {
+                    cross
+                } else if chord[0] != 0.0 {
+                    -chord[0]
+                } else {
+                    chord[1]
+                };
+                side * mid_side > 0.0
+            }
+            Segment::Spline { a, b, c1, c2 } => {
+                // Lune parity = parity of (ray crossings with the curve) +
+                // (ray crossings with the chord); the chord term cancels the
+                // even-odd chord contribution, leaving the true curve count.
+                (spline_ray_crossings(a, c1, c2, b, q) + chord_ray_crossing(a, b, q)) & 1 == 1
+            }
+        }
+    }
+
+    /// Interior points where the curve reaches an axis extreme (beyond its
+    /// endpoints), for tight profile bounds. Empty for straight segments.
+    fn extreme_points(&self) -> Vec<[f64; 2]> {
+        match *self {
+            Segment::Line { .. } => Vec::new(),
+            Segment::Arc {
+                center,
+                radius,
+                start_angle,
+                sweep,
+                ..
+            } => {
+                let mut pts = Vec::new();
+                for k in 0..4 {
+                    let ang = k as f64 * FRAC_PI_2;
+                    if Self::angle_on_arc(start_angle, sweep, ang) {
+                        pts.push([
+                            center[0] + radius * ang.cos(),
+                            center[1] + radius * ang.sin(),
+                        ]);
+                    }
+                }
+                pts
+            }
+            Segment::EllipseArc {
+                center,
+                u,
+                v,
+                rx,
+                ry,
+                theta0,
+                sweep,
+                ..
+            } => {
+                // x'(θ) = 0 at atan2(ry·vx, rx·ux) (+π); likewise y with vy, uy.
+                let mut pts = Vec::new();
+                for (num, den) in [(ry * v[0], rx * u[0]), (ry * v[1], rx * u[1])] {
+                    let base = num.atan2(den);
+                    for theta in [base, base + PI] {
+                        if Self::angle_on_arc(theta0, sweep, theta) {
+                            pts.push(Self::ellipse_point(center, u, v, rx, ry, theta));
+                        }
+                    }
+                }
+                pts
+            }
+            Segment::Spline { a, b, c1, c2 } => {
+                // p'(t) = 0 per axis: 3[(c-a) + 2(c2-2c1+a)t + (b-3c2+3c1-a)t²].
+                let mut pts = Vec::new();
+                for axis in 0..2 {
+                    let k2 = b[axis] - 3.0 * c2[axis] + 3.0 * c1[axis] - a[axis];
+                    let k1 = 2.0 * (c2[axis] - 2.0 * c1[axis] + a[axis]);
+                    let k0 = c1[axis] - a[axis];
+                    for t in quadratic_roots(k2, k1, k0) {
+                        if t > 0.0 && t < 1.0 {
+                            pts.push(bezier_point(a, c1, c2, b, t));
+                        }
+                    }
+                }
+                pts
+            }
+        }
+    }
+}
+
+/// Half-open crossing count (0 or 1) of the rightward ray from `q` with the
+/// straight chord `a → b`, matching the even-odd predicate used in
+/// [`Profile2D::contains`].
+fn chord_ray_crossing(a: [f64; 2], b: [f64; 2], q: [f64; 2]) -> u32 {
+    if (a[1] > q[1]) != (b[1] > q[1]) {
+        let x = a[0] + (q[1] - a[1]) / (b[1] - a[1]) * (b[0] - a[0]);
+        if x > q[0] {
+            return 1;
+        }
+    }
+    0
+}
+
+/// Number of times the rightward horizontal ray from `q` crosses the cubic
+/// Bézier `a → b` (controls `c1`, `c2`). The curve is split at the roots of
+/// `y'(t) = 0` into y-monotone pieces so each transverse crossing is counted
+/// once and tangential grazes at extrema are not counted.
+fn spline_ray_crossings(a: [f64; 2], c1: [f64; 2], c2: [f64; 2], b: [f64; 2], q: [f64; 2]) -> u32 {
+    // y'(t) = 3[(c1-a) + 2(c2-2c1+a)t + (b-3c2+3c1-a)t²]·ŷ, a quadratic.
+    let ay = a[1];
+    let by = b[1];
+    let cy1 = c1[1];
+    let cy2 = c2[1];
+    let k2 = by - 3.0 * cy2 + 3.0 * cy1 - ay;
+    let k1 = 2.0 * (cy2 - 2.0 * cy1 + ay);
+    let k0 = cy1 - ay;
+    let mut breaks = vec![0.0, 1.0];
+    for r in quadratic_roots(k2, k1, k0) {
+        if r > 0.0 && r < 1.0 {
+            breaks.push(r);
+        }
+    }
+    breaks.sort_by(|x, y| x.partial_cmp(y).unwrap());
+    let by_t = |t: f64| bezier_point(a, c1, c2, b, t)[1];
+    let mut count = 0u32;
+    for w in breaks.windows(2) {
+        let (t0, t1) = (w[0], w[1]);
+        let (y0, y1) = (by_t(t0), by_t(t1));
+        // Half-open crossing on this monotone piece.
+        if (y0 > q[1]) != (y1 > q[1]) {
+            // Bisect for the parameter where y = q.y, then test x.
+            let (mut lo, mut hi) = (t0, t1);
+            let ascending = y1 > y0;
+            for _ in 0..60 {
+                let mid = 0.5 * (lo + hi);
+                let ym = by_t(mid);
+                if (ym > q[1]) == ascending {
+                    hi = mid;
+                } else {
+                    lo = mid;
+                }
+            }
+            let t = 0.5 * (lo + hi);
+            if bezier_point(a, c1, c2, b, t)[0] > q[0] {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+/// One segment of a [`Profile2D`] built via [`Profile2D::from_segments`]:
+/// each variant carries the segment's *end* point `to`; its start is the
+/// previous segment's end (the first starts at the constructor's `start`,
+/// the last closes back to it).
+#[derive(Clone, Copy, Debug)]
+pub enum SegmentSpec {
+    /// Straight line to `to`.
+    Line { to: [f64; 2] },
+    /// Circular arc to `to`, DXF `bulge = tan(sweep / 4)` (CCW positive).
+    Arc { to: [f64; 2], bulge: f64 },
+    /// Elliptical arc to `to` on the ellipse centered at `center` with
+    /// semi-axes `radius = [rx, ry]` and major axis at `rotation` radians,
+    /// traversed counter-clockwise when `ccw`.
+    EllipseArc {
+        to: [f64; 2],
+        center: [f64; 2],
+        radius: [f64; 2],
+        rotation: f64,
+        ccw: bool,
+    },
+    /// Cubic Bézier to `to` with control points `c1`, `c2`.
+    Spline {
+        to: [f64; 2],
+        c1: [f64; 2],
+        c2: [f64; 2],
+    },
+}
+
+impl SegmentSpec {
+    fn end(&self) -> [f64; 2] {
+        match *self {
+            SegmentSpec::Line { to }
+            | SegmentSpec::Arc { to, .. }
+            | SegmentSpec::EllipseArc { to, .. }
+            | SegmentSpec::Spline { to, .. } => to,
         }
     }
 }
@@ -207,36 +718,127 @@ impl Profile2D {
         for &v in &vertices {
             include(v);
         }
-        // Arcs can extend past their endpoints: include each cardinal
-        // extreme of the circle that lies on the swept range.
+        // Curved segments can extend past their endpoints: include each
+        // axis extreme reached on the swept range.
         for seg in &segments {
-            if let Segment::Arc {
-                center,
-                radius,
-                start_angle,
-                sweep,
-                ..
-            } = *seg
-            {
-                for k in 0..4 {
-                    let ang = k as f64 * FRAC_PI_2;
-                    let delta = if sweep >= 0.0 {
-                        (ang - start_angle).rem_euclid(TAU)
-                    } else {
-                        (start_angle - ang).rem_euclid(TAU)
-                    };
-                    if delta <= sweep.abs() {
-                        include([
-                            center[0] + radius * ang.cos(),
-                            center[1] + radius * ang.sin(),
-                        ]);
-                    }
-                }
+            for p in seg.extreme_points() {
+                include(p);
             }
         }
 
         Ok(Self {
             verts: vertices,
+            segments,
+            min,
+            max,
+        })
+    }
+
+    /// Build a profile from a start point and a loop of typed segments
+    /// (lines, circular arcs, elliptical arcs, cubic Béziers). Segment `i`
+    /// runs from vertex `i` to vertex `i + 1`; the final segment closes the
+    /// loop back to `start`, so its `to` must coincide with `start`.
+    ///
+    /// # Errors
+    /// [`CoreError::InvalidArgument`] if fewer than two segments are given,
+    /// any coordinate or parameter is not finite, an ellipse radius is not
+    /// positive, consecutive vertices coincide, or the loop does not close.
+    pub fn from_segments(start: [f64; 2], specs: Vec<SegmentSpec>) -> CoreResult<Self> {
+        if specs.len() < 2 {
+            return Err(invalid(
+                "specs",
+                format!("profile needs at least 2 segments, got {}", specs.len()),
+            ));
+        }
+        let finite2 = |p: [f64; 2]| p[0].is_finite() && p[1].is_finite();
+        if !finite2(start) {
+            return Err(invalid("start", "coordinates must be finite".into()));
+        }
+        for (i, spec) in specs.iter().enumerate() {
+            let ok = finite2(spec.end())
+                && match *spec {
+                    SegmentSpec::Line { .. } => true,
+                    SegmentSpec::Arc { bulge, .. } => bulge.is_finite(),
+                    SegmentSpec::EllipseArc {
+                        center,
+                        radius,
+                        rotation,
+                        ..
+                    } => {
+                        finite2(center)
+                            && rotation.is_finite()
+                            && radius[0].is_finite()
+                            && radius[1].is_finite()
+                            && radius[0] > 0.0
+                            && radius[1] > 0.0
+                    }
+                    SegmentSpec::Spline { c1, c2, .. } => finite2(c1) && finite2(c2),
+                };
+            if !ok {
+                return Err(invalid(
+                    "specs",
+                    format!("segment {i} has non-finite or non-positive parameters"),
+                ));
+            }
+        }
+        // Loop vertices: start, then every segment end except the last
+        // (which closes back to start).
+        let n = specs.len();
+        if dist2d(specs[n - 1].end(), start) >= MIN_CHORD {
+            return Err(invalid(
+                "specs",
+                "the last segment must close the loop back to start".into(),
+            ));
+        }
+        let mut verts = Vec::with_capacity(n);
+        verts.push(start);
+        for spec in &specs[..n - 1] {
+            verts.push(spec.end());
+        }
+
+        let mut segments = Vec::with_capacity(n);
+        for i in 0..n {
+            let a = verts[i];
+            let b = verts[(i + 1) % n];
+            if dist2d(a, b) < MIN_CHORD {
+                return Err(invalid(
+                    "specs",
+                    format!("segment {i} is degenerate: consecutive vertices coincide"),
+                ));
+            }
+            segments.push(match specs[i] {
+                SegmentSpec::Line { .. } => Segment::Line { a, b },
+                SegmentSpec::Arc { bulge, .. } => Segment::new(a, b, bulge),
+                SegmentSpec::EllipseArc {
+                    center,
+                    radius,
+                    rotation,
+                    ccw,
+                    ..
+                } => Segment::ellipse_arc(a, b, center, radius[0], radius[1], rotation, ccw),
+                SegmentSpec::Spline { c1, c2, .. } => Segment::Spline { a, b, c1, c2 },
+            });
+        }
+
+        let mut min = [f64::INFINITY; 2];
+        let mut max = [f64::NEG_INFINITY; 2];
+        let mut include = |p: [f64; 2]| {
+            min[0] = min[0].min(p[0]);
+            min[1] = min[1].min(p[1]);
+            max[0] = max[0].max(p[0]);
+            max[1] = max[1].max(p[1]);
+        };
+        for &v in &verts {
+            include(v);
+        }
+        for seg in &segments {
+            for p in seg.extreme_points() {
+                include(p);
+            }
+        }
+
+        Ok(Self {
+            verts,
             segments,
             min,
             max,
@@ -256,10 +858,11 @@ impl Profile2D {
     /// contains `q`: an outward-bulging arc adds its circular segment to
     /// the chord polygon, an inward one removes it, and XOR covers both.
     ///
-    /// Arc chords are *interior* lines of the region, so a query exactly on
-    /// one must not be misclassified: the side test breaks the σ = 0 tie by
-    /// emulating the same virtual `+x` (then `+y`) nudge the even-odd ray
-    /// test applies implicitly, keeping the two parity sources consistent.
+    /// Curved-segment chords are *interior* lines of the region, so a query
+    /// exactly on one must not be misclassified: [`Segment::lune_parity`]
+    /// breaks the σ = 0 tie by emulating the same virtual `+x` (then `+y`)
+    /// nudge the even-odd ray test applies implicitly, keeping the two
+    /// parity sources consistent.
     fn contains(&self, q: [f64; 2]) -> bool {
         let n = self.verts.len();
         let mut inside = false;
@@ -274,34 +877,8 @@ impl Profile2D {
             }
         }
         for seg in &self.segments {
-            if let Segment::Arc {
-                a,
-                b,
-                bulge,
-                center,
-                radius,
-                ..
-            } = *seg
-            {
-                // Inside the circle and on the arc's side of the chord.
-                // The arc apex sits at cross(chord, apex - a)·bulge < 0,
-                // for both minor and major arcs.
-                if dist2d(q, center) < radius {
-                    let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
-                    let cross = dx * (q[1] - a[1]) - dy * (q[0] - a[0]);
-                    // σ = 0: on the chord line. Nudging q by (+ε, +ε')
-                    // shifts σ by dx·ε' - dy·ε; the x term dominates.
-                    let side = if cross != 0.0 {
-                        cross
-                    } else if dy != 0.0 {
-                        -dy
-                    } else {
-                        dx
-                    };
-                    if side * bulge < 0.0 {
-                        inside = !inside;
-                    }
-                }
+            if seg.lune_parity(q) {
+                inside = !inside;
             }
         }
         inside
@@ -337,7 +914,7 @@ impl Profile2D {
             .iter()
             .map(|s| match *s {
                 Segment::Line { a, b } => a[0].abs() <= MIN_CHORD && b[0].abs() <= MIN_CHORD,
-                Segment::Arc { .. } => false,
+                _ => false,
             })
             .collect()
     }
@@ -967,5 +1544,297 @@ mod tests {
         );
         assert!(!mesh.is_empty());
         assert!(mesh.is_closed_manifold());
+    }
+
+    // --- Curved segments: ellipse arcs and cubic-Bézier splines ---
+
+    /// Full ellipse (rx, ry) at origin, drawn as an upper + lower CCW arc
+    /// between (rx, 0) and (-rx, 0).
+    fn ellipse_profile(rx: f64, ry: f64, rotation: f64) -> Profile2D {
+        let u = [rotation.cos(), rotation.sin()];
+        let end = |sx: f64| [rx * sx * u[0], rx * sx * u[1]];
+        Profile2D::from_segments(
+            end(1.0),
+            vec![
+                SegmentSpec::EllipseArc {
+                    to: end(-1.0),
+                    center: [0.0, 0.0],
+                    radius: [rx, ry],
+                    rotation,
+                    ccw: true,
+                },
+                SegmentSpec::EllipseArc {
+                    to: end(1.0),
+                    center: [0.0, 0.0],
+                    radius: [rx, ry],
+                    rotation,
+                    ccw: true,
+                },
+            ],
+        )
+        .expect("valid ellipse")
+    }
+
+    /// Brute-force closest distance from `q` to an origin-centered ellipse
+    /// with axes `(rx, ry)` rotated by `rotation`, by dense sampling.
+    fn brute_ellipse_distance(rx: f64, ry: f64, rotation: f64, q: [f64; 2]) -> f64 {
+        let (cu, su) = (rotation.cos(), rotation.sin());
+        let mut best = f64::INFINITY;
+        for k in 0..200_000 {
+            let t = k as f64 / 200_000.0 * TAU;
+            let (c, s) = (t.cos(), t.sin());
+            let p = [rx * c * cu - ry * s * su, rx * c * su + ry * s * cu];
+            best = best.min(dist2d(p, q));
+        }
+        best
+    }
+
+    #[test]
+    fn ellipse_with_equal_radii_matches_circle() {
+        // rx = ry reduces the elliptical arc to a circular one: the field
+        // must match the analytic circle distance.
+        let p = ellipse_profile(1.0, 1.0, 0.0);
+        for (u, v) in [
+            (0.0, 0.0),
+            (0.5, 0.0),
+            (0.0, -0.7),
+            (2.0, 0.0),
+            (1.5, 1.5),
+            (0.0, 1.0),
+            (-0.3, 0.4),
+        ] {
+            let expected = f64::hypot(u, v) - 1.0;
+            assert!(
+                (p.signed_distance(u, v) - expected).abs() < 1e-9,
+                "at ({u}, {v}): {} vs {expected}",
+                p.signed_distance(u, v)
+            );
+        }
+    }
+
+    #[test]
+    fn ellipse_distance_matches_brute_force() {
+        let (rx, ry, rot) = (2.0, 1.0, 0.6);
+        let p = ellipse_profile(rx, ry, rot);
+        let mut probe = crate::test_util::Lcg(11);
+        for _ in 0..40 {
+            let q = [probe.in_range(-3.0, 3.0), probe.in_range(-3.0, 3.0)];
+            let got = p.signed_distance(q[0], q[1]).abs();
+            let want = brute_ellipse_distance(rx, ry, rot, q);
+            assert!((got - want).abs() < 1e-4, "at {q:?}: {got} vs {want}");
+        }
+    }
+
+    #[test]
+    fn ellipse_parity_inside_outside() {
+        let p = ellipse_profile(2.0, 1.0, 0.0);
+        // Inside: within the ellipse but outside its inscribed circle.
+        assert!(p.signed_distance(1.5, 0.0) < 0.0);
+        assert!(p.signed_distance(0.0, 0.5) < 0.0);
+        // Outside: past the minor axis but inside the major-axis span.
+        assert!(p.signed_distance(0.0, 1.5) > 0.0);
+        assert!(p.signed_distance(1.5, 0.9) > 0.0);
+    }
+
+    #[test]
+    fn ellipse_bounds_include_axis_extremes() {
+        // A 45°-rotated 2×1 ellipse reaches beyond its endpoints; bounds
+        // must contain the true extent sqrt(rx²cos²+ ry²sin²) along x.
+        let rot = std::f64::consts::FRAC_PI_4;
+        let p = ellipse_profile(2.0, 1.0, rot);
+        let (min, max) = p.bounds();
+        let ext = ((2.0f64 * rot.cos()).powi(2) + (1.0f64 * rot.sin()).powi(2)).sqrt();
+        assert!((max[0] - ext).abs() < 1e-9, "max {} vs {ext}", max[0]);
+        assert!((min[0] + ext).abs() < 1e-9, "min {} vs {ext}", min[0]);
+    }
+
+    /// A closed profile whose top edge is a cubic Bézier bulging up, over a
+    /// square base — for parity and distance checks.
+    fn bezier_cap_profile(c1: [f64; 2], c2: [f64; 2]) -> Profile2D {
+        Profile2D::from_segments(
+            [0.0, 0.0],
+            vec![
+                SegmentSpec::Line { to: [1.0, 0.0] },
+                SegmentSpec::Line { to: [1.0, 1.0] },
+                SegmentSpec::Spline {
+                    to: [0.0, 1.0],
+                    c1,
+                    c2,
+                },
+                SegmentSpec::Line { to: [0.0, 0.0] },
+            ],
+        )
+        .expect("valid bezier cap")
+    }
+
+    #[test]
+    fn spline_collinear_controls_reduce_to_a_line() {
+        // Evenly spaced collinear controls make the top "spline" the exact
+        // straight edge (1,1) → (0,1); the shape is the unit square.
+        let p = bezier_cap_profile([2.0 / 3.0, 1.0], [1.0 / 3.0, 1.0]);
+        assert!((p.signed_distance(0.5, 0.5) + 0.5).abs() < 1e-9);
+        assert!((p.signed_distance(0.5, 1.25) - 0.25).abs() < 1e-6);
+        assert!((p.signed_distance(0.5, 0.75) + 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn spline_bulge_adds_area_and_distance_is_brute_force_exact() {
+        // Controls pull the top edge up to a peak near y ≈ 1.5.
+        let (c1, c2) = ([0.75, 2.0], [0.25, 2.0]);
+        let p = bezier_cap_profile(c1, c2);
+        let a = [1.0, 1.0];
+        let b = [0.0, 1.0];
+        // Brute-force min distance to the whole boundary.
+        let brute = |q: [f64; 2]| {
+            let mut best = f64::INFINITY;
+            let seg = |s: [f64; 2], e: [f64; 2], best: &mut f64| {
+                for k in 0..=4000 {
+                    let t = k as f64 / 4000.0;
+                    let pt = [s[0] + t * (e[0] - s[0]), s[1] + t * (e[1] - s[1])];
+                    *best = best.min(dist2d(pt, q));
+                }
+            };
+            seg([0.0, 0.0], [1.0, 0.0], &mut best);
+            seg([1.0, 0.0], [1.0, 1.0], &mut best);
+            seg([0.0, 1.0], [0.0, 0.0], &mut best);
+            for k in 0..=8000 {
+                let t = k as f64 / 8000.0;
+                best = best.min(dist2d(bezier_point(a, c1, c2, b, t), q));
+            }
+            best
+        };
+        // A point above the chord but below the bulge peak is inside.
+        assert!(
+            p.signed_distance(0.5, 1.3) < 0.0,
+            "under the bulge is inside"
+        );
+        // Above the peak is outside.
+        assert!(
+            p.signed_distance(0.5, 2.2) > 0.0,
+            "above the bulge is outside"
+        );
+        let mut probe = crate::test_util::Lcg(23);
+        for _ in 0..40 {
+            let q = [probe.in_range(-0.5, 1.5), probe.in_range(-0.5, 2.5)];
+            let got = p.signed_distance(q[0], q[1]).abs();
+            let want = brute(q);
+            assert!((got - want).abs() < 2e-3, "at {q:?}: {got} vs {want}");
+        }
+    }
+
+    #[test]
+    fn spline_bounds_cover_the_bulge() {
+        let (c1, c2) = ([0.75, 2.0], [0.25, 2.0]);
+        let p = bezier_cap_profile(c1, c2);
+        let (_, max) = p.bounds();
+        // Peak of a symmetric cubic with both controls at y = 2: y_max =
+        // 0.25·1 + 0.75·2 = ... = (1 + 3·2 + ... )/8. Just assert it clears
+        // the chord (y = 1) by a solid margin and is below the control (2).
+        assert!(max[1] > 1.4 && max[1] < 2.0, "peak {}", max[1]);
+    }
+
+    #[test]
+    fn from_segments_rejects_bad_input() {
+        // Fewer than two segments.
+        assert!(
+            Profile2D::from_segments([0.0, 0.0], vec![SegmentSpec::Line { to: [1.0, 0.0] }])
+                .is_err()
+        );
+        // Loop does not close.
+        assert!(
+            Profile2D::from_segments(
+                [0.0, 0.0],
+                vec![
+                    SegmentSpec::Line { to: [1.0, 0.0] },
+                    SegmentSpec::Line { to: [1.0, 1.0] },
+                ],
+            )
+            .is_err()
+        );
+        // Non-positive ellipse radius.
+        assert!(
+            Profile2D::from_segments(
+                [1.0, 0.0],
+                vec![
+                    SegmentSpec::EllipseArc {
+                        to: [-1.0, 0.0],
+                        center: [0.0, 0.0],
+                        radius: [0.0, 1.0],
+                        rotation: 0.0,
+                        ccw: true,
+                    },
+                    SegmentSpec::EllipseArc {
+                        to: [1.0, 0.0],
+                        center: [0.0, 0.0],
+                        radius: [1.0, 1.0],
+                        rotation: 0.0,
+                        ccw: true,
+                    },
+                ],
+            )
+            .is_err()
+        );
+        // Non-finite spline control.
+        assert!(
+            Profile2D::from_segments(
+                [0.0, 0.0],
+                vec![
+                    SegmentSpec::Line { to: [1.0, 0.0] },
+                    SegmentSpec::Spline {
+                        to: [0.0, 0.0],
+                        c1: [f64::NAN, 0.0],
+                        c2: [0.5, 1.0],
+                    },
+                ],
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn extruded_ellipse_meshes_to_closed_manifold() {
+        use crate::mesh::{MeshOptions, mesh_sdf_indexed};
+        use opensolid_core::types::BoundingBox3;
+
+        let e = Extrude::new(ellipse_profile(1.5, 0.8, 0.3), 1.0).expect("valid extrude");
+        let mesh = mesh_sdf_indexed(
+            &e,
+            &MeshOptions {
+                bounds: BoundingBox3::new(
+                    Point3::new(-2.0, -0.5, -2.0),
+                    Point3::new(2.0, 1.5, 2.0),
+                ),
+                resolution: 40,
+            },
+        );
+        assert!(!mesh.is_empty());
+        assert!(mesh.is_closed_manifold());
+    }
+
+    #[test]
+    fn extruded_spline_profile_meshes_to_closed_manifold() {
+        use crate::mesh::{MeshOptions, mesh_sdf_indexed};
+        use opensolid_core::types::BoundingBox3;
+
+        let p = bezier_cap_profile([0.75, 2.0], [0.25, 2.0]);
+        let e = Extrude::new(p, 1.0).expect("valid extrude");
+        let mesh = mesh_sdf_indexed(
+            &e,
+            &MeshOptions {
+                bounds: BoundingBox3::new(
+                    Point3::new(-0.5, -0.5, -0.5),
+                    Point3::new(1.5, 1.5, 2.5),
+                ),
+                resolution: 40,
+            },
+        );
+        assert!(!mesh.is_empty());
+        assert!(mesh.is_closed_manifold());
+    }
+
+    #[test]
+    fn ellipse_interval_containment() {
+        let e = Extrude::new(ellipse_profile(1.2, 0.7, 0.4), 1.0).expect("valid extrude");
+        crate::test_util::assert_interval_containment(&e, 61);
     }
 }

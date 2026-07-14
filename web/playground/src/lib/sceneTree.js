@@ -118,6 +118,18 @@ export function createTracer(ShapeClass, ProfileClass) {
       if (!this.closed) this.segs.push({ x, y, bulge });
       this.real.arcTo(x, y, bulge);
     }
+    ellipseArcTo(x, y, cx, cy, rx, ry, rotation, ccw) {
+      if (!this.closed) {
+        this.segs.push({ kind: 'ellipse', x, y, cx, cy, rx, ry, rotation, ccw });
+      }
+      this.real.ellipseArcTo(x, y, cx, cy, rx, ry, rotation, ccw);
+    }
+    cubicTo(c1x, c1y, c2x, c2y, x, y) {
+      if (!this.closed) {
+        this.segs.push({ kind: 'spline', x, y, c1x, c1y, c2x, c2y });
+      }
+      this.real.cubicTo(c1x, c1y, c2x, c2y, x, y);
+    }
     close() {
       this.closed = true;
       this.real.close();
@@ -264,6 +276,25 @@ export function scriptHeader(source) {
  * builder statements first. `header` (see `scriptHeader`) is prepended with
  * a blank separator line when given.
  */
+/**
+ * One `Profile` builder statement (`p.lineTo(...)` etc.) for a profile
+ * segment snapshot. Line/arc segments carry a `bulge`; `kind: 'ellipse'`
+ * and `kind: 'spline'` segments name their geometry directly, matching the
+ * `WasmProfile2D` builder methods.
+ */
+export function profileSegStatement(name, seg) {
+  switch (seg.kind) {
+    case 'ellipse':
+      return `${name}.ellipseArcTo(${seg.x}, ${seg.y}, ${seg.cx}, ${seg.cy}, ${seg.rx}, ${seg.ry}, ${seg.rotation}, ${seg.ccw});`;
+    case 'spline':
+      return `${name}.cubicTo(${seg.c1x}, ${seg.c1y}, ${seg.c2x}, ${seg.c2y}, ${seg.x}, ${seg.y});`;
+    default:
+      return seg.bulge === 0
+        ? `${name}.lineTo(${seg.x}, ${seg.y});`
+        : `${name}.arcTo(${seg.x}, ${seg.y}, ${seg.bulge});`;
+  }
+}
+
 export function serializeTree(root, { header = '' } = {}) {
   const refs = new Map();
   const countRefs = (node) => {
@@ -281,11 +312,7 @@ export function serializeTree(root, { header = '' } = {}) {
     const name = `p${++profileCount}`;
     lines.push(`const ${name} = new Profile(${profile.start.map(String).join(', ')});`);
     for (const seg of profile.segs) {
-      lines.push(
-        seg.bulge === 0
-          ? `${name}.lineTo(${seg.x}, ${seg.y});`
-          : `${name}.arcTo(${seg.x}, ${seg.y}, ${seg.bulge});`
-      );
+      lines.push(profileSegStatement(name, seg));
     }
     lines.push(`${name}.close();`);
     return name;

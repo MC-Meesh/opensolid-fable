@@ -252,6 +252,33 @@ function extrudeArgs(height, draft) {
 }
 
 /**
+ * Feed one profile-ops segment to a `Profile` builder. Line/arc segments
+ * carry a `bulge`; `kind: 'ellipse'` and `kind: 'spline'` segments forward to
+ * the builder's `ellipseArcTo` / `cubicTo` methods.
+ */
+export function applyProfileSeg(profile, seg) {
+  switch (seg.kind) {
+    case 'ellipse':
+      profile.ellipseArcTo(
+        seg.x,
+        seg.y,
+        seg.cx,
+        seg.cy,
+        seg.rx,
+        seg.ry,
+        seg.rotation,
+        seg.ccw
+      );
+      break;
+    case 'spline':
+      profile.cubicTo(seg.c1x, seg.c1y, seg.c2x, seg.c2y, seg.x, seg.y);
+      break;
+    default:
+      profile.arcTo(seg.x, seg.y, seg.bulge);
+  }
+}
+
+/**
  * Build the swept, plane-oriented shape for a sweep descriptor. Extrudes
  * honor `mode`/`end`/`draft`/`target`/`reach` (see `extrudePlan`); revolves
  * take a signed angle in degrees. Frees the profile and every intermediate
@@ -265,7 +292,7 @@ export function buildSweepShape(ShapeClass, ProfileClass, sweep) {
   const profile = new ProfileClass(ops.start[0], ops.start[1]);
   let shape;
   try {
-    for (const seg of ops.segs) profile.arcTo(seg.x, seg.y, seg.bulge);
+    for (const seg of ops.segs) applyProfileSeg(profile, seg);
     profile.close();
     shape = plan
       ? ShapeClass.extrude(profile, ...extrudeArgs(plan.height, plan.draft))

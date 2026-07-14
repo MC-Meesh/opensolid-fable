@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { bulgeArcCenter, sketchFromOps } from './fromOps.js';
+import { bulgeArcCenter, opsHaveCurvedSegs, sketchFromOps } from './fromOps.js';
 import { extractProfile } from './profile.js';
 import { profileToOps } from '../sweep.js';
 
@@ -95,6 +95,41 @@ describe('sketchFromOps', () => {
     expect(ops2.start[1]).toBeCloseTo(0, 10);
     const arcSeg = ops2.segs.find((s) => s.bulge !== 0);
     expect(arcSeg.bulge).toBeCloseTo(bulge, 10);
+  });
+
+  it('refuses to rebuild profiles with ellipse/spline segments', () => {
+    const ellipseOps = {
+      start: [1, 0],
+      segs: [
+        { kind: 'ellipse', x: -1, y: 0, cx: 0, cy: 0, rx: 1, ry: 0.5, rotation: 0, ccw: true },
+        { kind: 'ellipse', x: 1, y: 0, cx: 0, cy: 0, rx: 1, ry: 0.5, rotation: 0, ccw: true },
+      ],
+    };
+    expect(opsHaveCurvedSegs(ellipseOps)).toBe(true);
+    expect(() => sketchFromOps(ellipseOps)).toThrow(/ellipse\/spline/);
+
+    const splineOps = {
+      start: [0, 0],
+      segs: [
+        { x: 1, y: 0, bulge: 0 },
+        { kind: 'spline', x: 0, y: 1, c1x: 1, c1y: 1, c2x: 0, c2y: 1 },
+        { x: 0, y: 0, bulge: 0 },
+      ],
+    };
+    expect(opsHaveCurvedSegs(splineOps)).toBe(true);
+    expect(() => sketchFromOps(splineOps)).toThrow(/ellipse\/spline/);
+  });
+
+  it('opsHaveCurvedSegs is false for plain line/arc snapshots', () => {
+    expect(
+      opsHaveCurvedSegs({
+        start: [0, 0],
+        segs: [
+          { x: 1, y: 0, bulge: 0 },
+          { x: 0, y: 1, bulge: 1 },
+        ],
+      })
+    ).toBe(false);
   });
 
   it('rebuilds a full circle snapshot (two semicircular arcs)', () => {

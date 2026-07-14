@@ -52,6 +52,8 @@ export function createStubApi() {
       live.add(this);
     }
     arcTo() {}
+    ellipseArcTo() {}
+    cubicTo() {}
     close() {}
     free() {
       live.delete(this);
