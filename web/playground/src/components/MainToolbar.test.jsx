@@ -44,6 +44,19 @@ describe('MainToolbar', () => {
     }
   });
 
+  it('renders the Measure (Inspect) toggle with its shortcut tooltip', () => {
+    const html = render();
+    expect(html).toContain('Inspect');
+    expect(html).toContain('Measure');
+    expect(html).toMatch(/title="[^"]*\(M\)"/);
+  });
+
+  it('marks the Measure button active while measuring', () => {
+    const html = render({ measureOpen: true });
+    // aria-pressed=true renders on the active toggle.
+    expect(html).toMatch(/aria-label="Measure"[^>]*aria-pressed="true"|aria-pressed="true"[^>]*aria-label="Measure"/);
+  });
+
   it('explains faceted export of organic shapes in the STEP tooltip', () => {
     const html = render();
     expect(html).toMatch(/title="[^"]*organic shapes export as faceted geometry/);
