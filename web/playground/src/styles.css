@@ -1090,9 +1090,18 @@ button.main-tool svg { flex: none; }
   user-select: none;
 }
 .sketch-svg .glyph.dim { text-decoration: underline dotted; cursor: text; }
+/* Driven (reference) dimensions read as measured-only: muted, italic. */
+.sketch-svg .glyph.driven { fill: var(--muted, #8a8f98); font-style: italic; font-weight: 500; }
 .sketch-svg circle.glyph { fill: none; stroke: var(--warn); stroke-width: 1.2; }
 .sketch-svg .glyph.selected { fill: var(--accent); }
 .sketch-svg circle.glyph.selected { stroke: var(--accent); }
+/* Smart Dimension pick highlight. */
+.sketch-svg .dim-pick {
+  stroke: var(--accent);
+  stroke-width: 1.5;
+  stroke-dasharray: 3 2;
+  pointer-events: none;
+}
 .sketch-toolbar {
   position: absolute;
   top: 46px;

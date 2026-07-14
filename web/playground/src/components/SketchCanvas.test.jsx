@@ -32,6 +32,7 @@ describe('SketchCanvas', () => {
       'Centerline',
       'Trim',
       'Extend',
+      'Dimension',
       'Mirror',
       'Offset',
       'Convert',

@@ -473,7 +473,125 @@ function projectSymmetric(pts, c, sketch, pinned) {
   return err;
 }
 
+/**
+ * Point-to-point distance dimension. `orient` selects what is measured:
+ * 'aligned' (straight-line), 'horizontal' (|Δx|), or 'vertical' (|Δy|). The
+ * correction is split between the two free (non-pinned) points.
+ */
+function projectDistance(pts, c, pinned) {
+  const a = pts[c.a];
+  const b = pts[c.b];
+  if (!a || !b) return 0;
+  const orient = c.orient ?? 'aligned';
+  if (orient === 'horizontal') return projectAxisDistance(a, b, c.value, pinned, 'x');
+  if (orient === 'vertical') return projectAxisDistance(a, b, c.value, pinned, 'y');
+  let ux = b.x - a.x;
+  let uy = b.y - a.y;
+  const len = Math.hypot(ux, uy);
+  if (len < 1e-12) {
+    ux = 1;
+    uy = 0;
+  } else {
+    ux /= len;
+    uy /= len;
+  }
+  const err = len - c.value;
+  const aPin = pinned.has(a.id);
+  const bPin = pinned.has(b.id);
+  if (aPin && bPin) return Math.abs(err);
+  if (aPin) {
+    b.x = a.x + ux * c.value;
+    b.y = a.y + uy * c.value;
+  } else if (bPin) {
+    a.x = b.x - ux * c.value;
+    a.y = b.y - uy * c.value;
+  } else {
+    a.x += (ux * err) / 2;
+    a.y += (uy * err) / 2;
+    b.x -= (ux * err) / 2;
+    b.y -= (uy * err) / 2;
+  }
+  return Math.abs(err);
+}
+
+/** Drive |b[axis] - a[axis]| to `value`, keeping the current sign. */
+function projectAxisDistance(a, b, value, pinned, axis) {
+  const d = b[axis] - a[axis];
+  const sign = d >= 0 ? 1 : -1;
+  const diff = sign * value - d; // amount to add to (b - a) along the axis
+  const err = Math.abs(Math.abs(d) - value);
+  const aPin = pinned.has(a.id);
+  const bPin = pinned.has(b.id);
+  if (aPin && bPin) return err;
+  if (aPin) b[axis] += diff;
+  else if (bPin) a[axis] -= diff;
+  else {
+    a[axis] -= diff / 2;
+    b[axis] += diff / 2;
+  }
+  return err;
+}
+
+/**
+ * Perpendicular distance from a point to an infinite line, driven to `value`.
+ * Splits the correction between the (free) point and the (free) line, moving
+ * both along the line normal — the same geometry as tangent, with the point
+ * playing the role of a circle center.
+ */
+function projectPdistance(pts, c, sketch, pinned) {
+  const line = sketch.entities[c.line];
+  const p = pts[c.point];
+  if (!line || !p) return 0;
+  const a = pts[line.p1];
+  const b = pts[line.p2];
+  let nx = -(b.y - a.y);
+  let ny = b.x - a.x;
+  const len = Math.hypot(nx, ny);
+  if (len < 1e-12) return 0;
+  nx /= len;
+  ny /= len;
+  const d = (p.x - a.x) * nx + (p.y - a.y) * ny;
+  const side = d >= 0 ? 1 : -1;
+  const err = Math.abs(d) - c.value;
+  const pointFree = !pinned.has(p.id);
+  const lineIsFree = !pinned.has(a.id) && !pinned.has(b.id);
+  if (!pointFree && !lineIsFree) return Math.abs(err);
+  const wPoint = pointFree && lineIsFree ? 0.5 : pointFree ? 1 : 0;
+  const wLine = pointFree && lineIsFree ? 0.5 : lineIsFree ? 1 : 0;
+  p.x -= nx * side * err * wPoint;
+  p.y -= ny * side * err * wPoint;
+  a.x += nx * side * err * wLine;
+  a.y += ny * side * err * wLine;
+  b.x += nx * side * err * wLine;
+  b.y += ny * side * err * wLine;
+  return Math.abs(err);
+}
+
+/** Angle dimension between two lines: drive their directions `value` apart. */
+function projectAngleDim(pts, c, sketch, pinned) {
+  const l1 = sketch.entities[c.a];
+  const l2 = sketch.entities[c.b];
+  if (!l1 || !l2) return 0;
+  return projectAngle(pts, l1, l2, c.value, pinned);
+}
+
+/** Diameter dimension on a circle/arc: half the target drives the radius. */
+function projectDiameter(pts, c, sketch, pinned) {
+  const entity = sketch.entities[c.entity];
+  if (!entity) return 0;
+  const r = c.value / 2;
+  if (entity.type === 'circle') {
+    const err = Math.abs(entity.radius - r);
+    entity.radius = r;
+    return err;
+  }
+  return projectArcEndpointsToRadius(pts, entity, r, pinned);
+}
+
 function projectConstraint(pts, c, sketch, pinned) {
+  // Driven (reference) dimensions are measured, never enforced — they must not
+  // push geometry or contribute to the residual.
+  if (c.driven) return 0;
   switch (c.type) {
     case 'horizontal':
       return projectHorizontal(pts, c, sketch, pinned);
@@ -501,6 +619,14 @@ function projectConstraint(pts, c, sketch, pinned) {
       return projectMidpoint(pts, c, sketch, pinned);
     case 'symmetric':
       return projectSymmetric(pts, c, sketch, pinned);
+    case 'distance':
+      return projectDistance(pts, c, pinned);
+    case 'pdistance':
+      return projectPdistance(pts, c, sketch, pinned);
+    case 'angle':
+      return projectAngleDim(pts, c, sketch, pinned);
+    case 'diameter':
+      return projectDiameter(pts, c, sketch, pinned);
     case 'fix':
       return 0; // enforced by pinning in solve()
     default:

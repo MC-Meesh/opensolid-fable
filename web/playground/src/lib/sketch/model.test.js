@@ -278,6 +278,63 @@ describe('sketch model', () => {
       constraintRefs({ type: 'symmetric', a: 'p1', b: 'p2', line: 'e1' })
     ).toEqual(['p1', 'p2', 'e1']);
     expect(constraintRefs({ type: 'fix', point: 'p1' })).toEqual(['p1']);
+    expect(
+      constraintRefs({ type: 'distance', a: 'p1', b: 'p2' })
+    ).toEqual(['p1', 'p2']);
+    expect(
+      constraintRefs({ type: 'pdistance', point: 'p1', line: 'e1' })
+    ).toEqual(['p1', 'e1']);
+    expect(constraintRefs({ type: 'angle', a: 'e1', b: 'e2' })).toEqual([
+      'e1',
+      'e2',
+    ]);
+    expect(constraintRefs({ type: 'diameter', entity: 'e3' })).toEqual(['e3']);
+  });
+
+  it('validateConstraint handles dimension constraints', () => {
+    const s = createSketch();
+    const a = addPoint(s, 0, 0);
+    const b = addPoint(s, 4, 0);
+    const c = addPoint(s, 0, 3);
+    const line = addLine(s, a, b);
+    const line2 = addLine(s, a, c);
+    const circle = addCircle(s, a, 1);
+    const off = addPoint(s, 2, 5);
+
+    expect(validateConstraint(s, { type: 'distance', a, b, value: 5 })).toBeNull();
+    expect(
+      validateConstraint(s, { type: 'distance', a, b: a, value: 5 })
+    ).toMatch(/distinct/);
+    expect(
+      validateConstraint(s, { type: 'distance', a, b, value: 0 })
+    ).toMatch(/positive/);
+
+    expect(
+      validateConstraint(s, { type: 'pdistance', point: off, line, value: 2 })
+    ).toBeNull();
+    expect(
+      validateConstraint(s, { type: 'pdistance', point: a, line, value: 2 })
+    ).toMatch(/endpoint/);
+    expect(
+      validateConstraint(s, { type: 'pdistance', point: off, line: circle, value: 2 })
+    ).toMatch(/line/);
+
+    expect(
+      validateConstraint(s, { type: 'angle', a: line, b: line2, value: 1 })
+    ).toBeNull();
+    expect(
+      validateConstraint(s, { type: 'angle', a: line, b: line, value: 1 })
+    ).toMatch(/distinct/);
+    expect(
+      validateConstraint(s, { type: 'angle', a: line, b: circle, value: 1 })
+    ).toMatch(/lines/);
+
+    expect(
+      validateConstraint(s, { type: 'diameter', entity: circle, value: 3 })
+    ).toBeNull();
+    expect(
+      validateConstraint(s, { type: 'diameter', entity: line, value: 3 })
+    ).toMatch(/circle or arc/);
   });
 
   it('validateConstraint accepts valid and rejects invalid combos', () => {

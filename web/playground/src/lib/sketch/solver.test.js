@@ -343,6 +343,103 @@ describe('constraint solver', () => {
     expect(lineLen(s, line)).toBeCloseTo(10, 7);
   });
 
+  it('distance drives two points to an aligned separation', () => {
+    const s = createSketch();
+    const a = addPoint(s, 0, 0);
+    const b = addPoint(s, 3, 4);
+    addConstraint(s, { type: 'distance', a, b, value: 10 });
+    const result = solve(s);
+    expect(result.converged).toBe(true);
+    expect(
+      Math.hypot(s.points[b].x - s.points[a].x, s.points[b].y - s.points[a].y)
+    ).toBeCloseTo(10, 7);
+    // Direction preserved (3-4-5 scaled to 6-8-10).
+    expect(s.points[b].x - s.points[a].x).toBeCloseTo(6, 6);
+  });
+
+  it('distance with horizontal orient constrains only Δx', () => {
+    const s = createSketch();
+    const a = addPoint(s, 0, 0);
+    const b = addPoint(s, 2, 5);
+    addConstraint(s, { type: 'distance', a, b, value: 8, orient: 'horizontal' });
+    const result = solve(s);
+    expect(result.converged).toBe(true);
+    expect(Math.abs(s.points[b].x - s.points[a].x)).toBeCloseTo(8, 7);
+    // Vertical offset is untouched.
+    expect(s.points[b].y - s.points[a].y).toBeCloseTo(5, 9);
+  });
+
+  it('distance with vertical orient constrains only Δy against a pin', () => {
+    const s = createSketch();
+    const a = addPoint(s, 0, 0);
+    const b = addPoint(s, 2, 5);
+    addConstraint(s, { type: 'distance', a, b, value: 3, orient: 'vertical' });
+    solve(s, { pinned: new Set([a]) });
+    expect(s.points[a].y).toBe(0);
+    expect(s.points[b].y).toBeCloseTo(3, 7);
+    expect(s.points[b].x).toBe(2); // x never touched by a vertical distance
+  });
+
+  it('pdistance drives a point to a perpendicular offset from a line', () => {
+    const s = createSketch();
+    const a = addPoint(s, -5, 0);
+    const b = addPoint(s, 5, 0);
+    const line = addLine(s, a, b);
+    const p = addPoint(s, 0, 1);
+    addConstraint(s, { type: 'pdistance', point: p, line, value: 4 });
+    const result = solve(s, { pinned: new Set([a, b]) });
+    expect(result.converged).toBe(true);
+    // Line is on y = 0; the point sits 4 above it.
+    expect(s.points[p].y).toBeCloseTo(4, 7);
+  });
+
+  it('angle drives two lines to a target angle', () => {
+    const s = createSketch();
+    const a = addPoint(s, 0, 0);
+    const b = addPoint(s, 4, 0);
+    const l1 = addLine(s, a, b);
+    const l2 = addLine(s, addPoint(s, 0, 0), addPoint(s, 4, 0.5));
+    addConstraint(s, { type: 'angle', a: l1, b: l2, value: Math.PI / 4 });
+    const result = solve(s, { pinned: new Set([a, b]) });
+    expect(result.converged).toBe(true);
+    const ang1 = lineAngle(s, l1);
+    const ang2 = lineAngle(s, l2);
+    let gap = Math.abs(ang1 - ang2) % Math.PI;
+    gap = Math.min(gap, Math.PI - gap);
+    expect(gap).toBeCloseTo(Math.PI / 4, 6);
+  });
+
+  it('diameter drives a circle radius to half the value', () => {
+    const s = createSketch();
+    const circle = addCircle(s, addPoint(s, 0, 0), 1);
+    addConstraint(s, { type: 'diameter', entity: circle, value: 7 });
+    solve(s);
+    expect(s.entities[circle].radius).toBeCloseTo(3.5, 9);
+  });
+
+  it('diameter moves arc endpoints onto the target circle', () => {
+    const s = createSketch();
+    const c = addPoint(s, 0, 0);
+    const p1 = addPoint(s, 2, 0);
+    const p2 = addPoint(s, 0, 3);
+    const arc = addArc(s, c, p1, p2, true);
+    addConstraint(s, { type: 'diameter', entity: arc, value: 10 });
+    const result = solve(s);
+    expect(result.converged).toBe(true);
+    expect(Math.hypot(s.points[p1].x, s.points[p1].y)).toBeCloseTo(5, 7);
+  });
+
+  it('driven dimensions are measured, not enforced', () => {
+    const s = createSketch();
+    const a = addPoint(s, 0, 0);
+    const b = addPoint(s, 3, 0);
+    addConstraint(s, { type: 'distance', a, b, value: 100, driven: true });
+    const result = solve(s);
+    expect(result.converged).toBe(true);
+    // The driven target is ignored — geometry stays put.
+    expect(s.points[b].x).toBe(3);
+  });
+
   it('solves a rectangle with two dimensions to exact size', () => {
     const s = createSketch();
     // Sloppy near-rectangle; constraints should square it up at 4 x 2.

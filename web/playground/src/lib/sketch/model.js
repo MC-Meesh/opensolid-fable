@@ -20,6 +20,14 @@
  *                { id, type: 'symmetric', a, b, line }         (points a,b mirrored over axis line)
  *                { id, type: 'fix', point }                    (anchor a point in place)
  *
+ * Dimension constraints (driving by default; `driven: true` makes them
+ * reference-only — measured, not enforced by the solver):
+ *                { id, type: 'distance', a, b, value, orient } (two points; orient:
+ *                    'aligned' | 'horizontal' | 'vertical')
+ *                { id, type: 'pdistance', point, line, value } (perpendicular point→line)
+ *                { id, type: 'angle', a, b, value }            (two lines; value radians)
+ *                { id, type: 'diameter', entity, value }       (circle or arc)
+ *
  * Entities reference points by id; chained lines share endpoint ids, which is
  * implicit coincidence. The explicit `coincident` constraint glues two
  * distinct points together via the solver.
@@ -275,7 +283,13 @@ export function constraintRefs(constraint) {
     case 'length':
       return [constraint.line];
     case 'radius':
+    case 'diameter':
       return [constraint.entity];
+    case 'distance':
+    case 'angle':
+      return [constraint.a, constraint.b];
+    case 'pdistance':
+      return [constraint.point, constraint.line];
     case 'parallel':
     case 'perpendicular':
     case 'collinear':
@@ -458,6 +472,41 @@ export function validateConstraint(sketch, constraint) {
     }
     case 'fix': {
       if (!sketch.points[constraint.point]) return 'requires a point';
+      return null;
+    }
+    case 'distance': {
+      if (constraint.a === constraint.b) return 'requires two distinct points';
+      if (!sketch.points[constraint.a] || !sketch.points[constraint.b]) {
+        return 'requires two points';
+      }
+      if (!(constraint.value > 0)) return 'distance must be positive';
+      return null;
+    }
+    case 'pdistance': {
+      if (!line || line.type !== 'line') return 'requires a line';
+      if (!sketch.points[constraint.point]) return 'requires a point';
+      if (constraint.point === line.p1 || constraint.point === line.p2) {
+        return 'point cannot be an endpoint of the line';
+      }
+      if (!(constraint.value > 0)) return 'distance must be positive';
+      return null;
+    }
+    case 'angle': {
+      if (constraint.a === constraint.b) return 'requires two distinct lines';
+      const la = sketch.entities[constraint.a];
+      const lb = sketch.entities[constraint.b];
+      if (!la || la.type !== 'line' || !lb || lb.type !== 'line') {
+        return 'requires two lines';
+      }
+      if (!(constraint.value > 0)) return 'angle must be positive';
+      return null;
+    }
+    case 'diameter': {
+      const curve = sketch.entities[constraint.entity];
+      if (!curve || (curve.type !== 'circle' && curve.type !== 'arc')) {
+        return 'requires a circle or arc';
+      }
+      if (!(constraint.value > 0)) return 'diameter must be positive';
       return null;
     }
     default:

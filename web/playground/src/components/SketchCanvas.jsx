@@ -50,6 +50,12 @@ import {
   normalizeAngle,
 } from '../lib/sketch/geom.js';
 import {
+  distanceDim,
+  inferDimension,
+  measureConstraint,
+  orientForPlacement,
+} from '../lib/sketch/dimension.js';
+import {
   extractProfile,
   isFacePlane,
   planeAxisLabels,
@@ -161,8 +167,32 @@ const TOOLS = [
     key: 'X',
     hint: 'Click near an open end to extend it to the nearest intersection',
   },
+  {
+    id: 'dimension',
+    label: 'Dimension',
+    key: 'D',
+    hint: 'Smart Dimension · click geometry (line, circle, arc, 2 points, point+line, 2 lines) · type a value + Enter for a driving dim · Esc for a driven reference dim',
+  },
   { id: 'pan', label: 'Pan', key: 'P', hint: 'Drag to pan (middle-drag works with any tool)' },
 ];
+
+/** Dimension constraint types the Smart Dimension tool and glyphs handle. */
+const DIM_TYPES = new Set([
+  'length',
+  'radius',
+  'diameter',
+  'distance',
+  'pdistance',
+  'angle',
+]);
+
+/** Label for a dimension constraint's measured/target value. */
+function dimLabel(type, value, unit) {
+  if (type === 'angle') return formatAngle(value);
+  if (type === 'diameter') return withUnit(`⌀${formatNumber(value)}`, unit);
+  if (type === 'radius') return withUnit(`R${formatNumber(value)}`, unit);
+  return withUnit(formatNumber(value), unit);
+}
 
 const DEFAULT_POLYGON_SIDES = 6;
 const MIN_POLYGON_SIDES = 3;
@@ -286,7 +316,15 @@ export default forwardRef(function SketchCanvas(
   const [dimEntry, setDimEntry] = useState(null); // typed exact dimension while drafting
   const dimEntryRef = useRef(null);
   dimEntryRef.current = dimEntry;
-  const [dimEdit, setDimEdit] = useState(null); // { id, text, wx, wy } editing a dimension
+  const [dimEdit, setDimEdit] = useState(null); // { id, text, wx, wy, angle } editing a dimension
+  // Smart Dimension tool state machine:
+  //   { phase: 'pick',  picks: [{kind,id}] }   accumulating a selection
+  //   { phase: 'place', info }                 distance dim following the cursor
+  //   { phase: 'value', info, text }           armed value entry
+  const [dim, setDim] = useState({ phase: 'pick', picks: [] });
+  const dimRef = useRef(dim);
+  dimRef.current = dim;
+  const resetDim = useCallback(() => setDim({ phase: 'pick', picks: [] }), []);
   const [message, setMessage] = useState(null);
   const [polygonSides, setPolygonSides] = useState(DEFAULT_POLYGON_SIDES);
   const polygonSidesRef = useRef(DEFAULT_POLYGON_SIDES);
@@ -321,6 +359,7 @@ export default forwardRef(function SketchCanvas(
     setDraft(null);
     setDimEntry(null);
     setDimEdit(null);
+    setDim({ phase: 'pick', picks: [] });
     setMessage(null);
     dragRef.current = null;
   }, []);
@@ -340,6 +379,12 @@ export default forwardRef(function SketchCanvas(
     resetTransient();
     touch();
   }, [resetTransient, touch]);
+
+  // Switching tools (including via keyboard shortcut) abandons any in-progress
+  // Smart Dimension picks so the next entry starts clean.
+  useEffect(() => {
+    resetDim();
+  }, [tool, resetDim]);
 
   // Entering sketch mode: draw-first default for an empty sketch.
   useEffect(() => {
@@ -865,6 +910,93 @@ export default forwardRef(function SketchCanvas(
     [commitDimEntry]
   );
 
+  // ---- smart dimension ---------------------------------------------------
+
+  /**
+   * Commit the armed dimension. `mode` is 'driving' (enforced constraint, at
+   * the typed value or the measured value if blank) or 'driven' (a reference
+   * dimension that only measures). Idempotent once the dim is cleared.
+   */
+  const commitDimension = useCallback(
+    (mode) => {
+      const d = dimRef.current;
+      if (!d || d.phase !== 'value') return;
+      const { info, text } = d;
+      const proto = { ...info.proto };
+      if (mode === 'driven') {
+        proto.driven = true;
+        proto.value = info.measured;
+      } else {
+        const typed = parseDimension(text);
+        // Angles are entered in degrees; the constraint stores radians.
+        if (info.proto.type === 'angle') {
+          proto.value = typed ? (typed * Math.PI) / 180 : info.measured;
+        } else {
+          proto.value = typed ?? info.measured;
+        }
+      }
+      const problem = validateConstraint(sketchRef.current, proto);
+      if (problem) {
+        setMessage(`Cannot dimension: ${problem}`);
+        return;
+      }
+      const before = takeBefore();
+      addConstraint(sketchRef.current, proto);
+      runSolve();
+      commitRecord(before);
+      resetDim();
+    },
+    [takeBefore, runSolve, commitRecord, resetDim]
+  );
+
+  /** A dimension-tool click: accumulate picks, place, and arm value entry. */
+  const smartDimClick = useCallback(
+    (world) => {
+      const s = sketchRef.current;
+      const d = dimRef.current;
+      // Placing a point-to-point distance: this click fixes the orientation.
+      if (d.phase === 'place') {
+        const a = s.points[d.info.proto.a];
+        const b = s.points[d.info.proto.b];
+        const orient = orientForPlacement(a.x, a.y, b.x, b.y, world.x, world.y);
+        setDim({ phase: 'value', info: distanceDim(s, a, b, orient), text: '' });
+        return;
+      }
+      const tol = HIT_PX / view.scale;
+      const hit = hitTest(s, world.x, world.y, tol, tol);
+      if (!hit) {
+        setMessage('Click a line, circle, arc, point, or point + line');
+        resetDim();
+        return;
+      }
+      const picks = d.phase === 'pick' ? d.picks : [];
+      // Toggle off a repeat pick; otherwise append.
+      const next = picks.some((p) => p.kind === hit.kind && p.id === hit.id)
+        ? picks.filter((p) => !(p.kind === hit.kind && p.id === hit.id))
+        : [...picks, hit];
+      const result = inferDimension(s, next);
+      if (result === null) {
+        setMessage(
+          next.length === 0 ? null : 'Pick another entity to complete the dimension'
+        );
+        setDim({ phase: 'pick', picks: next });
+        return;
+      }
+      if (result.error) {
+        setMessage(`Cannot dimension: ${result.error}`);
+        resetDim();
+        return;
+      }
+      setMessage(null);
+      if (result.needsPlacement) {
+        setDim({ phase: 'place', info: result });
+      } else {
+        setDim({ phase: 'value', info: result, text: '' });
+      }
+    },
+    [view.scale, resetDim]
+  );
+
   // ---- tool click handling ---------------------------------------------
 
   const handleToolClick = useCallback(
@@ -1125,6 +1257,10 @@ export default forwardRef(function SketchCanvas(
           }
           return;
         }
+        case 'dimension': {
+          smartDimClick(world);
+          return;
+        }
         default:
       }
     },
@@ -1142,6 +1278,7 @@ export default forwardRef(function SketchCanvas(
       commitSpline,
       commitPolygon,
       commitSlot,
+      smartDimClick,
       takeBefore,
       runSolve,
       commitRecord,
@@ -1172,10 +1309,16 @@ export default forwardRef(function SketchCanvas(
           setDimEdit(null);
           return;
         }
+        // A click while a dimension value is armed finalizes it (driving if a
+        // value was typed, otherwise a driven reference dim).
+        if (dimRef.current.phase === 'value') {
+          commitDimension(dimRef.current.text ? 'driving' : 'driven');
+          return;
+        }
         handleToolClick(eventWorld(event), event);
       }
     },
-    [tool, view, dimEdit, cancelDraft, handleToolClick, eventWorld]
+    [tool, view, dimEdit, cancelDraft, handleToolClick, commitDimension, eventWorld]
   );
 
   const onPointerMove = useCallback(
@@ -1491,11 +1634,16 @@ export default forwardRef(function SketchCanvas(
   // ---- dimension editing (click a dimension label) ------------------------
 
   const openDimEdit = useCallback((constraint, wx, wy) => {
+    const angle = constraint.type === 'angle';
     setDimEdit({
       id: constraint.id,
-      text: String(constraint.value),
+      // Angles are stored in radians but edited in degrees.
+      text: angle
+        ? formatNumber((constraint.value * 180) / Math.PI)
+        : String(constraint.value),
       wx,
       wy,
+      angle,
     });
   }, []);
 
@@ -1523,7 +1671,7 @@ export default forwardRef(function SketchCanvas(
     }
     const before = takeBefore();
     if (edit.entity) target[edit.param] = value;
-    else target.value = value;
+    else target.value = edit.angle ? (value * Math.PI) / 180 : value;
     runSolve();
     commitRecord(before);
     setDimEdit(null);
@@ -1537,6 +1685,8 @@ export default forwardRef(function SketchCanvas(
       setDimEntry(null);
     } else if (dimEdit) {
       setDimEdit(null);
+    } else if (dimRef.current.phase !== 'pick' || dimRef.current.picks.length > 0) {
+      resetDim();
     } else if (d?.kind === 'spline' && d.anchors.length >= 2) {
       // Finish the in-progress open spline rather than discarding it.
       commitSpline(d.anchors, { construction: d.construction });
@@ -1549,7 +1699,7 @@ export default forwardRef(function SketchCanvas(
     } else {
       onExit?.();
     }
-  }, [dimEdit, selection, tool, cancelDraft, commitSpline, onExit]);
+  }, [dimEdit, selection, tool, cancelDraft, commitSpline, resetDim, onExit]);
 
   useEffect(() => {
     if (!open) return undefined;
@@ -1610,9 +1760,10 @@ export default forwardRef(function SketchCanvas(
   const selectTool = useCallback(
     (id) => {
       cancelDraft();
+      resetDim();
       setTool(id);
     },
-    [cancelDraft]
+    [cancelDraft, resetDim]
   );
 
   // ---- rendering helpers --------------------------------------------------
@@ -1800,8 +1951,10 @@ export default forwardRef(function SketchCanvas(
 
   function renderConstraintGlyph(constraint) {
     const s = sketch;
-    const editable = constraint.type === 'length' || constraint.type === 'radius';
-    const cls = `glyph${editable ? ' dim' : ''}${
+    const isDim = DIM_TYPES.has(constraint.type);
+    const driven = Boolean(constraint.driven);
+    const editable = isDim && !driven;
+    const cls = `glyph${editable ? ' dim' : ''}${driven ? ' driven' : ''}${
       isSelected('constraint', constraint.id) ? ' selected' : ''
     }`;
     const select = (event) => {
@@ -1815,6 +1968,20 @@ export default forwardRef(function SketchCanvas(
           {label}
         </text>
       );
+    };
+    // A dimension label at (wx, wy): driving dims show the target and open an
+    // editor on click; driven (reference) dims show the live measured value in
+    // parentheses and only select.
+    const dimAt = (wx, wy) => {
+      if (driven) {
+        const m = measureConstraint(s, constraint);
+        const label = m == null ? '' : `(${dimLabel(constraint.type, m, documentUnit)})`;
+        return textAt(wx, wy, label);
+      }
+      return textAt(wx, wy, dimLabel(constraint.type, constraint.value, documentUnit), (event) => {
+        event.stopPropagation();
+        openDimEdit(constraint, wx, wy);
+      });
     };
     switch (constraint.type) {
       case 'horizontal':
@@ -1834,25 +2001,45 @@ export default forwardRef(function SketchCanvas(
         if (!line) return null;
         const a = s.points[line.p1];
         const b = s.points[line.p2];
-        const mx = (a.x + b.x) / 2;
-        const my = (a.y + b.y) / 2;
-        return textAt(mx, my, withUnit(formatNumber(constraint.value), documentUnit), (event) => {
-          event.stopPropagation();
-          openDimEdit(constraint, mx, my);
-        });
+        return dimAt((a.x + b.x) / 2, (a.y + b.y) / 2);
       }
-      case 'radius': {
+      case 'radius':
+      case 'diameter': {
         const entity = s.entities[constraint.entity];
         if (!entity) return null;
         const c = s.points[entity.center];
         const r = entityRadius(s, entity);
         const d = Math.SQRT1_2;
-        const wx = c.x + r * d;
-        const wy = c.y + r * d;
-        return textAt(wx, wy, withUnit(`R${formatNumber(constraint.value)}`, documentUnit), (event) => {
-          event.stopPropagation();
-          openDimEdit(constraint, wx, wy);
-        });
+        return dimAt(c.x + r * d, c.y + r * d);
+      }
+      case 'distance': {
+        const a = s.points[constraint.a];
+        const b = s.points[constraint.b];
+        if (!a || !b) return null;
+        return dimAt((a.x + b.x) / 2, (a.y + b.y) / 2);
+      }
+      case 'pdistance': {
+        const line = s.entities[constraint.line];
+        const p = s.points[constraint.point];
+        if (!line || !p) return null;
+        const a = s.points[line.p1];
+        const b = s.points[line.p2];
+        // Anchor the label between the point and its foot on the line.
+        const dx = b.x - a.x;
+        const dy = b.y - a.y;
+        const t = ((p.x - a.x) * dx + (p.y - a.y) * dy) / (dx * dx + dy * dy || 1);
+        const fx = a.x + dx * t;
+        const fy = a.y + dy * t;
+        return dimAt((p.x + fx) / 2, (p.y + fy) / 2);
+      }
+      case 'angle': {
+        const l1 = s.entities[constraint.a];
+        const l2 = s.entities[constraint.b];
+        if (!l1 || !l2) return null;
+        const m1 = entityAnchor(s, constraint.a);
+        const m2 = entityAnchor(s, constraint.b);
+        if (!m1 || !m2) return null;
+        return dimAt((m1.x + m2.x) / 2, (m1.y + m2.y) / 2);
       }
       case 'coincident': {
         const p = s.points[constraint.a];
@@ -2284,6 +2471,77 @@ export default forwardRef(function SketchCanvas(
     );
   }
 
+  /** Highlights, cursor preview, and picked geometry for Smart Dimension. */
+  function renderDimOverlay() {
+    if (tool !== 'dimension' || size.w === 0) return null;
+    const els = [];
+    const markPick = (pick, i) => {
+      if (pick.kind === 'point') {
+        const p = sketch.points[pick.id];
+        if (!p) return;
+        const [x, y] = worldToScreen(p.x, p.y);
+        els.push(
+          <circle key={`dp${i}`} className="dim-pick" cx={x} cy={y} r={7} fill="none" />
+        );
+        return;
+      }
+      const anchor = entityAnchor(sketch, pick.id);
+      if (!anchor) return;
+      const [x, y] = worldToScreen(anchor.x, anchor.y);
+      els.push(
+        <circle key={`dp${i}`} className="dim-pick" cx={x} cy={y} r={9} fill="none" />
+      );
+    };
+    if (dim.phase === 'pick') dim.picks.forEach(markPick);
+    if (dim.phase === 'place') {
+      const { a, b } = dim.info.proto;
+      [{ kind: 'point', id: a }, { kind: 'point', id: b }].forEach(markPick);
+      if (cursor) {
+        const pa = sketch.points[a];
+        const pb = sketch.points[b];
+        const orient = orientForPlacement(pa.x, pa.y, pb.x, pb.y, cursor.x, cursor.y);
+        const measured = distanceDim(sketch, pa, pb, orient).measured;
+        const [x, y] = worldToScreen(cursor.x, cursor.y);
+        els.push(
+          <text key="dim-place" className="glyph dim" x={x + 8} y={y - 8}>
+            {formatNumber(measured)}
+          </text>
+        );
+      }
+    }
+    return els;
+  }
+
+  /** Armed value entry for the Smart Dimension tool. */
+  function renderDimInput() {
+    if (dim.phase !== 'value' || size.w === 0) return null;
+    const info = dim.info;
+    const [sx, sy] = worldToScreen(info.anchor.x, info.anchor.y);
+    const isAngle = info.proto.type === 'angle';
+    const measuredLabel = isAngle
+      ? formatNumber((info.measured * 180) / Math.PI)
+      : formatNumber(info.measured);
+    return (
+      <input
+        className="dim-edit"
+        style={{ left: sx, top: sy - 26 }}
+        autoFocus
+        type="number"
+        min="0"
+        step="any"
+        placeholder={measuredLabel}
+        value={dim.text}
+        onChange={(e) => setDim({ ...dim, text: e.target.value })}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') commitDimension('driving');
+          else if (e.key === 'Escape') commitDimension('driven');
+        }}
+        onBlur={() => commitDimension(dim.text ? 'driving' : 'driven')}
+        onPointerDown={(e) => e.stopPropagation()}
+      />
+    );
+  }
+
   const activeTool = TOOLS.find((t) => t.id === tool);
   const dimTargets = selLines.length + selCurves.length;
   const chainStartPos =
@@ -2309,6 +2567,7 @@ export default forwardRef(function SketchCanvas(
         {Object.values(sketch.constraints).map(renderConstraintGlyph)}
         {renderEllipseDims()}
         {renderDraft()}
+        {renderDimOverlay()}
         {Object.values(sketch.points).map((p) => {
           const [x, y] = worldToScreen(p.x, p.y);
           const selected = isSelected('point', p.id);
@@ -2342,6 +2601,7 @@ export default forwardRef(function SketchCanvas(
 
       {renderDimReadout()}
       {renderDimEdit()}
+      {renderDimInput()}
 
       <div className="sketch-toolbar">
         <div className="group">
