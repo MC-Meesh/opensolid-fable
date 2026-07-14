@@ -109,7 +109,11 @@ export function createWasmLoader({
           `(diagnostic: ${diagnostic}).\n${PKG_HINT}`
       );
     }
-    return { WasmShape: mod.WasmShape, WasmProfile2D: mod.WasmProfile2D };
+    return {
+      WasmShape: mod.WasmShape,
+      WasmProfile2D: mod.WasmProfile2D,
+      WasmPath3D: mod.WasmPath3D,
+    };
   }
 
   function ensure() {

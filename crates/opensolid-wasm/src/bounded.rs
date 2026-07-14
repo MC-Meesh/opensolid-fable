@@ -16,8 +16,8 @@ use opensolid_frep::primitives::{
 };
 use opensolid_frep::refine::{RefineOptions, refine_mesh};
 use opensolid_frep::{
-    BlendMode, BooleanKind, EdgeRegion, Extrude, OpenPath2D, Profile2D, Revolve, Rib, RibSide,
-    SdfTransformExt, Shape,
+    BlendMode, BooleanKind, EdgeRegion, Extrude, Loft, OpenPath2D, Profile2D, Revolve, Rib,
+    RibSide, SdfTransformExt, Shape, Sweep,
 };
 
 /// Depth bounds for accuracy-driven adaptive meshing: the ceiling keeps the
@@ -244,6 +244,41 @@ impl BoundedShape {
         );
         Ok(Self {
             shape: Shape::new(rib),
+            bounds,
+        })
+    }
+
+    /// The profile swept along a polyline `path` (at least two 3D points).
+    /// The profile's local `(u, v)` origin rides on the path, oriented by a
+    /// twist-free frame perpendicular to each segment. The tracked box is the
+    /// AABB of every per-segment prism (conservative at mitred joints).
+    ///
+    /// # Errors
+    /// Propagates [`Sweep::new`] validation (≥ 2 finite, distinct points).
+    pub fn sweep(profile: Profile2D, path: &[[f64; 3]]) -> CoreResult<Self> {
+        let sweep = Sweep::new(profile, path)?;
+        let bounds = BoundingBox3::from_points(sweep.corners());
+        Ok(Self {
+            shape: Shape::new(sweep),
+            bounds,
+        })
+    }
+
+    /// A loft between `bottom` (on `y = 0`) and `top` (on `y = height`),
+    /// linearly morphing their signed distances along `y`. The tracked box is
+    /// the xz-union of the two profile bounds over `y ∈ [0, height]`.
+    ///
+    /// # Errors
+    /// Propagates [`Loft::new`] validation (`height > 0` and finite).
+    pub fn loft(bottom: Profile2D, top: Profile2D, height: f64) -> CoreResult<Self> {
+        let (bmin, bmax) = bottom.bounds();
+        let (tmin, tmax) = top.bounds();
+        let bounds = BoundingBox3::new(
+            Point3::new(bmin[0].min(tmin[0]), 0.0, bmin[1].min(tmin[1])),
+            Point3::new(bmax[0].max(tmax[0]), height, bmax[1].max(tmax[1])),
+        );
+        Ok(Self {
+            shape: Shape::new(Loft::new(bottom, top, height)?),
             bounds,
         })
     }
@@ -1195,6 +1230,58 @@ mod tests {
         let mesh = part.mesh(RES, None);
         assert!(!mesh.is_empty());
         assert!(mesh.is_closed_manifold());
+    }
+
+    #[test]
+    fn sweep_tracks_bounds_and_meshes() {
+        // A radius-0.25 disk swept straight up +Y over [0, 1]: a cylinder.
+        let disk =
+            Profile2D::new(vec![[-0.25, 0.0], [0.25, 0.0]], vec![1.0, 1.0]).expect("valid circle");
+        let s =
+            BoundedShape::sweep(disk, &[[0.0, 0.0, 0.0], [0.0, 1.0, 0.0]]).expect("valid sweep");
+        // Bounds hug the swept cylinder: x,z ∈ [-0.25, 0.25], y ∈ [0, 1].
+        assert!((s.bounds.min.x + 0.25).abs() < 1e-9 && (s.bounds.max.x - 0.25).abs() < 1e-9);
+        assert!(s.bounds.min.y.abs() < 1e-9 && (s.bounds.max.y - 1.0).abs() < 1e-9);
+        assert!(s.shape.eval(&Point3::new(0.25, 0.5, 0.0)).abs() < 1e-9);
+        assert_meshes_cleanly(&s);
+    }
+
+    #[test]
+    fn bent_sweep_meshes_within_auto_bounds() {
+        let disk =
+            Profile2D::new(vec![[-0.2, 0.0], [0.2, 0.0]], vec![1.0, 1.0]).expect("valid circle");
+        let s = BoundedShape::sweep(disk, &[[0.0, 0.0, 0.0], [0.0, 0.8, 0.0], [0.8, 0.8, 0.0]])
+            .expect("valid sweep");
+        assert_meshes_cleanly(&s);
+    }
+
+    #[test]
+    fn loft_tracks_bounds_and_meshes() {
+        let small = Profile2D::new(
+            vec![[-0.3, -0.3], [0.3, -0.3], [0.3, 0.3], [-0.3, 0.3]],
+            vec![0.0; 4],
+        )
+        .expect("valid");
+        let large = Profile2D::new(
+            vec![[-0.7, -0.7], [0.7, -0.7], [0.7, 0.7], [-0.7, 0.7]],
+            vec![0.0; 4],
+        )
+        .expect("valid");
+        let s = BoundedShape::loft(small, large, 1.2).expect("valid loft");
+        // Box spans the larger profile over y ∈ [0, height].
+        assert_eq!(s.bounds.min, Point3::new(-0.7, 0.0, -0.7));
+        assert_eq!(s.bounds.max, Point3::new(0.7, 1.2, 0.7));
+        // Top face wall sits at the large profile.
+        assert!(s.shape.eval(&Point3::new(0.7, 1.2, 0.0)).abs() < 1e-9);
+        assert_meshes_cleanly(&s);
+    }
+
+    #[test]
+    fn sweep_and_loft_reject_bad_input() {
+        assert!(BoundedShape::sweep(l_profile(), &[[0.0, 0.0, 0.0]]).is_err());
+        assert!(BoundedShape::sweep(l_profile(), &[[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]).is_err());
+        assert!(BoundedShape::loft(l_profile(), l_profile(), 0.0).is_err());
+        assert!(BoundedShape::loft(l_profile(), l_profile(), -1.0).is_err());
     }
 
     #[test]

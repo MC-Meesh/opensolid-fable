@@ -43,6 +43,8 @@ export function createStubApi() {
   for (const op of [...PRIMITIVE_OPS, ...SWEEP_OPS]) {
     StubShape[op] = () => new StubShape();
   }
+  StubShape.sweep = () => new StubShape();
+  StubShape.loft = () => new StubShape();
   for (const op of [...UNARY_OPS, ...BINARY_OPS]) {
     StubShape.prototype[op] = () => new StubShape();
   }
@@ -58,7 +60,17 @@ export function createStubApi() {
     }
   }
 
-  return { Shape: StubShape, Profile: StubProfile, live };
+  class StubPath {
+    constructor() {
+      live.add(this);
+    }
+    lineTo() {}
+    free() {
+      live.delete(this);
+    }
+  }
+
+  return { Shape: StubShape, Profile: StubProfile, Path: StubPath, live };
 }
 
 /**
@@ -72,7 +84,7 @@ export function createStubApi() {
  */
 export function reparseTree(source) {
   const api = createStubApi();
-  const traced = runTracedScript(source, api.Shape, api.Profile);
+  const traced = runTracedScript(source, api.Shape, api.Profile, api.Path);
   freeNodes(traced.nodes);
   return { root: traced.root, nodes: traced.nodes, leaked: api.live.size };
 }
@@ -142,4 +154,16 @@ export function addPrimitiveNode(root, ctor, args) {
   const prim = { id: -1, op: ctor, args: [...args], children: [], shape: null };
   if (!root) return prim;
   return { id: -2, op: 'union', args: [], children: [root, prim], shape: null };
+}
+
+/**
+ * Graft a prebuilt feature node (e.g. `defaultSweepNode`/`defaultLoftNode`,
+ * which carry `profile`/`path`/`profile2` snapshots) onto the tree, unioned
+ * onto the existing root. Like `addPrimitiveNode`, synthetic ids are negative
+ * and the result is only valid to serialize once and re-evaluate.
+ */
+export function addFeatureNode(root, node) {
+  const feature = { ...node, id: -1, children: [], shape: null };
+  if (!root) return feature;
+  return { id: -2, op: 'union', args: [], children: [root, feature], shape: null };
 }

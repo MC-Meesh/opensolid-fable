@@ -40,6 +40,15 @@ export const BINARY_OPS = ['union', 'intersect', 'subtract', 'smoothUnion'];
 // `{ start: [x, y], segs: [{ x, y, bulge }] }`.
 export const SWEEP_OPS = ['extrude', 'revolve'];
 
+// Static constructor sweeping a profile along a 3D `Path`. No children; the
+// node carries a `profile` snapshot plus a `path` snapshot `[[x, y, z], ...]`.
+export const PATH_SWEEP_OPS = ['sweep'];
+
+// Static constructor lofting between two profiles (bottom, top) plus a
+// numeric height. No children; the node carries a `profile` (bottom) snapshot
+// and a `profile2` (top) snapshot.
+export const LOFT_OPS = ['loft'];
+
 const OP_LABELS = {
   sphere: 'Sphere',
   box3: 'Box3',
@@ -60,6 +69,8 @@ const OP_LABELS = {
   smoothUnion: 'Smooth Union',
   extrude: 'Extrude',
   revolve: 'Revolve',
+  sweep: 'Sweep',
+  loft: 'Loft',
 };
 
 function formatArg(value) {
@@ -92,7 +103,7 @@ export function nodeLabel(node) {
  * additionally carry `profile`, a plain-data snapshot of the profile at the
  * moment of the sweep call.
  */
-export function createTracer(ShapeClass, ProfileClass) {
+export function createTracer(ShapeClass, ProfileClass, PathClass) {
   let nextId = 1;
   const nodes = [];
   const profiles = [];
@@ -127,11 +138,28 @@ export function createTracer(ShapeClass, ProfileClass) {
     }
   }
 
+  class TracingPath {
+    constructor(x, y, z) {
+      this.real = PathClass ? new PathClass(x, y, z) : null;
+      this.points = [[x, y, z]];
+      profiles.push(this);
+    }
+    lineTo(x, y, z) {
+      this.points.push([x, y, z]);
+      this.real?.lineTo(x, y, z);
+    }
+  }
+
   const record = (op, args, children, shape) => {
     const node = { id: nextId++, op, args, children, shape };
     nodes.push(node);
     return new TracingShape(node);
   };
+
+  const snapshotProfile = (profile) => ({
+    start: [...profile.start],
+    segs: profile.segs.map((s) => ({ ...s })),
+  });
 
   for (const op of PRIMITIVE_OPS) {
     TracingShape[op] = (...args) => record(op, args, [], ShapeClass[op](...args));
@@ -151,13 +179,38 @@ export function createTracer(ShapeClass, ProfileClass) {
         ShapeClass[op](profile.real, ...args)
       );
       // Snapshot so later mutation of the profile can't change this node.
-      traced.node.profile = {
-        start: [...profile.start],
-        segs: profile.segs.map((s) => ({ ...s })),
-      };
+      traced.node.profile = snapshotProfile(profile);
       return traced;
     };
   }
+
+  TracingShape.sweep = (profile, path) => {
+    if (!(profile instanceof TracingProfile)) {
+      throw new Error('Shape.sweep(...) expects a Profile as its first argument');
+    }
+    if (!(path instanceof TracingPath)) {
+      throw new Error('Shape.sweep(...) expects a Path as its second argument');
+    }
+    const traced = record('sweep', [], [], ShapeClass.sweep(profile.real, path.real));
+    traced.node.profile = snapshotProfile(profile);
+    traced.node.path = path.points.map((p) => [...p]);
+    return traced;
+  };
+
+  TracingShape.loft = (bottom, top, height) => {
+    if (!(bottom instanceof TracingProfile) || !(top instanceof TracingProfile)) {
+      throw new Error('Shape.loft(...) expects two Profiles as its first arguments');
+    }
+    const traced = record(
+      'loft',
+      [height],
+      [],
+      ShapeClass.loft(bottom.real, top.real, height)
+    );
+    traced.node.profile = snapshotProfile(bottom);
+    traced.node.profile2 = snapshotProfile(top);
+    return traced;
+  };
 
   for (const op of UNARY_OPS) {
     TracingShape.prototype[op] = function (...args) {
@@ -182,7 +235,7 @@ export function createTracer(ShapeClass, ProfileClass) {
     };
   }
 
-  return { TracingShape, TracingProfile, nodes, profiles };
+  return { TracingShape, TracingProfile, TracingPath, nodes, profiles };
 }
 
 /**
@@ -194,14 +247,12 @@ export function createTracer(ShapeClass, ProfileClass) {
  * only the plain-data snapshot). On error, any shapes created before the
  * failure are freed, then the error is rethrown.
  */
-export function runTracedScript(source, ShapeClass, ProfileClass) {
-  const { TracingShape, TracingProfile, nodes, profiles } = createTracer(
-    ShapeClass,
-    ProfileClass
-  );
+export function runTracedScript(source, ShapeClass, ProfileClass, PathClass) {
+  const { TracingShape, TracingProfile, TracingPath, nodes, profiles } =
+    createTracer(ShapeClass, ProfileClass, PathClass);
   let result;
   try {
-    result = runScript(source, TracingShape, TracingProfile);
+    result = runScript(source, TracingShape, TracingProfile, TracingPath);
   } catch (err) {
     freeNodes(nodes);
     throw err;
@@ -279,6 +330,7 @@ export function serializeTree(root, { header = '' } = {}) {
   const names = new Map();
   const lines = [];
   let profileCount = 0;
+  let pathCount = 0;
 
   const emitProfile = (profile) => {
     const name = `p${++profileCount}`;
@@ -294,11 +346,29 @@ export function serializeTree(root, { header = '' } = {}) {
     return name;
   };
 
+  const emitPath = (path) => {
+    const name = `path${++pathCount}`;
+    const [head, ...rest] = path;
+    lines.push(`const ${name} = new Path(${head.map(String).join(', ')});`);
+    for (const point of rest) {
+      lines.push(`${name}.lineTo(${point.map(String).join(', ')});`);
+    }
+    return name;
+  };
+
   const exprOf = (node) => {
     if (names.has(node.id)) return names.get(node.id);
     const args = node.args.map(String);
     let text;
-    if (node.profile) {
+    if (node.op === 'loft') {
+      const bottom = emitProfile(node.profile);
+      const top = emitProfile(node.profile2);
+      text = `Shape.loft(${bottom}, ${top}, ${args.join(', ')})`;
+    } else if (node.op === 'sweep') {
+      const pname = emitProfile(node.profile);
+      const path = emitPath(node.path);
+      text = `Shape.sweep(${pname}, ${path})`;
+    } else if (node.profile) {
       const pname = emitProfile(node.profile);
       const rest = args.length > 0 ? `, ${args.join(', ')}` : '';
       text = `Shape.${node.op}(${pname}${rest})`;

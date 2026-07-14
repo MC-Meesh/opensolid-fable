@@ -56,6 +56,20 @@ const Icons = {
       <path d="M12.7 12.6 L10.5 11.5 L12 9.6" />
     </svg>
   ),
+  sweep: (
+    <svg {...ICON}>
+      <path d="M3 13 C3 7 10 9 13 3" strokeDasharray="2 1.5" />
+      <ellipse cx="3" cy="13" rx="2" ry="1" />
+      <path d="M1 13 V11.5 M5 13 V11.5" />
+    </svg>
+  ),
+  loft: (
+    <svg {...ICON}>
+      <rect x="2.5" y="11" width="7" height="2.5" />
+      <ellipse cx="11" cy="4" rx="2.5" ry="1.2" />
+      <path d="M2.5 11 L9 4.2 M9.5 11 L13 4.6" />
+    </svg>
+  ),
   fit: (
     <svg {...ICON}>
       <path d="M2 5.5 V2 h3.5 M10.5 2 H14 v3.5 M14 10.5 V14 h-3.5 M5.5 14 H2 v-3.5" />
@@ -155,6 +169,7 @@ export default function MainToolbar({
   canSweep,
   sweepDisabledReason,
   onSweep,
+  onAddFeature,
   onView,
   onFit,
   wireframe,
@@ -227,6 +242,22 @@ export default function MainToolbar({
           disabledReason={disabled ? notReady : sweepDisabledReason}
           disabled={disabled || !canSweep}
           onClick={() => onSweep('revolve')}
+        />
+        <ToolButton
+          icon="sweep"
+          label="Sweep"
+          title="Add a Sweep feature: a profile swept along a 3D path (edit the path in the script)"
+          disabledReason={notReady}
+          disabled={disabled}
+          onClick={() => onAddFeature('sweep')}
+        />
+        <ToolButton
+          icon="loft"
+          label="Loft"
+          title="Add a Loft feature: a blend between two profiles on parallel planes (edit in the script)"
+          disabledReason={notReady}
+          disabled={disabled}
+          onClick={() => onAddFeature('loft')}
         />
       </div>
       <div className="tool-sep" />

@@ -27,6 +27,8 @@ export const FEATURE_META = {
   capsule: { kind: 'primitive', type: 'Capsule' },
   extrude: { kind: 'sweep', type: 'Extrude' },
   revolve: { kind: 'sweep', type: 'Revolve' },
+  sweep: { kind: 'sweep', type: 'Sweep' },
+  loft: { kind: 'sweep', type: 'Loft' },
   union: { kind: 'boolean', type: 'Union' },
   intersect: { kind: 'boolean', type: 'Intersect' },
   subtract: { kind: 'boolean', type: 'Subtract' },

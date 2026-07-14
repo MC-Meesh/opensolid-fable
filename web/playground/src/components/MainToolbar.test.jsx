@@ -17,6 +17,7 @@ function render(overrides = {}) {
       canSweep={false}
       sweepDisabledReason="Open a sketch and draw a closed profile first"
       onSweep={noop}
+      onAddFeature={noop}
       onView={noop}
       onFit={noop}
       wireframe={false}
@@ -40,7 +41,7 @@ describe('MainToolbar', () => {
     expect(html).toContain('View');
     expect(html).toContain('Drawing');
     expect(html).toContain('Export');
-    for (const label of ['Extrude', 'Revolve', 'Fit', 'Front', 'Top', 'Right', 'Iso', 'Wireframe', 'Section', 'STL', 'STEP']) {
+    for (const label of ['Extrude', 'Revolve', 'Sweep', 'Loft', 'Fit', 'Front', 'Top', 'Right', 'Iso', 'Wireframe', 'Section', 'STL', 'STEP']) {
       expect(html).toContain(label);
     }
   });
@@ -54,6 +55,17 @@ describe('MainToolbar', () => {
     const sketch = render({ sketchOpen: true });
     expect(sketch).toMatch(/<button[^>]*disabled[^>]*aria-label="Drawing"/);
     expect(sketch).toContain('Exit Sketch');
+  });
+
+  it('enables Sweep and Loft independently of the active sketch', () => {
+    // They seed an editable feature, so they only need the kernel ready —
+    // unlike Extrude/Revolve, they stay enabled with no active sketch.
+    const html = render({ canSweep: false });
+    expect(html).toMatch(/class="main-tool" aria-label="Sweep"/);
+    expect(html).toMatch(/class="main-tool" aria-label="Loft"/);
+    // ...but they do disable while the kernel is still loading.
+    const loading = render({ disabled: true });
+    expect(loading).toMatch(/disabled[^>]*aria-label="Sweep"/);
   });
 
   it('explains faceted export of organic shapes in the STEP tooltip', () => {

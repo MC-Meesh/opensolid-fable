@@ -55,6 +55,7 @@ pub mod primitives;
 pub mod profile;
 pub mod refine;
 pub mod shape;
+pub mod sweep;
 #[cfg(test)]
 pub(crate) mod test_util;
 pub mod transform;
@@ -66,4 +67,5 @@ pub use ops::{Offset, Rounded, SdfOpsExt, Shell};
 pub use profile::{Extrude, MAX_DRAFT, OpenPath2D, Profile2D, Revolve, Rib, RibSide};
 pub use refine::{RefineOptions, refine_mesh};
 pub use shape::Shape;
+pub use sweep::{Loft, Sweep};
 pub use transform::{AnisotropicScale, SdfTransformExt, Taper, Transformed, UniformScale};

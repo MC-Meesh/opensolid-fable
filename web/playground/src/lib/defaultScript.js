@@ -16,6 +16,10 @@ export const DEFAULT_SCRIPT = `// Build a shape with the OpenSolid API and retur
 //   Shape.extrude(p, height, draft?)    profile (x,y)->(x,z), swept along +y;
 //                                       optional draft angle (deg) tapers it
 //   Shape.revolve(p, angleDegrees)      around the y axis, x is the radius
+//   const path = new Path(x, y, z);     3D polyline; path.lineTo(x, y, z)
+//   Shape.sweep(p, path)                profile swept along path (no twist)
+//   Shape.loft(bottom, top, height)     morph bottom (y=0) to top (y=height);
+//                                       parallel planes, linear cross-section
 // Transforms (each returns a new shape):
 //   .translate(x, y, z)
 //   .rotate(ax, ay, az, angleRad)       about axis (ax,ay,az) through origin
