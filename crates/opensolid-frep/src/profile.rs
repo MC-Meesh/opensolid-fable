@@ -122,6 +122,56 @@ impl Segment {
             }
         }
     }
+
+    /// Unsigned distance from `q` to the segment paired with the signed
+    /// *lateral* offset `s`: positive on the left of the segment's travel
+    /// direction, negative on the right, `|s|` equal to the perpendicular
+    /// distance where `q` projects onto the segment's interior. Open-path
+    /// ribs use the sign to pick which side of the sketch line receives
+    /// material; the distance magnitude drives the field.
+    fn dist_and_side(&self, q: [f64; 2]) -> (f64, f64) {
+        match *self {
+            Segment::Line { a, b } => {
+                let (ex, ey) = (b[0] - a[0], b[1] - a[1]);
+                let (wx, wy) = (q[0] - a[0], q[1] - a[1]);
+                let len = ex.hypot(ey);
+                let t = ((wx * ex + wy * ey) / (ex * ex + ey * ey)).clamp(0.0, 1.0);
+                let dist = (wx - t * ex).hypot(wy - t * ey);
+                // cross(edge, w) / |edge|: signed perpendicular offset, left
+                // of the a→b direction positive.
+                let side = (ex * wy - ey * wx) / len;
+                (dist, side)
+            }
+            Segment::Arc {
+                a,
+                b,
+                center,
+                radius,
+                start_angle,
+                sweep,
+                ..
+            } => {
+                let (vx, vy) = (q[0] - center[0], q[1] - center[1]);
+                let rho = vx.hypot(vy);
+                let ang = vy.atan2(vx);
+                let delta = if sweep >= 0.0 {
+                    (ang - start_angle).rem_euclid(TAU)
+                } else {
+                    (start_angle - ang).rem_euclid(TAU)
+                };
+                // Travelling along the arc, the center is on the left for a
+                // CCW sweep and on the right for a CW sweep, so points inside
+                // the circle (rho < radius) are on the left iff sweep > 0.
+                let side = sweep.signum() * (radius - rho);
+                let dist = if delta <= sweep.abs() {
+                    (rho - radius).abs()
+                } else {
+                    dist2d(q, a).min(dist2d(q, b))
+                };
+                (dist, side)
+            }
+        }
+    }
 }
 
 /// A closed planar profile bounded by straight lines and circular arcs.
@@ -434,6 +484,222 @@ impl Sdf for Extrude {
     }
 }
 
+/// An *open* planar path — a polyline of straight lines and circular arcs
+/// that does **not** close back on itself. Segment `i` runs from vertex `i`
+/// to vertex `i + 1` and carries a bulge (the same DXF convention as
+/// [`Profile2D`]: `0` is a line, otherwise `tan(sweep / 4)`, positive
+/// counter-clockwise). A [`Rib`] thickens this path into a solid.
+#[derive(Clone, Debug)]
+pub struct OpenPath2D {
+    segments: Vec<Segment>,
+    min: [f64; 2],
+    max: [f64; 2],
+}
+
+impl OpenPath2D {
+    /// Build an open path from its vertices and per-segment bulges
+    /// (`bulges[i]` belongs to the segment leaving `vertices[i]`, so there
+    /// is one fewer bulge than vertex).
+    ///
+    /// # Errors
+    /// [`CoreError::InvalidArgument`] if fewer than two vertices are given,
+    /// `bulges.len() != vertices.len() - 1`, any coordinate or bulge is not
+    /// finite, or consecutive vertices coincide.
+    pub fn new(vertices: Vec<[f64; 2]>, bulges: Vec<f64>) -> CoreResult<Self> {
+        if vertices.len() < 2 {
+            return Err(invalid(
+                "vertices",
+                format!(
+                    "open path needs at least 2 vertices, got {}",
+                    vertices.len()
+                ),
+            ));
+        }
+        if bulges.len() != vertices.len() - 1 {
+            return Err(invalid(
+                "bulges",
+                format!(
+                    "expected one bulge per segment ({}), got {}",
+                    vertices.len() - 1,
+                    bulges.len()
+                ),
+            ));
+        }
+        if vertices.iter().flatten().any(|c| !c.is_finite()) {
+            return Err(invalid("vertices", "coordinates must be finite".into()));
+        }
+        if bulges.iter().any(|b| !b.is_finite()) {
+            return Err(invalid("bulges", "bulges must be finite".into()));
+        }
+        let mut segments = Vec::with_capacity(vertices.len() - 1);
+        for i in 0..vertices.len() - 1 {
+            let a = vertices[i];
+            let b = vertices[i + 1];
+            if dist2d(a, b) < MIN_CHORD {
+                return Err(invalid(
+                    "vertices",
+                    format!("segment {i} is degenerate: consecutive vertices coincide"),
+                ));
+            }
+            segments.push(Segment::new(a, b, bulges[i]));
+        }
+
+        let mut min = [f64::INFINITY; 2];
+        let mut max = [f64::NEG_INFINITY; 2];
+        let mut include = |p: [f64; 2]| {
+            min[0] = min[0].min(p[0]);
+            min[1] = min[1].min(p[1]);
+            max[0] = max[0].max(p[0]);
+            max[1] = max[1].max(p[1]);
+        };
+        for &v in &vertices {
+            include(v);
+        }
+        for seg in &segments {
+            if let Segment::Arc {
+                center,
+                radius,
+                start_angle,
+                sweep,
+                ..
+            } = *seg
+            {
+                for k in 0..4 {
+                    let ang = k as f64 * FRAC_PI_2;
+                    let delta = if sweep >= 0.0 {
+                        (ang - start_angle).rem_euclid(TAU)
+                    } else {
+                        (start_angle - ang).rem_euclid(TAU)
+                    };
+                    if delta <= sweep.abs() {
+                        include([
+                            center[0] + radius * ang.cos(),
+                            center[1] + radius * ang.sin(),
+                        ]);
+                    }
+                }
+            }
+        }
+
+        Ok(Self { segments, min, max })
+    }
+
+    /// Axis-aligned bounds of the path centreline (arc extremes included)
+    /// as `(min, max)` corners — before any thickening.
+    pub fn bounds(&self) -> ([f64; 2], [f64; 2]) {
+        (self.min, self.max)
+    }
+
+    /// Unsigned distance from `q` to the path and the signed lateral offset
+    /// of the *nearest* segment (left of travel positive). `|side|` equals
+    /// the distance where `q` projects onto a segment interior and only
+    /// carries a sign near vertices and endpoint caps.
+    fn dist_and_side(&self, q: [f64; 2]) -> (f64, f64) {
+        self.segments
+            .iter()
+            .map(|s| s.dist_and_side(q))
+            .fold(
+                (f64::INFINITY, 0.0),
+                |acc, cur| {
+                    if cur.0 < acc.0 { cur } else { acc }
+                },
+            )
+    }
+}
+
+/// Which side of the sketch path a [`Rib`] grows its material on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RibSide {
+    /// Symmetric about the path: `thickness / 2` to each side (SolidWorks'
+    /// default, and the only exact-distance option).
+    Both,
+    /// The full `thickness` on the left of the path's travel direction.
+    First,
+    /// The full `thickness` on the right of the path's travel direction.
+    Second,
+}
+
+/// An open sketch path thickened into a thin wall and extruded along +Y
+/// over `y ∈ [0, height]` — a support **rib**. The path `(u, v)` maps to
+/// world `(x, z)` exactly as [`Extrude`] does, so a rib unions cleanly with
+/// extruded/revolved parent bodies.
+///
+/// # Field exactness
+///
+/// - [`RibSide::Both`] is an exact signed distance field: the symmetric
+///   thick-path distance `d_path − thickness/2` is exact and the linear
+///   sweep preserves exactness (identical to [`Extrude`]'s slab combine).
+/// - [`RibSide::First`] / [`RibSide::Second`] are sign-exact and
+///   Lipschitz ≤ 1 (so the default `eval_interval` stays valid), but like
+///   partial [`Revolve`] the interior magnitude near the open side and the
+///   endpoint caps underestimates the true distance.
+pub struct Rib {
+    path: OpenPath2D,
+    thickness: f64,
+    height: f64,
+    side: RibSide,
+}
+
+impl Rib {
+    /// # Errors
+    /// [`CoreError::InvalidArgument`] if `thickness` or `height` is not
+    /// positive and finite.
+    pub fn new(path: OpenPath2D, thickness: f64, height: f64, side: RibSide) -> CoreResult<Self> {
+        if !(thickness.is_finite() && thickness > 0.0) {
+            return Err(invalid(
+                "thickness",
+                format!("must be positive and finite, got {thickness}"),
+            ));
+        }
+        if !(height.is_finite() && height > 0.0) {
+            return Err(invalid(
+                "height",
+                format!("must be positive and finite, got {height}"),
+            ));
+        }
+        Ok(Self {
+            path,
+            thickness,
+            height,
+            side,
+        })
+    }
+
+    /// Conservative `(min, max)` world-space bounds: the centreline box
+    /// grown by the full `thickness` in the sketch plane (`x`, `z`) and
+    /// `y ∈ [0, height]`.
+    pub fn world_bounds(&self) -> ([f64; 3], [f64; 3]) {
+        let (min, max) = self.path.bounds();
+        let t = self.thickness;
+        (
+            [min[0] - t, 0.0, min[1] - t],
+            [max[0] + t, self.height, max[1] + t],
+        )
+    }
+
+    /// Signed distance of the thickened 2D wall footprint at `(u, v)`.
+    fn footprint(&self, u: f64, v: f64) -> f64 {
+        let (d, side) = self.path.dist_and_side([u, v]);
+        match self.side {
+            RibSide::Both => d - 0.5 * self.thickness,
+            // Keep a band of width `thickness` on one side of the path:
+            // within `thickness` of the centreline AND on the chosen side.
+            RibSide::First => (d - self.thickness).max(-side),
+            RibSide::Second => (d - self.thickness).max(side),
+        }
+    }
+}
+
+impl Sdf for Rib {
+    fn eval(&self, p: &Point3) -> f64 {
+        let d = self.footprint(p.x, p.z);
+        let half = 0.5 * self.height;
+        let w = (p.y - half).abs() - half;
+        // Exact slab combine, identical to `Extrude`.
+        d.max(w).min(0.0) + d.max(0.0).hypot(w.max(0.0))
+    }
+}
+
 /// A profile revolved around the Y axis: profile `(u, v)` maps to
 /// `(radius, y) = (u, v)`, so the profile must lie in `u ≥ 0`.
 ///
@@ -706,6 +972,149 @@ mod tests {
         for h in [0.0, -1.0, f64::NAN, f64::INFINITY] {
             assert!(Extrude::new(unit_square(), h).is_err(), "height {h}");
         }
+    }
+
+    /// A straight diagonal path from `(0,0)` to `(2,0)`.
+    fn straight_path() -> OpenPath2D {
+        OpenPath2D::new(vec![[0.0, 0.0], [2.0, 0.0]], vec![0.0]).expect("valid path")
+    }
+
+    #[test]
+    fn open_path_rejects_bad_input() {
+        // Too few vertices.
+        assert!(OpenPath2D::new(vec![[0.0, 0.0]], vec![]).is_err());
+        // Wrong bulge count (open path has n-1 segments).
+        assert!(OpenPath2D::new(vec![[0.0, 0.0], [1.0, 0.0]], vec![0.0, 0.0]).is_err());
+        assert!(OpenPath2D::new(vec![[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]], vec![0.0]).is_err());
+        // Coincident consecutive vertices.
+        assert!(OpenPath2D::new(vec![[0.0, 0.0], [0.0, 0.0]], vec![0.0]).is_err());
+        // Non-finite.
+        assert!(OpenPath2D::new(vec![[0.0, f64::NAN], [1.0, 0.0]], vec![0.0]).is_err());
+        assert!(OpenPath2D::new(vec![[0.0, 0.0], [1.0, 0.0]], vec![f64::INFINITY]).is_err());
+        // A single straight segment (two vertices, one bulge) is valid —
+        // unlike a closed profile, an open path needs no enclosed area.
+        assert!(OpenPath2D::new(vec![[0.0, 0.0], [1.0, 0.0]], vec![0.0]).is_ok());
+    }
+
+    #[test]
+    fn open_path_bounds_include_arc_extremes() {
+        // Semicircle from (0,0) to (1,0) with bulge 1: its apex reaches
+        // beyond the chord, and the bounds must capture it.
+        let p = OpenPath2D::new(vec![[0.0, 0.0], [1.0, 0.0]], vec![1.0]).expect("valid path");
+        let (min, max) = p.bounds();
+        // Bulge 1 is a CCW semicircle; centre at (0.5, 0), radius 0.5.
+        // Travelling CCW from (0,0) to (1,0) dips through the bottom, so the
+        // apex sits at (0.5, -0.5): v spans [-0.5, 0], not [0, 0.5].
+        assert!((min[1] + 0.5).abs() < 1e-12, "min v = {}", min[1]);
+        assert!((max[1]).abs() < 1e-12, "max v = {}", max[1]);
+    }
+
+    #[test]
+    fn rib_both_sides_is_symmetric_and_exact() {
+        let rib = Rib::new(straight_path(), 0.4, 1.0, RibSide::Both).expect("valid rib");
+        // Centreline interior: nearest wall is the ±0.2 face.
+        assert!((rib.eval(&Point3::new(1.0, 0.5, 0.0)) + 0.2).abs() < 1e-12);
+        // On the +z wall face.
+        assert!(rib.eval(&Point3::new(1.0, 0.5, 0.2)).abs() < 1e-12);
+        // On the -z wall face (symmetry).
+        assert!(rib.eval(&Point3::new(1.0, 0.5, -0.2)).abs() < 1e-12);
+        // Outside the wall by 0.1.
+        assert!((rib.eval(&Point3::new(1.0, 0.5, 0.3)) - 0.1).abs() < 1e-12);
+        // Above the top cap by 0.5.
+        assert!((rib.eval(&Point3::new(1.0, 1.5, 0.0)) - 0.5).abs() < 1e-12);
+        // Diagonal past a top edge: hypot of the two clearances.
+        assert!(
+            (rib.eval(&Point3::new(1.0, 1.5, 0.5)) - 0.3f64.hypot(0.5)).abs() < 1e-12,
+            "got {}",
+            rib.eval(&Point3::new(1.0, 1.5, 0.5))
+        );
+    }
+
+    #[test]
+    fn rib_first_side_grows_left_of_travel() {
+        // Path runs +x; left of travel is +z (First), right is -z.
+        let rib = Rib::new(straight_path(), 0.4, 1.0, RibSide::First).expect("valid rib");
+        // Left side gets the full thickness: material out to z = +0.4.
+        assert!(rib.eval(&Point3::new(1.0, 0.5, 0.1)) < 0.0);
+        assert!(rib.eval(&Point3::new(1.0, 0.5, 0.4)).abs() < 1e-9);
+        // Right side gets nothing: even just off the line is outside.
+        assert!(rib.eval(&Point3::new(1.0, 0.5, -0.1)) > 0.0);
+
+        // Second is the mirror image.
+        let rib2 = Rib::new(straight_path(), 0.4, 1.0, RibSide::Second).expect("valid rib");
+        assert!(rib2.eval(&Point3::new(1.0, 0.5, -0.1)) < 0.0);
+        assert!(rib2.eval(&Point3::new(1.0, 0.5, 0.1)) > 0.0);
+    }
+
+    #[test]
+    fn rib_rejects_bad_input() {
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert!(Rib::new(straight_path(), bad, 1.0, RibSide::Both).is_err());
+            assert!(Rib::new(straight_path(), 0.4, bad, RibSide::Both).is_err());
+        }
+    }
+
+    #[test]
+    fn rib_world_bounds_grow_by_thickness() {
+        let rib = Rib::new(straight_path(), 0.4, 1.5, RibSide::Both).expect("valid rib");
+        let (min, max) = rib.world_bounds();
+        assert_eq!(min, [-0.4, 0.0, -0.4]);
+        assert_eq!(max, [2.4, 1.5, 0.4]);
+    }
+
+    #[test]
+    fn rib_is_lipschitz_one() {
+        // The one-sided field is the delicate case; verify the default
+        // interval bound stays conservative there.
+        let path = OpenPath2D::new(vec![[-0.6, -0.3], [0.2, 0.1], [0.7, -0.2]], vec![0.0, 0.4])
+            .expect("valid path");
+        let rib = Rib::new(path, 0.25, 0.9, RibSide::First).expect("valid rib");
+        crate::test_util::assert_interval_containment(&rib, 71);
+    }
+
+    #[test]
+    fn rib_meshes_and_unions_with_extrude() {
+        use crate::csg::Union;
+        use crate::mesh::{MeshOptions, mesh_sdf_indexed};
+        use opensolid_core::types::BoundingBox3;
+
+        // A rib between two walls: two upright plates joined by a diagonal
+        // rib thickened symmetrically.
+        let rib = Rib::new(
+            OpenPath2D::new(vec![[0.2, 0.2], [0.8, 0.8]], vec![0.0]).expect("valid path"),
+            0.15,
+            0.6,
+            RibSide::Both,
+        )
+        .expect("valid rib");
+        let mesh = mesh_sdf_indexed(
+            &rib,
+            &MeshOptions {
+                bounds: BoundingBox3::new(
+                    Point3::new(-0.2, -0.2, -0.2),
+                    Point3::new(1.2, 0.8, 1.2),
+                ),
+                resolution: 32,
+            },
+        );
+        assert!(!mesh.is_empty());
+        assert!(mesh.is_closed_manifold());
+
+        // Union with an extruded base plate composes cleanly.
+        let plate = Extrude::new(unit_square(), 0.2).expect("valid extrude");
+        let combined = Union { a: &rib, b: &plate };
+        let mesh = mesh_sdf_indexed(
+            &combined,
+            &MeshOptions {
+                bounds: BoundingBox3::new(
+                    Point3::new(-0.3, -0.1, -0.3),
+                    Point3::new(1.3, 0.9, 1.3),
+                ),
+                resolution: 40,
+            },
+        );
+        assert!(!mesh.is_empty());
+        assert!(mesh.is_closed_manifold());
     }
 
     #[test]

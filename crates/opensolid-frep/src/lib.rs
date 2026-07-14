@@ -63,7 +63,7 @@ pub use fillet::{BlendMode, BooleanKind, EdgeBlend, EdgeRegion};
 pub use mesh::{MeshOptions, Triangle, TriangleMesh, mesh_sdf, mesh_sdf_indexed};
 pub use mesh_adaptive::{AdaptiveMeshOptions, mesh_sdf_adaptive, mesh_sdf_adaptive_indexed};
 pub use ops::{Offset, Rounded, SdfOpsExt, Shell};
-pub use profile::{Extrude, MAX_DRAFT, Profile2D, Revolve};
+pub use profile::{Extrude, MAX_DRAFT, OpenPath2D, Profile2D, Revolve, Rib, RibSide};
 pub use refine::{RefineOptions, refine_mesh};
 pub use shape::Shape;
 pub use transform::{AnisotropicScale, SdfTransformExt, Taper, Transformed, UniformScale};
