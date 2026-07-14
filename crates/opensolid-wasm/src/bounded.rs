@@ -16,7 +16,8 @@ use opensolid_frep::primitives::{
 };
 use opensolid_frep::refine::{RefineOptions, refine_mesh};
 use opensolid_frep::{
-    BlendMode, BooleanKind, EdgeRegion, Extrude, Profile2D, Revolve, SdfTransformExt, Shape,
+    BlendMode, BooleanKind, EdgeRegion, Extrude, OpenPath2D, Profile2D, Revolve, Rib, RibSide,
+    SdfTransformExt, Shape,
 };
 
 /// Depth bounds for accuracy-driven adaptive meshing: the ceiling keeps the
@@ -222,6 +223,27 @@ impl BoundedShape {
         );
         Ok(Self {
             shape: Shape::new(Revolve::new(profile, angle)?),
+            bounds,
+        })
+    }
+
+    /// An open sketch path thickened into a support rib and swept along +Y
+    /// over `y ∈ [0, height]`; path `(u, v)` maps to world `(x, z)` exactly
+    /// as [`Self::extrude`] does. `side` selects which side of the path
+    /// receives material ([`RibSide::Both`] is symmetric and exact).
+    ///
+    /// # Errors
+    /// Propagates [`Rib::new`] validation (`thickness > 0`, `height > 0`,
+    /// both finite).
+    pub fn rib(path: OpenPath2D, thickness: f64, height: f64, side: RibSide) -> CoreResult<Self> {
+        let rib = Rib::new(path, thickness, height, side)?;
+        let (min, max) = rib.world_bounds();
+        let bounds = BoundingBox3::new(
+            Point3::new(min[0], min[1], min[2]),
+            Point3::new(max[0], max[1], max[2]),
+        );
+        Ok(Self {
+            shape: Shape::new(rib),
             bounds,
         })
     }
@@ -1119,6 +1141,60 @@ mod tests {
         )
         .expect("valid profile");
         assert!(BoundedShape::revolve(crossing, std::f64::consts::TAU).is_err());
+    }
+
+    #[test]
+    fn rib_tracks_bounds_and_meshes() {
+        // An open V-shaped path thickened symmetrically.
+        let path = OpenPath2D::new(vec![[-0.6, 0.0], [0.0, 0.4], [0.6, 0.0]], vec![0.0, 0.0])
+            .expect("valid path");
+        let s = BoundedShape::rib(path, 0.2, 0.8, RibSide::Both).expect("valid rib");
+        // Tracked box: centreline box [-0.6,0.6]×[0,0.4] grown by thickness
+        // 0.2 in x/z, y ∈ [0, 0.8].
+        let close = |a: Point3, b: Point3| (a - b).norm() < 1e-9;
+        assert!(close(s.bounds.min, Point3::new(-0.8, 0.0, -0.2)));
+        assert!(close(s.bounds.max, Point3::new(0.8, 0.8, 0.6)));
+        assert_meshes_cleanly(&s);
+
+        // One-sided ribs still mesh cleanly under auto-bounds.
+        let path2 = OpenPath2D::new(vec![[-0.5, 0.0], [0.5, 0.0]], vec![0.0]).expect("valid path");
+        let one_sided = BoundedShape::rib(path2, 0.25, 0.6, RibSide::First).expect("valid rib");
+        assert_meshes_cleanly(&one_sided);
+    }
+
+    #[test]
+    fn rib_rejects_bad_input() {
+        let path = || OpenPath2D::new(vec![[0.0, 0.0], [1.0, 0.0]], vec![0.0]).expect("valid path");
+        assert!(BoundedShape::rib(path(), 0.0, 1.0, RibSide::Both).is_err());
+        assert!(BoundedShape::rib(path(), -0.2, 1.0, RibSide::Both).is_err());
+        assert!(BoundedShape::rib(path(), 0.2, 0.0, RibSide::Both).is_err());
+        assert!(BoundedShape::rib(path(), 0.2, f64::NAN, RibSide::Both).is_err());
+    }
+
+    #[test]
+    fn rib_unions_with_extrude_base() {
+        // A rib standing on top of an extruded base plate — the canonical
+        // "support rib" composition: union, then mesh as one solid.
+        let base = BoundedShape::extrude(
+            Profile2D::new(
+                vec![[-0.8, -0.3], [0.8, -0.3], [0.8, 0.3], [-0.8, 0.3]],
+                vec![0.0; 4],
+            )
+            .expect("valid base"),
+            0.2,
+        )
+        .expect("valid extrude");
+        let rib = BoundedShape::rib(
+            OpenPath2D::new(vec![[-0.6, 0.0], [0.6, 0.0]], vec![0.0]).expect("valid path"),
+            0.15,
+            0.6,
+            RibSide::Both,
+        )
+        .expect("valid rib");
+        let part = base.union(&rib);
+        let mesh = part.mesh(RES, None);
+        assert!(!mesh.is_empty());
+        assert!(mesh.is_closed_manifold());
     }
 
     #[test]

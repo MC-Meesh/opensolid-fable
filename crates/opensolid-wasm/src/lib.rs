@@ -18,7 +18,7 @@ use bounded::{BoundedShape, flatten_mesh};
 use exact::{ExactPrim, ExactRep, ExactSpec};
 use opensolid_core::mesh::TriangleMesh;
 use opensolid_core::types::{Point3, Vector3};
-use opensolid_frep::Profile2D;
+use opensolid_frep::{OpenPath2D, Profile2D, RibSide};
 use opensolid_kernel::brep::BooleanOp;
 use opensolid_kernel::mass_properties;
 use std::rc::Rc;
@@ -111,6 +111,52 @@ fn polyline_region(edge: &[f64]) -> opensolid_frep::EdgeRegion {
         .map(|c| Point3::new(c[0], c[1], c[2]))
         .collect();
     opensolid_frep::EdgeRegion::from_polyline(&points)
+}
+
+/// Open 2D path builder for [`WasmShape::rib`]: start at a point, chain
+/// `lineTo`/`arcTo`, and pass it straight to `rib` (no `close()` — the path
+/// stays open). Arcs use the same DXF bulge convention as [`WasmProfile2D`]:
+/// `bulge = tan(sweep / 4)`, positive sweeping counter-clockwise.
+#[wasm_bindgen]
+pub struct WasmOpenPath2D {
+    points: Vec<[f64; 2]>,
+    /// Bulge of the segment leaving `points[i]`; `len == points.len() - 1`.
+    bulges: Vec<f64>,
+}
+
+#[wasm_bindgen]
+impl WasmOpenPath2D {
+    /// Start a path at `(x, y)`.
+    #[wasm_bindgen(constructor)]
+    pub fn new(x: f64, y: f64) -> WasmOpenPath2D {
+        WasmOpenPath2D {
+            points: vec![[x, y]],
+            bulges: Vec::new(),
+        }
+    }
+
+    /// Straight segment from the current point to `(x, y)`.
+    #[wasm_bindgen(js_name = lineTo)]
+    pub fn line_to(&mut self, x: f64, y: f64) {
+        self.arc_to(x, y, 0.0);
+    }
+
+    /// Circular arc from the current point to `(x, y)` with the given bulge
+    /// (`tan(sweep / 4)`, positive = counter-clockwise; `0` is a straight
+    /// line).
+    #[wasm_bindgen(js_name = arcTo)]
+    pub fn arc_to(&mut self, x: f64, y: f64, bulge: f64) {
+        self.points.push([x, y]);
+        self.bulges.push(bulge);
+    }
+}
+
+impl WasmOpenPath2D {
+    /// Assemble the validated frep open path. Fails per [`OpenPath2D::new`]
+    /// (fewer than two vertices, coincident vertices, non-finite input).
+    fn build(&self) -> Result<OpenPath2D, String> {
+        OpenPath2D::new(self.points.clone(), self.bulges.clone()).map_err(|e| e.to_string())
+    }
 }
 
 /// Mesh buffers for JS consumption: xyz-interleaved positions and normals
@@ -325,6 +371,35 @@ impl WasmShape {
     pub fn revolve(profile: &WasmProfile2D, angle_degrees: f64) -> Result<WasmShape, String> {
         let p = profile.build()?;
         BoundedShape::revolve(p, angle_degrees.to_radians())
+            .map(WasmShape::sdf_only)
+            .map_err(|e| e.to_string())
+    }
+
+    /// The open path thickened into a support rib and swept along +Y over
+    /// `y ∈ [0, height]`; path `(x, y)` maps to world `(x, z)`. `side` picks
+    /// which side of the path receives material: `"both"` (symmetric,
+    /// `thickness/2` each way — the exact-distance default), `"first"` (the
+    /// full `thickness` on the left of the path's travel direction), or
+    /// `"second"` (the full `thickness` on the right). Union the result with
+    /// the parent body at the script level.
+    pub fn rib(
+        path: &WasmOpenPath2D,
+        thickness: f64,
+        height: f64,
+        side: &str,
+    ) -> Result<WasmShape, String> {
+        let p = path.build()?;
+        let side = match side.to_ascii_lowercase().as_str() {
+            "both" => RibSide::Both,
+            "first" => RibSide::First,
+            "second" => RibSide::Second,
+            other => {
+                return Err(format!(
+                    "unknown rib side {other:?} (want both/first/second)"
+                ));
+            }
+        };
+        BoundedShape::rib(p, thickness, height, side)
             .map(WasmShape::sdf_only)
             .map_err(|e| e.to_string())
     }
@@ -949,6 +1024,43 @@ mod tests {
 
         let partial = WasmShape::revolve(&p, 135.0).expect("valid revolve");
         assert_valid(&partial.mesh(32, None));
+    }
+
+    #[test]
+    fn rib_via_wasm_api() {
+        // Open path with an arc, thickened both sides then meshed.
+        let mut path = WasmOpenPath2D::new(-0.6, 0.0);
+        path.line_to(0.0, 0.0);
+        path.arc_to(0.6, 0.0, 0.5);
+        let shape = WasmShape::rib(&path, 0.2, 0.8, "both").expect("valid rib");
+        let b = shape.bounds();
+        // y spans [0, height]; x/z grown by the full thickness.
+        assert!((b[1]).abs() < 1e-9 && (b[4] - 0.8).abs() < 1e-9);
+        assert_valid(&shape.mesh(32, None));
+
+        // Side is case-insensitive; first/second both build.
+        let mut line = WasmOpenPath2D::new(-0.5, 0.0);
+        line.line_to(0.5, 0.0);
+        assert!(WasmShape::rib(&line, 0.2, 0.5, "First").is_ok());
+        assert!(WasmShape::rib(&line, 0.2, 0.5, "SECOND").is_ok());
+    }
+
+    #[test]
+    fn rib_errors_surface_as_strings() {
+        let mut line = WasmOpenPath2D::new(0.0, 0.0);
+        line.line_to(1.0, 0.0);
+        // Unknown side name.
+        let err = match WasmShape::rib(&line, 0.2, 0.5, "middle") {
+            Ok(_) => panic!("unknown side must error"),
+            Err(e) => e,
+        };
+        assert!(err.contains("middle"), "got: {err}");
+        // Bad thickness / height propagate from Rib::new.
+        assert!(WasmShape::rib(&line, 0.0, 0.5, "both").is_err());
+        assert!(WasmShape::rib(&line, 0.2, -1.0, "both").is_err());
+        // A single-vertex path is not a valid open path.
+        let lone = WasmOpenPath2D::new(0.0, 0.0);
+        assert!(WasmShape::rib(&lone, 0.2, 0.5, "both").is_err());
     }
 
     #[test]
