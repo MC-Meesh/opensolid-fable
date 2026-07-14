@@ -38,6 +38,15 @@ describe('DrawingCanvas', () => {
     expect(html).toContain('polyline');
   });
 
+  it('renders the dimension tools and export/clear controls', () => {
+    const html = renderToString(
+      <DrawingCanvas open mesh={CUBE} onViewChange={() => {}} onExit={() => {}} />
+    );
+    for (const label of ['Pan', 'Linear', 'Radius', 'Export SVG', 'Clear dims']) {
+      expect(html).toContain(label);
+    }
+  });
+
   it('renders hidden when closed', () => {
     const html = renderToString(
       <DrawingCanvas open={false} mesh={CUBE} onViewChange={() => {}} onExit={() => {}} />

@@ -1105,11 +1105,34 @@ button.main-tool svg { flex: none; }
   stroke-width: 1;
   stroke-dasharray: 6 4;
 }
+.drawing-svg.picking { cursor: crosshair; }
+.drawing-svg.picking:active { cursor: crosshair; }
 .drawing-svg .view-label {
   fill: var(--muted);
   font-size: 12px;
   font-weight: 600;
   user-select: none;
+}
+.drawing-svg .dim-line {
+  stroke: var(--accent);
+  stroke-width: 1;
+}
+.drawing-svg .dim-arrow {
+  fill: var(--accent);
+  stroke: none;
+}
+.drawing-svg .dim-label {
+  fill: var(--accent);
+  font-weight: 600;
+  user-select: none;
+  paint-order: stroke;
+  stroke: var(--bg);
+  stroke-width: 3px;
+}
+.drawing-svg .dim-pending {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 1.5;
 }
 .drawing-toolbar {
   position: absolute;
