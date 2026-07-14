@@ -79,6 +79,110 @@ export function sampleArc(cx, cy, r, startAngle, sweep, ccw, n) {
 }
 
 /**
+ * Point on an ellipse centered at (cx, cy) with semi-axes rx (along the
+ * major axis) and ry, the major axis rotated `rotation` radians from +X, at
+ * ellipse parameter `t` (radians, measured in the unrotated frame).
+ */
+export function ellipsePoint(cx, cy, rx, ry, rotation, t) {
+  const cr = Math.cos(rotation);
+  const sr = Math.sin(rotation);
+  const ex = rx * Math.cos(t);
+  const ey = ry * Math.sin(t);
+  return [cx + ex * cr - ey * sr, cy + ex * sr + ey * cr];
+}
+
+/**
+ * Ellipse parameter `t` (in the unrotated frame) of a world point relative to
+ * the ellipse's center and axes: `atan2` of the point mapped back into the
+ * axis-aligned unit-circle frame — the value that `ellipsePoint` inverts.
+ */
+export function ellipseParam(cx, cy, rx, ry, rotation, px, py) {
+  const cr = Math.cos(rotation);
+  const sr = Math.sin(rotation);
+  const dx = px - cx;
+  const dy = py - cy;
+  const u = (dx * cr + dy * sr) / rx;
+  const v = (-dx * sr + dy * cr) / ry;
+  return Math.atan2(v, u);
+}
+
+/** Sample an elliptical arc from param `t0` sweeping `sweep` (signed) into
+ * `n + 1` points including both endpoints. */
+export function sampleEllipse(cx, cy, rx, ry, rotation, t0, sweep, n) {
+  const pts = [];
+  for (let i = 0; i <= n; i++) {
+    pts.push(ellipsePoint(cx, cy, rx, ry, rotation, t0 + (sweep * i) / n));
+  }
+  return pts;
+}
+
+/**
+ * Distance from a world point to an ellipse outline, approximated by sampling
+ * the outline into `n` chords and measuring to the nearest one. Exact enough
+ * for hit-testing at screen tolerances.
+ */
+export function distToEllipse(px, py, cx, cy, rx, ry, rotation, n = 64) {
+  let best = Infinity;
+  let [ax, ay] = ellipsePoint(cx, cy, rx, ry, rotation, 0);
+  for (let i = 1; i <= n; i++) {
+    const [bx, by] = ellipsePoint(cx, cy, rx, ry, rotation, (2 * Math.PI * i) / n);
+    best = Math.min(best, distToSegment(px, py, ax, ay, bx, by));
+    ax = bx;
+    ay = by;
+  }
+  return best;
+}
+
+/** Point on a cubic Bézier (p0, c1, c2, p1) at parameter `t` in [0, 1]. */
+export function cubicPoint(p0, c1, c2, p1, t) {
+  const mt = 1 - t;
+  const a = mt * mt * mt;
+  const b = 3 * mt * mt * t;
+  const c = 3 * mt * t * t;
+  const d = t * t * t;
+  return [
+    a * p0[0] + b * c1[0] + c * c2[0] + d * p1[0],
+    a * p0[1] + b * c1[1] + c * c2[1] + d * p1[1],
+  ];
+}
+
+/** Sample a cubic Bézier into `n + 1` points including both endpoints. */
+export function sampleCubic(p0, c1, c2, p1, n) {
+  const pts = [];
+  for (let i = 0; i <= n; i++) pts.push(cubicPoint(p0, c1, c2, p1, i / n));
+  return pts;
+}
+
+/**
+ * Distance from a world point to a cubic Bézier, approximated by sampling the
+ * curve into `n` chords and measuring to the nearest one.
+ */
+export function distToCubic(px, py, p0, c1, c2, p1, n = 48) {
+  let best = Infinity;
+  let [ax, ay] = p0;
+  for (let i = 1; i <= n; i++) {
+    const [bx, by] = cubicPoint(p0, c1, c2, p1, i / n);
+    best = Math.min(best, distToSegment(px, py, ax, ay, bx, by));
+    ax = bx;
+    ay = by;
+  }
+  return best;
+}
+
+/**
+ * Cubic-Bézier control points for the Catmull-Rom segment through p1 -> p2
+ * given neighbors p0 (before p1) and p3 (after p2). Handles are 1/6 of the
+ * neighbor span, the standard uniform Catmull-Rom -> Bézier conversion; this
+ * yields a smooth spline interpolating a sequence of clicked points.
+ */
+export function catmullRomHandles(p0, p1, p2, p3) {
+  return {
+    c1: [p1[0] + (p2[0] - p0[0]) / 6, p1[1] + (p2[1] - p0[1]) / 6],
+    c2: [p2[0] - (p3[0] - p1[0]) / 6, p2[1] - (p3[1] - p1[1]) / 6],
+  };
+}
+
+/**
  * Reflect point (px, py) across the infinite line through (ax, ay)-(bx, by).
  * A degenerate axis (a == b) reflects through the point instead.
  */

@@ -2,8 +2,10 @@ import { describe, expect, it } from 'vitest';
 import {
   addArc,
   addCircle,
+  addEllipse,
   addLine,
   addPoint,
+  addSpline,
   createSketch,
 } from './model.js';
 import {
@@ -61,6 +63,26 @@ describe('snap', () => {
     ).toBeCloseTo(1, 9);
   });
 
+  it('distToEntity measures ellipse and spline outlines', () => {
+    const s = createSketch();
+    const ec = addPoint(s, 0, 0);
+    const ellipse = addEllipse(s, ec, 3, 1, 0);
+    // On the major-axis vertex (3,0): distance ~0. Outside at (5,0): ~2.
+    expect(distToEntity(s, s.entities[ellipse], 3, 0)).toBeCloseTo(0, 2);
+    expect(distToEntity(s, s.entities[ellipse], 5, 0)).toBeCloseTo(2, 1);
+
+    const p1 = addPoint(s, 0, 0);
+    const p2 = addPoint(s, 4, 0);
+    const h1 = addPoint(s, 0, 2);
+    const h2 = addPoint(s, 4, 2);
+    const spline = addSpline(s, p1, p2, h1, h2);
+    // Endpoints lie on the curve.
+    expect(distToEntity(s, s.entities[spline], 0, 0)).toBeCloseTo(0, 6);
+    expect(distToEntity(s, s.entities[spline], 4, 0)).toBeCloseTo(0, 6);
+    // A point far from the arch is far.
+    expect(distToEntity(s, s.entities[spline], 2, -5)).toBeGreaterThan(4);
+  });
+
   it('hitTest prefers points over entities', () => {
     const s = createSketch();
     const a = addPoint(s, 0, 0);
@@ -69,5 +91,12 @@ describe('snap', () => {
     expect(hitTest(s, 0.05, 0.05, 0.2)).toEqual({ kind: 'point', id: a });
     expect(hitTest(s, 1, 0.1, 0.2)).toEqual({ kind: 'entity', id: line });
     expect(hitTest(s, 1, 5, 0.2)).toBeNull();
+  });
+
+  it('hitTest finds ellipse and spline entities', () => {
+    const s = createSketch();
+    const ec = addPoint(s, 0, 0);
+    const ellipse = addEllipse(s, ec, 3, 1, 0);
+    expect(hitTest(s, 3, 0.05, 0.2)).toEqual({ kind: 'entity', id: ellipse });
   });
 });

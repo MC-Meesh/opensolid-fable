@@ -3,11 +3,14 @@ import {
   addArc,
   addCircle,
   addConstraint,
+  addEllipse,
   addLine,
   addPoint,
   addRectangle,
+  addSpline,
   createSketch,
 } from './model.js';
+import { cubicPoint, signedArea } from './geom.js';
 import {
   extractProfile,
   isFacePlane,
@@ -284,5 +287,127 @@ describe('plane mapping', () => {
     expect(planeLabel('XZ')).toBe('XZ');
     expect(planeAxisLabels(FACE)).toEqual(['U', 'V']);
     expect(planeAxisLabels('YZ')).toEqual(['Z', 'Y']);
+  });
+});
+
+describe('extractProfile — ellipse', () => {
+  it('extracts a standalone ellipse as two CCW half-ellipse arcs', () => {
+    const s = createSketch();
+    const c = addPoint(s, 1, 2);
+    addEllipse(s, c, 3, 1, 0);
+    const profile = extractProfile(s, 'XY');
+    expect(profile.closed).toBe(true);
+    expect(profile.segments).toHaveLength(2);
+    expect(profile.segments.every((seg) => seg.kind === 'ellipse')).toBe(true);
+    expect(profile.segments.every((seg) => seg.ccw)).toBe(true);
+    // Endpoints chain: first half 0→π, second half π→2π=0.
+    expect(maxGap(profile)).toBeLessThan(1e-9);
+    // The two half-arcs meet at the far major-axis vertex (−3,0)+center.
+    expect(segmentEnd2D(profile.segments[0])[0]).toBeCloseTo(1 - 3, 9);
+  });
+
+  it('rejects a zero-radius ellipse', () => {
+    const s = createSketch();
+    const c = addPoint(s, 0, 0);
+    addEllipse(s, c, 0, 1, 0);
+    expect(extractProfile(s).closed).toBe(false);
+  });
+
+  it('rejects an ellipse mixed with other geometry', () => {
+    const s = createSketch();
+    const c = addPoint(s, 0, 0);
+    addEllipse(s, c, 2, 1, 0);
+    const a = addPoint(s, 5, 5);
+    const b = addPoint(s, 6, 6);
+    addLine(s, a, b);
+    const profile = extractProfile(s);
+    expect(profile.closed).toBe(false);
+    expect(profile.reason).toMatch(/only entity/);
+  });
+
+  it('ignores a construction ellipse when extracting a line loop', () => {
+    const s = triangle();
+    const c = addPoint(s, 10, 10);
+    addEllipse(s, c, 1, 1, 0, { construction: true });
+    const profile = extractProfile(s, 'XY');
+    expect(profile.closed).toBe(true);
+    expect(profile.segments).toHaveLength(3);
+  });
+});
+
+describe('extractProfile — spline', () => {
+  // A closed loop: line from A→B, then a spline curving back B→A.
+  function splineLoop() {
+    const s = createSketch();
+    const a = addPoint(s, 0, 0);
+    const b = addPoint(s, 4, 0);
+    const c1 = addPoint(s, 3, 3);
+    const c2 = addPoint(s, 1, 3);
+    addLine(s, a, b);
+    addSpline(s, b, a, c1, c2); // B→A with handles up top
+    return { s, a, b, c1, c2 };
+  }
+
+  it('extracts a line+spline loop with a spline segment', () => {
+    const { s } = splineLoop();
+    const profile = extractProfile(s, 'XY');
+    expect(profile.closed).toBe(true);
+    expect(profile.segments).toHaveLength(2);
+    const kinds = profile.segments.map((seg) => seg.kind).sort();
+    expect(kinds).toEqual(['line', 'spline']);
+    expect(maxGap(profile)).toBeLessThan(1e-9);
+  });
+
+  it('spline segment carries endpoints and control points', () => {
+    const { s } = splineLoop();
+    const profile = extractProfile(s, 'XY');
+    const spline = profile.segments.find((seg) => seg.kind === 'spline');
+    expect(spline.start).toBeDefined();
+    expect(spline.end).toBeDefined();
+    expect(spline.c1).toHaveLength(2);
+    expect(spline.c2).toHaveLength(2);
+  });
+
+  it('orients the loop counterclockwise (positive area)', () => {
+    const { s } = splineLoop();
+    const profile = extractProfile(s, 'XY');
+    // Densely sample the emitted loop and confirm positive signed area.
+    const poly = [];
+    for (const seg of profile.segments) {
+      if (seg.kind === 'spline') {
+        for (let i = 0; i < 16; i++) {
+          poly.push(cubicPoint(seg.start, seg.c1, seg.c2, seg.end, i / 16));
+        }
+      } else {
+        poly.push(seg.start);
+      }
+    }
+    expect(signedArea(poly)).toBeGreaterThan(0);
+  });
+
+  it('reverses a spline correctly when the loop winding flips', () => {
+    // Build the same loop wound the other way; the extractor must reverse it
+    // to CCW, swapping the spline's control-point order.
+    const s = createSketch();
+    const a = addPoint(s, 0, 0);
+    const b = addPoint(s, 4, 0);
+    const c1 = addPoint(s, 1, -3);
+    const c2 = addPoint(s, 3, -3);
+    addLine(s, a, b);
+    addSpline(s, b, a, c1, c2); // handles below → clockwise loop
+    const profile = extractProfile(s, 'XY');
+    expect(profile.closed).toBe(true);
+    const poly = [];
+    for (const seg of profile.segments) {
+      if (seg.kind === 'spline') {
+        for (let i = 0; i < 16; i++) {
+          poly.push(cubicPoint(seg.start, seg.c1, seg.c2, seg.end, i / 16));
+        }
+      } else {
+        poly.push(seg.start);
+      }
+    }
+    expect(signedArea(poly)).toBeGreaterThan(0);
+    expect(maxGap(profile)).toBeLessThan(1e-9);
   });
 });

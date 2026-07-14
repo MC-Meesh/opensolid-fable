@@ -5,6 +5,8 @@ import {
   arcSweep,
   distToArc,
   distToCircle,
+  distToCubic,
+  distToEllipse,
   distToSegment,
   normalizeAngle,
 } from './geom.js';
@@ -70,6 +72,17 @@ export function distToEntity(sketch, entity, x, y) {
       const end = normalizeAngle(Math.atan2(p2.y - c.y, p2.x - c.x));
       const sweep = arcSweep(start, end, entity.ccw);
       return distToArc(x, y, c.x, c.y, r, start, sweep, entity.ccw);
+    }
+    case 'ellipse': {
+      const c = pts[entity.center];
+      return distToEllipse(x, y, c.x, c.y, entity.rx, entity.ry, entity.rotation);
+    }
+    case 'spline': {
+      const p0 = pts[entity.p1];
+      const p1 = pts[entity.p2];
+      const c1 = pts[entity.c1];
+      const c2 = pts[entity.c2];
+      return distToCubic(x, y, [p0.x, p0.y], [c1.x, c1.y], [c2.x, c2.y], [p1.x, p1.y]);
     }
     default:
       return Infinity;

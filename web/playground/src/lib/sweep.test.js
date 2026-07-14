@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  applyProfileSeg,
   buildSweepShape,
   mirrorOpsV,
   nativeSweepOps,
@@ -10,7 +11,14 @@ import {
 } from './sweep.js';
 import { extrudePlan } from './sweep.js';
 import { serializeTree } from './sceneTree.js';
-import { planeNormal, planeToWorld } from './sketch/profile.js';
+import { extractProfile, planeNormal, planeToWorld } from './sketch/profile.js';
+import {
+  addEllipse,
+  addLine,
+  addPoint,
+  addSpline,
+  createSketch,
+} from './sketch/model.js';
 import { facePlaneBasis } from './facePlane.js';
 
 // Minimal stand-ins recording construction, like sceneTree.test.js.
@@ -153,6 +161,67 @@ describe('profileToOps', () => {
     ]);
     expect(ops.segs[1].x).toBe(ops.start[0]);
     expect(ops.segs[1].y).toBe(ops.start[1]);
+  });
+
+  it('converts an ellipse half-arc to a named ellipse op', () => {
+    const profile = {
+      closed: true,
+      plane: 'XY',
+      segments: [
+        {
+          kind: 'ellipse',
+          center: [1, 2],
+          rx: 3,
+          ry: 1,
+          rotation: 0.4,
+          ccw: true,
+          start: [4, 2],
+          end: [-2, 2],
+        },
+        { kind: 'line', start: [-2, 2], end: [4, 2] },
+      ],
+    };
+    const ops = profileToOps(profile);
+    expect(ops.start).toEqual([4, 2]);
+    expect(ops.segs[0]).toEqual({
+      kind: 'ellipse',
+      x: -2,
+      y: 2,
+      cx: 1,
+      cy: 2,
+      rx: 3,
+      ry: 1,
+      rotation: 0.4,
+      ccw: true,
+    });
+  });
+
+  it('converts a spline segment to a named cubic op', () => {
+    const profile = {
+      closed: true,
+      plane: 'XY',
+      segments: [
+        { kind: 'line', start: [0, 0], end: [4, 0] },
+        {
+          kind: 'spline',
+          start: [4, 0],
+          c1: [3, 3],
+          c2: [1, 3],
+          end: [0, 0],
+        },
+      ],
+    };
+    const ops = profileToOps(profile);
+    // Last segment lands exactly on start; the spline names its controls.
+    expect(ops.segs[1]).toEqual({
+      kind: 'spline',
+      x: ops.start[0],
+      y: ops.start[1],
+      c1x: 3,
+      c1y: 3,
+      c2x: 1,
+      c2y: 3,
+    });
   });
 
   it('rejects open profiles', () => {
@@ -338,6 +407,42 @@ describe('sweep plane mapping (WYSIWYG)', () => {
     // Vertex winding stays counterclockwise (checked on an area-carrying
     // polygon; the arc fixture's vertex polyline is degenerate).
     expect(signedArea(opsVerts(mirrorOpsV(profileToOps(SQUARE))))).toBeGreaterThan(0);
+  });
+
+  it('mirrorOpsV reflects ellipse and spline segments (center/rotation, controls)', () => {
+    // Loop: spline A→B up top, ellipse-arc B→C, line C→A.
+    const ops = {
+      start: [0, 1],
+      segs: [
+        { kind: 'spline', x: 4, y: 1, c1x: 1, c1y: 3, c2x: 3, c2y: 3 },
+        { kind: 'ellipse', x: 2, y: 5, cx: 3, cy: 3, rx: 2, ry: 1, rotation: 0.3, ccw: true },
+        { x: 0, y: 1, bulge: 0 },
+      ],
+    };
+    const m = mirrorOpsV(ops);
+    // Walk is reversed: line first (ends at C mirrored), then ellipse, then spline.
+    expect(m.start).toEqual([0, -1]);
+    const ell = m.segs.find((s) => s.kind === 'ellipse');
+    expect(ell.cy).toBe(-3);
+    expect(ell.cx).toBe(3);
+    expect(ell.rotation).toBeCloseTo(-0.3, 12);
+    expect(ell.ccw).toBe(true); // mirror + reversal both flip → unchanged
+    const sp = m.segs.find((s) => s.kind === 'spline');
+    // Reversed cubic swaps controls; v negates.
+    expect([sp.c1x, sp.c1y]).toEqual([3, -3]);
+    expect([sp.c2x, sp.c2y]).toEqual([1, -3]);
+  });
+
+  it('mirrorOpsV is an involution on curved loops', () => {
+    const ops = {
+      start: [0, 1],
+      segs: [
+        { kind: 'spline', x: 4, y: 2, c1x: 1, c1y: 3, c2x: 3, c2y: 3 },
+        { kind: 'ellipse', x: 2, y: 6, cx: 3, cy: 4, rx: 2, ry: 1, rotation: 0.3, ccw: true },
+        { x: 0, y: 1, bulge: 0 },
+      ],
+    };
+    expect(mirrorOpsV(mirrorOpsV(ops))).toEqual(ops);
   });
 
   it('nativeSweepOps mirrors only extrusions on XZ/YZ and face planes', () => {
@@ -814,5 +919,96 @@ describe('from-surface backoff (curved-face boss, of-fsl.5)', () => {
     });
     // translate -> rotate -> extrude(height 2), backoff dropped for named planes.
     expect(xy.desc[1][1][2]).toBe(2);
+  });
+});
+
+describe('applyProfileSeg', () => {
+  // Records every builder call so we can assert the forwarded arguments.
+  const recorder = () => {
+    const calls = [];
+    return {
+      calls,
+      arcTo: (...a) => calls.push(['arcTo', ...a]),
+      ellipseArcTo: (...a) => calls.push(['ellipseArcTo', ...a]),
+      cubicTo: (...a) => calls.push(['cubicTo', ...a]),
+    };
+  };
+
+  it('forwards line/arc snapshots through arcTo with their bulge', () => {
+    const p = recorder();
+    applyProfileSeg(p, { x: 1, y: 2, bulge: 0 });
+    applyProfileSeg(p, { x: 3, y: 4, bulge: 0.5 });
+    expect(p.calls).toEqual([
+      ['arcTo', 1, 2, 0],
+      ['arcTo', 3, 4, 0.5],
+    ]);
+  });
+
+  it('forwards ellipse segments to ellipseArcTo in builder order', () => {
+    const p = recorder();
+    applyProfileSeg(p, {
+      kind: 'ellipse',
+      x: -1,
+      y: 0,
+      cx: 0,
+      cy: 0,
+      rx: 2,
+      ry: 1,
+      rotation: 0.3,
+      ccw: true,
+    });
+    // rotation crosses from sketch radians to the builder's DEGREES here.
+    expect(p.calls).toEqual([
+      ['ellipseArcTo', -1, 0, 0, 0, 2, 1, (0.3 * 180) / Math.PI, true],
+    ]);
+  });
+
+  it('forwards spline segments to cubicTo (control points first)', () => {
+    const p = recorder();
+    applyProfileSeg(p, { kind: 'spline', x: 0, y: 1, c1x: 1, c1y: 2, c2x: 3, c2y: 4 });
+    expect(p.calls).toEqual([['cubicTo', 1, 2, 3, 4, 0, 1]]);
+  });
+});
+
+// End-to-end: a curved sketch flows through extractProfile -> profileToOps ->
+// the profile builder, exercising the whole of-ddh path in one shot.
+describe('curved sketch → sweep pipeline', () => {
+  const recorder = () => {
+    const calls = [];
+    return {
+      calls,
+      arcTo: (...a) => calls.push(['arcTo', ...a]),
+      ellipseArcTo: (...a) => calls.push(['ellipseArcTo', ...a]),
+      cubicTo: (...a) => calls.push(['cubicTo', ...a]),
+    };
+  };
+
+  it('drives a standalone ellipse into two ellipseArcTo calls', () => {
+    const s = createSketch();
+    const c = addPoint(s, 0, 0);
+    addEllipse(s, c, 3, 1, 0);
+    const ops = profileToOps(extractProfile(s, 'XY'));
+    const p = recorder();
+    for (const seg of ops.segs) applyProfileSeg(p, seg);
+    const ellipseCalls = p.calls.filter((c2) => c2[0] === 'ellipseArcTo');
+    expect(ellipseCalls).toHaveLength(2);
+    // Radii forwarded verbatim; a 0-rad rotation stays 0 in degrees.
+    for (const call of ellipseCalls) {
+      expect(call.slice(5, 8)).toEqual([3, 1, 0]);
+    }
+  });
+
+  it('drives a line+spline loop into one cubicTo call', () => {
+    const s = createSketch();
+    const a = addPoint(s, 0, 0);
+    const b = addPoint(s, 4, 0);
+    const c1 = addPoint(s, 3, 3);
+    const c2 = addPoint(s, 1, 3);
+    addLine(s, a, b);
+    addSpline(s, b, a, c1, c2);
+    const ops = profileToOps(extractProfile(s, 'XY'));
+    const p = recorder();
+    for (const seg of ops.segs) applyProfileSeg(p, seg);
+    expect(p.calls.filter((c3) => c3[0] === 'cubicTo')).toHaveLength(1);
   });
 });

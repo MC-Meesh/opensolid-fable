@@ -984,6 +984,13 @@ button.main-tool svg { flex: none; }
   fill: var(--accent);
   pointer-events: none;
 }
+.sketch-svg .spline-handle {
+  stroke: var(--accent);
+  stroke-width: 1;
+  stroke-dasharray: 3 3;
+  opacity: 0.6;
+  pointer-events: none;
+}
 .sketch-svg .profile-fill {
   fill: var(--ok);
   fill-opacity: 0.14;

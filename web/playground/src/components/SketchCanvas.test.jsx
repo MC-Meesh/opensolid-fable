@@ -25,6 +25,8 @@ describe('SketchCanvas', () => {
       'Rect',
       'Circle',
       'Arc',
+      'Ellipse',
+      'Spline',
       'Polygon',
       'Slot',
       'Centerline',

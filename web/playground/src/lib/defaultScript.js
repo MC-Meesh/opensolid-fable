@@ -13,6 +13,8 @@ export const DEFAULT_SCRIPT = `// Build a shape with the OpenSolid API and retur
 // Sweeps (build a closed 2D profile, then sweep it):
 //   const p = new Profile(x, y);        start point
 //   p.lineTo(x, y)  p.arcTo(x, y, bulge)  p.close()
+//   p.ellipseArcTo(x,y, cx,cy, rx,ry, rotation, ccw)   elliptical arc
+//   p.cubicTo(c1x,c1y, c2x,c2y, x,y)                   cubic Bezier
 //   Shape.extrude(p, height, draft?)    profile (x,y)->(x,z), swept along +y;
 //                                       optional draft angle (deg) tapers it
 //   Shape.revolve(p, angleDegrees)      around the y axis, x is the radius

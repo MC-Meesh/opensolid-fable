@@ -11,12 +11,14 @@ import {
   addArc,
   addCircle,
   addConstraint,
+  addEllipse,
   addLine,
   addLoop,
   addPoint,
   addPolygon,
   addRectangle,
   addSlot,
+  addSpline,
   createSketch,
   deleteConstraint,
   deleteEntity,
@@ -40,7 +42,13 @@ import {
   nearestPoint,
   snapToGrid,
 } from '../lib/sketch/snap.js';
-import { arcSweep, normalizeAngle } from '../lib/sketch/geom.js';
+import {
+  arcSweep,
+  catmullRomHandles,
+  ellipseParam,
+  ellipsePoint,
+  normalizeAngle,
+} from '../lib/sketch/geom.js';
 import {
   extractProfile,
   isFacePlane,
@@ -110,6 +118,18 @@ const TOOLS = [
     label: 'Arc',
     key: 'A',
     hint: 'Click center, start, then end (drag direction sets the sweep)',
+  },
+  {
+    id: 'ellipse',
+    label: 'Ellipse',
+    key: 'E',
+    hint: 'Click center, then a major-axis end, then set the minor radius · type radii (Tab between)',
+  },
+  {
+    id: 'spline',
+    label: 'Spline',
+    key: 'B',
+    hint: 'Click through points for a smooth curve · click the first point to close · Enter/Esc ends',
   },
   {
     id: 'polygon',
@@ -186,7 +206,7 @@ function nearestEntityAt(sketch, x, y, tol) {
 function entityAnchor(sketch, id) {
   const e = sketch.entities[id];
   if (!e) return null;
-  if (e.type === 'line') {
+  if (e.type === 'line' || e.type === 'spline') {
     const a = sketch.points[e.p1];
     const b = sketch.points[e.p2];
     return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
@@ -618,6 +638,69 @@ export default forwardRef(function SketchCanvas(
     [takeBefore, runSolve, commitRecord]
   );
 
+  /**
+   * Commit an ellipse at the draft center with semi-axis `rx` along `rotation`
+   * (radians) and semi-axis `ry` perpendicular to it. Rejects degenerate radii.
+   */
+  const commitEllipse = useCallback(
+    (rx, ry, rotation) => {
+      const d = draftRef.current;
+      const s = sketchRef.current;
+      if (!(rx > 1e-9) || !(ry > 1e-9)) return false;
+      const before = takeBefore();
+      const center = materialize(s, d.center);
+      addEllipse(s, center, rx, ry, rotation);
+      runSolve();
+      commitRecord(before);
+      setDraft(null);
+      setDimEntry(null);
+      return true;
+    },
+    [materialize, takeBefore, runSolve, commitRecord]
+  );
+
+  /**
+   * Commit a spline through the draft's anchor points as a chain of cubic
+   * Bézier segments with Catmull-Rom handles (a smooth interpolating curve).
+   * `closed` wraps the last anchor back to the first. Control points become
+   * draggable sketch points so the curve can be reshaped afterward.
+   */
+  const commitSpline = useCallback(
+    (anchors, { closed = false, construction = false } = {}) => {
+      const s = sketchRef.current;
+      if (anchors.length < 2) return false;
+      const before = takeBefore();
+      const ids = anchors.map((a) => materialize(s, a));
+      // Dedupe consecutive identical ids (e.g. a closing click on the start).
+      const n = ids.length;
+      const pt = (i) => s.points[ids[i]];
+      const segCount = closed ? n : n - 1;
+      for (let i = 0; i < segCount; i++) {
+        const i0 = i;
+        const i1 = (i + 1) % n;
+        // Catmull-Rom neighbors; open ends duplicate the endpoint.
+        const prev = closed ? pt((i - 1 + n) % n) : pt(Math.max(0, i - 1));
+        const next = closed ? pt((i + 2) % n) : pt(Math.min(n - 1, i + 2));
+        const a = pt(i0);
+        const b = pt(i1);
+        const { c1, c2 } = catmullRomHandles(
+          [prev.x, prev.y],
+          [a.x, a.y],
+          [b.x, b.y],
+          [next.x, next.y]
+        );
+        const c1id = addPoint(s, c1[0], c1[1]);
+        const c2id = addPoint(s, c2[0], c2[1]);
+        addSpline(s, ids[i0], ids[i1], c1id, c2id, { construction });
+      }
+      runSolve();
+      commitRecord(before);
+      setDraft(null);
+      return true;
+    },
+    [materialize, takeBefore, runSolve, commitRecord]
+  );
+
   // ---- exact dimension entry (type a number while drafting) ---------------
 
   const commitDimEntry = useCallback(() => {
@@ -677,8 +760,26 @@ export default forwardRef(function SketchCanvas(
       const sx = at && at.x < d.x1 ? -1 : 1;
       const sy = at && at.y < d.y1 ? -1 : 1;
       commitRect(d.x1 + sx * w, d.y1 + sy * h, { dims: { w, h } });
+      return;
     }
-  }, [anchorPos, cursor, commitLineSegment, commitCircle, commitRect]);
+    if (entry.kind === 'ellipse') {
+      const rx = parseDimension(entry.rx);
+      const ry = parseDimension(entry.ry);
+      if (rx && !ry) {
+        setDimEntry({ ...entry, field: 'ry' });
+        return;
+      }
+      if (!rx || !ry) {
+        setMessage('Enter positive major and minor radii');
+        return;
+      }
+      // Aim the major axis with the cursor; the typed values set the radii.
+      const c = anchorPos(d.center);
+      const at = cursor?.snap ?? cursor;
+      const rotation = at ? Math.atan2(at.y - c.y, at.x - c.x) : 0;
+      commitEllipse(rx, ry, rotation);
+    }
+  }, [anchorPos, cursor, commitLineSegment, commitCircle, commitRect, commitEllipse]);
 
   /** Route a printable/edit key into the dimension entry. Returns handled. */
   const dimEntryKey = useCallback(
@@ -692,10 +793,15 @@ export default forwardRef(function SketchCanvas(
             ? 'circle'
             : d.kind === 'rect'
               ? 'rect'
-              : d.kind === 'polygon'
-                ? 'polygon'
-                : null;
+              : d.kind === 'ellipse' && d.stage === 1
+                ? 'ellipse'
+                : d.kind === 'polygon'
+                  ? 'polygon'
+                  : null;
       if (!kind) return false;
+      // Two-field tools: type the first size, Tab/Enter to the second.
+      const FIELDS = { rect: ['w', 'h'], ellipse: ['rx', 'ry'] };
+      const fields = FIELDS[kind];
       const entry = dimEntryRef.current;
       const key = event.key;
       const isDigit = /^[0-9.]$/.test(key);
@@ -721,8 +827,11 @@ export default forwardRef(function SketchCanvas(
       }
 
       if (isDigit) {
-        if (kind === 'rect') {
-          const cur = entry?.kind === 'rect' ? entry : { kind: 'rect', w: '', h: '', field: 'w' };
+        if (fields) {
+          const cur =
+            entry?.kind === kind
+              ? entry
+              : { kind, [fields[0]]: '', [fields[1]]: '', field: fields[0] };
           const field = cur.field;
           if (cur[field].length < 10) {
             setDimEntry({ ...cur, [field]: cur[field] + key });
@@ -735,7 +844,7 @@ export default forwardRef(function SketchCanvas(
       }
       if (!entry) return false;
       if (key === 'Backspace') {
-        if (entry.kind === 'rect') {
+        if (fields && entry.kind === kind) {
           const field = entry.field;
           setDimEntry({ ...entry, [field]: entry[field].slice(0, -1) });
         } else {
@@ -743,8 +852,8 @@ export default forwardRef(function SketchCanvas(
         }
         return true;
       }
-      if (key === 'Tab' && entry.kind === 'rect') {
-        setDimEntry({ ...entry, field: entry.field === 'w' ? 'h' : 'w' });
+      if (key === 'Tab' && fields && entry.kind === kind) {
+        setDimEntry({ ...entry, field: entry.field === fields[0] ? fields[1] : fields[0] });
         return true;
       }
       if (key === 'Enter') {
@@ -886,6 +995,67 @@ export default forwardRef(function SketchCanvas(
           commitArc(Math.atan2(world.y - c.y, world.x - c.x));
           return;
         }
+        case 'ellipse': {
+          if (!draft) {
+            const snap = resolveSnap(world);
+            setDraft({ kind: 'ellipse', center: snap, stage: 1 });
+            return;
+          }
+          const c = anchorPos(draft.center);
+          if (draft.stage === 1) {
+            const snap = resolveSnap(world, {
+              exclude: draft.center.id ? new Set([draft.center.id]) : undefined,
+            });
+            const rx = Math.hypot(snap.x - c.x, snap.y - c.y);
+            if (!(rx > 1e-9)) return;
+            const rotation = Math.atan2(snap.y - c.y, snap.x - c.x);
+            setDraft({ ...draft, rx, rotation, stage: 2 });
+            return;
+          }
+          // Stage 2: minor radius = perpendicular distance to the major axis.
+          const ry = Math.abs(
+            (world.x - c.x) * -Math.sin(draft.rotation) +
+              (world.y - c.y) * Math.cos(draft.rotation)
+          );
+          commitEllipse(draft.rx, ry, draft.rotation);
+          return;
+        }
+        case 'spline': {
+          const construction = false;
+          if (!draft) {
+            const snap = resolveSnap(world);
+            setDraft({
+              kind: 'spline',
+              construction,
+              anchors: [snap],
+              chainStartId: snap.id ?? null,
+            });
+            return;
+          }
+          const anchors = draft.anchors;
+          const snap = resolveSnap(world);
+          const first = anchorPos(anchors[0]);
+          const last = anchorPos(anchors[anchors.length - 1]);
+          const closeR = SNAP_PX / view.scale;
+          // Clicking near the first point closes the loop; clicking the last
+          // point again finishes an open curve.
+          if (
+            anchors.length >= 3 &&
+            (Math.hypot(snap.x - first.x, snap.y - first.y) <= closeR ||
+              (snap.id && snap.id === draft.chainStartId))
+          ) {
+            commitSpline(anchors, { closed: true, construction: draft.construction });
+            return;
+          }
+          if (Math.hypot(snap.x - last.x, snap.y - last.y) <= closeR) {
+            if (anchors.length >= 2) {
+              commitSpline(anchors, { construction: draft.construction });
+            }
+            return;
+          }
+          setDraft({ ...draft, anchors: [...anchors, snap] });
+          return;
+        }
         case 'centerline': {
           if (!draft) {
             const snap = resolveSnap(world);
@@ -968,6 +1138,8 @@ export default forwardRef(function SketchCanvas(
       commitRect,
       commitCircle,
       commitArc,
+      commitEllipse,
+      commitSpline,
       commitPolygon,
       commitSlot,
       takeBefore,
@@ -1327,18 +1499,31 @@ export default forwardRef(function SketchCanvas(
     });
   }, []);
 
+  /** Edit an entity's own numeric parameter (e.g. an ellipse's rx/ry). */
+  const openEntityDimEdit = useCallback((entityId, param, wx, wy) => {
+    const e = sketchRef.current.entities[entityId];
+    if (!e) return;
+    setDimEdit({ entity: entityId, param, text: String(e[param]), wx, wy });
+  }, []);
+
   const commitDimEdit = useCallback(() => {
     const edit = dimEdit;
     if (!edit) return;
     const s = sketchRef.current;
-    const constraint = s.constraints[edit.id];
     const value = parseDimension(edit.text);
-    if (!constraint || !value) {
+    if (!value) {
+      setMessage('Enter a positive dimension value');
+      return;
+    }
+    // An entity-parameter edit (ellipse radius) or a constraint value edit.
+    const target = edit.entity ? s.entities[edit.entity] : s.constraints[edit.id];
+    if (!target) {
       setMessage('Enter a positive dimension value');
       return;
     }
     const before = takeBefore();
-    constraint.value = value;
+    if (edit.entity) target[edit.param] = value;
+    else target.value = value;
     runSolve();
     commitRecord(before);
     setDimEdit(null);
@@ -1347,11 +1532,15 @@ export default forwardRef(function SketchCanvas(
   // ---- keyboard ----------------------------------------------------------
 
   const escStep = useCallback(() => {
+    const d = draftRef.current;
     if (dimEntryRef.current) {
       setDimEntry(null);
     } else if (dimEdit) {
       setDimEdit(null);
-    } else if (draftRef.current) {
+    } else if (d?.kind === 'spline' && d.anchors.length >= 2) {
+      // Finish the in-progress open spline rather than discarding it.
+      commitSpline(d.anchors, { construction: d.construction });
+    } else if (d) {
       cancelDraft();
     } else if (selection.length > 0) {
       setSelection([]);
@@ -1360,7 +1549,7 @@ export default forwardRef(function SketchCanvas(
     } else {
       onExit?.();
     }
-  }, [dimEdit, selection, tool, cancelDraft, onExit]);
+  }, [dimEdit, selection, tool, cancelDraft, commitSpline, onExit]);
 
   useEffect(() => {
     if (!open) return undefined;
@@ -1392,6 +1581,16 @@ export default forwardRef(function SketchCanvas(
         return;
       }
 
+      // Enter finishes an in-progress open spline.
+      if (event.key === 'Enter') {
+        const d = draftRef.current;
+        if (d?.kind === 'spline' && d.anchors.length >= 2) {
+          event.preventDefault();
+          commitSpline(d.anchors, { construction: d.construction });
+        }
+        return;
+      }
+
       if (event.key === 'Delete' || event.key === 'Backspace') {
         deleteSelection();
         return;
@@ -1405,7 +1604,7 @@ export default forwardRef(function SketchCanvas(
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [open, escStep, dimEntryKey, deleteSelection, doUndo, doRedo]);
+  }, [open, escStep, dimEntryKey, deleteSelection, commitSpline, doUndo, doRedo]);
 
   // Leaving a tool cancels its draft.
   const selectTool = useCallback(
@@ -1475,6 +1674,24 @@ export default forwardRef(function SketchCanvas(
       const [ex, ey] = worldToScreen(...segmentEnd2D(seg));
       if (seg.kind === 'line') {
         d += ` L ${ex} ${ey}`;
+      } else if (seg.kind === 'spline') {
+        const [c1x, c1y] = worldToScreen(seg.c1[0], seg.c1[1]);
+        const [c2x, c2y] = worldToScreen(seg.c2[0], seg.c2[1]);
+        d += ` C ${c1x} ${c1y} ${c2x} ${c2y} ${ex} ${ey}`;
+      } else if (seg.kind === 'ellipse') {
+        // Sample the elliptical half-arc into line segments.
+        const [cx, cy] = seg.center;
+        const t0 = ellipseParam(cx, cy, seg.rx, seg.ry, seg.rotation, ...seg.start);
+        const t1 = ellipseParam(cx, cy, seg.rx, seg.ry, seg.rotation, ...seg.end);
+        const delta = seg.ccw
+          ? normalizeAngle(t1 - t0)
+          : -normalizeAngle(t0 - t1);
+        const n = 24;
+        for (let i = 1; i <= n; i++) {
+          const [wx, wy] = ellipsePoint(cx, cy, seg.rx, seg.ry, seg.rotation, t0 + (delta * i) / n);
+          const [px, py] = worldToScreen(wx, wy);
+          d += ` L ${px} ${py}`;
+        }
       } else {
         const rr = seg.radius * view.scale;
         const sweep = arcSweep(
@@ -1514,6 +1731,54 @@ export default forwardRef(function SketchCanvas(
           r={entity.radius * view.scale}
           fill="none"
         />
+      );
+    }
+    if (entity.type === 'ellipse') {
+      // Sample the outline (rotation + flipped screen Y make a native SVG
+      // <ellipse transform> error-prone; a sampled path is unambiguous).
+      const c = sketch.points[entity.center];
+      const n = 64;
+      let d = '';
+      for (let i = 0; i <= n; i++) {
+        const [wx, wy] = ellipsePoint(
+          c.x,
+          c.y,
+          entity.rx,
+          entity.ry,
+          entity.rotation,
+          (2 * Math.PI * i) / n
+        );
+        const [sx, sy] = worldToScreen(wx, wy);
+        d += `${i === 0 ? 'M' : 'L'} ${sx} ${sy} `;
+      }
+      return <path key={entity.id} className={cls} d={`${d}Z`} fill="none" />;
+    }
+    if (entity.type === 'spline') {
+      const p0 = sketch.points[entity.p1];
+      const p3 = sketch.points[entity.p2];
+      const h1 = sketch.points[entity.c1];
+      const h2 = sketch.points[entity.c2];
+      const [x0, y0] = worldToScreen(p0.x, p0.y);
+      const [hx1, hy1] = worldToScreen(h1.x, h1.y);
+      const [hx2, hy2] = worldToScreen(h2.x, h2.y);
+      const [x3, y3] = worldToScreen(p3.x, p3.y);
+      const curve = (
+        <path
+          key={entity.id}
+          className={cls}
+          d={`M ${x0} ${y0} C ${hx1} ${hy1} ${hx2} ${hy2} ${x3} ${y3}`}
+          fill="none"
+        />
+      );
+      if (!isSelected('entity', entity.id)) return curve;
+      // Show control handles (dashed leaders to the two control points) when
+      // the spline is selected, so its shape can be adjusted.
+      return (
+        <g key={entity.id}>
+          {curve}
+          <line className="spline-handle" x1={x0} y1={y0} x2={hx1} y2={hy1} />
+          <line className="spline-handle" x1={x3} y1={y3} x2={hx2} y2={hy2} />
+        </g>
       );
     }
     // Arc: world CCW renders as SVG sweep-flag 0 because screen Y is flipped.
@@ -1671,6 +1936,43 @@ export default forwardRef(function SketchCanvas(
     }
   }
 
+  /**
+   * Editable Rx / Ry dimension labels for each ellipse, sitting at the tips of
+   * the major and minor semi-axes. Clicking a label edits that radius directly
+   * (ellipse radii are entity parameters, not solver constraints).
+   */
+  function renderEllipseDims() {
+    const labels = [];
+    for (const e of Object.values(sketch.entities)) {
+      if (e.type !== 'ellipse' || e.construction) continue;
+      const c = sketch.points[e.center];
+      const cr = Math.cos(e.rotation);
+      const sr = Math.sin(e.rotation);
+      const axes = [
+        { param: 'rx', wx: c.x + e.rx * cr, wy: c.y + e.rx * sr, val: e.rx, prefix: 'Rx' },
+        { param: 'ry', wx: c.x - e.ry * sr, wy: c.y + e.ry * cr, val: e.ry, prefix: 'Ry' },
+      ];
+      for (const a of axes) {
+        const [x, y] = worldToScreen(a.wx, a.wy);
+        labels.push(
+          <text
+            key={`${e.id}-${a.param}`}
+            className="glyph dim"
+            x={x + 6}
+            y={y - 6}
+            onPointerDown={(event) => {
+              event.stopPropagation();
+              openEntityDimEdit(e.id, a.param, a.wx, a.wy);
+            }}
+          >
+            {withUnit(`${a.prefix}${formatNumber(a.val)}`, documentUnit)}
+          </text>
+        );
+      }
+    }
+    return labels;
+  }
+
   function renderDraft() {
     if (!draft || !cursor) return null;
     const snap = cursor.snap;
@@ -1737,6 +2039,74 @@ export default forwardRef(function SketchCanvas(
             } ${px} ${py}`}
             fill="none"
           />
+        </g>
+      );
+    }
+    if (draft.kind === 'ellipse') {
+      const c = anchorPos(draft.center);
+      const [cx, cy] = worldToScreen(c.x, c.y);
+      if (draft.stage === 1) {
+        // Major-axis rubber band from the center to the cursor.
+        const [ex, ey] = worldToScreen(snap.x, snap.y);
+        return (
+          <g>
+            <circle className="draft-anchor" cx={cx} cy={cy} r={3.5} />
+            <line className="draft faint" x1={cx} y1={cy} x2={ex} y2={ey} />
+          </g>
+        );
+      }
+      const ry = Math.abs(
+        (cursor.x - c.x) * -Math.sin(draft.rotation) +
+          (cursor.y - c.y) * Math.cos(draft.rotation)
+      );
+      const n = 64;
+      let d = '';
+      for (let i = 0; i <= n; i++) {
+        const [wx, wy] = ellipsePoint(
+          c.x,
+          c.y,
+          draft.rx,
+          Math.max(ry, 1e-6),
+          draft.rotation,
+          (2 * Math.PI * i) / n
+        );
+        const [sx, sy] = worldToScreen(wx, wy);
+        d += `${i === 0 ? 'M' : 'L'} ${sx} ${sy} `;
+      }
+      return <path className="draft" d={`${d}Z`} fill="none" />;
+    }
+    if (draft.kind === 'spline') {
+      // Preview the smooth curve through the placed anchors plus the cursor.
+      const pts = draft.anchors.map((a) => {
+        const p = anchorPos(a);
+        return [p.x, p.y];
+      });
+      const closeR = SNAP_PX / view.scale;
+      const closing =
+        pts.length >= 3 &&
+        Math.hypot(snap.x - pts[0][0], snap.y - pts[0][1]) <= closeR;
+      if (!closing) pts.push([snap.x, snap.y]);
+      const loop = closing ? [...pts, pts[0]] : pts;
+      const n = loop.length;
+      let d = '';
+      const [s0x, s0y] = worldToScreen(loop[0][0], loop[0][1]);
+      d = `M ${s0x} ${s0y}`;
+      for (let i = 0; i < n - 1; i++) {
+        const prev = loop[Math.max(0, i - 1)];
+        const next = loop[Math.min(n - 1, i + 2)];
+        const { c1, c2 } = catmullRomHandles(prev, loop[i], loop[i + 1], next);
+        const [h1x, h1y] = worldToScreen(c1[0], c1[1]);
+        const [h2x, h2y] = worldToScreen(c2[0], c2[1]);
+        const [ex, ey] = worldToScreen(loop[i + 1][0], loop[i + 1][1]);
+        d += ` C ${h1x} ${h1y} ${h2x} ${h2y} ${ex} ${ey}`;
+      }
+      return (
+        <g>
+          <path className="draft" d={d} fill="none" />
+          {pts.map(([wx, wy], i) => {
+            const [ax, ay] = worldToScreen(wx, wy);
+            return <circle key={i} className="draft-anchor" cx={ax} cy={ay} r={3} />;
+          })}
         </g>
       );
     }
@@ -1814,6 +2184,11 @@ export default forwardRef(function SketchCanvas(
         text = `W ${dimEntry.w || '…'}${w ? '▏' : ''} × H ${dimEntry.h || '…'}${
           w ? '' : '▏'
         }`;
+      } else if (dimEntry.kind === 'ellipse') {
+        const rx = dimEntry.field === 'rx';
+        text = `Rx ${dimEntry.rx || '…'}${rx ? '▏' : ''} × Ry ${
+          dimEntry.ry || '…'
+        }${rx ? '' : '▏'}`;
       } else if (dimEntry.kind === 'circle') {
         text = `R ${dimEntry.text}▏`;
       } else if (dimEntry.kind === 'polygon') {
@@ -1861,6 +2236,18 @@ export default forwardRef(function SketchCanvas(
     } else if (draft.kind === 'arc') {
       const c = anchorPos(draft.center);
       text = `R ${formatNumber(Math.hypot(cursor.x - c.x, cursor.y - c.y))}`;
+    } else if (draft.kind === 'ellipse' && draft.stage === 2) {
+      const c = anchorPos(draft.center);
+      const ry = Math.abs(
+        (cursor.x - c.x) * -Math.sin(draft.rotation) +
+          (cursor.y - c.y) * Math.cos(draft.rotation)
+      );
+      text = `Rx ${formatNumber(draft.rx)} · Ry ${formatNumber(ry)}`;
+    } else if (draft.kind === 'ellipse') {
+      const c = anchorPos(draft.center);
+      text = `Rx ${formatNumber(Math.hypot(snap.x - c.x, snap.y - c.y))}`;
+    } else if (draft.kind === 'spline') {
+      text = `${draft.anchors.length} pt${draft.anchors.length === 1 ? '' : 's'}`;
     }
     if (!text) return null;
     const [sx, sy] = worldToScreen(cursor.x, cursor.y);
@@ -1920,6 +2307,7 @@ export default forwardRef(function SketchCanvas(
         {renderProfileFill()}
         {Object.values(sketch.entities).map(renderEntity)}
         {Object.values(sketch.constraints).map(renderConstraintGlyph)}
+        {renderEllipseDims()}
         {renderDraft()}
         {Object.values(sketch.points).map((p) => {
           const [x, y] = worldToScreen(p.x, p.y);

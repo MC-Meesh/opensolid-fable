@@ -32,11 +32,25 @@ export function bulgeArcCenter(ax, ay, bx, by, bulge) {
 const CLOSE_TOL = 1e-9;
 
 /**
+ * True if any segment is a curved (ellipse / spline) kind that the sketch
+ * model cannot represent yet — such profiles cannot round-trip back into an
+ * editable sketch (see the of-fsl.22 follow-up for interactive curve tools).
+ */
+export function opsHaveCurvedSegs(ops) {
+  return ops.segs.some((s) => s.kind === 'ellipse' || s.kind === 'spline');
+}
+
+/**
  * Build a sketch whose entities trace the profile snapshot. Returns a fresh
  * sketch (model.js shape) with chained lines/arcs; consecutive segments and
  * the closing joint share point ids, so the loop is closed by construction.
  */
 export function sketchFromOps(ops) {
+  if (opsHaveCurvedSegs(ops)) {
+    throw new Error(
+      'this profile contains ellipse/spline segments, which cannot be edited as a sketch yet'
+    );
+  }
   const sketch = createSketch();
   const startId = addPoint(sketch, ops.start[0], ops.start[1]);
   let prevId = startId;

@@ -20,10 +20,18 @@
  * `planeToWorld` yields a winding normal of +Z / +Y / +X respectively.
  */
 
-import { arcSweep, normalizeAngle, sampleArc, signedArea } from './geom.js';
+import {
+  arcSweep,
+  ellipsePoint,
+  normalizeAngle,
+  sampleArc,
+  sampleCubic,
+  signedArea,
+} from './geom.js';
 import { entityRadius } from './model.js';
 
 const ARC_SAMPLES = 32;
+const SPLINE_SAMPLES = 24;
 
 /**
  * A sketch plane is either a named plane ('XY' | 'XZ' | 'YZ', through the
@@ -149,13 +157,32 @@ function arcGeometry(sketch, entity) {
   return { center: [c.x, c.y], radius, startAngle, endAngle };
 }
 
-/** Loop polyline for area/orientation checks (arcs sampled). */
+/** Control points of a spline entity in traversal order (start, c1, c2, end). */
+function splineControls(sketch, entity, forward) {
+  const p0 = sketch.points[forward ? entity.p1 : entity.p2];
+  const h1 = sketch.points[forward ? entity.c1 : entity.c2];
+  const h2 = sketch.points[forward ? entity.c2 : entity.c1];
+  const p3 = sketch.points[forward ? entity.p2 : entity.p1];
+  return {
+    p0: [p0.x, p0.y],
+    c1: [h1.x, h1.y],
+    c2: [h2.x, h2.y],
+    p3: [p3.x, p3.y],
+  };
+}
+
+/** Loop polyline for area/orientation checks (arcs and splines sampled). */
 function samplePolyline(sketch, ordered) {
   const pts = [];
   for (const { entity, forward } of ordered) {
     if (entity.type === 'line') {
       const p = sketch.points[forward ? entity.p1 : entity.p2];
       pts.push([p.x, p.y]);
+    } else if (entity.type === 'spline') {
+      const { p0, c1, c2, p3 } = splineControls(sketch, entity, forward);
+      const samples = sampleCubic(p0, c1, c2, p3, SPLINE_SAMPLES);
+      samples.pop(); // next segment supplies the shared endpoint
+      pts.push(...samples);
     } else {
       const { center, radius, startAngle, endAngle } = arcGeometry(
         sketch,
@@ -210,24 +237,58 @@ function circleProfile(sketch, circle, plane) {
 }
 
 /**
+ * A closed ellipse becomes two half-ellipse arcs (t: 0→π, π→2π), the elliptic
+ * analogue of `circleProfile`. Parametric t increases counter-clockwise, so
+ * both halves are `ccw` and the loop has positive area.
+ */
+function ellipseProfile(sketch, ellipse, plane) {
+  const c = sketch.points[ellipse.center];
+  const { rx, ry, rotation } = ellipse;
+  if (!(rx > 0) || !(ry > 0)) {
+    return { closed: false, reason: 'ellipse has zero radius' };
+  }
+  const at = (t) => ellipsePoint(c.x, c.y, rx, ry, rotation, t);
+  const p0 = at(0);
+  const pMid = at(Math.PI);
+  const common = { center: [c.x, c.y], rx, ry, rotation, ccw: true };
+  return {
+    closed: true,
+    plane,
+    segments: [
+      { kind: 'ellipse', ...common, start: p0, end: pMid },
+      { kind: 'ellipse', ...common, start: pMid, end: p0 },
+    ],
+  };
+}
+
+/**
  * Extract the sketch's single closed profile, or explain why there is none.
  */
 export function extractProfile(sketch, plane = 'XY') {
   // Construction geometry (centerlines, mirror axes) is reference-only.
   const entities = Object.values(sketch.entities).filter((e) => !e.construction);
-  const circles = entities.filter((e) => e.type === 'circle');
-  const chain = entities.filter((e) => e.type === 'line' || e.type === 'arc');
+  // Circles and ellipses are self-closed loops — each forms a whole profile
+  // on its own and cannot chain with other segments.
+  const closedCurves = entities.filter(
+    (e) => e.type === 'circle' || e.type === 'ellipse'
+  );
+  const chain = entities.filter(
+    (e) => e.type === 'line' || e.type === 'arc' || e.type === 'spline'
+  );
 
   if (entities.length === 0) {
     return { closed: false, reason: 'empty sketch' };
   }
-  if (circles.length > 0) {
-    if (circles.length === 1 && chain.length === 0) {
-      return circleProfile(sketch, circles[0], plane);
+  if (closedCurves.length > 0) {
+    if (closedCurves.length === 1 && chain.length === 0) {
+      const only = closedCurves[0];
+      return only.type === 'circle'
+        ? circleProfile(sketch, only, plane)
+        : ellipseProfile(sketch, only, plane);
     }
     return {
       closed: false,
-      reason: 'a circle must be the only entity in the sketch',
+      reason: 'a circle or ellipse must be the only entity in the sketch',
     };
   }
   if (chain.length < 2) {
@@ -321,6 +382,10 @@ export function extractProfile(sketch, plane = 'XY') {
       const b = sketch.points[forward ? entity.p2 : entity.p1];
       return { kind: 'line', start: [a.x, a.y], end: [b.x, b.y] };
     }
+    if (entity.type === 'spline') {
+      const { p0, c1, c2, p3 } = splineControls(sketch, entity, forward);
+      return { kind: 'spline', start: p0, c1, c2, end: p3 };
+    }
     const { center, radius, startAngle, endAngle } = arcGeometry(
       sketch,
       entity
@@ -355,9 +420,9 @@ function loopExtent(sketch, entities) {
   return Math.hypot(maxX - minX, maxY - minY) || 1;
 }
 
-/** Segment start point in 2D (line start or arc start-angle point). */
+/** Segment start point in 2D (line/spline/ellipse carry it; arcs compute it). */
 export function segmentStart2D(segment) {
-  if (segment.kind === 'line') return segment.start;
+  if (segment.start) return segment.start;
   const [cx, cy] = segment.center;
   return [
     cx + segment.radius * Math.cos(segment.startAngle),
@@ -367,7 +432,7 @@ export function segmentStart2D(segment) {
 
 /** Segment end point in 2D. */
 export function segmentEnd2D(segment) {
-  if (segment.kind === 'line') return segment.end;
+  if (segment.end) return segment.end;
   const [cx, cy] = segment.center;
   return [
     cx + segment.radius * Math.cos(segment.endAngle),
@@ -393,7 +458,7 @@ export function profileTo3D(profile) {
         start3: planeToWorld(plane, start[0], start[1]),
         end3: planeToWorld(plane, end[0], end[1]),
       };
-      if (seg.kind === 'arc') {
+      if (seg.kind === 'arc' || seg.kind === 'ellipse') {
         lifted.center3 = planeToWorld(plane, seg.center[0], seg.center[1]);
       }
       return lifted;

@@ -3,12 +3,14 @@ import {
   addArc,
   addCircle,
   addConstraint,
+  addEllipse,
   addLine,
   addLoop,
   addPoint,
   addPolygon,
   addRectangle,
   addSlot,
+  addSpline,
   constraintRefs,
   createSketch,
   deleteConstraint,
@@ -381,5 +383,81 @@ describe('sketch model', () => {
     expect(validateConstraint(s, { type: 'fix', point: 'nope' })).toMatch(
       /point/
     );
+  });
+
+  it('addEllipse stores center, radii, and rotation', () => {
+    const s = createSketch();
+    const c = addPoint(s, 1, 2);
+    const id = addEllipse(s, c, 3, 1, Math.PI / 4);
+    const e = s.entities[id];
+    expect(e).toMatchObject({ type: 'ellipse', center: c, rx: 3, ry: 1 });
+    expect(e.rotation).toBeCloseTo(Math.PI / 4, 12);
+    // Only the center is a referenced point.
+    expect(entityPointIds(e)).toEqual([c]);
+  });
+
+  it('addSpline references both endpoints and both control points', () => {
+    const s = createSketch();
+    const p1 = addPoint(s, 0, 0);
+    const p2 = addPoint(s, 4, 0);
+    const c1 = addPoint(s, 1, 2);
+    const c2 = addPoint(s, 3, 2);
+    const id = addSpline(s, p1, p2, c1, c2);
+    const e = s.entities[id];
+    expect(e).toMatchObject({ type: 'spline', p1, p2, c1, c2 });
+    expect(entityPointIds(e)).toEqual([p1, p2, c1, c2]);
+  });
+
+  it('deleting a spline removes its orphaned control points', () => {
+    const s = createSketch();
+    const p1 = addPoint(s, 0, 0);
+    const p2 = addPoint(s, 4, 0);
+    const c1 = addPoint(s, 1, 2);
+    const c2 = addPoint(s, 3, 2);
+    const id = addSpline(s, p1, p2, c1, c2);
+    deleteEntity(s, id);
+    expect(s.entities[id]).toBeUndefined();
+    // Every point was used only by the spline, so all are gone.
+    expect(Object.keys(s.points)).toHaveLength(0);
+  });
+
+  it('construction flag is settable on ellipse and spline', () => {
+    const s = createSketch();
+    const c = addPoint(s, 0, 0);
+    const el = addEllipse(s, c, 2, 1, 0, { construction: true });
+    expect(s.entities[el].construction).toBe(true);
+    const p1 = addPoint(s, 0, 0);
+    const p2 = addPoint(s, 1, 0);
+    const h1 = addPoint(s, 0, 1);
+    const h2 = addPoint(s, 1, 1);
+    const sp = addSpline(s, p1, p2, h1, h2, { construction: true });
+    expect(s.entities[sp].construction).toBe(true);
+  });
+
+  it('mirrorEntities reflects an ellipse (rotation negates across the u axis)', () => {
+    const s = createSketch();
+    const c = addPoint(s, 2, 3);
+    const id = addEllipse(s, c, 4, 1, 0.5);
+    // Mirror across the x axis (u): center.y flips, rotation negates.
+    const [copy] = mirrorEntities(s, [id], 0, 0, 1, 0);
+    const e = s.entities[copy];
+    expect(s.points[e.center]).toMatchObject({ x: 2, y: -3 });
+    expect(e.rotation).toBeCloseTo(-0.5, 12);
+    expect(e.rx).toBe(4);
+    expect(e.ry).toBe(1);
+  });
+
+  it('mirrorEntities reflects a spline endpoints and handles', () => {
+    const s = createSketch();
+    const p1 = addPoint(s, 0, 1);
+    const p2 = addPoint(s, 4, 1);
+    const c1 = addPoint(s, 1, 3);
+    const c2 = addPoint(s, 3, 3);
+    const id = addSpline(s, p1, p2, c1, c2);
+    const [copy] = mirrorEntities(s, [id], 0, 0, 1, 0); // across x axis
+    const e = s.entities[copy];
+    expect(s.points[e.p1]).toMatchObject({ x: 0, y: -1 });
+    expect(s.points[e.c1]).toMatchObject({ x: 1, y: -3 });
+    expect(s.points[e.c2]).toMatchObject({ x: 3, y: -3 });
   });
 });

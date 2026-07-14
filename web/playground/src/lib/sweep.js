@@ -56,6 +56,30 @@ export function profileToOps(profile) {
     const last = i === profile.segments.length - 1;
     const [x, y] = last ? start : segmentEnd2D(seg);
     if (seg.kind === 'line') return { x, y, bulge: 0 };
+    if (seg.kind === 'ellipse') {
+      return {
+        kind: 'ellipse',
+        x,
+        y,
+        cx: seg.center[0],
+        cy: seg.center[1],
+        rx: seg.rx,
+        ry: seg.ry,
+        rotation: seg.rotation,
+        ccw: seg.ccw,
+      };
+    }
+    if (seg.kind === 'spline') {
+      return {
+        kind: 'spline',
+        x,
+        y,
+        c1x: seg.c1[0],
+        c1y: seg.c1[1],
+        c2x: seg.c2[0],
+        c2y: seg.c2[1],
+      };
+    }
     const sweep = arcSweep(seg.startAngle, seg.endAngle, seg.ccw);
     const signed = seg.ccw ? sweep : -sweep;
     return { x, y, bulge: Math.tan(signed / 4) };
@@ -64,18 +88,54 @@ export function profileToOps(profile) {
 }
 
 /**
+ * Reflect one profile-ops segment across the u axis (v -> -v) while reversing
+ * its traversal, so it becomes the new segment ending at `end` (the mirror of
+ * the original segment's start vertex).
+ *
+ * Mirror and reversal each flip handedness, so an arc's bulge and an ellipse
+ * arc's `ccw` carry over unchanged. A cubic's control points swap (reversing
+ * a Bézier walks its controls in reverse) and negate in v. An ellipse's
+ * center reflects and its major-axis `rotation` negates.
+ */
+function mirrorSegV(seg, end) {
+  const base = { x: end[0], y: end[1] };
+  if (seg.kind === 'ellipse') {
+    return {
+      ...base,
+      kind: 'ellipse',
+      cx: seg.cx,
+      cy: -seg.cy,
+      rx: seg.rx,
+      ry: seg.ry,
+      rotation: -seg.rotation,
+      ccw: seg.ccw,
+    };
+  }
+  if (seg.kind === 'spline') {
+    return {
+      ...base,
+      kind: 'spline',
+      c1x: seg.c2x,
+      c1y: -seg.c2y,
+      c2x: seg.c1x,
+      c2y: -seg.c1y,
+    };
+  }
+  return { ...base, bulge: seg.bulge };
+}
+
+/**
  * Mirror profile ops across the u axis (v -> -v) while preserving the
  * counterclockwise traversal the kernel expects: the mirrored loop is walked
- * in reverse (mirror and reversal each negate a bulge, so bulges carry over
- * unchanged). The start vertex stays the loop's anchor.
+ * in reverse (see `mirrorSegV`). The start vertex stays the loop's anchor.
  */
 export function mirrorOpsV(ops) {
   // Loop vertices v0..vn-1 (segs[i] runs v_i -> v_i+1, the last back to v0).
   const verts = [ops.start, ...ops.segs.slice(0, -1).map((s) => [s.x, s.y])];
   const segs = [];
   for (let i = ops.segs.length - 1; i >= 0; i -= 1) {
-    const [x, y] = verts[i];
-    segs.push({ x, y: -y, bulge: ops.segs[i].bulge });
+    // Reversed seg i runs from v_{i+1} back to v_i, so it ends at v_i (mirrored).
+    segs.push(mirrorSegV(ops.segs[i], [verts[i][0], -verts[i][1]]));
   }
   return { start: [ops.start[0], -ops.start[1]], segs };
 }
@@ -277,6 +337,38 @@ function extrudeArgs(height, draft) {
 }
 
 /**
+ * Feed one profile-ops segment to a `Profile` builder. Line/arc segments
+ * carry a `bulge`; `kind: 'ellipse'` and `kind: 'spline'` segments forward to
+ * the builder's `ellipseArcTo` / `cubicTo` methods.
+ *
+ * `seg.rotation` is in radians (sketch/geom convention); the WASM
+ * `ellipseArcTo` builder takes the ellipse rotation in DEGREES (matching the
+ * revolve/draft angle convention). This is the single sketch→builder crossing,
+ * so the radians→degrees conversion happens here and nowhere else.
+ */
+export function applyProfileSeg(profile, seg) {
+  switch (seg.kind) {
+    case 'ellipse':
+      profile.ellipseArcTo(
+        seg.x,
+        seg.y,
+        seg.cx,
+        seg.cy,
+        seg.rx,
+        seg.ry,
+        (seg.rotation * 180) / Math.PI,
+        seg.ccw
+      );
+      break;
+    case 'spline':
+      profile.cubicTo(seg.c1x, seg.c1y, seg.c2x, seg.c2y, seg.x, seg.y);
+      break;
+    default:
+      profile.arcTo(seg.x, seg.y, seg.bulge);
+  }
+}
+
+/**
  * Build the swept, plane-oriented shape for a sweep descriptor. Extrudes
  * honor `mode`/`end`/`draft`/`target`/`reach` (see `extrudePlan`); revolves
  * take a signed angle in degrees. Frees the profile and every intermediate
@@ -290,7 +382,7 @@ export function buildSweepShape(ShapeClass, ProfileClass, sweep) {
   const profile = new ProfileClass(ops.start[0], ops.start[1]);
   let shape;
   try {
-    for (const seg of ops.segs) profile.arcTo(seg.x, seg.y, seg.bulge);
+    for (const seg of ops.segs) applyProfileSeg(profile, seg);
     profile.close();
     shape = plan
       ? ShapeClass.extrude(profile, ...extrudeArgs(plan.height, plan.draft))

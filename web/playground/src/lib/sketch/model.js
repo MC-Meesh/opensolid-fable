@@ -6,6 +6,8 @@
  *   entities:    { id, type: 'line',   p1, p2 }
  *                { id, type: 'circle', center, radius }
  *                { id, type: 'arc',    center, p1, p2, ccw }   (start p1 → end p2)
+ *                { id, type: 'ellipse', center, rx, ry, rotation }   (closed)
+ *                { id, type: 'spline', p1, p2, c1, c2 }         (cubic Bézier)
  *   constraints: { id, type: 'horizontal' | 'vertical', line }
  *                { id, type: 'coincident', a, b }              (point ids)
  *                { id, type: 'tangent', line, curve }          (curve: circle/arc id)
@@ -69,6 +71,36 @@ export function addArc(sketch, center, p1, p2, ccw = true, opts = {}) {
   const id = nextId(sketch, 'e');
   sketch.entities[id] = withConstruction(
     { id, type: 'arc', center, p1, p2, ccw },
+    opts
+  );
+  return id;
+}
+
+/**
+ * Closed ellipse centered at `center` (a point id) with semi-axis `rx` along
+ * the major axis and `ry` along the minor, the major axis rotated `rotation`
+ * radians from +X. Like a circle, an ellipse is a self-closed loop — it forms
+ * a whole profile on its own and does not chain with other segments.
+ */
+export function addEllipse(sketch, center, rx, ry, rotation = 0, opts = {}) {
+  const id = nextId(sketch, 'e');
+  sketch.entities[id] = withConstruction(
+    { id, type: 'ellipse', center, rx, ry, rotation },
+    opts
+  );
+  return id;
+}
+
+/**
+ * Cubic-Bézier spline segment from endpoint `p1` to `p2` (point ids) with
+ * control points `c1`, `c2` (also point ids, so the handles are draggable).
+ * Splines chain into a profile loop through shared endpoint ids exactly like
+ * lines and arcs.
+ */
+export function addSpline(sketch, p1, p2, c1, c2, opts = {}) {
+  const id = nextId(sketch, 'e');
+  sketch.entities[id] = withConstruction(
+    { id, type: 'spline', p1, p2, c1, c2 },
     opts
   );
   return id;
@@ -179,6 +211,24 @@ export function mirrorEntities(sketch, ids, ax, ay, bx, by, opts = {}) {
       created.push(
         addArc(sketch, reflect(e.center), reflect(e.p1), reflect(e.p2), !e.ccw, construction)
       );
+    } else if (e.type === 'ellipse') {
+      // Reflecting a direction θ across an axis at angle φ gives 2φ − θ, so the
+      // major axis rotation mirrors; the semi-axes are unchanged.
+      const axisAngle = Math.atan2(by - ay, bx - ax);
+      created.push(
+        addEllipse(sketch, reflect(e.center), e.rx, e.ry, 2 * axisAngle - e.rotation, construction)
+      );
+    } else if (e.type === 'spline') {
+      created.push(
+        addSpline(
+          sketch,
+          reflect(e.p1),
+          reflect(e.p2),
+          reflect(e.c1),
+          reflect(e.c2),
+          construction
+        )
+      );
     }
   }
   return created;
@@ -193,6 +243,10 @@ export function entityPointIds(entity) {
       return [entity.center];
     case 'arc':
       return [entity.center, entity.p1, entity.p2];
+    case 'ellipse':
+      return [entity.center];
+    case 'spline':
+      return [entity.p1, entity.p2, entity.c1, entity.c2];
     default:
       return [];
   }
