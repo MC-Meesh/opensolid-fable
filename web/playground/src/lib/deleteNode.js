@@ -8,10 +8,12 @@
 //
 // Kept free of React and WASM imports so it can be unit-tested directly.
 
-import { BINARY_OPS } from './sceneTree.js';
+import { BINARY_OPS, EDGE_BLEND_OPS } from './sceneTree.js';
 import { nodeAt, pathTo, replaceById } from './transformEdit.js';
 
-const binarySet = new Set(BINARY_OPS);
+// Edge blends join two operand bodies, so deleting one operand collapses the
+// blend to the survivor exactly as it would a boolean.
+const binarySet = new Set([...BINARY_OPS, ...EDGE_BLEND_OPS]);
 
 /**
  * Remove the branch containing node `id`. Returns `{ root }` with a new tree

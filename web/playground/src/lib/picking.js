@@ -1,6 +1,9 @@
-import { BINARY_OPS } from './sceneTree.js';
+import { BINARY_OPS, EDGE_BLEND_OPS } from './sceneTree.js';
 
-const binarySet = new Set(BINARY_OPS);
+// Edge blends are structurally binary (two operand bodies), so picking walks
+// into their children just like a boolean — the operands stay selectable, and
+// a filleted edge can be re-filleted.
+const binarySet = new Set([...BINARY_OPS, ...EDGE_BLEND_OPS]);
 
 function hasBinaryOp(node) {
   if (binarySet.has(node.op)) return true;

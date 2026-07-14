@@ -49,6 +49,14 @@ const Icons = {
       <path d="M12.7 12.6 L10.5 11.5 L12 9.6" />
     </svg>
   ),
+  fillet: (
+    <svg {...ICON}>
+      {/* An L of two walls meeting at a rounded corner. */}
+      <path d="M3 13 V7 C3 4.8 4.8 3 7 3 H13" />
+      <path d="M3 13 H8" opacity="0.5" strokeDasharray="1.6 1.4" />
+      <path d="M13 3 V8" opacity="0.5" strokeDasharray="1.6 1.4" />
+    </svg>
+  ),
   fit: (
     <svg {...ICON}>
       <path d="M2 5.5 V2 h3.5 M10.5 2 H14 v3.5 M14 10.5 V14 h-3.5 M5.5 14 H2 v-3.5" />
@@ -146,6 +154,9 @@ export default function MainToolbar({
   canSweep,
   sweepDisabledReason,
   onSweep,
+  canFillet = false,
+  filletActive = false,
+  onFillet,
   onView,
   onFit,
   wireframe,
@@ -216,6 +227,15 @@ export default function MainToolbar({
           disabledReason={disabled ? notReady : sweepDisabledReason}
           disabled={disabled || !canSweep}
           onClick={() => onSweep('revolve')}
+        />
+        <ToolButton
+          icon="fillet"
+          label={filletActive ? 'Pick Edge' : 'Fillet'}
+          title="Fillet or chamfer an edge — click, then pick an edge where two bodies meet"
+          disabledReason={disabled ? notReady : 'Add at least two bodies and union them first'}
+          active={filletActive}
+          disabled={disabled || !canFillet}
+          onClick={onFillet}
         />
       </div>
       <div className="tool-sep" />

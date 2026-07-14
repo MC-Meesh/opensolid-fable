@@ -16,6 +16,7 @@
 
 import {
   BINARY_OPS,
+  EDGE_BLEND_OPS,
   PRIMITIVE_OPS,
   SWEEP_OPS,
   UNARY_OPS,
@@ -43,7 +44,7 @@ export function createStubApi() {
   for (const op of [...PRIMITIVE_OPS, ...SWEEP_OPS]) {
     StubShape[op] = () => new StubShape();
   }
-  for (const op of [...UNARY_OPS, ...BINARY_OPS]) {
+  for (const op of [...UNARY_OPS, ...BINARY_OPS, ...EDGE_BLEND_OPS]) {
     StubShape.prototype[op] = () => new StubShape();
   }
 

@@ -62,6 +62,8 @@ const OP_LABELS = {
   intersect: 'Intersect',
   subtract: 'Subtract',
   smoothUnion: 'Smooth Union',
+  filletEdge: 'Fillet Edge',
+  chamferEdge: 'Chamfer Edge',
   extrude: 'Extrude',
   revolve: 'Revolve',
 };
@@ -183,6 +185,28 @@ export function createTracer(ShapeClass, ProfileClass) {
         [this.node, other.node],
         this.node.shape[op](other.node.shape, ...args)
       );
+    };
+  }
+
+  // Edge blends: `receiver.filletEdge(other, radius, edge)` where `edge` is a
+  // flat `[x, y, z, …]` crease polyline. The polyline is a data payload, not a
+  // numeric parameter, so it rides on `node.edge` (kept out of `args`, which
+  // stays purely numeric for the property panel / label). Structurally the
+  // node is binary — two operand children plus the radius arg.
+  for (const op of EDGE_BLEND_OPS) {
+    TracingShape.prototype[op] = function (other, radius, edge) {
+      if (!(other instanceof TracingShape)) {
+        throw new Error(`.${op}(...) expects a Shape as its first argument`);
+      }
+      const poly = edge ? Array.from(edge, Number) : [];
+      const traced = record(
+        op,
+        [radius],
+        [this.node, other.node],
+        this.node.shape[op](other.node.shape, radius, poly)
+      );
+      traced.node.edge = poly;
+      return traced;
     };
   }
 
@@ -310,6 +334,12 @@ export function serializeTree(root, { header = '' } = {}) {
       text = `Shape.${node.op}(${args.join(', ')})`;
     } else if (node.children.length === 1) {
       text = `${exprOf(node.children[0])}.${node.op}(${args.join(', ')})`;
+    } else if (node.edge) {
+      // Edge blend: the crease polyline serializes as a flat array literal
+      // after the radius, e.g. `a.filletEdge(b, 0.2, [x0, y0, z0, …])`.
+      const [receiver, other] = node.children;
+      const poly = `[${node.edge.map(String).join(', ')}]`;
+      text = `${exprOf(receiver)}.${node.op}(${exprOf(other)}, ${args.join(', ')}, ${poly})`;
     } else {
       const [receiver, other] = node.children;
       const rest = args.length > 0 ? `, ${args.join(', ')}` : '';

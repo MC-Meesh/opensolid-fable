@@ -11,6 +11,7 @@ import PropertyPanel from './components/PropertyPanel.jsx';
 import SketchCanvas from './components/SketchCanvas.jsx';
 import SweepPanel from './components/SweepPanel.jsx';
 import SectionPanel from './components/SectionPanel.jsx';
+import FilletPanel from './components/FilletPanel.jsx';
 import { DEFAULT_SCRIPT } from './lib/defaultScript.js';
 import { freeNodes, nodeLabel, runTracedScript, scriptHeader, serializeTree } from './lib/sceneTree.js';
 import { buildBinaryStl } from './lib/stl.js';
@@ -24,6 +25,8 @@ import { PALETTE } from './lib/shapeGraph.js';
 import { addPrimitiveNode, assertStoreConsistency } from './lib/storeSync.js';
 import { buildSweepShape, opsBounds, profileToOps, sweepTreeNode } from './lib/sweep.js';
 import { createFaceRegionIndex } from './lib/facePlane.js';
+import { pickEdge } from './lib/edgePick.js';
+import { resolveEdgeTarget, replaceWithBlend } from './lib/edgeFillet.js';
 import { isFacePlane } from './lib/sketch/profile.js';
 import { faceRefFromPlane, planarRegionsOf, resolveRefs } from './lib/persistentRef.js';
 import { computeRebuildState } from './lib/rebuildState.js';
@@ -126,6 +129,14 @@ export default function App() {
   const [sketchView, setSketchView] = useState(null);
   const [sweep, setSweep] = useState(null);
   const [sweepError, setSweepError] = useState(null);
+  // Edge fillet/chamfer tool (of-rpo). A single descriptor drives both states:
+  //   { armed: true, mode }                    — waiting for an edge click
+  //   { armed: false, mode, unionId, edge, radius, range } — edge picked
+  // where `unionId` names the union node to rewrite, `edge` is the flat
+  // `[x, y, z, …]` crease polyline, and `range` scales the radius controls.
+  // Mutually exclusive with sketch/sweep, so it shares the `previewMesh` slot.
+  const [fillet, setFillet] = useState(null);
+  const [filletError, setFilletError] = useState(null);
   const [previewMesh, setPreviewMesh] = useState(null);
   // Hovered planar face: `{ meshKey, tris }` — triangle indices into the
   // displayed mesh, shown as an in-place darkening (of-4eh.18). meshKey
@@ -459,6 +470,36 @@ export default function App() {
     (point, faceIndex) => {
       const root = tracedRef.current?.root;
       if (!root) return;
+      // While the fillet tool is armed, a click resolves the boolean edge
+      // nearest the cursor and locks the panel onto that union node.
+      if (fillet?.armed) {
+        const displayed = meshRef.current;
+        if (!point || faceIndex === null || faceIndex === undefined || !displayed?.indices?.length) {
+          setFilletError('Click on a flat face beside the edge to fillet');
+          return;
+        }
+        const pick = pickEdge(faceRegions(), displayed.positions, displayed.indices, point, faceIndex);
+        if (!pick.ok) {
+          setFilletError(pick.reason);
+          return;
+        }
+        const target = resolveEdgeTarget(root, pick);
+        if (!target.ok) {
+          setFilletError(target.reason);
+          return;
+        }
+        const range = meshRadius(displayed.positions) || 1;
+        setFilletError(null);
+        setFillet((f) => ({
+          ...f,
+          armed: false,
+          unionId: target.unionId,
+          edge: pick.flat,
+          range,
+          radius: f.radius && f.radius > 0 ? f.radius : range / 10,
+        }));
+        return;
+      }
       const region = point && faceIndex !== null ? faceRegions()?.regionAt(faceIndex) : null;
       // While an "up to face" extrude is pending, a planar-face click picks
       // that face as the terminating plane instead of selecting a body.
@@ -487,7 +528,7 @@ export default function App() {
         clearSelection();
       }
     },
-    [selectNode, clearSelection, faceRegions, sweep]
+    [selectNode, clearSelection, faceRegions, sweep, fillet]
   );
 
   // Hover highlight: resolve the pointer's triangle to its planar face
@@ -591,6 +632,13 @@ export default function App() {
   // ---- feature tree --------------------------------------------------------
 
   const features = useMemo(() => buildFeatures(tree, featureNames), [tree, featureNames]);
+
+  // The edge fillet/chamfer MVP only blends union edges, so the tool is
+  // available exactly when the tree contains a union to rewrite.
+  const canFillet = useMemo(() => {
+    const hasUnion = (n) => n.op === 'union' || n.children.some(hasUnion);
+    return Boolean(tree) && hasUnion(tree);
+  }, [tree]);
 
   // Persistent-reference rebuild pass (of-fsl.8). After each rebuild produces a
   // fresh mesh and feature list: (1) attach a pending face ref to its newly
@@ -752,6 +800,9 @@ export default function App() {
       const node = feature.node;
       if (!node?.profile) return;
       clearSelection();
+      setFillet(null);
+      setFilletError(null);
+      setPreviewMesh(null);
       setSweep(null);
       setSweepError(null);
       // A leftover face plane from a previous pick would be unrelated to
@@ -854,6 +905,8 @@ export default function App() {
       const { min, max } = opsBounds(ops);
       const extent = Math.max(max[0] - min[0], max[1] - min[1]) || 1;
       clearSelection();
+      setFillet(null);
+      setFilletError(null);
       setSweepError(null);
       setSketchOpen(false);
       setSweep(
@@ -934,6 +987,83 @@ export default function App() {
     }
   }, [sweep, wasm]);
 
+  // ---- edge fillet / chamfer workflow -------------------------------------
+
+  const cancelFillet = useCallback(() => {
+    setFillet(null);
+    setFilletError(null);
+    setPreviewMesh(null);
+  }, []);
+
+  // Toolbar toggle: arm the tool (or cancel it if already active). Arming
+  // clears any competing selection/sketch/sweep so the next viewport click is
+  // read as an edge pick.
+  const handleFilletStart = useCallback(() => {
+    if (fillet) {
+      cancelFillet();
+      return;
+    }
+    clearSelection();
+    setSketchOpen(false);
+    setEditingSketch(null);
+    setSweep(null);
+    setSweepError(null);
+    setFilletError(null);
+    setFillet({ armed: true, mode: 'fillet' });
+  }, [fillet, cancelFillet, clearSelection]);
+
+  const handleFilletMode = useCallback((mode) => {
+    setFillet((f) => (f ? { ...f, mode } : f));
+  }, []);
+
+  const handleFilletRadius = useCallback((radius) => {
+    setFillet((f) => (f && !f.armed ? { ...f, radius } : f));
+  }, []);
+
+  // Commit the picked blend: rewrite the union node into a filletEdge /
+  // chamferEdge carrying the radius + crease polyline, then commit through the
+  // store like any other tree edit.
+  const applyFillet = useCallback(() => {
+    if (!fillet || fillet.armed || !fillet.unionId) return;
+    const root = tracedRef.current?.root;
+    if (!root) return;
+    const newRoot = replaceWithBlend(
+      root,
+      fillet.unionId,
+      fillet.mode,
+      fillet.radius,
+      fillet.edge
+    );
+    cancelFillet();
+    commitTree(newRoot, { selectPath: null });
+  }, [fillet, cancelFillet, commitTree]);
+
+  // Live preview: rebuild the blended shape whenever the picked edge's mode or
+  // radius changes. Armed (pre-pick) state has nothing to preview.
+  useEffect(() => {
+    if (!fillet || fillet.armed || !fillet.unionId || !wasm) return;
+    const root = tracedRef.current?.root;
+    if (!root) return;
+    const newRoot = replaceWithBlend(
+      root,
+      fillet.unionId,
+      fillet.mode,
+      fillet.radius,
+      fillet.edge
+    );
+    let traced = null;
+    try {
+      traced = runTracedScript(serializeTree(newRoot), wasm.WasmShape, wasm.WasmProfile2D);
+      setPreviewMesh(meshShape(traced.root.shape));
+      setFilletError(null);
+    } catch (err) {
+      setPreviewMesh(null);
+      setFilletError(String(err));
+    } finally {
+      if (traced) freeNodes(traced.nodes);
+    }
+  }, [fillet, wasm]);
+
   // SolidWorks entry gesture: with a face picked, Sketch opens ON that face
   // (of-4eh.16). A curved face keeps the button honest with a toast instead
   // of silently sketching on a facet.
@@ -955,6 +1085,9 @@ export default function App() {
         setSketchPlane((p) => (isFacePlane(p) ? 'XY' : p));
       }
     }
+    setFillet(null);
+    setFilletError(null);
+    setPreviewMesh(null);
     setSweep(null);
     setSweepError(null);
     setEditingSketch(null);
@@ -1026,13 +1159,14 @@ export default function App() {
         event.preventDefault();
         handleDeleteSelected();
       } else if (event.key === 'Escape') {
-        if (sweep) cancelSweep();
+        if (fillet) cancelFillet();
+        else if (sweep) cancelSweep();
         else clearSelection();
       }
     }
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [clearSelection, sweep, cancelSweep, sketchOpen, handleDeleteSelected, undo, redo]);
+  }, [clearSelection, sweep, cancelSweep, fillet, cancelFillet, sketchOpen, handleDeleteSelected, undo, redo]);
 
   // Exact booleans rebuild shapes, not just meshes: re-run the script.
   const handleExactBooleansChange = useCallback(
@@ -1204,6 +1338,9 @@ export default function App() {
               : 'Open a sketch and draw a closed profile first'
           }
           onSweep={handleSweepStart}
+          canFillet={canFillet}
+          filletActive={Boolean(fillet)}
+          onFillet={handleFilletStart}
           onView={(name) => viewportRef.current?.snapView(name)}
           onFit={() => viewportRef.current?.zoomToFit()}
           wireframe={wireframe}
@@ -1260,6 +1397,14 @@ export default function App() {
             onClose={handleSectionClose}
           />
         )}
+        <FilletPanel
+          fillet={fillet}
+          error={filletError}
+          onMode={handleFilletMode}
+          onRadius={handleFilletRadius}
+          onApply={applyFillet}
+          onCancel={cancelFillet}
+        />
         {selectedNode && (
           <div className="gizmo-bar">
             <button
