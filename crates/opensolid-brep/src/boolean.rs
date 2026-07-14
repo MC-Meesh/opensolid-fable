@@ -4241,6 +4241,22 @@ fn triangulate_mesh_face(mf: &MeshFace, weld_eps: f64) -> CoreResult<(Vec<Triang
         }
         Chart::Plane { .. } => None,
     };
+    // Curved charts: replace the ear-clip seed with a constrained Delaunay
+    // triangulation of the ring vertices before laying the interior lattice.
+    // Ear clipping's least-reflex fallback force-clips corners across a wide
+    // imprint hole (the hole ring is not a barrier to it), and on a curved
+    // chart those flat cross-hole fills fold in 3D into orientation-non-
+    // manifold slivers on the imprint rim (of-6ry). The CDT recovers every
+    // ring edge as a constraint and drops hole/exterior triangles by parity,
+    // so bridging across a hole is impossible by construction. Fall back to
+    // the ear-clip seed if the CDT cannot be built (e.g. a degenerate ring or
+    // an unrecoverable constraint edge) — no worse than today for those.
+    if lattice.is_some() {
+        if let Some(cdt) = boundary_cdt(&all_uv, &ring_ranges) {
+            tris = cdt;
+        }
+    }
+
     if let Some((pitch_v, scale)) = lattice {
         refine_curved_region(
             &mut tris,
@@ -4602,6 +4618,69 @@ impl FlipMesh {
             }
         }
         used
+    }
+
+    /// Whether some triangle carries the undirected edge `{a, b}`.
+    fn has_edge(&self, a: usize, b: usize) -> bool {
+        self.tris.iter().any(|tri| {
+            (0..3).any(|k| {
+                let (x, y) = (tri[k], tri[(k + 1) % 3]);
+                (x == a && y == b) || (x == b && y == a)
+            })
+        })
+    }
+
+    /// Flip interior edge `k` of triangle `t` unconditionally — ignoring the
+    /// Delaunay criterion — provided the shared quad is strictly convex (both
+    /// resulting triangles come out counter-clockwise) and the edge is not a
+    /// constraint. This is the primitive constrained-triangulation edge
+    /// recovery (Sloan) drives: it removes an edge that crosses a target
+    /// constraint segment, regardless of whether the flip improves Delaunay-
+    /// ness. Returns `true` if the flip happened.
+    fn raw_flip(
+        &mut self,
+        t: usize,
+        k: usize,
+        verts: &[(f64, f64)],
+        constraints: &std::collections::HashSet<(usize, usize)>,
+    ) -> bool {
+        let n = self.adj[t][k];
+        if n == NO_TRI {
+            return false;
+        }
+        let u = self.tris[t][k];
+        let w = self.tris[t][(k + 1) % 3];
+        let p = self.tris[t][(k + 2) % 3];
+        if constraints.contains(&(u.min(w), u.max(w))) {
+            return false;
+        }
+        let q = {
+            let tri = &self.tris[n];
+            (0..3)
+                .map(|i| tri[i])
+                .find(|&x| x != u && x != w)
+                .expect("neighbor has a third vertex")
+        };
+        // Both post-flip triangles (p,u,q) and (p,q,w) must be strictly CCW,
+        // i.e. the quad p-u-q-w is convex; otherwise the flip would overlap.
+        if orient2d(verts[p], verts[u], verts[q]) <= 0.0
+            || orient2d(verts[p], verts[q], verts[w]) <= 0.0
+        {
+            return false;
+        }
+        let a_pu = self.adj[t][(k + 2) % 3]; // across (p,u)
+        let b_wp = self.adj[t][(k + 1) % 3]; // across (w,p)
+        let jq = self.edge_index(n, u, q).expect("edge (u,q)");
+        let jw = self.edge_index(n, q, w).expect("edge (q,w)");
+        let c_uq = self.adj[n][jq];
+        let d_qw = self.adj[n][jw];
+        self.tris[t] = [p, u, q];
+        self.adj[t] = [a_pu, c_uq, n];
+        self.tris[n] = [p, q, w];
+        self.adj[n] = [t, d_qw, b_wp];
+        self.relink(c_uq, u, q, t);
+        self.relink(b_wp, w, p, n);
+        true
     }
 }
 
