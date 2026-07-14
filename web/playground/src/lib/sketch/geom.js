@@ -94,6 +94,72 @@ export function reflectPoint(px, py, ax, ay, bx, by) {
   return [2 * fx - px, 2 * fy - py];
 }
 
+/**
+ * Intersection of two infinite lines, each given by two points. Returns
+ * `{ x, y, t, u }` where `t` is the parameter along A (0 at a1, 1 at a2) and
+ * `u` the parameter along B, or `null` when the lines are parallel.
+ */
+export function lineLineIntersection(a1, a2, b1, b2) {
+  const r = [a2[0] - a1[0], a2[1] - a1[1]];
+  const s = [b2[0] - b1[0], b2[1] - b1[1]];
+  const denom = r[0] * s[1] - r[1] * s[0];
+  if (Math.abs(denom) < 1e-12) return null; // parallel or degenerate
+  const qp = [b1[0] - a1[0], b1[1] - a1[1]];
+  const t = (qp[0] * s[1] - qp[1] * s[0]) / denom;
+  const u = (qp[0] * r[1] - qp[1] * r[0]) / denom;
+  return { x: a1[0] + t * r[0], y: a1[1] + t * r[1], t, u };
+}
+
+/**
+ * Intersections of the infinite line through (a1, a2) with the circle
+ * (center c, radius r). Returns 0, 1, or 2 points, each `{ x, y, t }` with
+ * `t` the parameter along the line (0 at a1, 1 at a2), ordered by `t`.
+ */
+export function lineCircleIntersections(a1, a2, c, r) {
+  const dx = a2[0] - a1[0];
+  const dy = a2[1] - a1[1];
+  const lenSq = dx * dx + dy * dy;
+  if (lenSq < 1e-24) return [];
+  // Foot of perpendicular from center to the line, as a parameter.
+  const tFoot = ((c[0] - a1[0]) * dx + (c[1] - a1[1]) * dy) / lenSq;
+  const fx = a1[0] + tFoot * dx;
+  const fy = a1[1] + tFoot * dy;
+  const distSq = (fx - c[0]) ** 2 + (fy - c[1]) ** 2;
+  const rSq = r * r;
+  if (distSq > rSq + 1e-12) return [];
+  const half = Math.sqrt(Math.max(0, rSq - distSq) / lenSq);
+  if (half < 1e-9) {
+    return [{ x: fx, y: fy, t: tFoot }];
+  }
+  const ts = [tFoot - half, tFoot + half];
+  return ts.map((t) => ({ x: a1[0] + t * dx, y: a1[1] + t * dy, t }));
+}
+
+/**
+ * Intersections of two circles (centers c1/c2, radii r1/r2). Returns 0 or 2
+ * points `{ x, y }` (a single tangent contact is returned once). Coincident
+ * circles yield `[]`.
+ */
+export function circleCircleIntersections(c1, r1, c2, r2) {
+  const dx = c2[0] - c1[0];
+  const dy = c2[1] - c1[1];
+  const d = Math.hypot(dx, dy);
+  if (d < 1e-12) return []; // concentric
+  if (d > r1 + r2 + 1e-9 || d < Math.abs(r1 - r2) - 1e-9) return []; // apart / nested
+  const a = (r1 * r1 - r2 * r2 + d * d) / (2 * d);
+  const hSq = r1 * r1 - a * a;
+  const mx = c1[0] + (a * dx) / d;
+  const my = c1[1] + (a * dy) / d;
+  if (hSq <= 1e-12) return [{ x: mx, y: my }];
+  const h = Math.sqrt(hSq);
+  const ox = (-dy * h) / d;
+  const oy = (dx * h) / d;
+  return [
+    { x: mx + ox, y: my + oy },
+    { x: mx - ox, y: my - oy },
+  ];
+}
+
 /** Signed area of a closed polygon (positive = counterclockwise). */
 export function signedArea(points) {
   let area = 0;
