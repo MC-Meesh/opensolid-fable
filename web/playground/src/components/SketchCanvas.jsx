@@ -63,6 +63,7 @@ import {
 } from '../lib/sketchView.js';
 import { sketchFromOps } from '../lib/sketch/fromOps.js';
 import { opsBounds } from '../lib/sweep.js';
+import { DEFAULT_LENGTH_UNIT, withUnit } from '../lib/units.js';
 
 const SNAP_PX = 10;
 const HIT_PX = 8;
@@ -207,6 +208,7 @@ export default forwardRef(function SketchCanvas(
     // orientation wrappers, so changing it here would lie).
     editing = null,
     onApplyEdit,
+    documentUnit = DEFAULT_LENGTH_UNIT,
   },
   ref
 ) {
@@ -1464,7 +1466,7 @@ export default forwardRef(function SketchCanvas(
         const b = s.points[line.p2];
         const mx = (a.x + b.x) / 2;
         const my = (a.y + b.y) / 2;
-        return textAt(mx, my, formatNumber(constraint.value), (event) => {
+        return textAt(mx, my, withUnit(formatNumber(constraint.value), documentUnit), (event) => {
           event.stopPropagation();
           openDimEdit(constraint, mx, my);
         });
@@ -1477,7 +1479,7 @@ export default forwardRef(function SketchCanvas(
         const d = Math.SQRT1_2;
         const wx = c.x + r * d;
         const wy = c.y + r * d;
-        return textAt(wx, wy, `R${formatNumber(constraint.value)}`, (event) => {
+        return textAt(wx, wy, withUnit(`R${formatNumber(constraint.value)}`, documentUnit), (event) => {
           event.stopPropagation();
           openDimEdit(constraint, wx, wy);
         });

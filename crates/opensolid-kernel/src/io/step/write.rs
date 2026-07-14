@@ -93,15 +93,23 @@ use opensolid_brep::{
 };
 use opensolid_core::{EntityId, Point3, Vector3};
 
-/// SI length unit declared in the emitted representation context.
+/// Length unit declared in the emitted representation context.
 /// Coordinates are written verbatim, interpreted in this unit.
+///
+/// The metric units emit a direct `SI_UNIT`; [`LengthUnit::Inch`] emits a
+/// `CONVERSION_BASED_UNIT` defined as `25.4` millimetres, the STEP-standard
+/// way to declare a non-SI length so importers resolve it to the right scale.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LengthUnit {
     /// `SI_UNIT(.MILLI., .METRE.)` — the conventional CAD exchange unit.
     #[default]
     Millimetre,
+    /// `SI_UNIT(.CENTI., .METRE.)`.
+    Centimetre,
     /// `SI_UNIT($, .METRE.)`.
     Metre,
+    /// `CONVERSION_BASED_UNIT('INCH', …)` — 25.4 mm.
+    Inch,
 }
 
 /// Options for [`write_step`].
@@ -197,14 +205,30 @@ pub fn write_step(
     ));
     let shape = emitter.emit(format!("PRODUCT_DEFINITION_SHAPE('','',#{definition})"));
 
-    // SI units and the geometric representation context.
-    let si_unit = match options.length_unit {
-        LengthUnit::Millimetre => ".MILLI.,.METRE.",
-        LengthUnit::Metre => "$,.METRE.",
+    // Units and the geometric representation context. Metric units emit a
+    // direct SI_UNIT; inch emits a CONVERSION_BASED_UNIT defined as 25.4 mm
+    // so importers resolve it to the correct scale.
+    let length_unit = match options.length_unit {
+        LengthUnit::Millimetre => {
+            emitter.emit("( LENGTH_UNIT() NAMED_UNIT(*) SI_UNIT(.MILLI.,.METRE.) )")
+        }
+        LengthUnit::Centimetre => {
+            emitter.emit("( LENGTH_UNIT() NAMED_UNIT(*) SI_UNIT(.CENTI.,.METRE.) )")
+        }
+        LengthUnit::Metre => emitter.emit("( LENGTH_UNIT() NAMED_UNIT(*) SI_UNIT($,.METRE.) )"),
+        LengthUnit::Inch => {
+            // Base millimetre unit the conversion is expressed against, plus
+            // the length dimensional signature (exponent 1 on length).
+            let mm = emitter.emit("( LENGTH_UNIT() NAMED_UNIT(*) SI_UNIT(.MILLI.,.METRE.) )");
+            let dims = emitter.emit("DIMENSIONAL_EXPONENTS(1.0,0.0,0.0,0.0,0.0,0.0,0.0)");
+            let measure = emitter.emit(format!(
+                "LENGTH_MEASURE_WITH_UNIT(LENGTH_MEASURE(25.4),#{mm})"
+            ));
+            emitter.emit(format!(
+                "( CONVERSION_BASED_UNIT('INCH',#{measure}) LENGTH_UNIT() NAMED_UNIT(#{dims}) )"
+            ))
+        }
     };
-    let length_unit = emitter.emit(format!(
-        "( LENGTH_UNIT() NAMED_UNIT(*) SI_UNIT({si_unit}) )"
-    ));
     let angle_unit = emitter.emit("( NAMED_UNIT(*) PLANE_ANGLE_UNIT() SI_UNIT($,.RADIAN.) )");
     let solid_angle_unit =
         emitter.emit("( NAMED_UNIT(*) SI_UNIT($,.STERADIAN.) SOLID_ANGLE_UNIT() )");
@@ -1023,6 +1047,56 @@ mod tests {
         assert!(
             (v - 1.0e9).abs() / 1.0e9 <= 1e-9,
             "1 m³ block must re-import as 1e9 mm³, got {v}"
+        );
+    }
+
+    #[test]
+    fn centimetre_unit_option_emits_centi_si_unit() {
+        let mut store = TopologyStore::new();
+        let mut geo = GeometryStore::new();
+        let body = block(&mut store, &mut geo, 1.0, 1.0, 1.0).expect("block");
+        let options = StepWriteOptions {
+            length_unit: LengthUnit::Centimetre,
+            ..StepWriteOptions::default()
+        };
+        let text = write_step(&store, &geo, &[body], &options).expect("write");
+        assert!(text.contains("SI_UNIT(.CENTI.,.METRE.)"));
+        // The reader honours the declared unit: a centimetre file's
+        // coordinates come back ×10, in the kernel's millimetres.
+        let (store2, geo2, bodies) = reimport(&text);
+        assert_eq!(bodies.len(), 1);
+        let v = volume(&store2, &geo2, bodies[0]);
+        assert!(
+            (v - 1000.0).abs() / 1000.0 <= 1e-9,
+            "1 cm³ block must re-import as 1000 mm³, got {v}"
+        );
+    }
+
+    #[test]
+    fn inch_unit_option_emits_conversion_based_unit() {
+        let mut store = TopologyStore::new();
+        let mut geo = GeometryStore::new();
+        let body = block(&mut store, &mut geo, 1.0, 1.0, 1.0).expect("block");
+        let options = StepWriteOptions {
+            length_unit: LengthUnit::Inch,
+            ..StepWriteOptions::default()
+        };
+        let text = write_step(&store, &geo, &[body], &options).expect("write");
+        // Non-SI: an inch is declared as 25.4 mm through a conversion unit.
+        assert!(text.contains("CONVERSION_BASED_UNIT('INCH'"));
+        assert!(text.contains("LENGTH_MEASURE(25.4)"));
+        // The emitted file must still parse through our own parser.
+        let file = crate::io::step::parse(&text).expect("emitted inch file parses");
+        assert!(!file.is_empty());
+        // The reader honours the declared unit: an inch file's coordinates
+        // come back ×25.4, in the kernel's millimetres.
+        let (store2, geo2, bodies) = reimport(&text);
+        assert_eq!(bodies.len(), 1);
+        let v = volume(&store2, &geo2, bodies[0]);
+        let expected = 25.4_f64.powi(3);
+        assert!(
+            (v - expected).abs() / expected <= 1e-9,
+            "1 in³ block must re-import as 25.4³ mm³, got {v}"
         );
     }
 

@@ -18,6 +18,7 @@ import { pickCandidates, pickNodeAt } from './lib/picking.js';
 import { applyTranslate, applyRotate, applyScale, pathTo, nodeAt, replaceById } from './lib/transformEdit.js';
 import { setNodeArg, setBooleanOp } from './lib/propertyEdit.js';
 import { deleteNode } from './lib/deleteNode.js';
+import { DEFAULT_LENGTH_UNIT, normalizeUnit, UNIT_STORAGE_KEY } from './lib/units.js';
 import { VIEW_SHORTCUTS } from './lib/views.js';
 import { buildFeatures, pruneTree, resolveKeys } from './lib/featureTree.js';
 import { PALETTE } from './lib/shapeGraph.js';
@@ -106,6 +107,25 @@ export default function App() {
   const { status: wasmStatus, error: wasmError, api: wasm, ready: wasmReady, retry: retryWasm } = useWasm();
   const [error, setError] = useState(null);
   const [exactBooleans, setExactBooleans] = useState(false);
+  // Document unit: labels every dimension and drives the STEP unit
+  // declaration. Coordinates are never rescaled — see lib/units.js. Persisted
+  // so a reload keeps the author's choice.
+  const [documentUnit, setDocumentUnit] = useState(() => {
+    try {
+      return normalizeUnit(globalThis.localStorage?.getItem(UNIT_STORAGE_KEY));
+    } catch {
+      return DEFAULT_LENGTH_UNIT;
+    }
+  });
+  const changeDocumentUnit = useCallback((next) => {
+    const unit = normalizeUnit(next);
+    setDocumentUnit(unit);
+    try {
+      globalThis.localStorage?.setItem(UNIT_STORAGE_KEY, unit);
+    } catch {
+      // Private-mode / storage-disabled: the choice just won't persist.
+    }
+  }, []);
   const [wireframe, setWireframe] = useState(false);
   // Section view (of-fsl.18): a display-only clipping plane { axis, offset,
   // flip }, or null when off. The offset is shared by the panel slider and the
@@ -857,13 +877,16 @@ export default function App() {
     }
     let text;
     try {
-      text = shape.exportStep(MESH_ACCURACY);
+      // The document unit becomes the STEP SI_UNIT/CONVERSION_BASED_UNIT
+      // declaration; coordinates are written verbatim. A pkg built before
+      // this arg existed simply ignores it and exports in millimetres.
+      text = shape.exportStep(MESH_ACCURACY, documentUnit);
     } catch (err) {
       setError(String(err));
       return;
     }
     downloadBlob(new Blob([text], { type: 'application/step' }), 'model.step');
-  }, []);
+  }, [documentUnit]);
 
   // ---- extrude / revolve workflow -----------------------------------------
 
@@ -1245,6 +1268,8 @@ export default function App() {
           onSectionToggle={handleSectionToggle}
           onDownloadStl={downloadStl}
           onDownloadStep={downloadStep}
+          documentUnit={documentUnit}
+          onDocumentUnitChange={changeDocumentUnit}
           exactBooleans={exactBooleans}
           onExactBooleansChange={handleExactBooleansChange}
         />
@@ -1335,6 +1360,7 @@ export default function App() {
             disabled={!wasmReady}
             onEditArg={handleEditArg}
             onChangeOp={handleChangeOp}
+            documentUnit={documentUnit}
           />
         )}
         <ErrorBoundary name="Sketch canvas">
@@ -1350,10 +1376,11 @@ export default function App() {
             onExit={handleSketchExit}
             editing={editingSketch ? { name: editingSketch.name } : null}
             onApplyEdit={handleApplySketchEdit}
+            documentUnit={documentUnit}
           />
         </ErrorBoundary>
         {toast && <div className="toast">{toast}</div>}
-        {stats && !sketchOpen && <StatusBar stats={stats} />}
+        {stats && !sketchOpen && <StatusBar stats={stats} documentUnit={documentUnit} />}
         {(wasmStatus === 'idle' || wasmStatus === 'loading') && (
           <div className="loading">Loading WASM…</div>
         )}

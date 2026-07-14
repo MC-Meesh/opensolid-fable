@@ -432,6 +432,30 @@ button.main-tool.active {
 button.main-tool svg { flex: none; }
 .tool-label { white-space: nowrap; }
 
+/* Document-unit picker, sitting in the Export group beside STL/STEP. */
+.tool-units {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0 2px;
+}
+.tool-units-label {
+  color: var(--muted);
+  font-size: 11px;
+  white-space: nowrap;
+}
+.tool-units-select {
+  background: transparent;
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 3px 6px;
+  font-size: 12px;
+}
+.tool-units-select:disabled {
+  opacity: 0.5;
+}
+
 /* Overflow menu (<details>): rare, set-and-forget controls. */
 .tool-menu {
   position: relative;

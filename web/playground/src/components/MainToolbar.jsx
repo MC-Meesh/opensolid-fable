@@ -4,6 +4,7 @@
 // One row, no wrapping: view buttons are icon-only (tooltips carry the names)
 // so the whole strip fits beside the side panel at 1280px-wide windows.
 import MeshSettings from './MeshSettings.jsx';
+import { LENGTH_UNITS } from '../lib/units.js';
 
 const ICON = {
   viewBox: '0 0 16 16',
@@ -154,6 +155,8 @@ export default function MainToolbar({
   onSectionToggle,
   onDownloadStl,
   onDownloadStep,
+  documentUnit = 'mm',
+  onDocumentUnitChange = () => {},
   exactBooleans,
   onExactBooleansChange,
 }) {
@@ -289,6 +292,22 @@ export default function MainToolbar({
       <div className="tool-sep" />
       <div className="tool-group" aria-label="Export">
         <span className="tool-group-label">Export</span>
+        <label className="tool-units" title="Document unit: labels dimensions and declares the STEP SI_UNIT (numbers are unchanged)">
+          <span className="tool-units-label">Units</span>
+          <select
+            className="tool-units-select"
+            aria-label="Document unit"
+            value={documentUnit}
+            disabled={disabled}
+            onChange={(event) => onDocumentUnitChange(event.target.value)}
+          >
+            {LENGTH_UNITS.map((u) => (
+              <option key={u.key} value={u.key}>
+                {u.name}
+              </option>
+            ))}
+          </select>
+        </label>
         <ToolButton
           icon="stl"
           label="STL"
@@ -300,7 +319,7 @@ export default function MainToolbar({
         <ToolButton
           icon="step"
           label="STEP"
-          title="Export STEP (AP203). Exact B-Rep models export analytic surfaces; organic shapes export as faceted geometry."
+          title="Export STEP (AP203) in the document unit. Exact B-Rep models export analytic surfaces; organic shapes export as faceted geometry."
           disabledReason={notReady}
           disabled={disabled}
           onClick={onDownloadStep}

@@ -49,6 +49,17 @@ describe('MainToolbar', () => {
     expect(html).toMatch(/title="[^"]*organic shapes export as faceted geometry/);
   });
 
+  it('offers the document-unit picker in the Export group', () => {
+    const html = render({ documentUnit: 'in' });
+    expect(html).toContain('Units');
+    expect(html).toContain('aria-label="Document unit"');
+    for (const name of ['Millimetres', 'Centimetres', 'Metres', 'Inches']) {
+      expect(html).toContain(name);
+    }
+    // Controlled to the passed unit (inches selected here).
+    expect(html).toMatch(/<option value="in"[^>]*>Inches<\/option>/);
+  });
+
   it('keeps the meshing settings in the overflow menu', () => {
     const html = render();
     expect(html).toContain('tool-menu');

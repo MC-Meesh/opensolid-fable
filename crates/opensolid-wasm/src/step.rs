@@ -17,7 +17,7 @@
 
 use opensolid_kernel::brep::{GeometryStore, TopologyStore};
 use opensolid_kernel::convert::sdf_to_brep::{SdfToBrepOptions, sdf_to_brep};
-use opensolid_kernel::io::step::write::{StepWriteOptions, write_step};
+use opensolid_kernel::io::step::write::{LengthUnit, StepWriteOptions, write_step};
 
 use crate::bounded::BoundedShape;
 use crate::exact::ExactRep;
@@ -37,12 +37,27 @@ pub struct StepExport {
     pub exact: bool,
 }
 
+/// Map a document-unit key (as passed from the playground) to the writer's
+/// [`LengthUnit`]. Anything unrecognised — including `None` — falls back to
+/// millimetres, the conventional CAD exchange unit and the enum's default.
+fn length_unit(key: Option<&str>) -> LengthUnit {
+    match key {
+        Some("cm") => LengthUnit::Centimetre,
+        Some("m") => LengthUnit::Metre,
+        Some("in") => LengthUnit::Inch,
+        _ => LengthUnit::Millimetre,
+    }
+}
+
 /// Serialize a shape to STEP: exact when an [`ExactRep`] is present and
 /// writable, faceted otherwise. `accuracy` is the faceted path's target
 /// chordal deviation in model units (same knob as adaptive meshing);
 /// non-finite, non-positive, or absent values fall back to 0.5% of the
 /// shape's extent. The exact path ignores it — analytic surfaces have no
-/// tessellation error.
+/// tessellation error. `unit` is the document unit key (`"mm"`, `"cm"`,
+/// `"m"`, `"in"`); it declares the STEP length unit only — coordinates are
+/// written verbatim, never rescaled — and unknown keys fall back to
+/// millimetres.
 ///
 /// # Errors
 /// A human-readable message when the faceted path cannot produce a valid
@@ -51,8 +66,12 @@ pub fn export_step(
     inner: &BoundedShape,
     exact: Option<&ExactRep>,
     accuracy: Option<f64>,
+    unit: Option<&str>,
 ) -> Result<StepExport, String> {
-    let options = StepWriteOptions::default();
+    let options = StepWriteOptions {
+        length_unit: length_unit(unit),
+        ..StepWriteOptions::default()
+    };
     if let Some(text) = exact.and_then(|rep| rep.to_step(&options)) {
         return Ok(StepExport { text, exact: true });
     }
@@ -188,7 +207,7 @@ mod tests {
         let out = exact_boolean(BooleanOp::Subtract, &sphere, &hole).expect("exact path");
         let rep = ExactRep::Boolean(Rc::new(out));
 
-        let export = export_step(&BoundedShape::sphere(1.0), Some(&rep), Some(0.01))
+        let export = export_step(&BoundedShape::sphere(1.0), Some(&rep), Some(0.01), None)
             .expect("exact export succeeds");
         assert!(export.exact);
         assert!(export.text.contains("SPHERICAL_SURFACE"));
@@ -203,7 +222,7 @@ mod tests {
             minor: 0.3,
         }));
         let export =
-            export_step(&BoundedShape::torus(1.0, 0.3), Some(&rep), None).expect("exports");
+            export_step(&BoundedShape::torus(1.0, 0.3), Some(&rep), None, None).expect("exports");
         assert!(export.exact);
         assert!(export.text.contains("TOROIDAL_SURFACE"));
         let (_, _, bodies) = reimport(&export.text);
@@ -222,7 +241,8 @@ mod tests {
         );
         // Coarse accuracy keeps the faceted body small; validity is what is
         // under test, not fidelity.
-        let export = export_step(&organic, None, Some(0.08)).expect("faceted export succeeds");
+        let export =
+            export_step(&organic, None, Some(0.08), None).expect("faceted export succeeds");
         assert!(!export.exact, "organic shapes must take the faceted path");
         assert!(
             export.text.contains("PLANE"),
@@ -240,7 +260,7 @@ mod tests {
             major: 0.2,
             minor: 0.5,
         }));
-        let export = export_step(&BoundedShape::torus(0.2, 0.5), Some(&rep), Some(0.05))
+        let export = export_step(&BoundedShape::torus(0.2, 0.5), Some(&rep), Some(0.05), None)
             .expect("faceted fallback succeeds");
         assert!(!export.exact);
         let (_, _, bodies) = reimport(&export.text);
@@ -253,7 +273,7 @@ mod tests {
     fn degenerate_accuracy_falls_back_to_default() {
         for acc in [Some(0.0), Some(-1.0), Some(f64::NAN), None] {
             let export =
-                export_step(&BoundedShape::box3(0.5, 0.5, 0.5), None, acc).expect("exports");
+                export_step(&BoundedShape::box3(0.5, 0.5, 0.5), None, acc, None).expect("exports");
             assert!(!export.exact);
         }
     }
@@ -265,7 +285,7 @@ mod tests {
         let a = BoundedShape::sphere(0.5);
         let b = BoundedShape::sphere(0.5)
             .translate(opensolid_core::types::Vector3::new(10.0, 0.0, 0.0));
-        let err = export_step(&a.intersect(&b), None, Some(0.05)).unwrap_err();
+        let err = export_step(&a.intersect(&b), None, Some(0.05), None).unwrap_err();
         assert!(err.contains("STEP export failed"), "{err}");
     }
 }

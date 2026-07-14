@@ -3,11 +3,20 @@ import {
   BOOLEAN_CHOICES,
   clampDisplay,
   displayValue,
+  LENGTH_UNIT,
   opSpec,
 } from '../lib/propertyEdit.js';
+import { DEFAULT_LENGTH_UNIT, unitLabel } from '../lib/units.js';
 
 function fmt(value) {
   return String(Number(value.toFixed(4)));
+}
+
+// Length-dimensioned fields carry the canonical `LENGTH_UNIT` marker; their
+// displayed suffix follows the document unit. Angle/scale/axis fields keep
+// their intrinsic unit (°, ×, none) regardless of the document setting.
+function fieldUnit(field, documentUnit) {
+  return field.unit === LENGTH_UNIT ? unitLabel(documentUnit) : field.unit;
 }
 
 /**
@@ -15,7 +24,7 @@ function fmt(value) {
  * the value (hold Shift for coarse steps), or type into the input and
  * commit with Enter/blur. Values are clamped to the field's range.
  */
-function DragNumber({ field, value, disabled, onCommit }) {
+function DragNumber({ field, value, unit, disabled, onCommit }) {
   const dragRef = useRef(null);
 
   const commit = (next) => {
@@ -78,7 +87,7 @@ function DragNumber({ field, value, disabled, onCommit }) {
           if (event.key === 'Enter') event.target.blur();
         }}
       />
-      <span className="prop-unit">{field.unit}</span>
+      <span className="prop-unit">{unit}</span>
     </label>
   );
 }
@@ -90,7 +99,13 @@ function DragNumber({ field, value, disabled, onCommit }) {
  * flow through the bidirectional sync: the script rewrites and the mesh
  * re-evaluates on every change.
  */
-export default function PropertyPanel({ node, disabled, onEditArg, onChangeOp }) {
+export default function PropertyPanel({
+  node,
+  disabled,
+  onEditArg,
+  onChangeOp,
+  documentUnit = DEFAULT_LENGTH_UNIT,
+}) {
   const spec = opSpec(node.op);
   return (
     <div className="prop-panel">
@@ -120,6 +135,7 @@ export default function PropertyPanel({ node, disabled, onEditArg, onChangeOp })
                 key={`${node.id}.${f.arg}`}
                 field={f}
                 value={displayValue(f, node)}
+                unit={fieldUnit(f, documentUnit)}
                 disabled={disabled}
                 onCommit={(v) => onEditArg(node.id, f.arg, v)}
               />
