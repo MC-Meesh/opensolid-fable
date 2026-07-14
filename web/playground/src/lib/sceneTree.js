@@ -34,6 +34,12 @@ export const UNARY_OPS = ['translate', 'rotate', 'scale', 'uniformScale', 'taper
 // Two children: the receiver, then the other shape.
 export const BINARY_OPS = ['union', 'intersect', 'subtract', 'smoothUnion'];
 
+// Edge-selective blends (of-rpo): two children (the operand bodies) plus a
+// numeric radius and a flat `[x, y, z, …]` crease polyline held on the node's
+// `edge` field (not in `args`, which stays numeric). Structurally binary —
+// picking and deletion treat them like the booleans above.
+export const EDGE_BLEND_OPS = ['filletEdge', 'chamferEdge'];
+
 // Static constructors sweeping a 2D profile (a `Profile` instance, then
 // numeric args). No children; the node carries a `profile` snapshot:
 // `{ start: [x, y], segs: [{ x, y, bulge }] }`.
