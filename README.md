@@ -303,7 +303,7 @@ checker rules, so the same class of error cannot silently return `Ok` twice.
 | Planes | ✅ today | ✅ |
 | Cylinders | ✅ today | ✅ |
 | Spheres / tori | ✅ today (of-7ld) | ✅ |
-| Cones | 🚧 (SSI partial) | ✅ |
+| Cones | 🚧 (plane-cone ✅; cone-cone → of-dtj.4) | ✅ |
 | Coincident / tangent contacts | rejected → fallback | ✅ |
 | Organic blends, offsets, shells | — | ✅ |
 | STEP (AP203) read/write | ✅ today (of-3qy) | mesh fallback on read |
@@ -311,7 +311,13 @@ checker rules, so the same class of error cannot silently return `Ok` twice.
 The exact analytic pipeline covers **plane, cylinder, sphere, and torus**
 faces today: the sphere/torus stress campaign (bead of-7ld) promoted both
 classes through the stress-suite-first policy, and marched SSI curves carry
-the oblique plane–torus and torus–torus configurations. **STEP (AP203)
+the oblique plane–torus and torus–torus configurations. **Cones** are nearly
+there: every **plane–cone** boolean is exact — the parabola/hyperbola/
+generator sections that arise when a planar face cuts a cone off-axis march
+through the bounded SSI entry point (of-dtj.1), and sphere–cone / torus–cone
+pairs march against their compact partner (of-dtj.2). The one remaining gap is
+**cone–cone** SSI (coaxial analytic + general marched), tracked by of-dtj.4;
+until it lands, coaxial cone/frustum overlaps fall to the F-Rep path. **STEP (AP203)
 interchange** shipped (bead of-3qy): analytic parts round-trip through
 `write_step`/`read_step` as exact B-Reps — byte-identical on re-export for
 primitive-derived geometry — with a welded-mesh fallback for files the kernel

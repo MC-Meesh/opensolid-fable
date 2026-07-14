@@ -165,19 +165,18 @@
 //! Section (9) is the cone/frustum campaign (of-fsl.23), written BEFORE
 //! cones were admitted to the exact path (tests-first-ignored, sphere/torus
 //! precedent, commit 567930a). The `Chart::build` gate has since lifted
-//! (of-dtj), so the cases whose SSIs are already exact now run live
-//! (of-fsl.27 promotion pass): the pure plane-cone bites — conical
-//! countersink at 1×/0.001×/1000× scale — and the tilted-cone-block
-//! inclusion–exclusion identity. The plane-cone parabola/hyperbola bites are
-//! now live too (of-dtj.1): axis-parallel (or generator-aligned) planar faces
-//! cut the cone as hyperbolae with no `Curve3` closed form, so those sections
-//! are marched inside the joint face extent
-//! (`ssi::intersect_marched_bounded`) — `frustum_through_slab`,
-//! `cone_block_inclusion_exclusion`,
-//! `rotated_frustum_bite_invariance` un-ignored. Two cases stay `#[ignore]`d
-//! on the remaining exact-SSI gap:
-//!   • of-dtj.2 (analytic cone-cone SSI / marched cone path):
+//! (of-dtj), and the plane-cone SSI now marches its parabola/hyperbola/
+//! generator sections through the bounded entry point (of-dtj.1), so every
+//! plane-cone case is live: the conical countersink bites at 1×/0.001×/1000×
+//! scale and the tilted-cone-block identity (of-fsl.27), plus the through-
+//! hole `frustum_through_slab`, `cone_block_inclusion_exclusion`, and the
+//! rigid-motion `rotated_frustum_bite_invariance` (of-fsl.28). Two cases
+//! remain `#[ignore]`d on the one unresolved gap:
+//!   • of-dtj.4 (cone-cone SSI — analytic coaxial + marched general):
 //!     `opposed_cones_intersection`, `coaxial_frustums_union_identity`.
+//!     of-dtj.2 delivered only the compact-partner cone pairs (sphere-cone,
+//!     torus-cone) and explicitly defers the unbounded cone-cone pair to
+//!     of-dtj.4; until it lands these return NotImplemented at analytic.rs:121.
 //! The no-panic guard `no_panics_on_cone_configurations` stays live across
 //! the promotion — it accepts both a valid exact solid and the structured
 //! `NotImplemented` F-Rep fallback. Run the still-ignored cone cases with
@@ -2430,9 +2429,11 @@ fn cone_bite_at_scale_1000() {
 /// where their radii coincide). Exercises coaxial cone-cone SSI (a single
 /// full-wrap circle at z = 2) and closed-form intersection volume.
 #[test]
-#[ignore = "of-dtj.2: no analytic SSI for cone-cone pairs (NotImplemented \
-            'analytic SSI for cone pairs other than plane-cone') — needs the \
-            marched cone path — analytic.rs:121"]
+#[ignore = "of-dtj.4: no analytic/marched SSI for cone-cone pairs yet \
+            (NotImplemented 'analytic SSI for cone pairs other than \
+            plane-cone') — of-dtj.2 delivered sphere-cone/torus-cone only \
+            and explicitly defers the unbounded cone-cone pair to of-dtj.4 \
+            — analytic.rs:121"]
 fn opposed_cones_intersection() {
     let context = "opposed coaxial cones intersection (bicone)";
     let mut scene = Scene::new();
@@ -2480,9 +2481,11 @@ fn cone_block_inclusion_exclusion() {
 /// identity must hold across their cone-cone wall intersection in the
 /// overlap band. Closed-form operand volumes, identity for the overlap.
 #[test]
-#[ignore = "of-dtj.2: no analytic SSI for cone-cone pairs (NotImplemented \
-            'analytic SSI for cone pairs other than plane-cone') — needs the \
-            marched cone path — analytic.rs:121"]
+#[ignore = "of-dtj.4: no analytic/marched SSI for cone-cone pairs yet \
+            (NotImplemented 'analytic SSI for cone pairs other than \
+            plane-cone') — of-dtj.2 delivered sphere-cone/torus-cone only \
+            and explicitly defers the unbounded cone-cone pair to of-dtj.4 \
+            — analytic.rs:121"]
 fn coaxial_frustums_union_identity() {
     let context = "coaxial frustums union/intersection identity";
     let mut scene = Scene::new();
