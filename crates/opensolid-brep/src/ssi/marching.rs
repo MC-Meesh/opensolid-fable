@@ -771,14 +771,15 @@ pub fn intersect_marched(
 }
 
 /// Marched intersection of two *unbounded* analytic primitives within an
-/// explicit region of interest — the plane-cone parabola/hyperbola sections.
+/// explicit region of interest — the plane-cone parabola/hyperbola sections
+/// and general-position cone-cone quartics.
 ///
 /// Unlike [`intersect_marched`], where one partner is always compact and
-/// bounds the seeding grid, neither a plane nor a cone is bounded, so the
-/// caller supplies the region as a bounding sphere `bounds = (center,
-/// radius)`. The boolean pipeline derives it from the joint extent of the
-/// two clipped faces; only the section inside that region is traced (the
-/// full parabola/hyperbola runs to infinity). Both infinite parameter
+/// bounds the seeding grid, a plane and a cone (or two cones) are all
+/// unbounded, so the caller supplies the region as a bounding sphere
+/// `bounds = (center, radius)`. The boolean pipeline derives it from the
+/// joint extent of the two clipped faces; only the section inside that region
+/// is traced (the full section runs to infinity). Both infinite parameter
 /// directions are clipped to the sphere's reach exactly as
 /// [`intersect_marched`] clips a plane against a compact partner.
 ///
@@ -789,14 +790,15 @@ pub fn intersect_marched(
 /// it (welded downstream), exactly like the periodic seam handling in
 /// [`intersect_marched`].
 ///
-/// Only the parabola/hyperbola branch is routed here; plane-cone circles,
-/// ellipses, the generator-line pair and the apex-only contact are exact in
-/// [`super::intersect`], which returns `NotImplemented` for precisely this
-/// branch.
+/// Only the sections with no closed form are routed here; plane-cone circles,
+/// ellipses, the generator-line pair and the apex-only contact, and coaxial
+/// cone-cone circles are exact in [`super::intersect`], which returns
+/// `NotImplemented` for precisely the marched branches.
 ///
 /// # Errors
-/// [`CoreError::NotImplemented`] for any pair other than plane-cone, and for
-/// a tangential contact detected while marching (transversal MVP).
+/// [`CoreError::NotImplemented`] for any pair other than plane-cone or
+/// cone-cone, and for a tangential contact detected while marching
+/// (transversal MVP).
 pub fn intersect_marched_bounded(
     a: &Surface3,
     b: &Surface3,
@@ -812,11 +814,18 @@ pub fn intersect_marched_bounded(
         (Plane { .. }, Cone { .. }) => {
             Ok(swap_params(intersect_marched_bounded(b, a, bounds, tol)?))
         }
+        // Two unbounded cones in general position: the intersection is a
+        // quartic with no `Curve3` closed form (coaxial pairs are exact in
+        // [`super::intersect`], which returns `NotImplemented` for exactly
+        // this branch). Both cones are clipped to the region sphere and one
+        // is gridded against the other.
+        (Cone { .. }, Cone { .. }) => march_bounded_pair(a, b, bounds, tol),
         _ => Err(CoreError::NotImplemented {
             feature: "bounded marched SSI for this surface pair (only the \
-                      unbounded plane-cone sections are marched with an \
-                      explicit region; every other pair is closed-form in \
-                      ssi::intersect or compact-bounded in intersect_marched)",
+                      unbounded plane-cone and cone-cone sections are marched \
+                      with an explicit region; every other pair is closed-form \
+                      in ssi::intersect or compact-bounded in \
+                      intersect_marched)",
         }),
     }
 }
@@ -834,7 +843,7 @@ fn march_bounded_pair(
     let [bu, bv] = clipped_domains(b, bounds, tol);
     match march_boxed(a, b, [au, av, bu, bv], tol) {
         Err(CoreError::Degenerate { .. }) => Err(CoreError::NotImplemented {
-            feature: "marched plane-cone SSI across a tangential contact \
+            feature: "marched bounded SSI across a tangential contact \
                       (transversal MVP)",
         }),
         other => other,
@@ -1436,6 +1445,43 @@ mod tests {
         let swapped = intersect_marched_bounded(&plane, &cone, bounds, &default_tol()).unwrap();
         assert_eq!(swapped.len(), 1);
         assert_marched_on_both(&swapped, &plane, &cone);
+    }
+
+    #[test]
+    fn marched_bounded_cone_cone_offset_axes() {
+        // Two identical upward cones (half-angle 30°, radius 1 at z = 0) on
+        // parallel axes 2 apart in x: non-coaxial, so no closed form. At each
+        // height z both are circles of radius r = 1 + z·tan30° whose centers
+        // sit 2 apart, meeting at x = 1, y = ±√(r² − 1) for z > 0. The region
+        // is held above the z = 0 node where the two branches join.
+        let half_angle = 30.0_f64.to_radians();
+        let cone_a = Surface3::Cone {
+            origin: Point3::origin(),
+            axis: Vector3::z(),
+            half_angle,
+            radius: 1.0,
+        };
+        let cone_b = Surface3::Cone {
+            origin: Point3::new(2.0, 0.0, 0.0),
+            axis: Vector3::z(),
+            half_angle,
+            radius: 1.0,
+        };
+        let bounds = (Point3::new(1.0, 0.0, 2.0), 2.5);
+        let curves = intersect_marched_bounded(&cone_a, &cone_b, bounds, &default_tol()).unwrap();
+        assert_marched_on_both(&curves, &cone_a, &cone_b);
+        // Every vertex sits on the shared radical plane x = 1.
+        for curve in &curves {
+            for p in &curve.points {
+                assert!(
+                    (p.x - 1.0).abs() < 1e-6,
+                    "vertex off the radical plane: {p}"
+                );
+            }
+        }
+        // Swapped argument order re-enters and swaps preimages back.
+        let swapped = intersect_marched_bounded(&cone_b, &cone_a, bounds, &default_tol()).unwrap();
+        assert_marched_on_both(&swapped, &cone_b, &cone_a);
     }
 
     #[test]

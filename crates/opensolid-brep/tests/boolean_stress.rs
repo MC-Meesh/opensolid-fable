@@ -2451,6 +2451,47 @@ fn crossing_frustums_intersection() {
     assert_close(vol, want, CURVED_VOLUME_RTOL, context);
 }
 
+/// Two FRUSTUMS on non-coaxial (crossing) axes: the general-position
+/// cone-cone SSI, a quartic with no closed form that the boolean pipeline
+/// marches within the clashing faces' box (of-dtj.4). Both are frustums
+/// (radii > 0, no apex pole), so promotion rides on the SSI alone. The
+/// removed/overlap geometry has no closed form, so the invariant is the
+/// scale-free inclusion–exclusion identity across all three ops.
+#[test]
+#[ignore = "of-9ia: the non-coaxial cone-cone SSI marches correctly (of-dtj.4, \
+            unit test marched_bounded_cone_cone_offset_axes), but hosting the \
+            marched imprint on the two curved cone faces yields an open chain \
+            that ends in the face interior (boolean::imprint Degenerate at \
+            boolean.rs:3376) — a reconstruction gap, not an SSI gap"]
+fn skew_frustums_inclusion_exclusion() {
+    let context = "non-coaxial frustums ∪/∩ identity";
+    let mut scene = Scene::new();
+    let upright = scene.cone(Point3::new(0.0, 0.0, 0.0), 2.5, 1.0, 4.0);
+    let tilted = scene.cone_tilted(
+        Point3::new(0.0, 0.0, 2.0),
+        2.5,
+        1.0,
+        4.0,
+        Vector3::new(1.0, 0.0, 0.0),
+        50.0_f64.to_radians(),
+    );
+    let union = scene
+        .unite(upright, tilted)
+        .unwrap_or_else(|e| panic!("{context}: unite failed: {e:?}"));
+    let inter = scene
+        .intersect(upright, tilted)
+        .unwrap_or_else(|e| panic!("{context}: intersect failed: {e:?}"));
+    let vol_union = volume(&union, &format!("{context}: union"));
+    let vol_inter = volume(&inter, &format!("{context}: intersection"));
+    let vol_each = frustum_volume(2.5, 1.0, 4.0);
+    assert_close(
+        vol_union + vol_inter,
+        2.0 * vol_each,
+        CURVED_VOLUME_RTOL,
+        &format!("{context}: identity"),
+    );
+}
+
 /// Two coaxial cones opposed apex-to-base overlap in a lens whose
 /// intersection is a bicone (two cones meeting base-to-base at the height
 /// where their radii coincide). Exercises coaxial cone-cone SSI (a single

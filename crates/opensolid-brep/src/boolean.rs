@@ -1331,17 +1331,19 @@ fn marched_ssi_supported(a: &Surface3, b: &Surface3) -> bool {
     )
 }
 
-/// Whether the pair is plane-cone (either order): the only surfaces marched
-/// through [`intersect_marched_bounded`], whose unbounded parabola/hyperbola
-/// sections have no [`Curve3`] closed form. Every other plane-cone
-/// configuration (circle, ellipse, generator lines, apex-only contact) is
-/// exact in [`ssi_intersect`], so this arm is reached only for the
-/// not-yet-representable branch.
-fn is_plane_cone(a: &Surface3, b: &Surface3) -> bool {
+/// Whether the pair is marched through [`intersect_marched_bounded`] with an
+/// explicit region: plane-cone (either order) or cone-cone. Both involve an
+/// unbounded section with no [`Curve3`] closed form — the plane-cone
+/// parabola/hyperbola/generator branch and the general-position cone-cone
+/// quartic. Their closed-form configurations (plane-cone circle, ellipse,
+/// generator lines, apex-only contact; coaxial cone-cone circle) are exact in
+/// [`ssi_intersect`], so this arm is reached only for the not-yet-representable
+/// branch.
+fn is_bounded_marched(a: &Surface3, b: &Surface3) -> bool {
     use Surface3::*;
     matches!(
         (a, b),
-        (Plane { .. }, Cone { .. }) | (Cone { .. }, Plane { .. })
+        (Plane { .. }, Cone { .. }) | (Cone { .. }, Plane { .. }) | (Cone { .. }, Cone { .. })
     )
 }
 
@@ -1482,13 +1484,14 @@ impl<'a> Pipeline<'a> {
                         }
                     }
                 }
-                // Plane-cone parabola/hyperbola sections: unbounded, no
-                // Curve3 closed form, so analytic SSI reports NotImplemented.
-                // Both faces are finite, so their box overlap bounds the
-                // section actually needed here — march only that region
-                // (of-dtj.1). An axis-parallel box wall cutting the cone is
-                // exactly this case.
-                Err(CoreError::NotImplemented { .. }) if is_plane_cone(sa, sb) => {
+                // Plane-cone parabola/hyperbola sections (of-dtj.1) and
+                // general-position cone-cone quartics (of-dtj.4): unbounded,
+                // no Curve3 closed form, so analytic SSI reports
+                // NotImplemented. Both faces are finite, so their box overlap
+                // bounds the section actually needed here — march only that
+                // region. An axis-parallel box wall cutting the cone, or two
+                // cones on skew axes, are exactly these cases.
+                Err(CoreError::NotImplemented { .. }) if is_bounded_marched(sa, sb) => {
                     let joint = box_a.intersection(box_b);
                     let bounds = (joint.center(), 0.5 * joint.extents().norm());
                     for mc in intersect_marched_bounded(sa, sb, bounds, &self.tol)? {
