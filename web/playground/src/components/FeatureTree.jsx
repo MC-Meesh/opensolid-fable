@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { rebuildStateTitle } from '../lib/rebuildState.js';
 
 // Feature-type icons (12×12 stroke glyphs, SolidWorks-ish shorthand).
 const ICON_PATHS = {
@@ -19,6 +20,23 @@ function FeatureIcon({ kind }) {
   );
 }
 
+// SolidWorks-style rebuild-state badge: a red "!" for a dangling persistent
+// reference, a red "⊘" for a feature that failed to evaluate. `ok` shows
+// nothing. Purely a status glyph — the tooltip carries the reason.
+function RebuildBadge({ state }) {
+  if (!state || state.status === 'ok') return null;
+  const glyph = state.status === 'error' ? '⊘' : '!';
+  return (
+    <span
+      className={`feature-badge ${state.status}`}
+      title={rebuildStateTitle(state)}
+      aria-label={rebuildStateTitle(state)}
+    >
+      {glyph}
+    </span>
+  );
+}
+
 function EyeIcon({ off }) {
   return (
     <svg viewBox="0 0 12 12" aria-hidden="true">
@@ -34,6 +52,7 @@ function FeatureRow({
   selected,
   hidden,
   suppressed,
+  rebuildState,
   expandable,
   open,
   onToggleOpen,
@@ -46,6 +65,7 @@ function FeatureRow({
 }) {
   const [renaming, setRenaming] = useState(false);
   const isSketch = feature.kind === 'sketch';
+  const flagged = rebuildState && rebuildState.status !== 'ok';
 
   const commitRename = (value) => {
     setRenaming(false);
@@ -57,7 +77,7 @@ function FeatureRow({
     <div
       className={`feature-row${selected ? ' selected' : ''}${
         suppressed ? ' suppressed' : ''
-      }${hidden ? ' hidden-feature' : ''}`}
+      }${hidden ? ' hidden-feature' : ''}${flagged ? ` rebuild-${rebuildState.status}` : ''}`}
       style={{ paddingLeft: 6 + feature.depth * 16 }}
       role="treeitem"
       aria-selected={selected}
@@ -112,6 +132,7 @@ function FeatureRow({
           {feature.name}
         </span>
       )}
+      <RebuildBadge state={rebuildState} />
       {!isSketch && (
         <span className="feature-actions">
           <button
@@ -173,6 +194,7 @@ export default function FeatureTree({
   selectedId,
   hiddenKeys,
   suppressedKeys,
+  rebuildState,
   collapsed,
   embedded = false,
   disabled,
@@ -243,6 +265,7 @@ export default function FeatureTree({
               selected={feature.kind !== 'sketch' && feature.id === selectedId}
               hidden={hiddenKeys.has(feature.key)}
               suppressed={suppressedKeys.has(feature.key)}
+              rebuildState={rebuildState?.get(feature.key)}
               expandable={(childCount.get(feature.key) ?? 0) > 0}
               open={!closedKeys.has(feature.key)}
               onToggleOpen={() => toggleOpen(feature.key)}

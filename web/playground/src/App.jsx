@@ -24,6 +24,8 @@ import { addPrimitiveNode, assertStoreConsistency } from './lib/storeSync.js';
 import { buildSweepShape, opsBounds, profileToOps, sweepTreeNode } from './lib/sweep.js';
 import { createFaceRegionIndex } from './lib/facePlane.js';
 import { isFacePlane } from './lib/sketch/profile.js';
+import { faceRefFromPlane, planarRegionsOf, resolveRefs } from './lib/persistentRef.js';
+import { computeRebuildState } from './lib/rebuildState.js';
 
 // Adaptive meshing target: maximum chordal deviation from the exact
 // surface, in model units. The octree refines near curvature and CSG
@@ -61,6 +63,22 @@ function meshShape(shape, accuracy = MESH_ACCURACY) {
 function shapePivot(shape) {
   const b = shape.bounds();
   return [(b[0] + b[3]) / 2, (b[1] + b[4]) / 2, (b[2] + b[5]) / 2];
+}
+
+// Half the bounding-box diagonal of a positions array — the natural scale for
+// the persistent-reference anchor tolerance. Returns 0 for an empty mesh.
+function meshRadius(positions) {
+  if (!positions || positions.length === 0) return 0;
+  const min = [Infinity, Infinity, Infinity];
+  const max = [-Infinity, -Infinity, -Infinity];
+  for (let i = 0; i < positions.length; i += 3) {
+    for (let k = 0; k < 3; k += 1) {
+      const c = positions[i + k];
+      if (c < min[k]) min[k] = c;
+      if (c > max[k]) max[k] = c;
+    }
+  }
+  return Math.hypot(max[0] - min[0], max[1] - min[1], max[2] - min[2]) / 2;
 }
 
 export default function App() {
@@ -110,6 +128,16 @@ export default function App() {
   const [hiddenKeys, setHiddenKeys] = useState(() => new Set());
   const [suppressedKeys, setSuppressedKeys] = useState(() => new Set());
   const [editingSketch, setEditingSketch] = useState(null); // { nodeId, name }
+
+  // Persistent face references (of-fsl.8): Map<featureKey, FaceRef> for
+  // sweeps placed on a picked face. Held in a ref (survives renders without
+  // re-triggering) and re-resolved against the rebuilt mesh after every edit;
+  // the derived per-feature rebuild status drives the tree badges.
+  const faceRefsRef = useRef(new Map());
+  // A face-sketch just applied but whose new feature key isn't known until the
+  // tree rebuilds: { plane, priorKeys } consumed by the assignment effect.
+  const pendingFaceRefRef = useRef(null);
+  const [rebuildState, setRebuildState] = useState(() => new Map());
 
   // Side panel: one tabbed panel (Code | Tree) with a draggable splitter.
   // Both panes stay mounted (CSS-hidden) — the CodeMirror instance and the
@@ -497,6 +525,56 @@ export default function App() {
 
   const features = useMemo(() => buildFeatures(tree, featureNames), [tree, featureNames]);
 
+  // Persistent-reference rebuild pass (of-fsl.8). After each rebuild produces a
+  // fresh mesh and feature list: (1) attach a pending face ref to its newly
+  // created sweep feature, (2) drop refs whose owning feature no longer exists,
+  // (3) re-resolve every surviving reference against the current mesh's planar
+  // faces, re-anchoring live ones and flagging vanished ones as dangling, and
+  // (4) publish the per-feature rebuild status the tree paints as badges.
+  useEffect(() => {
+    const refs = faceRefsRef.current;
+
+    // (1) Assign a just-applied face-sketch ref to its new sweep feature.
+    const pending = pendingFaceRefRef.current;
+    if (pending) {
+      const created = features.find(
+        (f) => f.kind === 'sweep' && !pending.priorKeys.has(f.key)
+      );
+      if (created) {
+        refs.set(created.key, faceRefFromPlane(created.key, pending.plane));
+        pendingFaceRefRef.current = null;
+      }
+    }
+
+    // (2) Prune references orphaned by feature deletion / script edits.
+    const liveKeys = new Set(features.map((f) => f.key));
+    for (const key of [...refs.keys()]) if (!liveKeys.has(key)) refs.delete(key);
+
+    if (refs.size === 0) {
+      setRebuildState((prev) => (prev.size === 0 ? prev : new Map()));
+      return;
+    }
+
+    // (3) Re-resolve against the displayed mesh's planar faces.
+    const displayed = meshRef.current;
+    const index = faceRegions();
+    let statuses = new Map();
+    if (index && displayed?.indices?.length) {
+      const regions = planarRegionsOf(index, displayed.indices.length / 3);
+      const result = resolveRefs(refs, regions, meshRadius(displayed.positions));
+      faceRefsRef.current = result.refs;
+      statuses = result.statuses;
+    } else {
+      // No mesh to resolve against: every reference is dangling for now.
+      for (const key of refs.keys()) {
+        statuses.set(key, { status: 'dangling', reason: 'model has no faces to resolve against' });
+      }
+    }
+
+    // (4) Fold into per-feature rebuild state for the tree badges.
+    setRebuildState(computeRebuildState(features, statuses));
+  }, [mesh, features, faceRegions]);
+
   // Hide/suppress are view-layer: recompute the displayed mesh from a pruned
   // copy of the tree; the script (source of truth) is untouched. The pruned
   // tree is serialized and re-run because bypassed operations need fresh
@@ -734,10 +812,18 @@ export default function App() {
   // existing shape) and commit through the store.
   const applySweep = useCallback(() => {
     if (!sweep) return;
+    // A sweep placed on a picked face carries a persistent reference: remember
+    // the face plane and the sweep keys that already exist, so the assignment
+    // effect can attach the ref to the newly-created sweep feature once the
+    // tree rebuilds (its key isn't known until then).
+    if (isFacePlane(sweep.plane)) {
+      const priorKeys = new Set(features.filter((f) => f.kind === 'sweep').map((f) => f.key));
+      pendingFaceRefRef.current = { plane: sweep.plane, priorKeys };
+    }
     setSweep(null);
     setSweepError(null);
     commitTree(sweepTreeNode(tracedRef.current?.root ?? null, sweep));
-  }, [sweep, commitTree]);
+  }, [sweep, commitTree, features]);
 
   // Live preview: remesh the pending sweep whenever its parameters change.
   useEffect(() => {
@@ -945,6 +1031,7 @@ export default function App() {
             selectedId={selectedNode?.id}
             hiddenKeys={hiddenKeys}
             suppressedKeys={suppressedKeys}
+            rebuildState={rebuildState}
             disabled={!wasmReady}
             onSelect={handleFeatureSelect}
             onRename={handleFeatureRename}

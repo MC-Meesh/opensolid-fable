@@ -73,6 +73,30 @@ describe('FeatureTree', () => {
     expect(html).toContain('Unsuppress Extrude1');
   });
 
+  it('paints a rebuild badge for a dangling reference and none for ok', () => {
+    const html = render({
+      features: sampleFeatures(),
+      rebuildState: new Map([
+        ['extrude:1', { status: 'dangling', reason: 'nearest face too far' }],
+        ['box:1', { status: 'ok' }],
+      ]),
+    });
+    expect(html).toContain('feature-badge dangling');
+    expect(html).toContain('rebuild-dangling');
+    expect(html).toContain('Dangling reference');
+    // An ok feature carries no badge markup.
+    expect(html).not.toContain('feature-badge error');
+  });
+
+  it('paints an error badge for a feature that failed to rebuild', () => {
+    const html = render({
+      features: sampleFeatures(),
+      rebuildState: new Map([['union:1', { status: 'error', reason: 'nan bounds' }]]),
+    });
+    expect(html).toContain('feature-badge error');
+    expect(html).toContain('Rebuild error');
+  });
+
   it('collapses to a thin docked strip', () => {
     const html = render({ collapsed: true });
     expect(html).toContain('feature-tree collapsed');

@@ -215,6 +215,27 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+/* Rebuild-state badge (of-fsl.8): a dangling persistent reference or a
+   feature that failed to evaluate. SolidWorks paints such features red. */
+.feature-badge {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 13px;
+  height: 13px;
+  margin-left: 4px;
+  border-radius: 50%;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+  color: #fff;
+  background: #d9503f;
+  cursor: help;
+}
+.feature-badge.error { background: #b02a1c; }
+.feature-row.rebuild-dangling .feature-name,
+.feature-row.rebuild-error .feature-name { color: #d9503f; }
 .feature-rename {
   flex: 1;
   min-width: 0;
