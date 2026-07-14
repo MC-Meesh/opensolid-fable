@@ -17,6 +17,9 @@
 //!
 //! # Modules
 //!
+//! - [`assembly`] — multi-part [`Assembly`] documents: `Transformed`-backed
+//!   instancing, `max<0` interference detection, and rigid-body
+//!   mass-property aggregation ([`Assembly`], [`Instance`], [`Part`]).
 //! - [`hybrid`] — the never-fail boolean entry point ([`HybridBoolean`]).
 //! - [`convert`] — conversion both ways: [`MeshSdf`] (B-Rep→SDF) and
 //!   [`sdf_to_brep()`] (SDF→faceted B-Rep).
@@ -31,6 +34,7 @@
 //!
 //! The three underlying crates are re-exported as [`core`], [`frep`], and
 //! [`brep`] for direct access.
+pub mod assembly;
 pub mod builder;
 pub mod convert;
 pub mod hybrid;
@@ -47,6 +51,10 @@ pub use opensolid_frep as frep;
 // for boolean clash detection; keep the old kernel paths working.
 pub use opensolid_core::bvh;
 
+pub use assembly::{
+    Assembly, AssemblyError, AssemblyMassProperties, Instance, InterferenceReport,
+    Part as AssemblyPart,
+};
 pub use builder::{Part, shape};
 pub use convert::{MeshSdf, SdfToBrepOptions, sdf_to_brep};
 pub use hybrid::{
