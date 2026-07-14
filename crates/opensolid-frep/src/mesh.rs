@@ -159,7 +159,7 @@ const CELL_FACES: [([usize; 4], [usize; 4]); 6] = [
 ];
 
 /// Marker for cell edges without a sign change in [`CellVerts::comp_of_edge`].
-const NO_COMP: u8 = u8::MAX;
+pub(crate) const NO_COMP: u8 = u8::MAX;
 
 /// Dual vertices for one cell: one Hermite vertex (centroid of the edge
 /// crossings) per surface component. Every crossed edge is paired with
@@ -189,14 +189,68 @@ fn uf_union(parent: &mut [u8; 12], a: u8, b: u8) {
     parent[ra as usize] = rb;
 }
 
-/// Dual vertices for one cell, or `None` if no edge crosses the surface.
+/// Group a cell's sign-changing edges into surface components from its eight
+/// corner field values, returning the component id of each [`CELL_EDGES`]
+/// slot ([`NO_COMP`] where the edge has no sign change) and the component
+/// count (0 if no edge crosses).
 ///
-/// Crossed edges are grouped into surface components by tracing across the
-/// six faces: a face with two crossings links them; a face with four
-/// (checkerboard corner signs) is resolved by the asymptotic decider —
-/// the sign of the face's bilinear interpolant at its saddle point picks
-/// which diagonal corner pair the two contour arcs separate. The decider
-/// reads only face data, so adjacent cells always agree.
+/// Components are traced across the six faces: a face with two crossings
+/// links them; a face with four (checkerboard corner signs) is resolved by
+/// the asymptotic decider — the sign of the face's bilinear interpolant at
+/// its saddle point picks which diagonal corner pair the two contour arcs
+/// separate. The decider reads only face data, so adjacent cells always
+/// agree. Purely a function of the corner signs (and saddle magnitudes on
+/// ambiguous faces), so the uniform and adaptive meshers share it and stitch
+/// consistently across a shared face.
+pub(crate) fn classify_components(v: &[f64; 8]) -> ([u8; 12], u8) {
+    let inside = |c: usize| v[c] < 0.0;
+    let crossed = |e: usize| {
+        let (a, b) = CELL_EDGES[e];
+        inside(a) != inside(b)
+    };
+
+    let mut parent: [u8; 12] = core::array::from_fn(|e| e as u8);
+    for &(corners, edges) in &CELL_FACES {
+        let cross: Vec<usize> = (0..4).filter(|&n| crossed(edges[n])).collect();
+        match cross[..] {
+            [p, q] => uf_union(&mut parent, edges[p] as u8, edges[q] as u8),
+            [_, _, _, _] => {
+                // Checkerboard face: corners alternate inside/outside, all
+                // four edges crossed. The two contour arcs wrap the diagonal
+                // corner pair whose sign differs from the bilinear saddle.
+                let f: [f64; 4] = core::array::from_fn(|n| v[corners[n]]);
+                let saddle = (f[0] * f[2] - f[1] * f[3]) / (f[0] + f[2] - f[1] - f[3]);
+                let wrap_even = inside(corners[0]) != (saddle < 0.0);
+                let (m, n) = if wrap_even { (0, 2) } else { (1, 3) };
+                for w in [m, n] {
+                    uf_union(&mut parent, edges[(w + 3) % 4] as u8, edges[w] as u8);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut comp_of_edge = [NO_COMP; 12];
+    let mut root_comp = [NO_COMP; 12];
+    let mut ncomp = 0u8;
+    for (e, slot) in comp_of_edge.iter_mut().enumerate() {
+        if !crossed(e) {
+            continue;
+        }
+        let r = uf_find(&mut parent, e as u8) as usize;
+        if root_comp[r] == NO_COMP {
+            debug_assert!(ncomp < 4, "more than four edge components in a cell");
+            root_comp[r] = ncomp;
+            ncomp += 1;
+        }
+        *slot = root_comp[r];
+    }
+    (comp_of_edge, ncomp)
+}
+
+/// Dual vertices for one cell, or `None` if no edge crosses the surface.
+/// One Hermite vertex (centroid of the edge crossings) per surface component
+/// as grouped by [`classify_components`].
 fn cell_verts(g: &Grid, values: &[f64], i: usize, j: usize, k: usize) -> Option<Box<CellVerts>> {
     let v: [f64; 8] = core::array::from_fn(|c| {
         let (cx, cy, cz) = corner(c);
@@ -222,44 +276,14 @@ fn cell_verts(g: &Grid, values: &[f64], i: usize, j: usize, k: usize) -> Option<
         return None;
     }
 
-    let mut parent: [u8; 12] = core::array::from_fn(|e| e as u8);
-    for &(corners, edges) in &CELL_FACES {
-        let crossed: Vec<usize> = (0..4).filter(|&n| crossing[edges[n]].is_some()).collect();
-        match crossed[..] {
-            [p, q] => uf_union(&mut parent, edges[p] as u8, edges[q] as u8),
-            [_, _, _, _] => {
-                // Checkerboard face: corners alternate inside/outside, all
-                // four edges crossed. The two contour arcs wrap the diagonal
-                // corner pair whose sign differs from the bilinear saddle.
-                let f: [f64; 4] = core::array::from_fn(|n| v[corners[n]]);
-                let saddle = (f[0] * f[2] - f[1] * f[3]) / (f[0] + f[2] - f[1] - f[3]);
-                let wrap_even = inside(corners[0]) != (saddle < 0.0);
-                let (m, n) = if wrap_even { (0, 2) } else { (1, 3) };
-                for w in [m, n] {
-                    uf_union(&mut parent, edges[(w + 3) % 4] as u8, edges[w] as u8);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    let mut comp_of_edge = [NO_COMP; 12];
-    let mut root_comp = [NO_COMP; 12];
+    let (comp_of_edge, ncomp) = classify_components(&v);
     let mut sums = [Vector3::zeros(); 4];
     let mut counts = [0usize; 4];
-    let mut ncomp = 0u8;
     for e in 0..12 {
         let Some(x) = crossing[e] else { continue };
-        let r = uf_find(&mut parent, e as u8) as usize;
-        if root_comp[r] == NO_COMP {
-            debug_assert!(ncomp < 4, "more than four edge components in a cell");
-            root_comp[r] = ncomp;
-            ncomp += 1;
-        }
-        let c = root_comp[r];
-        comp_of_edge[e] = c;
-        sums[c as usize] += x;
-        counts[c as usize] += 1;
+        let c = comp_of_edge[e] as usize;
+        sums[c] += x;
+        counts[c] += 1;
     }
     let mut points = [Point3::origin(); 4];
     for c in 0..ncomp as usize {

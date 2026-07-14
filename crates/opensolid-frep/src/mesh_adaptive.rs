@@ -8,16 +8,29 @@
 //! number of field evaluations scales with the surface area
 //! (`O(4^depth)`) instead of the volume (`O(8^depth)`).
 //!
-//! Each surviving leaf places one vertex by minimizing a quadratic error
-//! function (QEF) over the cell's Hermite data: for every sign-changing cell
-//! edge, the crossing point `p_i` (linear interpolation of the field) and
-//! the unit normal `n_i` (field gradient at the crossing) define a tangent
-//! plane, and the vertex minimizes `sum_i (n_i . (x - p_i))^2`. The normal
-//! equations are solved through an SVD pseudo-inverse with relative
-//! singular-value truncation, seeded at the mass point of the crossings, so
-//! flat regions stay stable while edges and corners of the surface attract
-//! the vertex exactly onto the sharp feature — the classic dual-contouring
-//! advantage over plain crossing-centroid placement.
+//! Each surviving leaf places one vertex per surface component by minimizing
+//! a quadratic error function (QEF) over the component's Hermite data: for
+//! every sign-changing cell edge, the crossing point `p_i` (linear
+//! interpolation of the field) and the unit normal `n_i` (field gradient at
+//! the crossing) define a tangent plane, and the vertex minimizes
+//! `sum_i (n_i . (x - p_i))^2`. The normal equations are solved through an
+//! SVD pseudo-inverse with relative singular-value truncation, seeded at the
+//! mass point of the crossings, so flat regions stay stable while edges and
+//! corners of the surface attract the vertex exactly onto the sharp feature —
+//! the classic dual-contouring advantage over plain crossing-centroid
+//! placement.
+//!
+//! A cell's surface components are the connected groups of its crossed edges
+//! ([`classify_components`], shared with the uniform mesher), traced across
+//! the cell faces. A single vertex per cell cannot represent two surface
+//! sheets crossing one cell — e.g. the band beside a CSG crease where both
+//! surfaces pass through a cell that does not contain the crease itself — and
+//! would pinch them together into non-manifold four-triangle edges (of-54d).
+//! Placing one vertex per component and routing each stitch edge to the
+//! component that owns it keeps such bands manifold. Multi-component cells in
+//! the graded octree always refine to `max_depth` (their crossing normals
+//! disagree, tripping the feature test), so only finest-level leaves ever
+//! carry more than one vertex.
 //!
 //! # Leaf-depth choice: uniform or graded
 //!
@@ -42,19 +55,19 @@
 //! Mixed leaf depths are stitched crack-free by the recursive octree
 //! traversal of Ju et al. (2002): `cell_proc`/`face_proc`/`edge_proc`
 //! enumerate every minimal (finest) interior edge exactly once, and each
-//! sign-changing minimal edge connects the vertices of its (up to four
-//! distinct) adjacent leaves into a quad — or a triangle where a coarse leaf
-//! spans two quadrants. Because polygons are dual (one vertex per leaf) no
-//! T-junction cracks can occur, and corner signs are sampled on one global
-//! finest lattice with bit-identical coordinates, so adjacent cells always
-//! agree about crossings.
+//! sign-changing minimal edge connects the owning component vertex of its
+//! (up to four distinct) adjacent leaves into a quad — or a triangle where a
+//! coarse leaf spans two quadrants. Because polygons are dual (one vertex per
+//! leaf component) no T-junction cracks can occur, and corner signs are
+//! sampled on one global finest lattice with bit-identical coordinates, so
+//! adjacent cells always agree about crossings.
 //!
 //! The surface must lie strictly inside `bounds`; crossings on the boundary
 //! layer of cells are not stitched and would leave holes.
 
 use std::collections::HashMap;
 
-use crate::mesh::{CELL_EDGES, corner};
+use crate::mesh::{CELL_EDGES, NO_COMP, classify_components, corner};
 use crate::primitives::Sdf;
 use nalgebra::Matrix3;
 use opensolid_core::types::{BoundingBox3, Point3, Vector3};
@@ -215,6 +228,77 @@ fn unit_grad(sdf: &dyn Sdf, p: &Point3) -> Vector3 {
     }
 }
 
+/// Perpendicular axes to `e` in increasing order. Within the group of four
+/// [`CELL_EDGES`] slots parallel to `e`, the slot of the edge at
+/// perpendicular position `pos` is `4*e + pos[p] + 2*pos[q]` — the same
+/// layout the uniform mesher's stitch uses, so the two meshers index cell
+/// edges identically.
+fn perp_axes(e: usize) -> (usize, usize) {
+    match e {
+        0 => (1, 2),
+        1 => (0, 2),
+        _ => (0, 1),
+    }
+}
+
+/// Crossing point and unit gradient normal for each sign-changing cell edge
+/// (`None` on uncrossed edges). The crossing is the linear interpolation of
+/// the corner field values; `corner_pt(bits)` gives the world position of
+/// corner `bits`. A degenerate gradient yields a zero normal, which anchors
+/// the QEF mass point but contributes no plane.
+fn edge_crossings(
+    sdf: &dyn Sdf,
+    corners: &[f64; 8],
+    corner_pt: impl Fn(usize) -> Point3,
+) -> [Option<(Vector3, Vector3)>; 12] {
+    let mut out = [None; 12];
+    for (e, &(a, b)) in CELL_EDGES.iter().enumerate() {
+        if (corners[a] < 0.0) == (corners[b] < 0.0) {
+            continue;
+        }
+        let t = corners[a] / (corners[a] - corners[b]);
+        let pa = corner_pt(a).coords;
+        let pb = corner_pt(b).coords;
+        let p = pa + (pb - pa) * t;
+        let grad = sdf.grad(&Point3::from(p));
+        let norm = grad.norm();
+        let n = if norm > 1e-12 {
+            grad / norm
+        } else {
+            Vector3::zeros()
+        };
+        out[e] = Some((p, n));
+    }
+    out
+}
+
+/// One QEF vertex per surface component: for each component `c` in
+/// `0..count`, solve [`solve_qef`] over the crossings whose edge belongs to
+/// `c`. `crossings[e]` must be `Some` for every edge with
+/// `comp_of_edge[e] == c` (guaranteed when both come from the same corner
+/// values). Vertices land in `[0..count]`.
+fn component_qef(
+    comp_of_edge: &[u8; 12],
+    count: u8,
+    crossings: &[Option<(Vector3, Vector3)>; 12],
+    cell_bounds: &BoundingBox3,
+) -> [Point3; 4] {
+    let mut out = [Point3::origin(); 4];
+    for (c, slot) in out.iter_mut().enumerate().take(count as usize) {
+        let mut points: Vec<Vector3> = Vec::new();
+        let mut normals: Vec<Vector3> = Vec::new();
+        for (e, cross) in crossings.iter().enumerate() {
+            if comp_of_edge[e] as usize == c {
+                let (p, n) = cross.expect("component edge must carry a crossing");
+                points.push(p);
+                normals.push(n);
+            }
+        }
+        *slot = solve_qef(&points, &normals, cell_bounds);
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Uniform leaf depth (`accuracy: None`): interval-pruned descent to
 // `max_depth`, then the same per-edge stitch rule as the uniform grid.
@@ -245,19 +329,28 @@ fn mesh_uniform_depth(sdf: &dyn Sdf, opts: &AdaptiveMeshOptions) -> TriangleMesh
         .map(|&key| (key, sdf.eval(&g.point_at(key))))
         .collect();
 
-    // Phase 3: one QEF vertex per leaf that has sign-changing edges. A leaf
-    // can survive pruning without a crossing (intervals are conservative);
-    // such cells get no vertex, exactly like uncrossed cells of the uniform
-    // grid.
-    let candidates: Vec<Option<Point3>> = leaves
+    // Phase 3: one QEF vertex per surface component of each leaf that has
+    // sign-changing edges. A leaf can survive pruning without a crossing
+    // (intervals are conservative); such cells get no vertex, exactly like
+    // uncrossed cells of the uniform grid. Two-sheet cells get one vertex per
+    // sheet so the stitch never pinches them (of-54d).
+    let candidates: Vec<Option<CellComponents>> = leaves
         .par_iter()
-        .map(|&cell| qef_vertex(sdf, &g, &corner_values, cell))
+        .map(|&cell| cell_components(sdf, &g, &corner_values, cell))
         .collect();
-    let mut cell_vertex: HashMap<[u32; 3], usize> = HashMap::new();
+    let mut cell_vertex: HashMap<[u32; 3], LeafRef> = HashMap::new();
     for (cell, candidate) in leaves.iter().zip(candidates) {
-        if let Some(p) = candidate {
-            cell_vertex.insert(*cell, mesh.positions.len());
-            mesh.positions.push(p);
+        if let Some(cc) = candidate {
+            let base = mesh.positions.len();
+            mesh.positions
+                .extend_from_slice(&cc.points[..cc.count as usize]);
+            cell_vertex.insert(
+                *cell,
+                LeafRef {
+                    base,
+                    comp_of_edge: cc.comp_of_edge,
+                },
+            );
         }
     }
 
@@ -327,55 +420,58 @@ fn collect_leaves(
     }
 }
 
-/// QEF vertex for one leaf cell, or `None` if no cell edge crosses the
-/// surface. Crossing points come from linear interpolation of the corner
-/// values; normals from the SDF gradient at each crossing.
-fn qef_vertex(
+/// Per-component QEF vertices for one leaf cell.
+struct CellComponents {
+    /// Component id per [`CELL_EDGES`] slot ([`NO_COMP`] on uncrossed edges).
+    comp_of_edge: [u8; 12],
+    /// Number of surface components (1..=4).
+    count: u8,
+    /// One QEF vertex per component, in `[0..count]`.
+    points: [Point3; 4],
+}
+
+/// Numbered dual vertices for one leaf: component `c`'s vertex is mesh
+/// position `base + c`, and a crossed edge slot maps to its component through
+/// `comp_of_edge`.
+struct LeafRef {
+    base: usize,
+    comp_of_edge: [u8; 12],
+}
+
+/// Per-component QEF vertices for one leaf cell, or `None` if no cell edge
+/// crosses the surface. Crossing points come from linear interpolation of the
+/// corner values; normals from the SDF gradient at each crossing; components
+/// from [`classify_components`].
+fn cell_components(
     sdf: &dyn Sdf,
     g: &OctGrid,
     values: &HashMap<[u32; 3], f64>,
     cell: [u32; 3],
-) -> Option<Point3> {
-    let mut points: Vec<Vector3> = Vec::new();
-    let mut normals: Vec<Vector3> = Vec::new();
-    for &(a, b) in &CELL_EDGES {
-        let ka = cell_corner(cell, a);
-        let kb = cell_corner(cell, b);
-        let va = values[&ka];
-        let vb = values[&kb];
-        if (va < 0.0) == (vb < 0.0) {
-            continue;
-        }
-        let t = va / (va - vb);
-        let pa = g.point_at(ka);
-        let pb = g.point_at(kb);
-        let p = pa.coords + (pb.coords - pa.coords) * t;
-        let grad = sdf.grad(&Point3::from(p));
-        let norm = grad.norm();
-        points.push(p);
-        // Degenerate gradient: the point still anchors the mass point but
-        // contributes no plane.
-        normals.push(if norm > 1e-12 {
-            grad / norm
-        } else {
-            Vector3::zeros()
-        });
-    }
-    if points.is_empty() {
+) -> Option<CellComponents> {
+    let corners: [f64; 8] = std::array::from_fn(|c| values[&cell_corner(cell, c)]);
+    if !has_sign_change(&corners) {
         return None;
     }
-    Some(solve_qef(&points, &normals, &g.cell_bounds(0, cell)))
+    let (comp_of_edge, count) = classify_components(&corners);
+    let crossings = edge_crossings(sdf, &corners, |b| g.point_at(cell_corner(cell, b)));
+    let points = component_qef(&comp_of_edge, count, &crossings, &g.cell_bounds(0, cell));
+    Some(CellComponents {
+        comp_of_edge,
+        count,
+        points,
+    })
 }
 
 /// Two triangles for the interior grid edge along axis `d` starting at
 /// lattice point `e0`, or `None` if the edge has no sign change or lies on
-/// the boundary layer. Winding matches the uniform mesher: the quad
-/// (0,0),(1,0),(1,1),(0,1) over the perpendicular axes faces +d, reversed
-/// when the surface faces -d.
+/// the boundary layer. Each surrounding cell contributes the vertex of the
+/// surface component that owns this edge, so two-sheet cells no longer pinch.
+/// Winding matches the uniform mesher: the quad (0,0),(1,0),(1,1),(0,1) over
+/// the perpendicular axes faces +d, reversed when the surface faces -d.
 fn edge_quad(
     g: &OctGrid,
     values: &HashMap<[u32; 3], f64>,
-    cell_vertex: &HashMap<[u32; 3], usize>,
+    cell_vertex: &HashMap<[u32; 3], LeafRef>,
     d: usize,
     e0: [u32; 3],
 ) -> Option<[[usize; 3]; 2]> {
@@ -392,6 +488,7 @@ fn edge_quad(
     if inside0 == (v1 < 0.0) {
         return None;
     }
+    let (p, q) = perp_axes(d);
     let cell = |a: u32, b: u32| {
         let mut c = e0;
         c[u] = c[u] - 1 + a;
@@ -399,9 +496,18 @@ fn edge_quad(
         // A sign change on this edge puts both signs in every adjacent
         // cell's corner set, so eval_interval must contain zero for all
         // four: none was pruned and each has a crossing, hence a vertex.
-        *cell_vertex
+        let lr = cell_vertex
             .get(&c)
-            .expect("cell adjacent to a sign-change edge must have a vertex")
+            .expect("cell adjacent to a sign-change edge must have a vertex");
+        // This grid edge's slot within the cell's CELL_EDGES, then the
+        // component that owns it.
+        let mut delta = [0usize; 3];
+        delta[u] = 1 - a as usize;
+        delta[v] = 1 - b as usize;
+        let slot = 4 * d + delta[p] + 2 * delta[q];
+        let comp = lr.comp_of_edge[slot];
+        debug_assert_ne!(comp, NO_COMP, "crossed edge missing from its cell");
+        lr.base + comp as usize
     };
     let mut quad = [cell(0, 0), cell(1, 0), cell(1, 1), cell(0, 1)];
     if !inside0 {
@@ -430,9 +536,37 @@ struct Leaf {
     depth: u32,
     /// Field values at the cell corners ([`corner`] bit layout).
     corners: [f64; 8],
-    vertex: Point3,
-    /// Position of `vertex` in the mesh, assigned by [`number_leaves`].
-    index: usize,
+    /// Component id per [`CELL_EDGES`] slot ([`NO_COMP`] on uncrossed edges).
+    /// Only meaningful for `count > 1`; single-component leaves always use
+    /// their one vertex regardless of slot.
+    comp_of_edge: [u8; 12],
+    /// Number of surface components (1..=4). Coarse (non-`max_depth`) leaves
+    /// are always 1; only finest leaves can hold two sheets.
+    count: u8,
+    /// One QEF vertex per component, in `[0..count]`.
+    vertices: [Point3; 4],
+    /// Mesh position of each component vertex, assigned by [`number_leaves`].
+    indices: [usize; 4],
+}
+
+impl Leaf {
+    /// Mesh vertex index of the component owning the minimal edge parallel to
+    /// `e` on side `k` (the slot layout of [`edge_proc`]). Single-component
+    /// leaves ignore the slot; multi-component leaves (always finest, so the
+    /// minimal edge is one of their own cell edges) look the owner up.
+    fn comp_index(&self, e: usize, k: usize) -> usize {
+        if self.count == 1 {
+            return self.indices[0];
+        }
+        let (p, q) = perp_axes(e);
+        let mut pos = [0usize; 3];
+        pos[(e + 1) % 3] = 1 - (k >> 1);
+        pos[(e + 2) % 3] = 1 - (k & 1);
+        let slot = 4 * e + pos[p] + 2 * pos[q];
+        let c = self.comp_of_edge[slot];
+        let c = if c == NO_COMP { 0 } else { c as usize };
+        self.indices[c]
+    }
 }
 
 fn as_leaf(node: &Node) -> Option<&Leaf> {
@@ -478,13 +612,16 @@ fn mesh_graded(sdf: &dyn Sdf, opts: &AdaptiveMeshOptions, accuracy: f64) -> Tria
     mesh
 }
 
-/// Assign mesh vertex indices to leaves in deterministic recursion order.
+/// Assign mesh vertex indices to leaf component vertices in deterministic
+/// recursion order.
 fn number_leaves(node: &mut Node, positions: &mut Vec<Point3>) {
     match node {
         Node::Empty => {}
         Node::Leaf(l) => {
-            l.index = positions.len();
-            positions.push(l.vertex);
+            for c in 0..l.count as usize {
+                l.indices[c] = positions.len();
+                positions.push(l.vertices[c]);
+            }
         }
         Node::Internal(children) => {
             for child in children.iter_mut() {
@@ -510,41 +647,18 @@ impl GradedBuilder<'_> {
         self.subdivide(depth, coords, corners)
     }
 
-    /// Linear-interpolation surface crossings on the sign-changing edges of
-    /// the cell.
-    fn hit_points(&self, depth: u32, coords: [u32; 3], corners: &[f64; 8]) -> Vec<Vector3> {
+    /// Crossing point and unit normal for each sign-changing cell edge, at
+    /// this cell's depth.
+    fn crossings(
+        &self,
+        depth: u32,
+        coords: [u32; 3],
+        corners: &[f64; 8],
+    ) -> [Option<(Vector3, Vector3)>; 12] {
         let shift = self.max_depth - depth;
-        let mut points = Vec::new();
-        for &(a, b) in &CELL_EDGES {
-            let va = corners[a];
-            let vb = corners[b];
-            if (va < 0.0) == (vb < 0.0) {
-                continue;
-            }
-            let t = va / (va - vb);
-            let pa = self.g.point_at(corner_key(coords, shift, a));
-            let pb = self.g.point_at(corner_key(coords, shift, b));
-            points.push(pa.coords + (pb.coords - pa.coords) * t);
-        }
-        points
-    }
-
-    /// Unit normals at the crossing points; zero where the gradient is
-    /// degenerate (those anchor the QEF mass point but contribute no plane
-    /// and are skipped by the feature test).
-    fn hit_normals(&self, points: &[Vector3]) -> Vec<Vector3> {
-        points
-            .iter()
-            .map(|p| {
-                let grad = self.sdf.grad(&Point3::from(*p));
-                let norm = grad.norm();
-                if norm > 1e-12 {
-                    grad / norm
-                } else {
-                    Vector3::zeros()
-                }
-            })
-            .collect()
+        edge_crossings(self.sdf, corners, |b| {
+            self.g.point_at(corner_key(coords, shift, b))
+        })
     }
 
     /// Terminate refinement here if the cell's one-vertex surface model is
@@ -552,25 +666,33 @@ impl GradedBuilder<'_> {
     /// `None` means the cell must subdivide. Only called on sign-changing
     /// cells, so a returned leaf always carries a vertex — which the stitch
     /// relies on: any sign-changing minimal edge abutting this leaf can
-    /// reference it.
+    /// reference it. A returned leaf is always single-component: two-sheet
+    /// cells (whose crossing normals disagree) are forced to subdivide so
+    /// each sheet gets its own vertex at `max_depth`.
     fn try_leaf(&self, depth: u32, coords: [u32; 3], corners: [f64; 8]) -> Option<Node> {
-        let points = self.hit_points(depth, coords, &corners);
-        debug_assert!(!points.is_empty(), "sign change must produce crossings");
+        let (comp_of_edge, count) = classify_components(&corners);
+        debug_assert!(count >= 1, "sign change must produce a component");
+        // Two sheets in one cell cannot be modeled by a single vertex; refine
+        // so the finest level places one vertex per sheet.
+        if count > 1 {
+            return None;
+        }
+        let crossings = self.crossings(depth, coords, &corners);
 
         // Chordal deviation of the linear edge model: |f| at an interpolated
         // crossing measures how far the local linearization strays from the
         // true surface (cheap first: skips gradient work on cells that
         // clearly refine).
-        let err = points
+        let err = crossings
             .iter()
-            .map(|p| self.sdf.eval(&Point3::from(*p)).abs())
+            .filter_map(|c| c.map(|(p, _)| self.sdf.eval(&Point3::from(p)).abs()))
             .fold(0.0, f64::max);
         if err > self.accuracy {
             return None;
         }
 
         // Sharp feature or strong curvature: refine to max_depth.
-        let normals = self.hit_normals(&points);
+        let normals: Vec<Vector3> = crossings.iter().filter_map(|c| c.map(|(_, n)| n)).collect();
         for (i, a) in normals.iter().enumerate() {
             if a.norm_squared() == 0.0 {
                 continue;
@@ -583,33 +705,49 @@ impl GradedBuilder<'_> {
         }
 
         let shift = self.max_depth - depth;
-        let vertex = solve_qef(&points, &normals, &self.g.cell_bounds(shift, coords));
-        if self.sdf.eval(&vertex).abs() > self.accuracy {
+        let vertices = component_qef(
+            &comp_of_edge,
+            count,
+            &crossings,
+            &self.g.cell_bounds(shift, coords),
+        );
+        if self.sdf.eval(&vertices[0]).abs() > self.accuracy {
             return None;
         }
         Some(Node::Leaf(Box::new(Leaf {
             depth,
             corners,
-            vertex,
-            index: usize::MAX,
+            comp_of_edge,
+            count,
+            vertices,
+            indices: [usize::MAX; 4],
         })))
     }
 
     /// Finest-level cell: a leaf if any edge crosses, otherwise `Empty`
     /// (conservative intervals let crossingless cells survive to the
-    /// bottom, exactly like uncrossed cells of the uniform grid).
+    /// bottom, exactly like uncrossed cells of the uniform grid). This is the
+    /// only place two-sheet cells materialize, so it places one vertex per
+    /// surface component.
     fn max_depth_leaf(&self, depth: u32, coords: [u32; 3], corners: [f64; 8]) -> Node {
         if !has_sign_change(&corners) {
             return Node::Empty;
         }
-        let points = self.hit_points(depth, coords, &corners);
-        let normals = self.hit_normals(&points);
-        let vertex = solve_qef(&points, &normals, &self.g.cell_bounds(0, coords));
+        let (comp_of_edge, count) = classify_components(&corners);
+        let crossings = self.crossings(depth, coords, &corners);
+        let vertices = component_qef(
+            &comp_of_edge,
+            count,
+            &crossings,
+            &self.g.cell_bounds(0, coords),
+        );
         Node::Leaf(Box::new(Leaf {
             depth,
             corners,
-            vertex,
-            index: usize::MAX,
+            comp_of_edge,
+            count,
+            vertices,
+            indices: [usize::MAX; 4],
         }))
     }
 
@@ -830,9 +968,11 @@ fn edge_proc(n: [&Node; 4], e: usize, out: &mut Vec<[usize; 3]>) {
 /// Emit the dual polygon for the minimal edge shared by four leaves. The
 /// sign test reads the deepest leaf's own corners (the minimal edge is one
 /// of its lattice edges); a coarse leaf spanning two quadrants appears
-/// twice and degenerates the quad into a triangle. Winding matches
-/// [`edge_quad`]: the quad `(0,0),(1,0),(1,1),(0,1)` over the perpendicular
-/// axes faces `+e`, reversed when the surface faces `-e`.
+/// twice and degenerates the quad into a triangle. Each leaf contributes the
+/// vertex of the component that owns the minimal edge, so two-sheet cells no
+/// longer pinch. Winding matches [`edge_quad`]: the quad
+/// `(0,0),(1,0),(1,1),(0,1)` over the perpendicular axes faces `+e`, reversed
+/// when the surface faces `-e`.
 fn process_edge(leaves: [&Leaf; 4], e: usize, out: &mut Vec<[usize; 3]>) {
     let deepest = (0..4)
         .max_by_key(|&k| leaves[k].depth)
@@ -850,10 +990,10 @@ fn process_edge(leaves: [&Leaf; 4], e: usize, out: &mut Vec<[usize; 3]>) {
         return;
     }
     let mut quad = [
-        leaves[0].index,
-        leaves[2].index,
-        leaves[3].index,
-        leaves[1].index,
+        leaves[0].comp_index(e, 0),
+        leaves[2].comp_index(e, 2),
+        leaves[3].comp_index(e, 3),
+        leaves[1].comp_index(e, 1),
     ];
     if !inside0 {
         quad.reverse();
@@ -1165,6 +1305,99 @@ mod tests {
             let centroid =
                 (tri.positions[0].coords + tri.positions[1].coords + tri.positions[2].coords) / 3.0;
             assert!(e1.cross(&e2).dot(&centroid) > 0.0, "triangle wound inward");
+        }
+    }
+
+    /// Undirected edges shared by exactly four triangles: the pinched-edge
+    /// signature of two surface sheets forced through one cell vertex (of-54d).
+    /// Zero on a correctly component-split mesh.
+    fn four_triangle_edges(mesh: &TriangleMesh) -> usize {
+        let mut edges: HashMap<(usize, usize), u32> = HashMap::new();
+        for tri in &mesh.indices {
+            for e in 0..3 {
+                let a = tri[e];
+                let b = tri[(e + 1) % 3];
+                *edges.entry((a.min(b), a.max(b))).or_insert(0) += 1;
+            }
+        }
+        edges.values().filter(|&&c| c == 4).count()
+    }
+
+    /// Two overlapping unit spheres, subtracted: the difference has a sharp
+    /// concave crease circle where the sheets meet, so cells beside the crease
+    /// are crossed by both sheets — the two-sheets-per-cell band that pinched
+    /// with one vertex per cell (of-54d).
+    fn subtracted_spheres() -> Subtraction<Sphere, Sphere> {
+        Subtraction {
+            a: Sphere {
+                center: Point3::origin(),
+                radius: 1.0,
+            },
+            b: Sphere {
+                center: Point3::new(1.0, 0.0, 0.0),
+                radius: 1.0,
+            },
+        }
+    }
+
+    /// Regression for of-54d: the uniform-depth adaptive mesher shares the
+    /// uniform grid's per-edge stitch, so — like the uniform grid — one vertex
+    /// per surface component must keep the CSG crease band free of
+    /// four-triangle (pinched) edges at every resolution. Before the port a
+    /// single vertex per cell fused the two sheets into non-manifold pinches.
+    #[test]
+    fn uniform_depth_crease_band_has_no_pinched_edges() {
+        let shape = subtracted_spheres();
+        for max_depth in [4, 5, 6, 7] {
+            let mesh = mesh_sdf_adaptive_indexed(
+                &shape,
+                &AdaptiveMeshOptions {
+                    bounds: bounds(1.4),
+                    max_depth,
+                    accuracy: None,
+                },
+            );
+            assert!(!mesh.is_empty(), "empty mesh at depth {max_depth}");
+            assert_eq!(
+                four_triangle_edges(&mesh),
+                0,
+                "pinched edges at depth {max_depth}"
+            );
+            assert!(
+                mesh.is_closed_manifold(),
+                "not a closed manifold at depth {max_depth}"
+            );
+        }
+    }
+
+    /// Graded refinement must also place one vertex per sheet: the two-sheet
+    /// crease band comes out manifold with no pinched edges. Multi-sheet cells
+    /// refine to `max_depth` and split into per-component vertices there.
+    #[test]
+    fn graded_crease_band_has_no_pinched_edges() {
+        let shape = subtracted_spheres();
+        for (max_depth, acc) in [(5, 0.02), (5, 0.005), (6, 0.01), (6, 0.005)] {
+            let mesh = mesh_sdf_adaptive_indexed(
+                &shape,
+                &AdaptiveMeshOptions {
+                    bounds: bounds(1.4),
+                    max_depth,
+                    accuracy: Some(acc),
+                },
+            );
+            assert!(
+                !mesh.is_empty(),
+                "empty mesh at depth {max_depth}, acc {acc}"
+            );
+            assert_eq!(
+                four_triangle_edges(&mesh),
+                0,
+                "pinched edges at depth {max_depth}, acc {acc}"
+            );
+            assert!(
+                mesh.is_closed_manifold(),
+                "not a closed manifold at depth {max_depth}, acc {acc}"
+            );
         }
     }
 

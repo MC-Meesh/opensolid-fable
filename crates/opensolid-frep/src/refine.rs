@@ -145,27 +145,47 @@ pub fn refine_mesh(sdf: &dyn Sdf, mesh: &mut TriangleMesh, opts: &RefineOptions)
         .collect();
 }
 
+/// Number of undirected edges shared by exactly four triangles — the
+/// pinched-edge signature of two surface sheets fused through one dual-contour
+/// cell vertex (of-1ad / of-54d). Zero on a mesh whose meshers placed one
+/// vertex per surface component; a non-zero count means [`repair_pinched_edges`]
+/// would act.
+pub fn pinched_edge_count(mesh: &TriangleMesh) -> usize {
+    let mut counts: HashMap<(usize, usize), u32> = HashMap::new();
+    for tri in &mesh.indices {
+        for e in 0..3 {
+            let a = tri[e];
+            let b = tri[(e + 1) % 3];
+            *counts.entry((a.min(b), a.max(b))).or_insert(0) += 1;
+        }
+    }
+    counts.values().filter(|&&c| c == 4).count()
+}
+
 /// Split pinched edges — edges shared by four triangles — into their two
-/// surface sheets, duplicating the shared vertices per sheet.
+/// surface sheets, duplicating the shared vertices per sheet. Returns the
+/// number of four-triangle edges repaired.
 ///
 /// Dual contouring with one vertex per cell cannot represent two surface
 /// sheets crossing the same cell (the band around a CSG crease where both
 /// surfaces pass through a cell that does not contain the crease itself,
-/// of-1ad): it forces both sheets through one vertex, emitting edges used
-/// by four triangles. The uniform mesher places one vertex per surface
-/// component; the adaptive mesher does not (yet), so its output is repaired
-/// here: at each four-triangle edge the two coherently-wound triangle pairs
-/// are matched into sheets by geometric normal, triangle fans around every
-/// vertex are traced with sheet-mates connected *across* the pinched edges,
-/// and each extra fan gets its own copy of the vertex. Positions are
-/// unchanged (the pinch stays geometrically, at sub-cell scale on the
-/// crease band); the topology becomes two clean sheets with exactly two
-/// triangles per edge.
+/// of-1ad): it forces both sheets through one vertex, emitting edges used by
+/// four triangles. Both meshers now place one vertex per surface component
+/// ([`crate::mesh::classify_components`]), so this repair is a no-op on
+/// well-resolved output; it survives only as a safety net for the graded
+/// adaptive mesher's residual coarse cross-level creases (of-54d follow-up),
+/// where a single-vertex coarse cell can still bridge two finer sheets. At
+/// each four-triangle edge the two coherently-wound triangle pairs are
+/// matched into sheets by geometric normal, triangle fans around every vertex
+/// are traced with sheet-mates connected *across* the pinched edges, and each
+/// extra fan gets its own copy of the vertex. Positions are unchanged (the
+/// pinch stays geometrically, at sub-cell scale on the crease band); the
+/// topology becomes two clean sheets with exactly two triangles per edge.
 ///
 /// Edges with three, five, or more triangles, or without balanced
 /// orientations, are left untouched — no repair is guessed for genuinely
 /// broken input.
-fn repair_pinched_edges(mesh: &mut TriangleMesh) {
+fn repair_pinched_edges(mesh: &mut TriangleMesh) -> usize {
     // Directed incidences per undirected edge: (triangle, forward?).
     let mut edges: HashMap<(usize, usize), Vec<(usize, bool)>> = HashMap::new();
     for (t, tri) in mesh.indices.iter().enumerate() {
@@ -178,8 +198,9 @@ fn repair_pinched_edges(mesh: &mut TriangleMesh) {
                 .push((t, a < b));
         }
     }
-    if !edges.values().any(|inc| inc.len() == 4) {
-        return;
+    let pinched = edges.values().filter(|inc| inc.len() == 4).count();
+    if pinched == 0 {
+        return 0;
     }
 
     let geo_normal = |t: usize| {
@@ -287,6 +308,7 @@ fn repair_pinched_edges(mesh: &mut TriangleMesh) {
         }
     }
     mesh.indices = new_tris;
+    pinched
 }
 
 /// Active branch surfaces near `p`, deduplicated by normal direction:

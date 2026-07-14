@@ -517,6 +517,45 @@ mod tests {
         }
     }
 
+    /// Regression for of-54d: at the playground's default accuracy the raw
+    /// graded adaptive mesh of the default scene must have zero four-triangle
+    /// (pinched) edges — the crown where the hole meets the sphere is a
+    /// two-sheets-per-cell band that fused into a ragged non-manifold scar
+    /// before per-component cell vertices. The `repair_pinched_edges` fallback
+    /// therefore does nothing here (a no-op), and the crown wireframe is
+    /// locally manifold.
+    #[test]
+    fn mesh_adaptive_default_scene_has_no_pinched_edges() {
+        let part = default_playground_scene();
+        let bounds = part.mesh_bounds(64);
+        let extent = max_extent(&bounds).max(1e-9);
+        // The playground meshes at 0.005; check the whole clean band around it.
+        for acc in [0.01, 0.005, 0.0025, 0.001] {
+            let max_depth = (extent / acc)
+                .log2()
+                .ceil()
+                .clamp(ADAPTIVE_MIN_DEPTH as f64, ADAPTIVE_MAX_DEPTH as f64)
+                as u32;
+            let mesh = mesh_sdf_adaptive_indexed(
+                &part.shape,
+                &AdaptiveMeshOptions {
+                    bounds,
+                    max_depth,
+                    accuracy: Some(acc),
+                },
+            );
+            assert_eq!(
+                opensolid_frep::refine::pinched_edge_count(&mesh),
+                0,
+                "raw adaptive default scene has pinched edges at acc {acc}"
+            );
+            assert!(
+                mesh.is_closed_manifold(),
+                "raw adaptive default scene not manifold at acc {acc}"
+            );
+        }
+    }
+
     /// The default playground scene (smooth blend + sharp hole rims) must
     /// mesh watertight and on-target through the adaptive path.
     #[test]
