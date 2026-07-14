@@ -280,11 +280,12 @@ fn step_block_minus_sphere_reimports_with_analytic_volume() {
 
 /// Direct volume measurement of the re-imported solid, by using it as an
 /// operand of a second exact boolean (a corner nibble far from the dimple)
-/// and measuring that output's CDT tessellation. Blocked on of-6cf: a
-/// second boolean on a body carrying circular-arc edges passes `check()`
-/// but tessellates non-manifold — even without the STEP trip.
+/// and measuring that output's CDT tessellation. Regression for of-6cf: a
+/// second boolean on a body carrying circular-arc edges used to pass
+/// `check()` but tessellate non-manifold, because the untouched spherical
+/// cap's closed rim ring was not cut at its seam vertex (shared with the
+/// cap's seam meridian), tearing the pole slit at the seam.
 #[test]
-#[ignore = "of-6cf: chained boolean on a curved-edge body tessellates non-manifold"]
 fn reimported_step_solid_works_as_boolean_operand() {
     let context = "re-imported STEP solid as boolean operand";
     let (r, h) = (0.3, 0.05);

@@ -2104,6 +2104,31 @@ impl<'a> Pipeline<'a> {
             by_source.insert(source, ids);
         };
         for s in 0..2 {
+            // Closed boundary edges that share a loop with other edges (e.g.
+            // a spherical cap's rim ring alongside its seam meridian) meet
+            // those edges at their topological vertex. That vertex must bound
+            // an atom or the loop walk tears there: with no split the closed
+            // ring keeps its full-period parameterization, and when the loop
+            // is reversed (a face whose outward side opposes the surface
+            // normal) the ring becomes the first dart and starts one sample
+            // off the shared vertex — so the pole slit's two sides get
+            // mismatched rim vertices and the seam tessellates non-manifold
+            // (of-6cf). A lone closed edge (its own single-edge loop) keeps
+            // embed_walk's ring rotation.
+            let mut closed_shares_loop: std::collections::HashSet<usize> =
+                std::collections::HashSet::new();
+            for face in &self.solids[s].faces {
+                for lp in &face.loops {
+                    if lp.len() <= 1 {
+                        continue;
+                    }
+                    for de in lp {
+                        if self.solids[s].edges[de.edge].closed {
+                            closed_shares_loop.insert(de.edge);
+                        }
+                    }
+                }
+            }
             for (e, sampled) in self.edge_samples[s].iter().enumerate() {
                 let source = CurveSource::Edge { solid: s, edge: e };
                 let mut splits = self.splits.get(&source).cloned().unwrap_or_default();
@@ -2113,8 +2138,11 @@ impl<'a> Pipeline<'a> {
                 // too or the traversal tears there (full-wrap imprints
                 // crossing the torus seam circles, of-7ld.7). Inserted
                 // first so a coincident imprint split defers to the
-                // vertex's exact position in `split_sampled`'s dedup.
-                if sampled.closed && !splits.is_empty() {
+                // vertex's exact position in `split_sampled`'s dedup. The
+                // same cut is forced for a closed edge that shares a
+                // multi-edge loop (of-6cf), even when it carries no imprint
+                // splits of its own.
+                if sampled.closed && (!splits.is_empty() || closed_shares_loop.contains(&e)) {
                     splits.insert(0, sampled.points[0]);
                 }
                 push_all(
