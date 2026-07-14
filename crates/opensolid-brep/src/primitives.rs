@@ -1,5 +1,5 @@
 //! B-Rep primitive solids (`spec/03-topology.md` §4): block, cylinder,
-//! sphere, torus.
+//! sphere, torus, cone/frustum.
 //!
 //! Every builder produces a closed, manifold, consistently-oriented solid
 //! that passes [`TopologyStore::check`] and carries full geometry: a
@@ -27,11 +27,16 @@
 //! | cylinder  | 2 | 3 | 3 | 3 | 0     | 2-3+3 = 2                |
 //! | sphere    | 2 | 1 | 1 | 1 | 0     | 2-1+1 = 2                |
 //! | torus     | 1 | 2 | 1 | 1 | 1     | 1-2+1 = 0                |
+//! | frustum   | 2 | 3 | 3 | 3 | 0     | 2-3+3 = 2                |
+//! | cone(apex)| 2 | 2 | 2 | 2 | 0     | 2-2+2 = 2                |
 //!
 //! The sphere's poles need no edges: the seam meridian ends in a vertex at
 //! each pole, and the surface parameterization's polar singularities lie in
 //! the face interior (handled by [`SurfaceEval::is_singular`], see
-//! [`crate::surface`]).
+//! [`crate::surface`]). A cone with a pointed cap (one radius zero) is the
+//! same story: the apex is a lone vertex where the wall's `u`-circle
+//! collapses, so that end contributes no cap face or circle edge — a frustum
+//! (both radii positive) mirrors the cylinder exactly.
 //!
 //! Builders validate all arguments and construct all geometry *before*
 //! touching either store, so a failed call leaves both stores exactly as
@@ -366,6 +371,139 @@ pub fn torus(
     Ok(body)
 }
 
+/// Truncated or pointed cone about the `+Z` axis, centered at the origin:
+/// radius `radius_bottom` at `z = -height/2`, radius `radius_top` at
+/// `z = +height/2`. Exactly one radius may be zero (a pointed apex); both
+/// zero, or two (nearly) equal radii, are rejected — an equal-radius solid
+/// is a cylinder, which has its own builder and a well-defined half-angle.
+///
+/// A frustum (both radii positive) has the cylinder's topology — two cap
+/// circles, an axial-generator seam, three faces. A pointed cone replaces
+/// the zero-radius cap with a single apex vertex where the wall's `u`-circle
+/// collapses, dropping that end's cap face and circle edge.
+///
+/// # Errors
+/// [`CoreError::InvalidArgument`] if `height` is not positive and finite, if
+/// either radius is negative or non-finite, if both radii are zero, or if
+/// the radii are equal to within [`SYSTEM_RESOLUTION`] (use `cylinder`).
+pub fn cone(
+    store: &mut TopologyStore,
+    geo: &mut GeometryStore,
+    radius_bottom: f64,
+    radius_top: f64,
+    height: f64,
+) -> CoreResult<EntityId<Body>> {
+    for (name, r) in [("radius_bottom", radius_bottom), ("radius_top", radius_top)] {
+        if r < 0.0 || !r.is_finite() {
+            return Err(CoreError::InvalidArgument {
+                argument: name,
+                reason: format!("must be non-negative and finite, got {r}"),
+            });
+        }
+    }
+    if radius_bottom == 0.0 && radius_top == 0.0 {
+        return Err(CoreError::InvalidArgument {
+            argument: "radius_bottom",
+            reason: "radius_bottom and radius_top cannot both be zero; give at \
+                     least one cap a positive radius"
+                .into(),
+        });
+    }
+    if (radius_bottom - radius_top).abs() <= SYSTEM_RESOLUTION {
+        return Err(CoreError::InvalidArgument {
+            argument: "radius_top",
+            reason: format!(
+                "radii are equal to within resolution ({radius_bottom} ≈ \
+                 {radius_top}); build a cylinder instead"
+            ),
+        });
+    }
+    let h = positive_dim("height", height)?;
+    let hz = h / 2.0;
+    let axis = Vector3::z();
+    let bottom_center = Point3::new(0.0, 0.0, -hz);
+    let top_center = Point3::new(0.0, 0.0, hz);
+
+    // The wall is a `Surface3::Cone` widening toward its larger cap, so its
+    // frame axis points that way and its `v = 0` sits on that (always
+    // positive-radius) cap — never the apex, keeping `v = 0` regular.
+    // `plane_basis(±Z).0 = +X`, so either orientation puts the `u = 0`
+    // generator on the `+X` half-plane, matching the caps' circles (`t = 0`
+    // at `+X`) and the seam. Validate-then-mutate: build all geometry before
+    // touching either store.
+    let half_angle = ((radius_bottom - radius_top).abs() / h).atan();
+    let (big_center, big_radius, small_center) = if radius_bottom > radius_top {
+        (bottom_center, radius_bottom, top_center)
+    } else {
+        (top_center, radius_top, bottom_center)
+    };
+    let wall = Surface3::cone(
+        big_center,
+        (big_center - small_center).normalize(),
+        half_angle,
+        big_radius,
+    )?;
+
+    let body = store.create_body(BodyType::Solid);
+    let shell = store.create_shell(body, true, ShellOrientation::Outward);
+
+    // The apex-side vertex sits on the axis; a positive-radius cap sits at
+    // `+X`. The seam runs bottom→top along the `+X` generator.
+    let v_bottom = store.create_vertex(Point3::new(radius_bottom, 0.0, -hz), SYSTEM_RESOLUTION);
+    let v_top = store.create_vertex(Point3::new(radius_top, 0.0, hz), SYSTEM_RESOLUTION);
+    let seam_dir = Vector3::new(radius_top - radius_bottom, 0.0, h);
+    let slant = seam_dir.norm();
+    let e_seam = {
+        let seam = Curve3::line(Point3::new(radius_bottom, 0.0, -hz), seam_dir)?;
+        let curve = geo.add_curve(seam);
+        make_edge(store, v_bottom, v_top, curve, 0.0, slant)
+    };
+
+    // Each positive-radius cap contributes a circle edge, a cap plane face,
+    // and a wall-loop fin; a zero-radius apex contributes none (its vertex is
+    // the seam endpoint). The wall loop is the cylinder's
+    // `bottom · seam↑ · top⁻¹ · seam↓` with any collapsed cap's circle fin
+    // dropped.
+    let mut wall_loop: Vec<(EntityId<Edge>, FinSense)> = Vec::with_capacity(4);
+
+    if radius_bottom > 0.0 {
+        let e_bottom = {
+            let circle = Curve3::circle(bottom_center, axis, radius_bottom)?;
+            let curve = geo.add_curve(circle);
+            make_edge(store, v_bottom, v_bottom, curve, 0.0, TWO_PI)
+        };
+        // Bottom cap looks along -Z: CCW about -Z runs against the circle.
+        let plane = Surface3::plane(bottom_center, -axis)?;
+        let f_bottom = store.create_face(shell, FaceSense::Positive);
+        store.faces.get_mut(f_bottom).expect("just created").surface = Some(geo.add_surface(plane));
+        store.create_loop(f_bottom, LoopType::Outer, &[(e_bottom, FinSense::Reversed)]);
+        wall_loop.push((e_bottom, FinSense::Forward));
+    }
+
+    wall_loop.push((e_seam, FinSense::Forward));
+
+    if radius_top > 0.0 {
+        let e_top = {
+            let circle = Curve3::circle(top_center, axis, radius_top)?;
+            let curve = geo.add_curve(circle);
+            make_edge(store, v_top, v_top, curve, 0.0, TWO_PI)
+        };
+        let plane = Surface3::plane(top_center, axis)?;
+        let f_top = store.create_face(shell, FaceSense::Positive);
+        store.faces.get_mut(f_top).expect("just created").surface = Some(geo.add_surface(plane));
+        store.create_loop(f_top, LoopType::Outer, &[(e_top, FinSense::Forward)]);
+        wall_loop.push((e_top, FinSense::Reversed));
+    }
+
+    wall_loop.push((e_seam, FinSense::Reversed));
+
+    let f_wall = store.create_face(shell, FaceSense::Positive);
+    store.faces.get_mut(f_wall).expect("just created").surface = Some(geo.add_surface(wall));
+    store.create_loop(f_wall, LoopType::Outer, &wall_loop);
+
+    Ok(body)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -634,11 +772,148 @@ mod tests {
         // Spindle torus (major <= minor) rejected by the surface constructor.
         assert!(torus(&mut store, &mut geo, 1.0, 1.0).is_err());
         assert!(torus(&mut store, &mut geo, 0.5, 1.0).is_err());
+        // Cone: both radii zero, equal radii (→ cylinder), negatives, bad
+        // height.
+        assert!(cone(&mut store, &mut geo, 0.0, 0.0, 2.0).is_err());
+        assert!(cone(&mut store, &mut geo, 1.0, 1.0, 2.0).is_err());
+        assert!(cone(&mut store, &mut geo, -1.0, 0.5, 2.0).is_err());
+        assert!(cone(&mut store, &mut geo, 1.0, 0.5, 0.0).is_err());
+        assert!(cone(&mut store, &mut geo, 1.0, 0.5, f64::NAN).is_err());
 
         // Failed builders leave both stores untouched.
         assert!(store.bodies.is_empty());
         assert!(store.vertices.is_empty());
         assert!(geo.curves.is_empty());
         assert!(geo.surfaces.is_empty());
+    }
+
+    /// Build a frustum and both pointed-apex orientations into one store.
+    fn build_cones() -> (TopologyStore, GeometryStore, [EntityId<Body>; 3]) {
+        let mut store = TopologyStore::new();
+        let mut geo = GeometryStore::new();
+        let bodies = [
+            cone(&mut store, &mut geo, 2.0, 1.0, 3.0).expect("valid frustum"),
+            cone(&mut store, &mut geo, 1.5, 0.0, 4.0).expect("valid apex-top cone"),
+            cone(&mut store, &mut geo, 0.0, 1.5, 4.0).expect("valid apex-bottom cone"),
+        ];
+        (store, geo, bodies)
+    }
+
+    #[test]
+    fn cone_variants_pass_check_and_count() {
+        let (store, geo, [frustum, apex_top, apex_bottom]) = build_cones();
+        for body in [frustum, apex_top, apex_bottom] {
+            let failures = store.check(body);
+            assert!(failures.is_empty(), "{body:?} failed check: {failures:?}");
+            assert!(store.euler_counts(body).euler_poincare_holds(), "{body:?}");
+        }
+
+        let counts = |body| store.euler_counts(body);
+        // Frustum mirrors the cylinder; a pointed cone drops one cap face and
+        // circle edge (the apex is a lone seam-endpoint vertex).
+        assert_eq!(
+            counts(frustum),
+            EulerCounts {
+                vertices: 2,
+                edges: 3,
+                faces: 3,
+                loops: 3,
+                rings: 0,
+                shells: 1,
+                genus: 0
+            }
+        );
+        for apex in [apex_top, apex_bottom] {
+            assert_eq!(
+                counts(apex),
+                EulerCounts {
+                    vertices: 2,
+                    edges: 2,
+                    faces: 2,
+                    loops: 2,
+                    rings: 0,
+                    shells: 1,
+                    genus: 0
+                }
+            );
+        }
+
+        // Surfaces: frustum = 2 caps + wall; pointed cone = 1 cap + wall.
+        let kinds = |body| -> Vec<&'static str> {
+            store
+                .faces_of_body(body)
+                .iter()
+                .map(|&f| {
+                    match geo
+                        .surface(store.face(f).unwrap().surface.unwrap())
+                        .unwrap()
+                    {
+                        Surface3::Plane { .. } => "plane",
+                        Surface3::Cone { .. } => "cone",
+                        _ => "other",
+                    }
+                })
+                .collect()
+        };
+        assert_eq!(kinds(frustum), vec!["plane", "plane", "cone"]);
+        assert_eq!(kinds(apex_top), vec!["plane", "cone"]);
+        assert_eq!(kinds(apex_bottom), vec!["plane", "cone"]);
+    }
+
+    #[test]
+    fn cone_is_a_closed_outward_solid_with_outward_wall() {
+        let (store, geo, bodies) = build_cones();
+        for body in bodies {
+            let shells = store.shells_of_body(body);
+            assert_eq!(shells.len(), 1);
+            let shell = store.shell(shells[0]).unwrap();
+            assert!(shell.is_closed);
+            assert_eq!(shell.orientation, ShellOrientation::Outward);
+
+            // The wall's normal at a mid-height, non-apex sample points away
+            // from the axis (outward radial component): a flipped wall loop
+            // would fail check() above, but this pins the orientation.
+            for &face in store.faces_of_body(body).iter() {
+                assert_eq!(store.face(face).unwrap().sense, FaceSense::Positive);
+                let surface = geo
+                    .surface(store.face(face).unwrap().surface.unwrap())
+                    .unwrap();
+                if let Surface3::Cone { .. } = surface {
+                    let n = surface.normal(0.0, 0.0).expect("wall non-apex normal");
+                    // +X-generator sample: outward normal has +X component.
+                    assert!(n.x > 0.0, "{face:?}: wall normal points inward");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cone_edges_interpolate_and_lie_on_surfaces() {
+        let (store, geo, bodies) = build_cones();
+        for body in bodies {
+            for face in store.faces_of_body(body) {
+                for edge_id in store.edges_of_face(face) {
+                    let edge = store.edge(edge_id).unwrap();
+                    let curve = geo.curve(edge.curve.unwrap()).unwrap();
+                    let start = store.vertex(edge.start_vertex).unwrap().point;
+                    let end = store.vertex(edge.end_vertex).unwrap().point;
+                    assert!((curve.point(edge.t_start) - start).norm() < 1e-9);
+                    assert!((curve.point(edge.t_end) - end).norm() < 1e-9);
+                    for adjacent in store.faces_of_edge(edge_id) {
+                        let surface = geo
+                            .surface(store.face(adjacent).unwrap().surface.unwrap())
+                            .unwrap();
+                        for k in 0..=8 {
+                            let t = edge.t_start + (edge.t_end - edge.t_start) * f64::from(k) / 8.0;
+                            let proj = surface.project_point(&curve.point(t));
+                            assert!(
+                                proj.distance < 1e-8,
+                                "{edge_id:?} at t={t}: off {adjacent:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 }
