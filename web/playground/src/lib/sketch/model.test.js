@@ -142,6 +142,32 @@ describe('sketch model', () => {
       ['e1', 'e2']
     );
     expect(constraintRefs({ type: 'radius', entity: 'e3' })).toEqual(['e3']);
+    expect(constraintRefs({ type: 'parallel', a: 'e1', b: 'e2' })).toEqual([
+      'e1',
+      'e2',
+    ]);
+    expect(
+      constraintRefs({ type: 'perpendicular', a: 'e1', b: 'e2' })
+    ).toEqual(['e1', 'e2']);
+    expect(constraintRefs({ type: 'collinear', a: 'e1', b: 'e2' })).toEqual([
+      'e1',
+      'e2',
+    ]);
+    expect(constraintRefs({ type: 'equal', a: 'e1', b: 'e2' })).toEqual([
+      'e1',
+      'e2',
+    ]);
+    expect(constraintRefs({ type: 'concentric', a: 'e1', b: 'e2' })).toEqual([
+      'e1',
+      'e2',
+    ]);
+    expect(
+      constraintRefs({ type: 'midpoint', point: 'p1', line: 'e1' })
+    ).toEqual(['p1', 'e1']);
+    expect(
+      constraintRefs({ type: 'symmetric', a: 'p1', b: 'p2', line: 'e1' })
+    ).toEqual(['p1', 'p2', 'e1']);
+    expect(constraintRefs({ type: 'fix', point: 'p1' })).toEqual(['p1']);
   });
 
   it('validateConstraint accepts valid and rejects invalid combos', () => {
@@ -177,5 +203,75 @@ describe('sketch model', () => {
       validateConstraint(s, { type: 'radius', entity: line, value: 1 })
     ).toMatch(/circle or arc/);
     expect(validateConstraint(s, { type: 'nope' })).toMatch(/unknown/);
+  });
+
+  it('validateConstraint handles the added relations', () => {
+    const s = createSketch();
+    const a = addPoint(s, 0, 0);
+    const b = addPoint(s, 1, 0);
+    const c = addPoint(s, 2, 2);
+    const line1 = addLine(s, a, b);
+    const line2 = addLine(s, b, c);
+    const circle1 = addCircle(s, a, 1);
+    const circle2 = addCircle(s, c, 2);
+
+    // parallel / perpendicular / collinear — two lines.
+    for (const type of ['parallel', 'perpendicular', 'collinear']) {
+      expect(validateConstraint(s, { type, a: line1, b: line2 })).toBeNull();
+      expect(
+        validateConstraint(s, { type, a: line1, b: circle1 })
+      ).toMatch(/lines/);
+      expect(validateConstraint(s, { type, a: line1, b: line1 })).toMatch(
+        /distinct/
+      );
+    }
+
+    // equal — two lines, or two curves, but not a mix.
+    expect(
+      validateConstraint(s, { type: 'equal', a: line1, b: line2 })
+    ).toBeNull();
+    expect(
+      validateConstraint(s, { type: 'equal', a: circle1, b: circle2 })
+    ).toBeNull();
+    expect(
+      validateConstraint(s, { type: 'equal', a: line1, b: circle1 })
+    ).toMatch(/lines or two circles/);
+
+    // concentric — two curves.
+    expect(
+      validateConstraint(s, { type: 'concentric', a: circle1, b: circle2 })
+    ).toBeNull();
+    expect(
+      validateConstraint(s, { type: 'concentric', a: line1, b: circle1 })
+    ).toMatch(/circles or arcs/);
+
+    // midpoint — a point not on the line's ends, plus a line.
+    const mid = addPoint(s, 5, 5);
+    expect(
+      validateConstraint(s, { type: 'midpoint', point: mid, line: line1 })
+    ).toBeNull();
+    expect(
+      validateConstraint(s, { type: 'midpoint', point: a, line: line1 })
+    ).toMatch(/endpoint/);
+    expect(
+      validateConstraint(s, { type: 'midpoint', point: mid, line: circle1 })
+    ).toMatch(/line/);
+
+    // symmetric — two distinct points about an axis line.
+    expect(
+      validateConstraint(s, { type: 'symmetric', a, b: c, line: line1 })
+    ).toBeNull();
+    expect(
+      validateConstraint(s, { type: 'symmetric', a, b: a, line: line1 })
+    ).toMatch(/distinct/);
+    expect(
+      validateConstraint(s, { type: 'symmetric', a, b: c, line: circle1 })
+    ).toMatch(/axis line/);
+
+    // fix — a point.
+    expect(validateConstraint(s, { type: 'fix', point: a })).toBeNull();
+    expect(validateConstraint(s, { type: 'fix', point: 'nope' })).toMatch(
+      /point/
+    );
   });
 });

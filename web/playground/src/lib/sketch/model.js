@@ -11,6 +11,12 @@
  *                { id, type: 'tangent', line, curve }          (curve: circle/arc id)
  *                { id, type: 'length', line, value }
  *                { id, type: 'radius', entity, value }         (circle or arc id)
+ *                { id, type: 'parallel' | 'perpendicular' | 'collinear', a, b } (line ids)
+ *                { id, type: 'equal', a, b }                   (two lines, or two circles/arcs)
+ *                { id, type: 'concentric', a, b }              (two circle/arc ids)
+ *                { id, type: 'midpoint', point, line }         (point at line's midpoint)
+ *                { id, type: 'symmetric', a, b, line }         (points a,b mirrored over axis line)
+ *                { id, type: 'fix', point }                    (anchor a point in place)
  *
  * Entities reference points by id; chained lines share endpoint ids, which is
  * implicit coincidence. The explicit `coincident` constraint glues two
@@ -114,6 +120,18 @@ export function constraintRefs(constraint) {
       return [constraint.line];
     case 'radius':
       return [constraint.entity];
+    case 'parallel':
+    case 'perpendicular':
+    case 'collinear':
+    case 'equal':
+    case 'concentric':
+      return [constraint.a, constraint.b];
+    case 'midpoint':
+      return [constraint.point, constraint.line];
+    case 'symmetric':
+      return [constraint.a, constraint.b, constraint.line];
+    case 'fix':
+      return [constraint.point];
     default:
       return [];
   }
@@ -207,6 +225,57 @@ export function validateConstraint(sketch, constraint) {
         return 'requires a circle or arc';
       }
       if (!(constraint.value > 0)) return 'radius must be positive';
+      return null;
+    }
+    case 'parallel':
+    case 'perpendicular':
+    case 'collinear': {
+      if (constraint.a === constraint.b) return 'requires two distinct lines';
+      const la = sketch.entities[constraint.a];
+      const lb = sketch.entities[constraint.b];
+      if (!la || la.type !== 'line' || !lb || lb.type !== 'line') {
+        return 'requires two lines';
+      }
+      return null;
+    }
+    case 'equal': {
+      if (constraint.a === constraint.b) return 'requires two distinct entities';
+      const ea = sketch.entities[constraint.a];
+      const eb = sketch.entities[constraint.b];
+      if (!ea || !eb) return 'requires two entities';
+      const isCurve = (e) => e.type === 'circle' || e.type === 'arc';
+      if (ea.type === 'line' && eb.type === 'line') return null;
+      if (isCurve(ea) && isCurve(eb)) return null;
+      return 'requires two lines or two circles/arcs';
+    }
+    case 'concentric': {
+      if (constraint.a === constraint.b) return 'requires two distinct curves';
+      const ea = sketch.entities[constraint.a];
+      const eb = sketch.entities[constraint.b];
+      const isCurve = (e) => e && (e.type === 'circle' || e.type === 'arc');
+      if (!isCurve(ea) || !isCurve(eb)) return 'requires two circles or arcs';
+      return null;
+    }
+    case 'midpoint': {
+      const ml = sketch.entities[constraint.line];
+      if (!ml || ml.type !== 'line') return 'requires a line';
+      if (!sketch.points[constraint.point]) return 'requires a point';
+      if (constraint.point === ml.p1 || constraint.point === ml.p2) {
+        return 'point cannot be an endpoint of the line';
+      }
+      return null;
+    }
+    case 'symmetric': {
+      const axis = sketch.entities[constraint.line];
+      if (!axis || axis.type !== 'line') return 'requires an axis line';
+      if (constraint.a === constraint.b) return 'requires two distinct points';
+      if (!sketch.points[constraint.a] || !sketch.points[constraint.b]) {
+        return 'requires two points';
+      }
+      return null;
+    }
+    case 'fix': {
+      if (!sketch.points[constraint.point]) return 'requires a point';
       return null;
     }
     default:

@@ -176,6 +176,173 @@ describe('constraint solver', () => {
     expect(d).toBeCloseTo(2, 6);
   });
 
+  const lineAngle = (s, id) => {
+    const l = s.entities[id];
+    return Math.atan2(
+      s.points[l.p2].y - s.points[l.p1].y,
+      s.points[l.p2].x - s.points[l.p1].x
+    );
+  };
+  const lineLen = (s, id) => {
+    const l = s.entities[id];
+    return Math.hypot(
+      s.points[l.p2].x - s.points[l.p1].x,
+      s.points[l.p2].y - s.points[l.p1].y
+    );
+  };
+  // Deviation of two lines' directions from parallel, in (0, π/2].
+  const parallelGap = (s, a, b) => {
+    let d = Math.abs(lineAngle(s, a) - lineAngle(s, b)) % Math.PI;
+    return Math.min(d, Math.PI - d);
+  };
+
+  it('parallel aligns two line directions', () => {
+    const s = createSketch();
+    const l1 = addLine(s, addPoint(s, 0, 0), addPoint(s, 4, 0));
+    const l2 = addLine(s, addPoint(s, 0, 2), addPoint(s, 3, 4));
+    addConstraint(s, { type: 'parallel', a: l1, b: l2 });
+    const result = solve(s);
+    expect(result.converged).toBe(true);
+    expect(parallelGap(s, l1, l2)).toBeCloseTo(0, 7);
+  });
+
+  it('parallel rotates only the free line when the other is pinned', () => {
+    const s = createSketch();
+    const a = addPoint(s, 0, 0);
+    const b = addPoint(s, 4, 0);
+    const l1 = addLine(s, a, b);
+    const l2 = addLine(s, addPoint(s, 0, 2), addPoint(s, 3, 5));
+    addConstraint(s, { type: 'parallel', a: l1, b: l2 });
+    solve(s, { pinned: new Set([a, b]) });
+    // Pinned horizontal reference is untouched; l2 becomes horizontal too.
+    expect(lineAngle(s, l1)).toBeCloseTo(0, 9);
+    expect(parallelGap(s, l1, l2)).toBeCloseTo(0, 7);
+  });
+
+  it('perpendicular makes two lines meet at a right angle', () => {
+    const s = createSketch();
+    const l1 = addLine(s, addPoint(s, 0, 0), addPoint(s, 4, 0));
+    const l2 = addLine(s, addPoint(s, 1, 1), addPoint(s, 4, 2));
+    addConstraint(s, { type: 'perpendicular', a: l1, b: l2 });
+    const result = solve(s);
+    expect(result.converged).toBe(true);
+    let gap = Math.abs(lineAngle(s, l1) - lineAngle(s, l2)) % Math.PI;
+    gap = Math.min(gap, Math.PI - gap);
+    expect(gap).toBeCloseTo(Math.PI / 2, 7);
+  });
+
+  it('equal drives two lines to the same length', () => {
+    const s = createSketch();
+    const l1 = addLine(s, addPoint(s, 0, 0), addPoint(s, 6, 0));
+    const l2 = addLine(s, addPoint(s, 0, 5), addPoint(s, 0, 7));
+    addConstraint(s, { type: 'equal', a: l1, b: l2 });
+    const result = solve(s);
+    expect(result.converged).toBe(true);
+    expect(lineLen(s, l1)).toBeCloseTo(lineLen(s, l2), 7);
+    expect(lineLen(s, l1)).toBeCloseTo(4, 7); // met in the middle (6 and 2)
+  });
+
+  it('equal matches the free line to a fully pinned one', () => {
+    const s = createSketch();
+    const a = addPoint(s, 0, 0);
+    const b = addPoint(s, 6, 0);
+    const l1 = addLine(s, a, b);
+    const l2 = addLine(s, addPoint(s, 0, 5), addPoint(s, 0, 7));
+    addConstraint(s, { type: 'equal', a: l1, b: l2 });
+    solve(s, { pinned: new Set([a, b]) });
+    expect(lineLen(s, l1)).toBeCloseTo(6, 9);
+    expect(lineLen(s, l2)).toBeCloseTo(6, 7);
+  });
+
+  it('equal drives two circles to the same radius', () => {
+    const s = createSketch();
+    const c1 = addCircle(s, addPoint(s, 0, 0), 2);
+    const c2 = addCircle(s, addPoint(s, 10, 0), 8);
+    addConstraint(s, { type: 'equal', a: c1, b: c2 });
+    solve(s);
+    expect(s.entities[c1].radius).toBeCloseTo(5, 9);
+    expect(s.entities[c2].radius).toBeCloseTo(5, 9);
+  });
+
+  it('concentric brings two circle centers together', () => {
+    const s = createSketch();
+    const c1 = addCircle(s, addPoint(s, 0, 0), 2);
+    const c2 = addCircle(s, addPoint(s, 4, 3), 5);
+    addConstraint(s, { type: 'concentric', a: c1, b: c2 });
+    const result = solve(s);
+    expect(result.converged).toBe(true);
+    const center1 = s.points[s.entities[c1].center];
+    const center2 = s.points[s.entities[c2].center];
+    expect(center1.x).toBeCloseTo(center2.x, 7);
+    expect(center1.y).toBeCloseTo(center2.y, 7);
+  });
+
+  it('midpoint moves a point to the center of a line', () => {
+    const s = createSketch();
+    const a = addPoint(s, 0, 0);
+    const b = addPoint(s, 8, 4);
+    const line = addLine(s, a, b);
+    const p = addPoint(s, 1, 1);
+    addConstraint(s, { type: 'midpoint', point: p, line });
+    const result = solve(s);
+    expect(result.converged).toBe(true);
+    expect(s.points[p].x).toBeCloseTo(4, 7);
+    expect(s.points[p].y).toBeCloseTo(2, 7);
+  });
+
+  it('collinear places two lines on one infinite line', () => {
+    const s = createSketch();
+    const l1 = addLine(s, addPoint(s, 0, 0), addPoint(s, 4, 0));
+    const l2 = addLine(s, addPoint(s, 6, 1), addPoint(s, 10, 2));
+    addConstraint(s, { type: 'collinear', a: l1, b: l2 });
+    const result = solve(s);
+    expect(result.converged).toBe(true);
+    expect(parallelGap(s, l1, l2)).toBeCloseTo(0, 6);
+    // Endpoints of l2 lie on l1's infinite line (through its two points).
+    const a = s.points[s.entities[l1].p1];
+    const b = s.points[s.entities[l1].p2];
+    let nx = -(b.y - a.y);
+    let ny = b.x - a.x;
+    const nl = Math.hypot(nx, ny);
+    nx /= nl;
+    ny /= nl;
+    for (const pid of [s.entities[l2].p1, s.entities[l2].p2]) {
+      const q = s.points[pid];
+      const off = (q.x - a.x) * nx + (q.y - a.y) * ny;
+      expect(off).toBeCloseTo(0, 6);
+    }
+  });
+
+  it('symmetric mirrors two points across an axis line', () => {
+    const s = createSketch();
+    // Vertical axis along x = 0.
+    const axis = addLine(s, addPoint(s, 0, -1), addPoint(s, 0, 1));
+    const a = addPoint(s, 2, 3);
+    const b = addPoint(s, -5, -1);
+    addLine(s, a, b);
+    addConstraint(s, { type: 'symmetric', a, b, line: axis });
+    const result = solve(s);
+    expect(result.converged).toBe(true);
+    // Reflection over x = 0: x flips, y matches.
+    expect(s.points[a].x).toBeCloseTo(-s.points[b].x, 7);
+    expect(s.points[a].y).toBeCloseTo(s.points[b].y, 7);
+  });
+
+  it('fix anchors a point so constraints move the other end', () => {
+    const s = createSketch();
+    const a = addPoint(s, 1, 2);
+    const b = addPoint(s, 5, 2);
+    const line = addLine(s, a, b);
+    addConstraint(s, { type: 'fix', point: a });
+    addConstraint(s, { type: 'length', line, value: 10 });
+    const result = solve(s);
+    expect(result.converged).toBe(true);
+    // The fixed endpoint stays put; the free one absorbs the length change.
+    expect(s.points[a].x).toBeCloseTo(1, 9);
+    expect(s.points[a].y).toBeCloseTo(2, 9);
+    expect(lineLen(s, line)).toBeCloseTo(10, 7);
+  });
+
   it('solves a rectangle with two dimensions to exact size', () => {
     const s = createSketch();
     // Sloppy near-rectangle; constraints should square it up at 4 x 2.

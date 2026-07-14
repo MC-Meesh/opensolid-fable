@@ -128,6 +128,18 @@ function arcScreenGeometry(sketch, entity) {
   return { c, p1, p2, r, start, end, sweep };
 }
 
+/** A representative world point for an entity: line midpoint, or curve center. */
+function entityAnchor(sketch, id) {
+  const e = sketch.entities[id];
+  if (!e) return null;
+  if (e.type === 'line') {
+    const a = sketch.points[e.p1];
+    const b = sketch.points[e.p2];
+    return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+  }
+  return sketch.points[e.center];
+}
+
 /**
  * 2D sketch canvas: an SVG overlay in world units (v up), with drawing
  * tools, direct manipulation, dimension entry, undo/redo, and live
@@ -1300,6 +1312,54 @@ export default forwardRef(function SketchCanvas(
         const t = ((c.x - a.x) * dx + (c.y - a.y) * dy) / lenSq;
         return textAt(a.x + dx * t, a.y + dy * t, 'T');
       }
+      case 'parallel':
+      case 'perpendicular':
+      case 'collinear':
+      case 'equal': {
+        // Place the glyph at the midpoint of the first referenced entity.
+        const label = {
+          parallel: '∥',
+          perpendicular: '⊥',
+          collinear: 'C',
+          equal: '=',
+        }[constraint.type];
+        const anchor = entityAnchor(s, constraint.a);
+        if (!anchor) return null;
+        return textAt(anchor.x, anchor.y, label);
+      }
+      case 'concentric': {
+        const ea = s.entities[constraint.a];
+        if (!ea) return null;
+        const c = s.points[ea.center];
+        const [x, y] = worldToScreen(c.x, c.y);
+        return (
+          <circle
+            key={constraint.id}
+            className={cls}
+            cx={x}
+            cy={y}
+            r={9}
+            fill="none"
+            onPointerDown={select}
+          />
+        );
+      }
+      case 'midpoint': {
+        const p = s.points[constraint.point];
+        if (!p) return null;
+        return textAt(p.x, p.y, 'M');
+      }
+      case 'symmetric': {
+        const a = s.points[constraint.a];
+        const b = s.points[constraint.b];
+        if (!a || !b) return null;
+        return textAt((a.x + b.x) / 2, (a.y + b.y) / 2, 'S');
+      }
+      case 'fix': {
+        const p = s.points[constraint.point];
+        if (!p) return null;
+        return textAt(p.x, p.y, '⯐');
+      }
       default:
         return null;
     }
@@ -1644,6 +1704,113 @@ export default forwardRef(function SketchCanvas(
             }
           >
             Tan
+          </button>
+          <button
+            className="tool-btn"
+            disabled={selLines.length !== 2}
+            title="Parallel (two lines)"
+            onClick={() =>
+              applyConstraint([
+                { type: 'parallel', a: selLines[0].id, b: selLines[1].id },
+              ])
+            }
+          >
+            ∥
+          </button>
+          <button
+            className="tool-btn"
+            disabled={selLines.length !== 2}
+            title="Perpendicular (two lines)"
+            onClick={() =>
+              applyConstraint([
+                { type: 'perpendicular', a: selLines[0].id, b: selLines[1].id },
+              ])
+            }
+          >
+            ⊥
+          </button>
+          <button
+            className="tool-btn"
+            disabled={selLines.length !== 2}
+            title="Collinear (two lines)"
+            onClick={() =>
+              applyConstraint([
+                { type: 'collinear', a: selLines[0].id, b: selLines[1].id },
+              ])
+            }
+          >
+            Col
+          </button>
+          <button
+            className="tool-btn"
+            disabled={selLines.length !== 2 && selCurves.length !== 2}
+            title="Equal (two lines → length, or two circles/arcs → radius)"
+            onClick={() =>
+              applyConstraint([
+                selLines.length === 2
+                  ? { type: 'equal', a: selLines[0].id, b: selLines[1].id }
+                  : { type: 'equal', a: selCurves[0].id, b: selCurves[1].id },
+              ])
+            }
+          >
+            =
+          </button>
+          <button
+            className="tool-btn"
+            disabled={selCurves.length !== 2}
+            title="Concentric (two circles/arcs)"
+            onClick={() =>
+              applyConstraint([
+                { type: 'concentric', a: selCurves[0].id, b: selCurves[1].id },
+              ])
+            }
+          >
+            ◎
+          </button>
+          <button
+            className="tool-btn"
+            disabled={selPoints.length !== 1 || selLines.length !== 1}
+            title="Midpoint (point + line)"
+            onClick={() =>
+              applyConstraint([
+                {
+                  type: 'midpoint',
+                  point: selPoints[0].id,
+                  line: selLines[0].id,
+                },
+              ])
+            }
+          >
+            Mid
+          </button>
+          <button
+            className="tool-btn"
+            disabled={selPoints.length !== 2 || selLines.length !== 1}
+            title="Symmetric (two points about an axis line)"
+            onClick={() =>
+              applyConstraint([
+                {
+                  type: 'symmetric',
+                  a: selPoints[0].id,
+                  b: selPoints[1].id,
+                  line: selLines[0].id,
+                },
+              ])
+            }
+          >
+            Sym
+          </button>
+          <button
+            className="tool-btn"
+            disabled={selPoints.length === 0}
+            title="Fix (anchor selected points in place)"
+            onClick={() =>
+              applyConstraint(
+                selPoints.map((p) => ({ type: 'fix', point: p.id }))
+              )
+            }
+          >
+            Fix
           </button>
           <input
             className="dim-input"
