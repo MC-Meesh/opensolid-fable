@@ -743,6 +743,77 @@ button.main-tool svg { flex: none; }
 .sweep-actions { display: flex; gap: 8px; }
 .sweep-actions button { padding: 5px 14px; font-size: 12.5px; }
 
+/* ---- section-view controls ---- */
+.section-panel {
+  position: absolute;
+  top: 46px;
+  right: 10px;
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 220px;
+  padding: 10px 12px;
+  background: color-mix(in srgb, var(--panel) 94%, transparent);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 12.5px;
+  backdrop-filter: blur(6px);
+}
+.section-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 13px;
+  font-weight: 600;
+}
+.section-close {
+  padding: 0 6px;
+  font-size: 16px;
+  line-height: 1;
+  background: none;
+  border: none;
+  color: var(--muted);
+  cursor: pointer;
+}
+.section-close:hover { color: var(--text); }
+.section-axes { display: flex; gap: 6px; }
+.section-axes button {
+  flex: 1;
+  padding: 5px 0;
+  font-size: 12.5px;
+  font-weight: 600;
+}
+.section-axes button.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #06121f;
+}
+.section-field {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+}
+.section-field input[type="range"] { flex: 1; accent-color: var(--accent); }
+.section-value {
+  width: 72px;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 4px 6px;
+  font-size: 12px;
+}
+.section-flip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  cursor: pointer;
+}
+.section-flip input { accent-color: var(--accent); }
+
 /* Transient notice (e.g. "sketch on curved faces not supported yet"). */
 .toast {
   position: absolute;

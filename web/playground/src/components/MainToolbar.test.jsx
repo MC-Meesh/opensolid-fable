@@ -21,6 +21,8 @@ function render(overrides = {}) {
       onFit={noop}
       wireframe={false}
       onWireframeChange={noop}
+      section={false}
+      onSectionToggle={noop}
       onDownloadStl={noop}
       onDownloadStep={noop}
       exactBooleans={false}
@@ -37,7 +39,7 @@ describe('MainToolbar', () => {
     expect(html).toContain('Features');
     expect(html).toContain('View');
     expect(html).toContain('Export');
-    for (const label of ['Extrude', 'Revolve', 'Fit', 'Front', 'Top', 'Right', 'Iso', 'Wireframe', 'STL', 'STEP']) {
+    for (const label of ['Extrude', 'Revolve', 'Fit', 'Front', 'Top', 'Right', 'Iso', 'Wireframe', 'Section', 'STL', 'STEP']) {
       expect(html).toContain(label);
     }
   });
@@ -65,10 +67,10 @@ describe('MainToolbar', () => {
     expect(html).toContain('Exit Sketch');
   });
 
-  it('marks active toggles (sketch open, wireframe on)', () => {
-    const html = render({ sketchOpen: true, wireframe: true });
+  it('marks active toggles (sketch open, wireframe on, section on)', () => {
+    const html = render({ sketchOpen: true, wireframe: true, section: true });
     const activeCount = (html.match(/main-tool active/g) ?? []).length;
-    expect(activeCount).toBe(2);
+    expect(activeCount).toBe(3);
   });
 
   it('disables everything with a loading tooltip before WASM is ready', () => {

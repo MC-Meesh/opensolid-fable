@@ -85,6 +85,14 @@ const Icons = {
       <path d="M5 13 L8 7.5 L11 13 M6.5 5.2 L8 7.5 L9.5 5.2" />
     </svg>
   ),
+  section: (
+    <svg {...ICON}>
+      <path d="M3 4 H10 V11 H3 Z" opacity="0.55" />
+      <path d="M3 4 L6 1.5 H13 V8.5 L10 11" opacity="0.55" />
+      <path d="M3 4 H10 V11 H3 Z" fill="currentColor" fillOpacity="0.28" stroke="none" />
+      <path d="M1.5 7.5 H11.5" />
+    </svg>
+  ),
   stl: (
     <svg {...ICON}>
       <path d="M8 2 v7.5 M5.2 6.8 L8 9.5 L10.8 6.8" />
@@ -142,6 +150,8 @@ export default function MainToolbar({
   onFit,
   wireframe,
   onWireframeChange,
+  section,
+  onSectionToggle,
   onDownloadStl,
   onDownloadStep,
   exactBooleans,
@@ -264,6 +274,16 @@ export default function MainToolbar({
           disabled={disabled}
           compact
           onClick={() => onWireframeChange(!wireframe)}
+        />
+        <ToolButton
+          icon="section"
+          label="Section"
+          title="Section view: slice the model with a movable clipping plane"
+          disabledReason={notReady}
+          active={section}
+          disabled={disabled}
+          compact
+          onClick={onSectionToggle}
         />
       </div>
       <div className="tool-sep" />

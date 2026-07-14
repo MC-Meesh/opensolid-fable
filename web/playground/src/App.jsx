@@ -10,6 +10,7 @@ import FeatureTree from './components/FeatureTree.jsx';
 import PropertyPanel from './components/PropertyPanel.jsx';
 import SketchCanvas from './components/SketchCanvas.jsx';
 import SweepPanel from './components/SweepPanel.jsx';
+import SectionPanel from './components/SectionPanel.jsx';
 import { DEFAULT_SCRIPT } from './lib/defaultScript.js';
 import { freeNodes, nodeLabel, runTracedScript, scriptHeader, serializeTree } from './lib/sceneTree.js';
 import { buildBinaryStl } from './lib/stl.js';
@@ -33,6 +34,7 @@ import {
   redo as redoHistory,
   depth as historyDepthOf,
 } from './lib/history.js';
+import { defaultSection, offsetRange, reseatOffset, sectionBounds } from './lib/sectionView.js';
 
 // Adaptive meshing target: maximum chordal deviation from the exact
 // surface, in model units. The octree refines near curvature and CSG
@@ -105,6 +107,10 @@ export default function App() {
   const [error, setError] = useState(null);
   const [exactBooleans, setExactBooleans] = useState(false);
   const [wireframe, setWireframe] = useState(false);
+  // Section view (of-fsl.18): a display-only clipping plane { axis, offset,
+  // flip }, or null when off. The offset is shared by the panel slider and the
+  // viewport drag handle.
+  const [section, setSection] = useState(null);
   const [mesh, setMesh] = useState(null);
   const [stats, setStats] = useState(null);
   const [tree, setTree] = useState(null);
@@ -1043,6 +1049,35 @@ export default function App() {
     setProfileClosed(Boolean(profile?.closed));
   }, []);
 
+  // ---- section view --------------------------------------------------------
+  // Toggle on: seed a default plane through the current model center. Axis
+  // changes re-seat the offset back to center; offset/flip are simple edits.
+  // Bounds are read from the live mesh so the plane always spans the model.
+  const handleSectionToggle = useCallback(() => {
+    setSection((cur) => (cur ? null : defaultSection(sectionBounds(meshRef.current?.positions))));
+  }, []);
+
+  const handleSectionAxis = useCallback((axis) => {
+    setSection((cur) =>
+      cur ? reseatOffset({ ...cur, axis }, sectionBounds(meshRef.current?.positions)) : cur
+    );
+  }, []);
+
+  const handleSectionOffset = useCallback((offset) => {
+    setSection((cur) => (cur ? { ...cur, offset } : cur));
+  }, []);
+
+  const handleSectionFlip = useCallback((flip) => {
+    setSection((cur) => (cur ? { ...cur, flip } : cur));
+  }, []);
+
+  const handleSectionClose = useCallback(() => setSection(null), []);
+
+  const sectionRange = useMemo(
+    () => (section ? offsetRange(sectionBounds(mesh?.positions), section.axis) : null),
+    [section, mesh]
+  );
+
   // Splitter drag: clamp so the editor stays usable and the viewport never
   // starves. Listeners go on the window — the pointer outruns a 5px handle.
   const startSplitterDrag = useCallback((event) => {
@@ -1173,6 +1208,8 @@ export default function App() {
           onFit={() => viewportRef.current?.zoomToFit()}
           wireframe={wireframe}
           onWireframeChange={setWireframe}
+          section={Boolean(section)}
+          onSectionToggle={handleSectionToggle}
           onDownloadStl={downloadStl}
           onDownloadStep={downloadStep}
           exactBooleans={exactBooleans}
@@ -1198,6 +1235,8 @@ export default function App() {
                 : null
             }
             previewMesh={previewMesh}
+            section={section}
+            onSectionOffsetChange={handleSectionOffset}
             onPick={handlePick}
             onHover={handleHover}
             onTransform={handleTransform}
@@ -1211,6 +1250,16 @@ export default function App() {
           onApply={applySweep}
           onCancel={cancelSweep}
         />
+        {section && sectionRange && (
+          <SectionPanel
+            section={section}
+            range={sectionRange}
+            onAxisChange={handleSectionAxis}
+            onFlip={handleSectionFlip}
+            onOffsetChange={handleSectionOffset}
+            onClose={handleSectionClose}
+          />
+        )}
         {selectedNode && (
           <div className="gizmo-bar">
             <button

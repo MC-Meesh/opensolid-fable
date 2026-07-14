@@ -15,6 +15,12 @@ import {
 } from '../lib/sketchView.js';
 import { isFacePlane } from '../lib/sketch/profile.js';
 import { HOVER_RGB, SELECTED_RGB, expandToNonIndexed, paintHighlights } from '../lib/faceHighlight.js';
+import {
+  axisComponent,
+  clipPlaneParams,
+  handlePosition,
+  sectionBounds,
+} from '../lib/sectionView.js';
 
 // World convention: Y up, ground grid in the XZ plane, front view looks
 // along -Z. Standard view directions live in lib/views.js.
@@ -178,6 +184,106 @@ const PREVIEW_MATERIAL = new THREE.MeshStandardMaterial({
   depthWrite: false,
 });
 
+// Section view (of-fsl.18): a movable clipping plane whose exposed interior is
+// filled with a capped cross-section via the stencil-buffer technique from the
+// three.js `webgl_clipping_stencil` example. The section color tints the cap
+// and the plane widget; a distinct hue reads as "cut material".
+const SECTION_COLOR = 0x6fa8dc;
+const WIDGET_COLOR = 0x4f9cf9;
+
+// Rotation of the plane widget so its quad (native normal +Z) sits
+// perpendicular to the section axis.
+const WIDGET_ROTATION = {
+  X: [0, Math.PI / 2, 0],
+  Y: [-Math.PI / 2, 0, 0],
+  Z: [0, 0, 0],
+};
+
+/**
+ * Two invisible copies of the model that write the stencil buffer where the
+ * clip plane passes through solid: back faces increment, front faces
+ * decrement, so the count is non-zero exactly across the cut. The cap quad
+ * then fills those pixels. Both meshes share the model's geometry (assigned by
+ * the caller and refreshed on every remesh) — they never own it.
+ */
+function createSectionStencilGroup(plane) {
+  const base = new THREE.MeshBasicMaterial();
+  base.depthWrite = false;
+  base.depthTest = false;
+  base.colorWrite = false;
+  base.stencilWrite = true;
+  base.stencilFunc = THREE.AlwaysStencilFunc;
+
+  const backMat = base.clone();
+  backMat.side = THREE.BackSide;
+  backMat.clippingPlanes = [plane];
+  backMat.stencilFail = THREE.IncrementWrapStencilOp;
+  backMat.stencilZFail = THREE.IncrementWrapStencilOp;
+  backMat.stencilZPass = THREE.IncrementWrapStencilOp;
+
+  const frontMat = base.clone();
+  frontMat.side = THREE.FrontSide;
+  frontMat.clippingPlanes = [plane];
+  frontMat.stencilFail = THREE.DecrementWrapStencilOp;
+  frontMat.stencilZFail = THREE.DecrementWrapStencilOp;
+  frontMat.stencilZPass = THREE.DecrementWrapStencilOp;
+
+  const back = new THREE.Mesh(new THREE.BufferGeometry(), backMat);
+  const front = new THREE.Mesh(new THREE.BufferGeometry(), frontMat);
+  back.renderOrder = 1;
+  front.renderOrder = 1;
+  const group = new THREE.Group();
+  group.add(back, front);
+  base.dispose();
+  return { group, back, front, backMat, frontMat };
+}
+
+/** The filled cross-section quad: drawn only where the stencil count is
+ *  non-zero, and it clears the stencil after itself so the next frame starts
+ *  clean. Oriented onto the plane each frame by the render loop. */
+function createSectionCap() {
+  const mat = new THREE.MeshStandardMaterial({
+    color: SECTION_COLOR,
+    metalness: 0.1,
+    roughness: 0.75,
+    side: THREE.DoubleSide,
+    stencilWrite: true,
+    stencilRef: 0,
+    stencilFunc: THREE.NotEqualStencilFunc,
+    stencilFail: THREE.ReplaceStencilOp,
+    stencilZFail: THREE.ReplaceStencilOp,
+    stencilZPass: THREE.ReplaceStencilOp,
+  });
+  const cap = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), mat);
+  cap.onAfterRender = (renderer) => renderer.clearStencil();
+  cap.renderOrder = 1.1;
+  return { cap, mat };
+}
+
+/** Faint translucent quad + outline marking the whole section plane, so the
+ *  cut reads even where it doesn't intersect solid, and giving the drag handle
+ *  a visible surface. A child of the handle anchor, so it moves with it. */
+function createSectionWidget() {
+  const fillGeometry = new THREE.PlaneGeometry(1, 1);
+  const fillMaterial = new THREE.MeshBasicMaterial({
+    color: WIDGET_COLOR,
+    transparent: true,
+    opacity: 0.06,
+    side: THREE.DoubleSide,
+    depthWrite: false,
+  });
+  const edgeGeometry = new THREE.EdgesGeometry(fillGeometry);
+  const edgeMaterial = new THREE.LineBasicMaterial({
+    color: WIDGET_COLOR,
+    transparent: true,
+    opacity: 0.5,
+  });
+  const group = new THREE.Group();
+  group.add(new THREE.Mesh(fillGeometry, fillMaterial));
+  group.add(new THREE.LineSegments(edgeGeometry, edgeMaterial));
+  return { group, fillGeometry, fillMaterial, edgeGeometry, edgeMaterial };
+}
+
 const Viewport3D = forwardRef(function Viewport3D(
   {
     mesh,
@@ -191,6 +297,8 @@ const Viewport3D = forwardRef(function Viewport3D(
     hoverFaceTris,
     selectedFaceTris,
     previewMesh,
+    section,
+    onSectionOffsetChange,
     onPick,
     onHover,
     onTransform,
@@ -229,6 +337,9 @@ const Viewport3D = forwardRef(function Viewport3D(
 
     const renderer = new THREE.WebGLRenderer({ antialias: true });
     renderer.setPixelRatio(window.devicePixelRatio);
+    // Section view clips per-material (main mesh + stencil group only), so the
+    // cap quad and grid stay unclipped. Local, not global, clipping.
+    renderer.localClippingEnabled = true;
     container.appendChild(renderer.domElement);
 
     const scene = new THREE.Scene();
@@ -313,6 +424,41 @@ const Viewport3D = forwardRef(function Viewport3D(
 
     transformControls.addEventListener('dragging-changed', (event) => {
       orbitControls.enabled = !event.value;
+    });
+
+    // ---- Section view: clip plane + capped cross-section + drag handle ------
+    const sectionPlane = new THREE.Plane(new THREE.Vector3(1, 0, 0), 0);
+    const stencil = createSectionStencilGroup(sectionPlane);
+    stencil.group.visible = false;
+    scene.add(stencil.group);
+    const capParts = createSectionCap();
+    capParts.cap.visible = false;
+    scene.add(capParts.cap);
+
+    // The handle anchor carries the plane widget and is what TransformControls
+    // drags; the offset is read back off its position each frame.
+    const sectionAnchor = new THREE.Group();
+    sectionAnchor.visible = false;
+    const sectionWidget = createSectionWidget();
+    sectionAnchor.add(sectionWidget.group);
+    scene.add(sectionAnchor);
+
+    const sectionHandle = new TransformControls(camera, renderer.domElement);
+    sectionHandle.setMode('translate');
+    sectionHandle.setSpace('world');
+    sectionHandle.attach(sectionAnchor);
+    const sectionHandleHelper = sectionHandle.getHelper();
+    sectionHandleHelper.visible = false;
+    sectionHandle.enabled = false;
+    scene.add(sectionHandleHelper);
+    sectionHandle.addEventListener('dragging-changed', (event) => {
+      orbitControls.enabled = !event.value;
+    });
+    sectionHandle.addEventListener('mouseUp', () => {
+      const s = sceneRef.current?.section;
+      const cb = sceneRef.current?._onSectionOffset;
+      if (!s?.active || !cb) return;
+      cb(sectionAnchor.position.getComponent(axisComponent(s.axis)));
     });
 
     const raycaster = new THREE.Raycaster();
@@ -448,6 +594,25 @@ const Viewport3D = forwardRef(function Viewport3D(
       camera.far = viewDist * 500;
       camera.updateProjectionMatrix();
 
+      // Section view: the handle position (dragged, or set from the panel) is
+      // the source of truth for the offset. Re-derive the clip plane from it
+      // every frame so dragging updates the cut live, and re-seat the cap onto
+      // the plane.
+      const sec = ctx?.section;
+      if (sec?.active) {
+        const offset = sectionAnchor.position.getComponent(axisComponent(sec.axis));
+        const { normal, constant } = clipPlaneParams({ axis: sec.axis, offset, flip: sec.flip });
+        sectionPlane.normal.set(normal[0], normal[1], normal[2]);
+        sectionPlane.constant = constant;
+        const cap = capParts.cap;
+        sectionPlane.coplanarPoint(cap.position);
+        cap.lookAt(
+          cap.position.x - sectionPlane.normal.x,
+          cap.position.y - sectionPlane.normal.y,
+          cap.position.z - sectionPlane.normal.z
+        );
+      }
+
       const sketching = Boolean(ctx?.sketchOrtho);
       const activeCamera = sketching ? orthoCamera : camera;
       if (sketching) syncOrthoCamera();
@@ -491,6 +656,16 @@ const Viewport3D = forwardRef(function Viewport3D(
       anchor,
       ghostMesh,
       previewObject,
+      sectionPlane,
+      sectionStencil: stencil,
+      sectionCap: capParts,
+      sectionWidget,
+      sectionAnchor,
+      sectionHandle,
+      sectionHandleHelper,
+      // Live section descriptor mirrored from the `section` prop; the render
+      // loop reads axis/flip and the handle position each frame.
+      section: { active: false, axis: 'X', flip: false },
       paintedTris: [],
       cameraAnim: null,
       sketchOrtho: false,
@@ -499,6 +674,7 @@ const Viewport3D = forwardRef(function Viewport3D(
       _onPick: null,
       _onHover: null,
       _onTransform: null,
+      _onSectionOffset: null,
     };
 
     return () => {
@@ -513,6 +689,17 @@ const Viewport3D = forwardRef(function Viewport3D(
       renderer.setAnimationLoop(null);
       transformControls.detach();
       transformControls.dispose();
+      sectionHandle.detach();
+      sectionHandle.dispose();
+      // Stencil meshes borrow the model geometry; never dispose it here.
+      stencil.backMat.dispose();
+      stencil.frontMat.dispose();
+      capParts.cap.geometry.dispose();
+      capParts.mat.dispose();
+      sectionWidget.fillGeometry.dispose();
+      sectionWidget.fillMaterial.dispose();
+      sectionWidget.edgeGeometry.dispose();
+      sectionWidget.edgeMaterial.dispose();
       orbitControls.dispose();
       meshObject.geometry.dispose();
       ghostMesh.geometry.dispose();
@@ -598,6 +785,74 @@ const Viewport3D = forwardRef(function Viewport3D(
       ctx.previewObject.visible = false;
     }
   }, [previewMesh]);
+
+  // Section view: activate/teardown the clip plane and configure its widget,
+  // handle, and cap from the `section` prop. Runs after the mesh effect above
+  // so the stencil group binds to the freshly loaded geometry; re-runs on
+  // every remesh to keep that binding and the widget sizing current.
+  useEffect(() => {
+    const ctx = sceneRef.current;
+    if (!ctx) return;
+    const {
+      material,
+      sectionPlane,
+      sectionStencil,
+      sectionCap,
+      sectionWidget,
+      sectionAnchor,
+      sectionHandle,
+      sectionHandleHelper,
+    } = ctx;
+    const s = ctx.section;
+
+    if (!section) {
+      if (s.active) {
+        s.active = false;
+        material.clippingPlanes = null;
+        material.needsUpdate = true;
+        sectionStencil.group.visible = false;
+        sectionCap.cap.visible = false;
+        sectionAnchor.visible = false;
+        sectionHandleHelper.visible = false;
+        sectionHandle.enabled = false;
+      }
+      return;
+    }
+
+    s.active = true;
+    s.axis = section.axis;
+    s.flip = section.flip;
+
+    const geometry = ctx.meshObject.geometry;
+    const bounds = sectionBounds(geometry.getAttribute('position')?.array);
+    const size = Math.max(bounds.radius * 2.5, 1);
+
+    // Widget quad: perpendicular to the section axis, sized to the model.
+    sectionWidget.group.rotation.set(...WIDGET_ROTATION[section.axis]);
+    sectionWidget.group.scale.setScalar(size);
+    sectionCap.cap.scale.setScalar(size);
+
+    // Seat the handle at the plane center; restrict its arrows to the axis.
+    const pos = handlePosition(bounds, section);
+    sectionAnchor.position.set(pos[0], pos[1], pos[2]);
+    sectionHandle.showX = section.axis === 'X';
+    sectionHandle.showY = section.axis === 'Y';
+    sectionHandle.showZ = section.axis === 'Z';
+
+    // Bind the stencil meshes to the current model geometry (borrowed, not
+    // owned) and clip the model itself against the shared plane.
+    sectionStencil.back.geometry = geometry;
+    sectionStencil.front.geometry = geometry;
+    material.clippingPlanes = [sectionPlane];
+    material.clipShadows = true;
+    material.needsUpdate = true;
+
+    sectionStencil.group.visible = true;
+    sectionCap.cap.visible = true;
+    sectionAnchor.visible = true;
+    sectionHandleHelper.visible = true;
+    sectionHandle.enabled = true;
+  }, [section, mesh]);
 
   // Face hover/selection: darken the region's triangles in the main mesh's
   // color attribute (selected paints after hover, so it wins on overlap).
@@ -782,12 +1037,15 @@ const Viewport3D = forwardRef(function Viewport3D(
   onPickRef.current = onPick;
   const onHoverRef = useRef(onHover);
   onHoverRef.current = onHover;
+  const onSectionOffsetChangeRef = useRef(onSectionOffsetChange);
+  onSectionOffsetChangeRef.current = onSectionOffsetChange;
 
   useEffect(() => {
     const ctx = sceneRef.current;
     if (!ctx) return;
     ctx._onPick = (...args) => onPickRef.current?.(...args);
     ctx._onHover = (...args) => onHoverRef.current?.(...args);
+    ctx._onSectionOffset = (...args) => onSectionOffsetChangeRef.current?.(...args);
   });
 
   useEffect(() => {
