@@ -70,6 +70,14 @@ const Icons = {
       <path d="M2.5 11 L9 4.2 M9.5 11 L13 4.6" />
     </svg>
   ),
+  measure: (
+    // A caliper: a graduated bar with two jaws bracketing a span.
+    <svg {...ICON}>
+      <path d="M2 4.5 L14 4.5" />
+      <path d="M2 4.5 V11 M14 4.5 V11" />
+      <path d="M4.5 4.5 V6.5 M7 4.5 V6.5 M9.5 4.5 V6.5 M12 4.5 V6.5" />
+    </svg>
+  ),
   fit: (
     <svg {...ICON}>
       <path d="M2 5.5 V2 h3.5 M10.5 2 H14 v3.5 M14 10.5 V14 h-3.5 M5.5 14 H2 v-3.5" />
@@ -166,6 +174,8 @@ export default function MainToolbar({
   onSketchToggle,
   drawingOpen,
   onDrawingToggle,
+  measureOpen = false,
+  onMeasureToggle,
   canSweep,
   sweepDisabledReason,
   onSweep,
@@ -258,6 +268,19 @@ export default function MainToolbar({
           disabledReason={notReady}
           disabled={disabled}
           onClick={() => onAddFeature('loft')}
+        />
+      </div>
+      <div className="tool-sep" />
+      <div className="tool-group" aria-label="Inspect">
+        <span className="tool-group-label">Inspect</span>
+        <ToolButton
+          icon="measure"
+          label="Measure"
+          title="Measure distance, angle, radius between entities (M)"
+          disabledReason={notReady}
+          active={measureOpen}
+          disabled={disabled}
+          onClick={onMeasureToggle}
         />
       </div>
       <div className="tool-sep" />

@@ -12,6 +12,7 @@ import SketchCanvas from './components/SketchCanvas.jsx';
 import DrawingCanvas from './components/DrawingCanvas.jsx';
 import SweepPanel from './components/SweepPanel.jsx';
 import SectionPanel from './components/SectionPanel.jsx';
+import MeasurePanel from './components/MeasurePanel.jsx';
 import { DEFAULT_SCRIPT } from './lib/defaultScript.js';
 import { freeNodes, nodeLabel, runTracedScript, scriptHeader, serializeTree } from './lib/sceneTree.js';
 import { buildBinaryStl } from './lib/stl.js';
@@ -33,6 +34,8 @@ import {
   sweepTreeNode,
 } from './lib/sweep.js';
 import { createFaceRegionIndex, makeTangentPlane } from './lib/facePlane.js';
+import { buildEdgeModel, snapEntity } from './lib/measureTopology.js';
+import { boundingBoxDims, measurePair, measureSingle, triListArea } from './lib/measure.js';
 import { isFacePlane } from './lib/sketch/profile.js';
 import { faceBoundaryLoopsUV } from './lib/sketch/edit.js';
 import { faceRefFromPlane, planarRegionsOf, resolveRefs } from './lib/persistentRef.js';
@@ -175,10 +178,18 @@ export default function App() {
   // consumed when a sketch opens on it.
   const [pickedFace, setPickedFace] = useState(null);
   const [toast, setToast] = useState(null);
+  // Measure tool (of-fsl.17): mutually exclusive with sketch. `measureEntities`
+  // holds up to two picked entities (vertex / edge / circle / face / point);
+  // `measureHover` is the snap affordance under the cursor.
+  const [measureMode, setMeasureMode] = useState(false);
+  const [measureEntities, setMeasureEntities] = useState([]);
+  const [measureHover, setMeasureHover] = useState(null);
   const profileRef = useRef(null);
   const viewportRef = useRef(null);
   // Face-region index over the displayed mesh, rebuilt lazily per mesh key.
   const faceRegionsRef = useRef({ key: null, index: null });
+  // Model edge/vertex/circle topology over the displayed mesh, lazy per key.
+  const edgeModelRef = useRef({ key: null, model: null });
 
   // Feature tree (presentation layer over the traced tree): user renames,
   // per-feature visibility/suppression, panel collapse, and the sketch
@@ -519,8 +530,98 @@ export default function App() {
     return fallback;
   }, []);
 
+  // Lazily (re)build the model-edge topology (corner vertices, straight edges,
+  // circular rims) for the displayed mesh — the Measure tool's snap targets.
+  const edgeModel = useCallback(() => {
+    const displayed = meshRef.current;
+    if (!displayed?.indices?.length) return null;
+    if (edgeModelRef.current.key !== displayed.key) {
+      edgeModelRef.current = {
+        key: displayed.key,
+        model: buildEdgeModel(displayed.positions, displayed.indices),
+      };
+    }
+    return edgeModelRef.current.model;
+  }, []);
+
+  // Snap tolerance for measure picks: a small fraction of the body diagonal.
+  const measureTol = useCallback(() => {
+    const displayed = meshRef.current;
+    const bb = displayed && boundingBoxDims(displayed.positions);
+    return bb && bb.diagonal > 0 ? bb.diagonal * 0.02 : 0.05;
+  }, []);
+
+  // Resolve a raycast hit to a measurable entity: snap to a corner vertex,
+  // straight edge, or circular rim; else the planar face region (with its
+  // area); else the raw hit point.
+  const measureEntityAt = useCallback(
+    (point, faceIndex) => {
+      const displayed = meshRef.current;
+      if (!point || !displayed) return null;
+      const snapped = snapEntity(edgeModel(), point, measureTol());
+      if (snapped) return snapped;
+      if (faceIndex !== null) {
+        const region = faceRegions()?.regionAt(faceIndex);
+        if (region?.planar) {
+          const area = triListArea(displayed.positions, displayed.indices, region.tris);
+          return {
+            kind: 'face',
+            point,
+            plane: { origin: region.plane.origin, normal: region.plane.normal },
+            area,
+          };
+        }
+      }
+      return { kind: 'point', point };
+    },
+    [edgeModel, measureTol, faceRegions]
+  );
+
+  // Measure pick: append the entity, keeping at most two (drop the oldest so
+  // successive clicks "walk" the measurement). An empty click clears both.
+  const handleMeasurePick = useCallback(
+    (point, faceIndex) => {
+      if (!point) {
+        setMeasureEntities([]);
+        return;
+      }
+      const entity = measureEntityAt(point, faceIndex);
+      if (!entity) return;
+      setMeasureEntities((prev) => (prev.length >= 2 ? [prev[1], entity] : [...prev, entity]));
+    },
+    [measureEntityAt]
+  );
+
+  // Measure hover: show a snap affordance only for real entities (vertex /
+  // edge / circle) — face/raw-point hovers would jitter with the cursor.
+  const handleMeasureHover = useCallback(
+    (point) => {
+      const snapped = point ? snapEntity(edgeModel(), point, measureTol()) : null;
+      setMeasureHover((prev) => {
+        if (prev === snapped) return prev;
+        if (
+          prev &&
+          snapped &&
+          prev.kind === snapped.kind &&
+          prev.point[0] === snapped.point[0] &&
+          prev.point[1] === snapped.point[1] &&
+          prev.point[2] === snapped.point[2]
+        ) {
+          return prev;
+        }
+        return snapped;
+      });
+    },
+    [edgeModel, measureTol]
+  );
+
   const handlePick = useCallback(
     (point, faceIndex) => {
+      // Measure mode owns picking: entities feed the readout, not selection.
+      if (measureMode) {
+        handleMeasurePick(point, faceIndex);
+        return;
+      }
       const root = tracedRef.current?.root;
       if (!root) return;
       const region = point && faceIndex !== null ? faceRegions()?.regionAt(faceIndex) : null;
@@ -562,7 +663,7 @@ export default function App() {
         clearSelection();
       }
     },
-    [selectNode, clearSelection, faceRegions, sweep, surfaceNormalAt]
+    [selectNode, clearSelection, faceRegions, sweep, surfaceNormalAt, measureMode, handleMeasurePick]
   );
 
   // Hover highlight: resolve the pointer's triangle to its planar face
@@ -571,6 +672,10 @@ export default function App() {
   // which keeps hover an honest "you can sketch here" affordance.
   const handleHover = useCallback(
     (point, faceIndex) => {
+      if (measureMode) {
+        handleMeasureHover(point);
+        return;
+      }
       const displayed = meshRef.current;
       if (!point || faceIndex === null || !displayed) {
         setHoverFace(null);
@@ -589,7 +694,7 @@ export default function App() {
           : { meshKey: displayed.key, tris: region.tris }
       );
     },
-    [faceRegions]
+    [faceRegions, measureMode, handleMeasureHover]
   );
 
   // SolidWorks Delete gesture: remove the selected body/branch from the tree
@@ -666,6 +771,17 @@ export default function App() {
   // ---- feature tree --------------------------------------------------------
 
   const features = useMemo(() => buildFeatures(tree, featureNames), [tree, featureNames]);
+
+  // Measure readouts (of-fsl.17): body bounding box (always shown while
+  // measuring) plus the single-entity or pair measurement for what's picked.
+  const measureBBox = useMemo(
+    () => (measureMode && mesh?.positions?.length ? boundingBoxDims(mesh.positions) : null),
+    [measureMode, mesh]
+  );
+  const measureSingleReadout =
+    measureEntities.length === 1 ? measureSingle(measureEntities[0]) : null;
+  const measurePairReadout =
+    measureEntities.length === 2 ? measurePair(measureEntities[0], measureEntities[1]) : null;
 
   // Persistent-reference rebuild pass (of-fsl.8). After each rebuild produces a
   // fresh mesh and feature list: (1) attach a pending face ref to its newly
@@ -1057,6 +1173,10 @@ export default function App() {
     setSweep(null);
     setSweepError(null);
     setEditingSketch(null);
+    // Sketch and Measure are mutually exclusive modes.
+    setMeasureMode(false);
+    setMeasureEntities([]);
+    setMeasureHover(null);
     setSketchOpen((v) => !v);
   }, [sketchOpen, pickedFace]);
 
@@ -1074,6 +1194,10 @@ export default function App() {
         setDrawingView(null);
         return false;
       }
+      // Drawing and Measure are mutually exclusive modes.
+      setMeasureMode(false);
+      setMeasureEntities([]);
+      setMeasureHover(null);
       return true;
     });
   }, []);
@@ -1082,6 +1206,28 @@ export default function App() {
     setDrawingView(null);
     setDrawingOpen(false);
   }, []);
+
+  // Toggle the Measure tool. Entering it exits sketch/sweep/drawing and clears
+  // any body selection; leaving it drops the picked entities and hover.
+  const handleMeasureToggle = useCallback(() => {
+    setMeasureMode((on) => {
+      const next = !on;
+      if (next) {
+        setSketchOpen(false);
+        setEditingSketch(null);
+        setSweep(null);
+        setSweepError(null);
+        setDrawingOpen(false);
+        setDrawingView(null);
+        clearSelection();
+        setHoverFace(null);
+        setPickedFace(null);
+      }
+      setMeasureEntities([]);
+      setMeasureHover(null);
+      return next;
+    });
+  }, [clearSelection]);
 
   // Transient toast (non-blocking notice, e.g. "curved face").
   useEffect(() => {
@@ -1139,17 +1285,35 @@ export default function App() {
         // 1-7: standard views in SolidWorks Ctrl+1..7 order (plain digits —
         // browsers reserve Ctrl/Cmd+digit for tab switching).
         viewportRef.current?.snapView(VIEW_SHORTCUTS[event.key]);
+      } else if (event.key === 'm' || event.key === 'M') {
+        handleMeasureToggle();
       } else if (event.key === 'Delete' || event.key === 'Backspace') {
         event.preventDefault();
         handleDeleteSelected();
       } else if (event.key === 'Escape') {
-        if (sweep) cancelSweep();
+        // In measure mode Esc clears the picked entities, then exits the tool.
+        if (measureMode) {
+          if (measureEntities.length) setMeasureEntities([]);
+          else handleMeasureToggle();
+        } else if (sweep) cancelSweep();
         else clearSelection();
       }
     }
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [clearSelection, sweep, cancelSweep, sketchOpen, drawingOpen, handleDeleteSelected, undo, redo]);
+  }, [
+    clearSelection,
+    sweep,
+    cancelSweep,
+    sketchOpen,
+    drawingOpen,
+    handleDeleteSelected,
+    undo,
+    redo,
+    measureMode,
+    measureEntities,
+    handleMeasureToggle,
+  ]);
 
   // Exact booleans rebuild shapes, not just meshes: re-run the script.
   const handleExactBooleansChange = useCallback(
@@ -1316,6 +1480,8 @@ export default function App() {
           onSketchToggle={handleSketchToggle}
           drawingOpen={drawingOpen}
           onDrawingToggle={handleDrawingToggle}
+          measureOpen={measureMode}
+          onMeasureToggle={handleMeasureToggle}
           canSweep={sketchOpen && profileClosed && !sweep}
           sweepDisabledReason={
             sketchOpen
@@ -1359,6 +1525,8 @@ export default function App() {
             previewMesh={previewMesh}
             section={section}
             onSectionOffsetChange={handleSectionOffset}
+            measureEntities={measureMode ? measureEntities : null}
+            measureHover={measureMode ? measureHover : null}
             onPick={handlePick}
             onHover={handleHover}
             onTransform={handleTransform}
@@ -1382,6 +1550,14 @@ export default function App() {
             onClose={handleSectionClose}
           />
         )}
+        <MeasurePanel
+          active={measureMode}
+          bbox={measureBBox}
+          entities={measureEntities}
+          single={measureSingleReadout}
+          pair={measurePairReadout}
+          onClear={() => setMeasureEntities([])}
+        />
         {selectedNode && (
           <div className="gizmo-bar">
             <button

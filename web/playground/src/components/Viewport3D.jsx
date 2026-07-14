@@ -299,6 +299,8 @@ const Viewport3D = forwardRef(function Viewport3D(
     previewMesh,
     section,
     onSectionOffsetChange,
+    measureEntities,
+    measureHover,
     onPick,
     onHover,
     onTransform,
@@ -853,6 +855,139 @@ const Viewport3D = forwardRef(function Viewport3D(
     sectionHandleHelper.visible = true;
     sectionHandle.enabled = true;
   }, [section, mesh]);
+
+  // Measure-tool overlay (of-fsl.17): depth-test-free markers on picked
+  // entities, edge/circle highlights, a dashed link line between the two
+  // picks, and a hover snap marker. Everything renders on top of the model so
+  // the measurement stays legible at any angle or zoom.
+  useEffect(() => {
+    const ctx = sceneRef.current;
+    if (!ctx) return undefined;
+    if (!measureEntities?.length && !measureHover) return undefined;
+
+    const MEASURE_COLOR = 0x4fc3f7;
+    const HOVER_COLOR = 0xffd479;
+    const LINK_COLOR = 0xf2a65a;
+
+    const scene = ctx.meshObject.parent;
+    const group = new THREE.Group();
+    group.renderOrder = 5;
+
+    const geo = ctx.meshObject.geometry;
+    if (!geo.boundingSphere) geo.computeBoundingSphere();
+    const sphere = geo.boundingSphere;
+    const modelR = sphere && sphere.radius > 0 ? sphere.radius : 1;
+    const markerR = Math.max(modelR * 0.018, 1e-3);
+
+    const disposables = [];
+    const sphereGeo = new THREE.SphereGeometry(markerR, 16, 12);
+    disposables.push(sphereGeo);
+
+    const basicMat = (color, opacity = 1) => {
+      const m = new THREE.MeshBasicMaterial({
+        color,
+        depthTest: false,
+        depthWrite: false,
+        transparent: true,
+        opacity,
+      });
+      disposables.push(m);
+      return m;
+    };
+    const solidLineMat = (color) => {
+      const m = new THREE.LineBasicMaterial({
+        color,
+        depthTest: false,
+        depthWrite: false,
+        transparent: true,
+      });
+      disposables.push(m);
+      return m;
+    };
+
+    const addMarker = (point, color, scale = 1) => {
+      const s = new THREE.Mesh(sphereGeo, basicMat(color));
+      s.scale.setScalar(scale);
+      s.position.set(point[0], point[1], point[2]);
+      s.renderOrder = 6;
+      group.add(s);
+    };
+    const addPolyline = (points, color, dashed = false) => {
+      const g = new THREE.BufferGeometry().setFromPoints(
+        points.map((p) => new THREE.Vector3(p[0], p[1], p[2]))
+      );
+      disposables.push(g);
+      let material;
+      if (dashed) {
+        material = new THREE.LineDashedMaterial({
+          color,
+          depthTest: false,
+          depthWrite: false,
+          transparent: true,
+          dashSize: markerR * 2.5,
+          gapSize: markerR * 1.8,
+        });
+        disposables.push(material);
+      } else {
+        material = solidLineMat(color);
+      }
+      const line = new THREE.Line(g, material);
+      if (dashed) line.computeLineDistances();
+      line.renderOrder = 6;
+      group.add(line);
+    };
+    const addCircle = (center, normal, radius, color) => {
+      const c = new THREE.Vector3(center[0], center[1], center[2]);
+      const n = new THREE.Vector3(normal[0], normal[1], normal[2]).normalize();
+      const ref =
+        Math.abs(n.y) < 0.99 ? new THREE.Vector3(0, 1, 0) : new THREE.Vector3(1, 0, 0);
+      const u = new THREE.Vector3().crossVectors(ref, n).normalize();
+      const v = new THREE.Vector3().crossVectors(n, u).normalize();
+      const pts = [];
+      const N = 64;
+      for (let i = 0; i <= N; i += 1) {
+        const a = (2 * Math.PI * i) / N;
+        pts.push(
+          c
+            .clone()
+            .addScaledVector(u, radius * Math.cos(a))
+            .addScaledVector(v, radius * Math.sin(a))
+        );
+      }
+      const g = new THREE.BufferGeometry().setFromPoints(pts);
+      disposables.push(g);
+      const line = new THREE.Line(g, solidLineMat(color));
+      line.renderOrder = 6;
+      group.add(line);
+    };
+
+    const drawEntity = (e, color) => {
+      if (!e) return;
+      if (e.point) addMarker(e.point, color);
+      if (e.kind === 'edge') addPolyline([e.a, e.b], color);
+      else if (e.kind === 'circle') addCircle(e.center, e.normal, e.radius, color);
+    };
+
+    for (const e of measureEntities ?? []) drawEntity(e, MEASURE_COLOR);
+    if (measureEntities?.length === 2) {
+      const [a, b] = measureEntities;
+      if (a.point && b.point) addPolyline([a.point, b.point], LINK_COLOR, true);
+    }
+    if (measureHover) {
+      const hoverColor = HOVER_COLOR;
+      if (measureHover.point) addMarker(measureHover.point, hoverColor, 0.85);
+      if (measureHover.kind === 'edge') addPolyline([measureHover.a, measureHover.b], hoverColor);
+      else if (measureHover.kind === 'circle') {
+        addCircle(measureHover.center, measureHover.normal, measureHover.radius, hoverColor);
+      }
+    }
+
+    scene.add(group);
+    return () => {
+      scene.remove(group);
+      for (const d of disposables) d.dispose();
+    };
+  }, [measureEntities, measureHover, mesh]);
 
   // Face hover/selection: darken the region's triangles in the main mesh's
   // color attribute (selected paints after hover, so it wins on overlap).
