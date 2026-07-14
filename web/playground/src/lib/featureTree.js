@@ -22,6 +22,7 @@ export const FEATURE_META = {
   box3: { kind: 'primitive', type: 'Box' },
   roundedBox: { kind: 'primitive', type: 'RoundedBox' },
   cylinder: { kind: 'primitive', type: 'Cylinder' },
+  cone: { kind: 'primitive', type: 'Cone' },
   torus: { kind: 'primitive', type: 'Torus' },
   capsule: { kind: 'primitive', type: 'Capsule' },
   extrude: { kind: 'sweep', type: 'Extrude' },

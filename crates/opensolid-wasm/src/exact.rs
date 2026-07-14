@@ -61,6 +61,15 @@ pub enum ExactPrim {
     Cylinder { radius: f64, half_height: f64 },
     /// Torus with its ring in the xz plane, centered at the origin.
     Torus { major: f64, minor: f64 },
+    /// Cone/frustum along Y: `radius_bottom` at `y = -half_height`,
+    /// `radius_top` at `y = +half_height`. The exact B-Rep builder rejects
+    /// equal radii (a cylinder) and both-zero, so a near-cylinder cone falls
+    /// back to the SDF path at materialization.
+    Cone {
+        radius_bottom: f64,
+        radius_top: f64,
+        half_height: f64,
+    },
 }
 
 /// A primitive plus the similarity transform accumulated from the
@@ -148,6 +157,20 @@ impl ExactSpec {
             ExactPrim::Torus { major, minor } => {
                 (primitives::torus(store, geo, major * s, minor * s)?, true)
             }
+            ExactPrim::Cone {
+                radius_bottom,
+                radius_top,
+                half_height,
+            } => (
+                primitives::cone(
+                    store,
+                    geo,
+                    radius_bottom * s,
+                    radius_top * s,
+                    2.0 * half_height * s,
+                )?,
+                true,
+            ),
         };
         let mut placement = self.iso;
         if needs_axis_fix {

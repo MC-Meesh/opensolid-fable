@@ -263,6 +263,20 @@ impl WasmShape {
         )
     }
 
+    /// Cone/frustum along the y axis: `radius_bottom` at `y = -half_height`,
+    /// `radius_top` at `y = +half_height`. Either radius may be zero for a
+    /// pointed tip (but not both).
+    pub fn cone(radius_bottom: f64, radius_top: f64, half_height: f64) -> WasmShape {
+        WasmShape::with_prim(
+            BoundedShape::cone(radius_bottom, radius_top, half_height),
+            ExactPrim::Cone {
+                radius_bottom,
+                radius_top,
+                half_height,
+            },
+        )
+    }
+
     /// Capsule (sphere-swept segment) from `(x1,y1,z1)` to `(x2,y2,z2)`.
     #[allow(clippy::too_many_arguments)]
     pub fn capsule(x1: f64, y1: f64, z1: f64, x2: f64, y2: f64, z2: f64, radius: f64) -> WasmShape {

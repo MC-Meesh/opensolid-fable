@@ -5,6 +5,7 @@ export const DEFAULT_SCRIPT = `// Build a shape with the OpenSolid API and retur
 //   Shape.box3(hx, hy, hz)              half-extents
 //   Shape.roundedBox(hx, hy, hz, r)     edge radius r
 //   Shape.cylinder(r, halfHeight)       axis along y
+//   Shape.cone(rBottom, rTop, halfH)    axis along y; a radius may be 0
 //   Shape.torus(major, minor)           ring in the xz plane
 //   Shape.capsule(x1,y1,z1, x2,y2,z2, r)
 //   Shape.halfSpace(px,py,pz, nx,ny,nz)  solid side of a plane; intersect it

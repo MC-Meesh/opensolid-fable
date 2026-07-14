@@ -21,6 +21,7 @@ export const PRIMITIVE_OPS = [
   'box3',
   'roundedBox',
   'cylinder',
+  'cone',
   'torus',
   'capsule',
   // The terminating half-space of an "up to face" extrude (Shape.halfSpace).
@@ -44,6 +45,7 @@ const OP_LABELS = {
   box3: 'Box3',
   roundedBox: 'Rounded Box',
   cylinder: 'Cylinder',
+  cone: 'Cone',
   torus: 'Torus',
   capsule: 'Capsule',
   halfSpace: 'Half Space',

@@ -86,6 +86,15 @@ export const OP_SPECS = {
     title: 'Cylinder',
     groups: [{ label: 'Size', fields: [size(0, 'r'), size(1, 'half h')] }],
   },
+  cone: {
+    kind: 'primitive',
+    title: 'Cone',
+    // Either radius may be zero (a pointed apex), so the radii use the
+    // non-negative field; the half-height must stay strictly positive.
+    groups: [
+      { label: 'Size', fields: [radius0(0, 'r bottom'), radius0(1, 'r top'), size(2, 'half h')] },
+    ],
+  },
   torus: {
     kind: 'primitive',
     title: 'Torus',

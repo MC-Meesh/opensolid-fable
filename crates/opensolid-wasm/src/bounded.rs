@@ -12,7 +12,7 @@ use opensolid_core::types::{BoundingBox3, Point3, Transform3, Vector3};
 use opensolid_frep::mesh::{MeshOptions, mesh_sdf_indexed};
 use opensolid_frep::mesh_adaptive::{AdaptiveMeshOptions, mesh_sdf_adaptive_indexed};
 use opensolid_frep::primitives::{
-    Box3, Capsule, Cylinder, HalfSpace, RoundedBox, Sdf, Sphere, Torus,
+    Box3, Capsule, Cone, Cylinder, HalfSpace, RoundedBox, Sdf, Sphere, Torus,
 };
 use opensolid_frep::refine::{RefineOptions, refine_mesh};
 use opensolid_frep::{
@@ -118,6 +118,22 @@ impl BoundedShape {
                 minor_radius,
             }),
             bounds: symmetric_bounds(reach, minor_radius, reach),
+        }
+    }
+
+    /// Cone/frustum along the y axis (matches [`Cone`]'s axial convention):
+    /// `radius_bottom` at `y = -half_height`, `radius_top` at
+    /// `y = +half_height`.
+    pub fn cone(radius_bottom: f64, radius_top: f64, half_height: f64) -> Self {
+        let reach = radius_bottom.max(radius_top);
+        Self {
+            shape: Shape::new(Cone {
+                center: Point3::origin(),
+                half_height,
+                radius_bottom,
+                radius_top,
+            }),
+            bounds: symmetric_bounds(reach, half_height, reach),
         }
     }
 

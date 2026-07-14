@@ -416,6 +416,7 @@ export const PALETTE = [
   { ctor: 'box3', label: 'Box', args: [0.5, 0.5, 0.5] },
   { ctor: 'roundedBox', label: 'Rounded box', args: [0.5, 0.5, 0.5, 0.1] },
   { ctor: 'cylinder', label: 'Cylinder', args: [0.3, 0.6] },
+  { ctor: 'cone', label: 'Cone', args: [0.5, 0.0, 0.6] },
   { ctor: 'torus', label: 'Torus', args: [0.6, 0.2] },
 ];
 
@@ -449,6 +450,7 @@ export const PARAM_NAMES = {
   box3: ['hx', 'hy', 'hz'],
   roundedBox: ['hx', 'hy', 'hz', 'r'],
   cylinder: ['r', 'halfH'],
+  cone: ['rBottom', 'rTop', 'halfH'],
   torus: ['R', 'r'],
   capsule: ['x1', 'y1', 'z1', 'x2', 'y2', 'z2', 'r'],
   translate: ['x', 'y', 'z'],
