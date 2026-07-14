@@ -728,14 +728,18 @@ describe('from-surface backoff (curved-face boss, of-fsl.5)', () => {
   it('sinks the column base backoff below the tangent plane, top unchanged', () => {
     const h = 2;
     const b = 0.5;
-    // Kernel spans native y ∈ [0, h + b]; carried through the post-ops each
-    // sketch point's base sits at planeToWorld - b*n and its outward face
-    // still at planeToWorld + h*n.
+    // Backoff flows through extrudePlan: the kernel spans native y ∈ [0, h + b]
+    // and the plan's postExtra sinks the whole column b along -normal. Carried
+    // through the full post-op chain (sweepPostOps then postExtra) each sketch
+    // point's base lands at planeToWorld - b*n and its outward face still at
+    // planeToWorld + h*n.
+    const plan = extrudePlan({ kind: 'extrude', plane: FACE_PLANE, value: h, backoff: b });
+    expect(plan.height).toBeCloseTo(h + b, 12);
     const native = nativeSweepOps(profileToOps({ ...SQUARE, plane: FACE_PLANE }), FACE_PLANE, 'extrude');
-    const post = sweepPostOps(FACE_PLANE, 'extrude', h, b);
+    const post = [...sweepPostOps(FACE_PLANE, 'extrude', plan.param), ...plan.postExtra];
     const edges = opsVerts(native).map(([p, q]) => [
       applyPostOps([p, 0, q], post),
-      applyPostOps([p, h + b, q], post),
+      applyPostOps([p, plan.height, q], post),
     ]);
     for (const [u, v] of SKETCH_VERTS) {
       const world = planeToWorld(FACE_PLANE, u, v);
@@ -763,14 +767,21 @@ describe('from-surface backoff (curved-face boss, of-fsl.5)', () => {
       value: 2,
       backoff: 0.5,
     });
-    // Outer wrapper is the translate to origin - backoff*n; inner is extrude
-    // with height 2 + 0.5.
+    // Construction outer -> inner: the backoff translate (-b*n, from the plan's
+    // postExtra) wraps the plane translate (origin) wrapping the face rotate
+    // wrapping the lengthened extrude. The two translates compose to origin -
+    // b*n, sinking the base flush below the tangent plane.
     expect(shape.desc[0]).toBe('translate');
-    const want = FACE_PLANE.origin.map((c, i) => c - 0.5 * n[i]);
-    expect(closeTo3(shape.desc.slice(2), want)).toBe(true);
-    expect(shape.desc[1][0]).toBe('rotate');
-    expect(shape.desc[1][1][0]).toBe('extrude');
-    expect(shape.desc[1][1][2]).toBeCloseTo(2.5, 12);
+    const backoffShift = shape.desc.slice(2);
+    expect(closeTo3(backoffShift, n.map((c) => -0.5 * c))).toBe(true);
+    const inner = shape.desc[1];
+    expect(inner[0]).toBe('translate');
+    expect(closeTo3(inner.slice(2), FACE_PLANE.origin)).toBe(true);
+    const net = FACE_PLANE.origin.map((c, i) => c + backoffShift[i]);
+    expect(closeTo3(net, FACE_PLANE.origin.map((c, i) => c - 0.5 * n[i]))).toBe(true);
+    expect(inner[1][0]).toBe('rotate');
+    expect(inner[1][1][0]).toBe('extrude');
+    expect(inner[1][1][2]).toBeCloseTo(2.5, 12);
   });
 
   it('sweepTreeNode bakes height + backoff and unions with the body', () => {
