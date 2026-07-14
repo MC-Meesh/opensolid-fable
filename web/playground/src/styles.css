@@ -1070,6 +1070,22 @@ button.main-tool svg { flex: none; }
   cursor: grab;
 }
 .drawing-svg:active { cursor: grabbing; }
+.drawing-svg.picking { cursor: crosshair; }
+.drawing-svg .dim-line {
+  stroke: #6ab0ff;
+  stroke-width: 1;
+}
+.drawing-svg .dim-arrow { fill: #6ab0ff; }
+.drawing-svg .dim-label {
+  fill: #9fcbff;
+  font-size: 11px;
+  user-select: none;
+}
+.drawing-svg .dim-pick {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 1.5;
+}
 .drawing-svg .edge {
   stroke: #e6ebf2;
   stroke-width: 1.6;
