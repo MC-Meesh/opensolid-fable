@@ -705,41 +705,80 @@ impl Chart {
         }
     }
 
-    /// Latitude (`±π/2`) of the sphere pole that `p` sits on, or `None`
-    /// when `p` is not on a pole (always `None` for non-sphere charts,
-    /// whose parameterizations never collapse a point). Uses the same
+    /// The `v` of the singular pole that `p` sits on, or `None` when `p`
+    /// is not on a pole (always `None` for charts whose parameterization
+    /// never collapses a point — plane, cylinder, torus). Uses the same
     /// axis-distance floor as [`Chart::param`]'s pole convention, so a
     /// point reads as a pole here exactly when `param` would refuse to
     /// give it a longitude of its own.
+    ///
+    /// - Sphere: `±π/2` for the north/south pole (signed by hemisphere).
+    /// - Cone: the apex `v = -radius/tan(half_angle)`, the single point
+    ///   where the `u`-circle collapses. The apex `v` is always negative
+    ///   (the surface widens toward `+v`), so it reads like a sphere's
+    ///   *south* pole in the CCW pole-row sweep — correct, since the cone
+    ///   interior always lies on the `+v` side of the apex.
     fn pole_v(&self, p: &Point3) -> Option<f64> {
-        let Chart::Sphere {
-            center,
-            axis,
-            e_u,
-            e_v,
-            radius,
-        } = self
-        else {
-            return None;
-        };
-        let d = p - center;
-        (d.dot(e_u).hypot(d.dot(e_v)) <= radius * POLE_REL_EPS)
-            .then(|| std::f64::consts::FRAC_PI_2.copysign(d.dot(axis)))
+        match self {
+            Chart::Sphere {
+                center,
+                axis,
+                e_u,
+                e_v,
+                radius,
+            } => {
+                let d = p - center;
+                (d.dot(e_u).hypot(d.dot(e_v)) <= radius * POLE_REL_EPS)
+                    .then(|| std::f64::consts::FRAC_PI_2.copysign(d.dot(axis)))
+            }
+            Chart::Cone {
+                origin,
+                e_u,
+                e_v,
+                radius,
+                half_angle,
+                ..
+            } => {
+                let d = p - origin;
+                (d.dot(e_u).hypot(d.dot(e_v)) <= radius.abs() * POLE_REL_EPS)
+                    .then(|| -radius / half_angle.tan())
+            }
+            _ => None,
+        }
     }
 
-    /// The chart's pole points `[south, north]` (`v = -π/2, +π/2`), where
-    /// the `u`-circle collapses to a point — only spheres have them.
-    fn pole_points(&self) -> Option<[Point3; 2]> {
-        let Chart::Sphere {
-            center,
+    /// The cone's apex — the lone point where its `u`-circle collapses —
+    /// or `None` for non-cone charts. `v = -radius/tan(half_angle)` off
+    /// the reference (`v = 0`) circle, along `-axis`.
+    fn apex(&self) -> Option<Point3> {
+        let Chart::Cone {
+            origin,
             axis,
             radius,
+            half_angle,
             ..
         } = self
         else {
             return None;
         };
-        Some([center - axis * *radius, center + axis * *radius])
+        Some(origin - axis * (radius / half_angle.tan()))
+    }
+
+    /// The chart's singular pole points — the sphere's `[south, north]`
+    /// (`v = -π/2, +π/2`) and the cone's lone apex — where the `u`-circle
+    /// collapses to a point. Empty for charts with no such degeneracy
+    /// (plane, cylinder, torus).
+    fn pole_points(&self) -> Vec<Point3> {
+        match self {
+            Chart::Sphere {
+                center,
+                axis,
+                radius,
+                ..
+            } => vec![center - axis * *radius, center + axis * *radius],
+            Chart::Cone { .. } => self.apex().into_iter().collect(),
+            _ => Vec::new(),
+        }
     }
 }
 
@@ -987,25 +1026,7 @@ impl<'c> CoverEmbedder<'c> {
         let uv = if let Some((vp, pole_pt)) = self.at_pole.take() {
             let (u_in, _) = self.last_uv.expect("standing on a pole implies a uv");
             let (raw_u, v) = self.chart.param(&p, None);
-            // Interior meridians sweep from the departure to the arrival
-            // longitude going the row's way; a CCW cycle keeps them left
-            // of the walk (north row toward -u, south row toward +u).
-            let toward_neg_u = self.ccw == (vp > 0.0);
-            let turn = if toward_neg_u {
-                (u_in - raw_u).rem_euclid(TWO_PI)
-            } else {
-                (raw_u - u_in).rem_euclid(TWO_PI)
-            };
-            let turn = if turn < POLE_TURN_EPS || TWO_PI - turn < POLE_TURN_EPS {
-                TWO_PI
-            } else {
-                turn
-            };
-            let u_out = if toward_neg_u {
-                u_in - turn
-            } else {
-                u_in + turn
-            };
+            let u_out = self.pole_row_u_out(u_in, raw_u, vp);
             out.push(((u_out, vp), pole_pt));
             (u_out, v)
         } else {
@@ -1013,6 +1034,52 @@ impl<'c> CoverEmbedder<'c> {
         };
         out.push((uv, p));
         self.last_uv = Some(uv);
+    }
+
+    /// The `u` of a pole row's departure end: sweep from the arrival
+    /// meridian `u_in` to the departure meridian `target_u`, going the way
+    /// that keeps the region interior on the walk's left — a CCW cycle
+    /// runs a north row toward `-u` and a south row toward `+u` (mirrored
+    /// when `ccw` is false). A cone apex always has `vp < 0`, so it sweeps
+    /// like a south pole. A departure within [`POLE_TURN_EPS`] of the
+    /// arrival is a doubling-back (a seam tip) and sweeps the full period.
+    fn pole_row_u_out(&self, u_in: f64, target_u: f64, vp: f64) -> f64 {
+        let toward_neg_u = self.ccw == (vp > 0.0);
+        let turn = if toward_neg_u {
+            (u_in - target_u).rem_euclid(TWO_PI)
+        } else {
+            (target_u - u_in).rem_euclid(TWO_PI)
+        };
+        let turn = if turn < POLE_TURN_EPS || TWO_PI - turn < POLE_TURN_EPS {
+            TWO_PI
+        } else {
+            turn
+        };
+        if toward_neg_u {
+            u_in - turn
+        } else {
+            u_in + turn
+        }
+    }
+
+    /// Close a cycle whose final point is a pole: emit the departure end
+    /// of the pole row toward the cycle's first meridian `u_arr` (where
+    /// the closing seam returns), turning the lone pole vertex into a full
+    /// row. Needed when the walk REACHES a pole last and stops — e.g. a
+    /// cone wall bounded by a full-wrap imprint ring plus a straight seam
+    /// to the apex, whose dropped-interior seam leaves no post-pole point
+    /// to fire the leave-a-pole branch of [`CoverEmbedder::push`]. Without
+    /// it the closure chord cuts a diagonal across the pole and the cover
+    /// collapses to a triangle (of-dtj.5). No-op when the walk never ended
+    /// on a pole.
+    fn close_at_pole(&mut self, u_arr: f64, out: &mut Vec<CoverPoint>) {
+        let Some((vp, pole_pt)) = self.at_pole.take() else {
+            return;
+        };
+        let (u_in, _) = self.last_uv.expect("standing on a pole implies a uv");
+        let u_out = self.pole_row_u_out(u_in, u_arr, vp);
+        out.push(((u_out, vp), pole_pt));
+        self.last_uv = Some((u_out, vp));
     }
 
     /// Shift the embedder's continuity hint after the caller relocated the
@@ -1913,10 +1980,7 @@ impl<'a> Pipeline<'a> {
             // interior ring.
             for (s, f) in [(0usize, imp.face_a), (1usize, imp.face_b)] {
                 let chart = &self.face_polys[s][f].chart;
-                let Some(poles) = chart.pole_points() else {
-                    continue;
-                };
-                for pole in poles {
+                for pole in chart.pole_points() {
                     if !imp.sampled.closed {
                         let pts = &imp.sampled.points;
                         if (pts[0] - pole).norm() <= self.snap * 4.0
@@ -2007,12 +2071,13 @@ impl<'a> Pipeline<'a> {
                 continue;
             }
             for (s, f) in [(0usize, imp.face_a), (1usize, imp.face_b)] {
-                let Some(poles) = self.face_polys[s][f].chart.pole_points() else {
+                let poles = self.face_polys[s][f].chart.pole_points();
+                if poles.is_empty() {
                     continue;
-                };
+                }
                 let last = imp.sampled.points.len() - 1;
                 for i in [0, last] {
-                    for pole in poles {
+                    for &pole in &poles {
                         let d = (imp.sampled.points[i] - pole).norm();
                         if d > 0.0 && d <= band {
                             imp.sampled.points[i] = pole;
@@ -2893,6 +2958,21 @@ fn embed_walk(
         } else {
             pts[pts.len() - 1]
         });
+    }
+    // Close a cycle whose walk ENDED standing on a pole (its last point is
+    // the singular apex/pole). This is the cone-wall shape: a full-wrap
+    // imprint ring plus a straight seam up to the apex, whose
+    // dropped-interior seam leaves the apex as the terminal point with no
+    // post-pole vertex to fire `push`'s leave-a-pole row (of-dtj.5). The
+    // pole row is swept toward `poly[0]`'s meridian — where the closing
+    // seam returns — so the cover is the full rectangle, not the triangle
+    // the raw closure chord would cut. Skipped when the walk also STARTED
+    // at a pole (`poly[0]` is itself a pole): that placeholder case is the
+    // fixup just below, which already restores the start row. Chains
+    // (`keep_final`) stay open and are never closed at a pole.
+    if !keep_final && poly.len() >= 2 && face_poly.chart.pole_v(&poly[0].1).is_none() {
+        let u_arr = poly[0].0.0;
+        emb.close_at_pole(u_arr, &mut poly);
     }
     // Fix up a cycle that started at a pole: the placeholder longitude at
     // poly[0] becomes the true arrival longitude (the final meridian of
@@ -3916,6 +3996,19 @@ fn build_output(
                     };
                     for flag in &mut keep[start + 1..end] {
                         *flag = false;
+                    }
+                }
+                // Pole-row endpoints survive the straight-dart drop. The
+                // departure end of a cone-apex (or sphere-pole) row carries
+                // the pole's 3D point but a distinct meridian, and it falls
+                // inside the straight seam dart's index range — yet it is
+                // structural, not oversampling. Dropping it collapses the
+                // row to one vertex and the cover degenerates to a triangle
+                // (of-dtj.5). Only points a hair off the axis read as poles,
+                // so this never rescues genuine straight-seam samples.
+                for (i, k) in keep.iter_mut().enumerate() {
+                    if !*k && fp.chart.pole_v(&cy.poly[i].1).is_some() {
+                        *k = true;
                     }
                 }
                 let mut uv = Vec::with_capacity(n);
@@ -5603,8 +5696,54 @@ mod tests {
         // u wraps every 2π; v is an unbounded axial length, so aperiodic.
         let chart = cone_chart(Point3::origin(), FRAC_PI_4_CONST, 1.0);
         assert_eq!((chart.period_u(), chart.period_v()), (Some(TWO_PI), None));
-        // No poles: the apex is not a chart pole point (frustum-first).
-        assert!(chart.pole_points().is_none());
+        // One pole: the apex, where the u-circle collapses (of-dtj.5). At
+        // half-angle π/4, tan = 1, so the apex sits one unit down -axis.
+        let apex = chart.apex().expect("cone has an apex");
+        assert_eq!(chart.pole_points(), vec![apex]);
+        // The apex reads as a pole at v = -radius/tan(α) = -1; a point off
+        // the axis does not.
+        assert!((chart.pole_v(&apex).expect("apex is a pole") + 1.0).abs() < 1e-12);
+        assert_eq!(chart.pole_v(&chart_point(&chart, (0.3, 0.5))), None);
+    }
+
+    #[test]
+    fn cone_wall_cover_closes_the_apex_row() {
+        // A cone wall whose boundary is a full-wrap ring at v0 plus a
+        // straight seam up to the apex: the walk reaches the apex last, so
+        // the pole row must be closed toward the seam meridian (of-dtj.5)
+        // or the cover collapses from the [0, 2π]×[v_apex, v0] rectangle to
+        // a triangle. The cone analog of
+        // `seam_only_sphere_loop_covers_the_full_rectangle`.
+        let (half_angle, radius, v0) = (0.4_f64, 1.0, 0.0);
+        let chart = cone_chart(Point3::origin(), half_angle, radius);
+        let apex = chart.apex().expect("cone apex");
+        let v_apex = chart.pole_v(&apex).expect("apex is a pole");
+        // Walk the reference ring (u: 0 → -2π, closing back on the seam),
+        // then up the seam to the apex as the final point.
+        let n = 48;
+        let mut walk: Vec<Point3> = (0..=n)
+            .map(|i| chart_point(&chart, (-TWO_PI * i as f64 / n as f64, v0)))
+            .collect();
+        walk.push(apex);
+        let mut emb = CoverEmbedder::new(&chart, true);
+        let mut cover = Vec::new();
+        for p in &walk {
+            emb.push(*p, &mut cover);
+        }
+        emb.close_at_pole(cover[0].0.0, &mut cover);
+        // Both apex-row endpoints (arrival + departure) are present and
+        // span the full period; without the closure only one exists.
+        let poles = cover
+            .iter()
+            .filter(|(_, p)| chart.pole_v(p).is_some())
+            .count();
+        assert_eq!(poles, 2, "apex row has both endpoints");
+        let area = shoelace(&cover).abs();
+        let want = TWO_PI * (v0 - v_apex);
+        assert!(
+            (area - want).abs() < 1e-6,
+            "apex-closed cover area {area} != full rectangle {want}"
+        );
     }
 
     #[test]

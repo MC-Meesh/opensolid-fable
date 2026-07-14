@@ -2541,10 +2541,6 @@ fn skew_frustums_inclusion_exclusion() {
 /// where their radii coincide). Exercises coaxial cone-cone SSI (a single
 /// full-wrap circle at z = 2) and closed-form intersection volume.
 #[test]
-#[ignore = "of-dtj.5: coaxial cone-cone SSI now yields the z=2 circle (of-dtj.4), \
-            but the bicone intersection's two apex poles (true cones, r→0) need \
-            the apex pole-imprint reconstruction of of-dtj.5; today the exact \
-            pipeline builds a SolidWithoutShells at the apexes"]
 fn opposed_cones_intersection() {
     let context = "opposed coaxial cones intersection (bicone)";
     let mut scene = Scene::new();
