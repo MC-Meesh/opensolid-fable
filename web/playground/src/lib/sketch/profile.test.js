@@ -14,6 +14,7 @@ import { cubicPoint, signedArea } from './geom.js';
 import {
   extractProfile,
   isFacePlane,
+  isReferencePlane,
   planeAxisLabels,
   planeLabel,
   planeNormal,
@@ -287,6 +288,19 @@ describe('plane mapping', () => {
     expect(planeLabel('XZ')).toBe('XZ');
     expect(planeAxisLabels(FACE)).toEqual(['U', 'V']);
     expect(planeAxisLabels('YZ')).toEqual(['Z', 'Y']);
+  });
+
+  it('distinguishes reference planes from ephemeral face picks', () => {
+    const refPlane = { ...FACE, reference: true, name: 'Plane1' };
+    expect(isReferencePlane(refPlane)).toBe(true);
+    expect(isReferencePlane(FACE)).toBe(false); // a face pick is not a reference
+    expect(isReferencePlane('XY')).toBe(false);
+    expect(isReferencePlane(null)).toBe(false);
+    // A reference plane labels with its name; an unnamed one falls back.
+    expect(planeLabel(refPlane)).toBe('Plane1');
+    expect(planeLabel({ ...FACE, reference: true })).toBe('Plane');
+    // Reference planes still read U/V for their axis lines.
+    expect(planeAxisLabels(refPlane)).toEqual(['U', 'V']);
   });
 });
 

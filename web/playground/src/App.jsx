@@ -13,6 +13,7 @@ import DrawingCanvas from './components/DrawingCanvas.jsx';
 import SweepPanel from './components/SweepPanel.jsx';
 import SectionPanel from './components/SectionPanel.jsx';
 import MeasurePanel from './components/MeasurePanel.jsx';
+import ReferencePanel from './components/ReferencePanel.jsx';
 import { DEFAULT_SCRIPT } from './lib/defaultScript.js';
 import { freeNodes, nodeLabel, runTracedScript, scriptHeader, serializeTree } from './lib/sceneTree.js';
 import { buildBinaryStl } from './lib/stl.js';
@@ -22,7 +23,7 @@ import { setNodeArg, setBooleanOp } from './lib/propertyEdit.js';
 import { deleteNode } from './lib/deleteNode.js';
 import { DEFAULT_LENGTH_UNIT, normalizeUnit, UNIT_STORAGE_KEY } from './lib/units.js';
 import { VIEW_SHORTCUTS } from './lib/views.js';
-import { buildFeatures, pruneTree, resolveKeys } from './lib/featureTree.js';
+import { buildFeatures, buildReferenceFeatures, pruneTree, resolveKeys } from './lib/featureTree.js';
 import { PALETTE } from './lib/shapeGraph.js';
 import { addFeatureNode, addPrimitiveNode, assertStoreConsistency } from './lib/storeSync.js';
 import {
@@ -36,7 +37,7 @@ import {
 import { createFaceRegionIndex, makeTangentPlane } from './lib/facePlane.js';
 import { buildEdgeModel, snapEntity } from './lib/measureTopology.js';
 import { boundingBoxDims, measurePair, measureSingle, triListArea } from './lib/measure.js';
-import { isFacePlane } from './lib/sketch/profile.js';
+import { isFacePlane, isReferencePlane } from './lib/sketch/profile.js';
 import { faceBoundaryLoopsUV } from './lib/sketch/edit.js';
 import { opsHaveCurvedSegs } from './lib/sketch/fromOps.js';
 import { faceRefFromPlane, planarRegionsOf, resolveRefs } from './lib/persistentRef.js';
@@ -200,6 +201,16 @@ export default function App() {
   const [hiddenKeys, setHiddenKeys] = useState(() => new Set());
   const [suppressedKeys, setSuppressedKeys] = useState(() => new Set());
   const [editingSketch, setEditingSketch] = useState(null); // { nodeId, name }
+
+  // Reference geometry (of-fsl.14): datum planes/axes/points/coordinate systems,
+  // parallel App-level state (like featureNames) rather than Shapes — they carry
+  // no mesh and never enter the CSG tree. Each entry is
+  // `{ id, kind, name?, geom }`; `geom` is plain data from lib/referenceGeometry.js.
+  // Ids come from a monotonic counter so feature keys (`ref:<id>`) stay stable
+  // across rebuilds. Hidden reference glyphs reuse `hiddenKeys` (keyed `ref:<id>`).
+  const [refGeom, setRefGeom] = useState([]);
+  const [refPanelOpen, setRefPanelOpen] = useState(false);
+  const refIdRef = useRef(0);
 
   // Persistent face references (of-fsl.8): Map<featureKey, FaceRef> for
   // sweeps placed on a picked face. Held in a ref (survives renders without
@@ -784,6 +795,22 @@ export default function App() {
   const measurePairReadout =
     measureEntities.length === 2 ? measurePair(measureEntities[0], measureEntities[1]) : null;
 
+  // Reference-geometry rows (of-fsl.14) merged after the construction-tree
+  // features so datums appear in the same FeatureManager list. Kept as its own
+  // memo so the persistent-reference rebuild pass over `features` is untouched.
+  const referenceFeatures = useMemo(() => buildReferenceFeatures(refGeom), [refGeom]);
+  const allFeatures = useMemo(
+    () => [...features, ...referenceFeatures],
+    [features, referenceFeatures]
+  );
+
+  // Visible reference geometry for the viewport glyph layer: hidden datums
+  // (eye toggled off, keyed `ref:<id>`) are dropped.
+  const visibleRefGeom = useMemo(
+    () => refGeom.filter((r) => !hiddenKeys.has(`ref:${r.id}`)),
+    [refGeom, hiddenKeys]
+  );
+
   // Persistent-reference rebuild pass (of-fsl.8). After each rebuild produces a
   // fresh mesh and feature list: (1) attach a pending face ref to its newly
   // created sweep feature, (2) drop refs whose owning feature no longer exists,
@@ -887,14 +914,48 @@ export default function App() {
     remesh({ generation });
   }, [tree, hiddenKeys, suppressedKeys, wasmReady, remesh]);
 
-  const handleFeatureRename = useCallback((key, name) => {
-    setFeatureNames((prev) => {
-      const next = { ...prev };
-      if (name) next[key] = name;
-      else delete next[key]; // empty rename reverts to the default name
+  // ---- reference geometry (of-fsl.14) --------------------------------------
+
+  const handleRefAdd = useCallback((kind, geom, name) => {
+    refIdRef.current += 1;
+    const id = `rg${refIdRef.current}`;
+    setRefGeom((prev) => [...prev, { id, kind, name, geom }]);
+  }, []);
+
+  const handleRefDelete = useCallback((id) => {
+    setRefGeom((prev) => prev.filter((r) => r.id !== id));
+    // Drop any visibility toggle so a re-used id can't inherit a stale hide.
+    setHiddenKeys((prev) => {
+      if (!prev.has(`ref:${id}`)) return prev;
+      const next = new Set(prev);
+      next.delete(`ref:${id}`);
       return next;
     });
+    // If the deleted plane is the active sketch plane, fall back to XY.
+    setSketchPlane((p) => (isReferencePlane(p) && p.refId === id ? 'XY' : p));
   }, []);
+
+  const handleRefRename = useCallback((id, name) => {
+    setRefGeom((prev) => prev.map((r) => (r.id === id ? { ...r, name: name || undefined } : r)));
+  }, []);
+
+  const handleRefPanelToggle = useCallback(() => setRefPanelOpen((v) => !v), []);
+
+  const handleFeatureRename = useCallback(
+    (key, name) => {
+      if (key.startsWith('ref:')) {
+        handleRefRename(key.slice(4), name);
+        return;
+      }
+      setFeatureNames((prev) => {
+        const next = { ...prev };
+        if (name) next[key] = name;
+        else delete next[key]; // empty rename reverts to the default name
+        return next;
+      });
+    },
+    [handleRefRename]
+  );
 
   const handleToggleHide = useCallback((key) => {
     setHiddenKeys((prev) => {
@@ -925,6 +986,10 @@ export default function App() {
 
   const handleFeatureDelete = useCallback(
     (feature) => {
+      if (feature.reference) {
+        handleRefDelete(feature.id);
+        return;
+      }
       const root = tracedRef.current?.root;
       if (!root) return;
       const pruned = pruneTree(root, new Set([feature.id]));
@@ -936,7 +1001,7 @@ export default function App() {
       clearSelection();
       commitRoot(pruned);
     },
-    [clearSelection, commitRoot]
+    [clearSelection, commitRoot, handleRefDelete]
   );
 
   const enterSketchEdit = useCallback(
@@ -967,6 +1032,16 @@ export default function App() {
     (feature) => {
       if (feature.kind === 'sketch') {
         enterSketchEdit(feature);
+        return;
+      }
+      if (feature.reference) {
+        // Selecting a reference plane arms it as the sketch plane: the picker
+        // and handleSketchToggle then open a sketch on it. `name`/`refId`
+        // travel with the object so planeLabel shows the datum's name and a
+        // later delete can detach it. Axes/points/csys have no sketch action.
+        if (feature.kind === 'plane') {
+          setSketchPlane({ ...feature.geom, name: feature.name, refId: feature.id });
+        }
         return;
       }
       selectNode(feature.node, { allowRoot: true });
@@ -1172,8 +1247,10 @@ export default function App() {
           setToast(`Cannot sketch on this face: ${pickedFace.reason}`);
           return;
         }
-        // No face picked: never reopen on a stale face plane.
-        setSketchPlane((p) => (isFacePlane(p) ? 'XY' : p));
+        // No face picked: never reopen on a stale ephemeral face plane, but a
+        // persistent reference plane (of-fsl.14) is kept — it is the deliberate
+        // sketch plane (fixes the "offset plane above a face" repro).
+        setSketchPlane((p) => (isFacePlane(p) && !isReferencePlane(p) ? 'XY' : p));
         setFaceSketchLoops(null);
       }
     }
@@ -1451,7 +1528,7 @@ export default function App() {
           </div>
           <FeatureTree
             embedded
-            features={features}
+            features={allFeatures}
             selectedId={selectedNode?.id}
             hiddenKeys={hiddenKeys}
             suppressedKeys={suppressedKeys}
@@ -1503,6 +1580,8 @@ export default function App() {
           onWireframeChange={setWireframe}
           section={Boolean(section)}
           onSectionToggle={handleSectionToggle}
+          referenceOpen={refPanelOpen}
+          onReferenceToggle={handleRefPanelToggle}
           onDownloadStl={downloadStl}
           onDownloadStep={downloadStep}
           documentUnit={documentUnit}
@@ -1531,6 +1610,7 @@ export default function App() {
             }
             previewMesh={previewMesh}
             section={section}
+            referenceGeometry={visibleRefGeom}
             onSectionOffsetChange={handleSectionOffset}
             measureEntities={measureMode ? measureEntities : null}
             measureHover={measureMode ? measureHover : null}
@@ -1564,6 +1644,12 @@ export default function App() {
           single={measureSingleReadout}
           pair={measurePairReadout}
           onClear={() => setMeasureEntities([])}
+        />
+        <ReferencePanel
+          open={refPanelOpen}
+          refGeom={refGeom}
+          onAdd={handleRefAdd}
+          onClose={handleRefPanelToggle}
         />
         {selectedNode && (
           <div className="gizmo-bar">

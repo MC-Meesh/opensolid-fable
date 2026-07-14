@@ -41,7 +41,7 @@ describe('MainToolbar', () => {
     expect(html).toContain('View');
     expect(html).toContain('Drawing');
     expect(html).toContain('Export');
-    for (const label of ['Extrude', 'Revolve', 'Sweep', 'Loft', 'Fit', 'Front', 'Top', 'Right', 'Iso', 'Wireframe', 'Section', 'STL', 'STEP']) {
+    for (const label of ['Extrude', 'Revolve', 'Sweep', 'Loft', 'Reference', 'Fit', 'Front', 'Top', 'Right', 'Iso', 'Wireframe', 'Section', 'STL', 'STEP']) {
       expect(html).toContain(label);
     }
   });
@@ -79,6 +79,11 @@ describe('MainToolbar', () => {
     const html = render({ measureOpen: true });
     // aria-pressed=true renders on the active toggle.
     expect(html).toMatch(/aria-label="Measure"[^>]*aria-pressed="true"|aria-pressed="true"[^>]*aria-label="Measure"/);
+  });
+
+  it('marks the Reference button active when the panel is open', () => {
+    const html = render({ referenceOpen: true });
+    expect(html).toMatch(/<button[^>]*aria-pressed="true"[^>]*aria-label="Reference"/);
   });
 
   it('explains faceted export of organic shapes in the STEP tooltip', () => {

@@ -6,7 +6,7 @@
 import { describe, expect, it } from 'vitest';
 import { renderToString } from 'react-dom/server';
 import FeatureTree from './FeatureTree.jsx';
-import { buildFeatures } from '../lib/featureTree.js';
+import { buildFeatures, buildReferenceFeatures } from '../lib/featureTree.js';
 
 const noop = () => {};
 
@@ -57,6 +57,23 @@ describe('FeatureTree', () => {
     expect(html).toContain('Delete Extrude1');
     // Sketch rows have no visibility/suppress/delete of their own.
     expect(html).not.toContain('Hide Sketch1');
+  });
+
+  it('renders reference-geometry rows with a hide + delete but no suppress', () => {
+    const refFeatures = buildReferenceFeatures([
+      { id: 'r1', kind: 'plane', geom: {} },
+      { id: 'r2', kind: 'axis', geom: {} },
+    ]);
+    const html = render({
+      features: [...sampleFeatures(), ...refFeatures],
+      hiddenKeys: new Set(['ref:r1']),
+    });
+    expect(html).toContain('Plane1');
+    expect(html).toContain('Axis1');
+    expect(html).toContain('Delete Plane1');
+    expect(html).toContain('Show Plane1'); // hidden → "Show"
+    // Reference rows have no suppress control.
+    expect(html).not.toContain('Suppress Plane1');
   });
 
   it('marks selected, hidden and suppressed rows', () => {

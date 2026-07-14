@@ -108,6 +108,51 @@ export function buildFeatures(root, names = {}) {
   return features;
 }
 
+/** Display metadata per reference-geometry kind: feature type name used for
+ * numbering and the icon key. Reference geometry (of-fsl.14) is not part of
+ * the construction tree, so it is numbered independently here. */
+export const REFERENCE_META = {
+  plane: { type: 'Plane' },
+  axis: { type: 'Axis' },
+  point: { type: 'Point' },
+  csys: { type: 'CSys' },
+};
+
+/**
+ * Feature rows for the reference-geometry collection, to be concatenated after
+ * the construction-tree features. Each `item` is `{ id, kind, name?, geom }`
+ * as held in App state; `kind` is one of REFERENCE_META's keys.
+ *
+ * Rows mirror `buildFeatures`' shape so they render through the same
+ * FeatureTree component: `{ key, id, kind, type, name, defaultName, depth:0,
+ * reference:true, geom }`. `key` is `ref:<id>` — stable across rebuilds since
+ * reference ids are assigned once and never renumbered. `name` on the item
+ * (a user rename) wins over the ordinal default (Plane1, Axis2, …).
+ */
+export function buildReferenceFeatures(items = []) {
+  const counters = {};
+  const features = [];
+  for (const item of items) {
+    const meta = REFERENCE_META[item.kind];
+    if (!meta) continue; // unknown kind — skip rather than crash the tree
+    const { type } = meta;
+    counters[type] = (counters[type] ?? 0) + 1;
+    const defaultName = `${type}${counters[type]}`;
+    features.push({
+      key: `ref:${item.id}`,
+      id: item.id,
+      kind: item.kind,
+      type,
+      name: item.name || defaultName,
+      defaultName,
+      depth: 0,
+      reference: true,
+      geom: item.geom,
+    });
+  }
+  return features;
+}
+
 /** Node ids for the feature keys that resolve in the current feature list.
  * Sketch keys resolve to their owning sweep node. */
 export function resolveKeys(features, keys) {
