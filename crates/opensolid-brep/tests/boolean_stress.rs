@@ -1584,7 +1584,7 @@ fn rotated_block_cap_bite_volume_invariance() {
 /// intersection has the exact cap closed form, and the three-way volume
 /// identities must hold.
 #[test]
-#[ignore = "of-2ql: refinement lattice slivers — case 1 union tessellation not a closed manifold (of-43n seam splits fixed)"]
+#[ignore = "of-6ry fixed the case 1 union fold (CDT curved-face seed); remaining blocker is of-s89 bounded-cap volume — case 6 intersection cap 5.3e-3 low, allowed 5e-3. Un-ignore once of-s89 lands."]
 fn random_sphere_face_caps_identity() {
     let mut rng = Rng::new(0x0F1_CA9);
     for case in 0..8 {
