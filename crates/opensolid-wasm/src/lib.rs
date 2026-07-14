@@ -1442,7 +1442,7 @@ mod tests {
         p.line_to(5.0, 5.0);
         p.arc_to(9.0, 9.0, 1.0);
         // Curved segments after close() are dropped too.
-        p.ellipse_arc_to(20.0, 20.0, 3.0, 3.0, 0.0, 180.0);
+        p.ellipse_arc_to(-20.0, 20.0, 20.0, 20.0, 3.0, 3.0, 0.0, true);
         p.cubic_to(30.0, 30.0, 31.0, 31.0, 32.0, 32.0);
         let shape = WasmShape::extrude(&p, 1.0, None).expect("valid extrude");
         assert_eq!(shape.bounds(), vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0]);
@@ -1511,11 +1511,12 @@ mod tests {
 
     #[test]
     fn extrude_ellipse_profile_via_wasm_api() {
-        // A full axis-aligned ellipse rx=1.5, ry=0.6 from two half-arcs
-        // (eccentric sweep 180° each), extruded and meshed.
+        // A full axis-aligned ellipse rx=1.5, ry=0.6 from two CCW half-arcs
+        // (start (1.5,0) → (-1.5,0) over the top, then back), extruded and
+        // meshed. Endpoints given directly (endpoint + ccw contract).
         let mut p = WasmProfile2D::new(1.5, 0.0);
-        p.ellipse_arc_to(0.0, 0.0, 1.5, 0.6, 0.0, 180.0);
-        p.ellipse_arc_to(0.0, 0.0, 1.5, 0.6, 0.0, 180.0);
+        p.ellipse_arc_to(-1.5, 0.0, 0.0, 0.0, 1.5, 0.6, 0.0, true);
+        p.ellipse_arc_to(1.5, 0.0, 0.0, 0.0, 1.5, 0.6, 0.0, true);
         p.close();
         let shape = WasmShape::extrude(&p, 0.8, None).expect("valid ellipse extrude");
         let b = shape.bounds();
@@ -1532,6 +1533,67 @@ mod tests {
         );
         assert!((b[1]).abs() < 1e-9 && (b[4] - 0.8).abs() < 1e-9, "y: {b:?}");
         assert_valid(&shape.mesh(40, None));
+    }
+
+    #[test]
+    fn ellipse_endpoint_ccw_recovers_circle_geometry() {
+        // rx = ry = 1 makes the ellipse a unit circle; two CCW half-arcs
+        // from (1,0) → (-1,0) → (1,0) must reproduce the exact circle SDF.
+        // This pins the endpoint+ccw → eccentric-sweep conversion.
+        let mut p = WasmProfile2D::new(1.0, 0.0);
+        p.ellipse_arc_to(-1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, true);
+        p.ellipse_arc_to(1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, true);
+        p.close();
+        // Extrude tall (height 4) and probe the mid-plane y = 2: the caps sit
+        // 2 away, so the interior field is the 2D circle distance
+        // hypot(x,z) − 1 wherever the wall is nearer than the caps.
+        let shape = WasmShape::extrude(&p, 4.0, None).expect("valid circle extrude");
+        for (x, z, want) in [
+            (0.0, 0.0, -1.0),
+            (0.5, 0.0, -0.5),
+            (0.0, -0.9, -0.1),
+            (1.5, 0.0, 0.5),
+        ] {
+            let d = shape.distance(x, 2.0, z);
+            assert!((d - want).abs() < 1e-6, "at ({x},{z}): {d} vs {want}");
+        }
+        // Bounds are the unit circle box in x/z (axis extremes captured).
+        let b = shape.bounds();
+        assert!(
+            (b[0] + 1.0).abs() < 1e-6 && (b[3] - 1.0).abs() < 1e-6,
+            "{b:?}"
+        );
+        assert!(
+            (b[2] + 1.0).abs() < 1e-6 && (b[5] - 1.0).abs() < 1e-6,
+            "{b:?}"
+        );
+    }
+
+    #[test]
+    fn ellipse_cw_direction_takes_the_other_arc() {
+        // Same endpoints (1,0) → (-1,0) but CW sweeps under the bottom, so
+        // the enclosed region differs from the CCW (over-the-top) arc. Build
+        // a half-disk each way and check the interior side flips.
+        // CCW half from (1,0) to (-1,0) bulges through +y, closing straight
+        // back along y = 0 encloses the upper half-disk (z > 0 in world).
+        let mut up = WasmProfile2D::new(1.0, 0.0);
+        up.ellipse_arc_to(-1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, true);
+        up.close();
+        let up_shape = WasmShape::extrude(&up, 1.0, None).expect("valid upper half");
+        // CW half from (1,0) to (-1,0) bulges through -y → lower half-disk.
+        let mut down = WasmProfile2D::new(1.0, 0.0);
+        down.ellipse_arc_to(-1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, false);
+        down.close();
+        let down_shape = WasmShape::extrude(&down, 1.0, None).expect("valid lower half");
+        // World z = +profile-y. Upper half contains (0, mid, +0.5); lower
+        // half contains (0, mid, -0.5). Each excludes the other's point.
+        assert!(up_shape.distance(0.0, 0.5, 0.5) < 0.0, "upper missing +z");
+        assert!(up_shape.distance(0.0, 0.5, -0.5) > 0.0, "upper has -z");
+        assert!(
+            down_shape.distance(0.0, 0.5, -0.5) < 0.0,
+            "lower missing -z"
+        );
+        assert!(down_shape.distance(0.0, 0.5, 0.5) > 0.0, "lower has +z");
     }
 
     #[test]
@@ -1559,8 +1621,8 @@ mod tests {
     fn curved_builder_errors_surface_as_strings() {
         // Ellipse with a zero radius is rejected at build time.
         let mut bad = WasmProfile2D::new(1.0, 0.0);
-        bad.ellipse_arc_to(0.0, 0.0, 0.0, 1.0, 0.0, 180.0);
-        bad.ellipse_arc_to(0.0, 0.0, 1.0, 1.0, 0.0, 180.0);
+        bad.ellipse_arc_to(-1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, true);
+        bad.ellipse_arc_to(1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, true);
         bad.close();
         assert!(WasmShape::extrude(&bad, 1.0, None).is_err());
 
