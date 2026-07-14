@@ -10,6 +10,7 @@ import FeatureTree from './components/FeatureTree.jsx';
 import PropertyPanel from './components/PropertyPanel.jsx';
 import SketchCanvas from './components/SketchCanvas.jsx';
 import SweepPanel from './components/SweepPanel.jsx';
+import MeasurePanel from './components/MeasurePanel.jsx';
 import { DEFAULT_SCRIPT } from './lib/defaultScript.js';
 import { freeNodes, nodeLabel, runTracedScript, scriptHeader, serializeTree } from './lib/sceneTree.js';
 import { buildBinaryStl } from './lib/stl.js';
@@ -26,6 +27,8 @@ import { createFaceRegionIndex } from './lib/facePlane.js';
 import { isFacePlane } from './lib/sketch/profile.js';
 import { faceRefFromPlane, planarRegionsOf, resolveRefs } from './lib/persistentRef.js';
 import { computeRebuildState } from './lib/rebuildState.js';
+import { buildEdgeModel, snapEntity } from './lib/measureTopology.js';
+import { boundingBoxDims, measurePair, measureSingle, refPoint, triListArea } from './lib/measure.js';
 
 // Adaptive meshing target: maximum chordal deviation from the exact
 // surface, in model units. The octree refines near curvature and CSG
@@ -115,10 +118,18 @@ export default function App() {
   // consumed when a sketch opens on it.
   const [pickedFace, setPickedFace] = useState(null);
   const [toast, setToast] = useState(null);
+  // Measure tool (of-fsl.17): a mode where clicks snap to a vertex/edge/face
+  // and accumulate up to two entities. Entities carry the geometry the
+  // readout and viewport overlay both need.
+  const [measureMode, setMeasureMode] = useState(false);
+  const [measureEntities, setMeasureEntities] = useState([]);
+  const [measureHover, setMeasureHover] = useState(null);
   const profileRef = useRef(null);
   const viewportRef = useRef(null);
   // Face-region index over the displayed mesh, rebuilt lazily per mesh key.
   const faceRegionsRef = useRef({ key: null, index: null });
+  // Edge/vertex topology model over the displayed mesh, rebuilt lazily too.
+  const edgeModelRef = useRef({ key: null, model: null });
 
   // Feature tree (presentation layer over the traced tree): user renames,
   // per-feature visibility/suppression, panel collapse, and the sketch
@@ -399,8 +410,71 @@ export default function App() {
     return faceRegionsRef.current.index;
   }, []);
 
+  // Lazily (re)build the edge/vertex topology model for the displayed mesh.
+  const edgeModel = useCallback(() => {
+    const displayed = meshRef.current;
+    if (!displayed?.indices?.length) return null;
+    if (edgeModelRef.current.key !== displayed.key) {
+      edgeModelRef.current = {
+        key: displayed.key,
+        model: buildEdgeModel(displayed.positions, displayed.indices),
+      };
+    }
+    return edgeModelRef.current.model;
+  }, []);
+
+  // Resolve a raycast hit into a measure entity: snap to the nearest vertex,
+  // edge, or circular rim; fall back to a planar face (with its area) or the
+  // raw surface point.
+  const pickMeasureEntity = useCallback(
+    (point, faceIndex) => {
+      const displayed = meshRef.current;
+      const model = edgeModel();
+      if (model) {
+        const tol = (model.diagonal || 1) * 0.03;
+        const snapped = snapEntity(model, point, tol);
+        if (snapped) return snapped;
+      }
+      if (faceIndex !== null && displayed) {
+        const region = faceRegions()?.regionAt(faceIndex);
+        if (region?.planar) {
+          return {
+            kind: 'face',
+            origin: region.plane.origin,
+            normal: region.plane.normal,
+            area: triListArea(displayed.positions, displayed.indices, region.tris),
+            tris: region.tris,
+          };
+        }
+      }
+      return { kind: 'point', point };
+    },
+    [edgeModel, faceRegions]
+  );
+
+  // Two entities are "the same" if they read as the same kind at the same
+  // location — used to skip re-renders while hovering within one feature.
+  const sameEntity = useCallback((a, b) => {
+    if (!a || !b || a.kind !== b.kind) return false;
+    const pa = refPoint(a);
+    const pb = refPoint(b);
+    if (!pa || !pb) return false;
+    return Math.hypot(pa[0] - pb[0], pa[1] - pb[1], pa[2] - pb[2]) < 1e-9;
+  }, []);
+
   const handlePick = useCallback(
     (point, faceIndex) => {
+      if (measureMode) {
+        // Clicking empty space clears the measurement; otherwise append the
+        // snapped entity, keeping at most two (a third click restarts).
+        if (!point) {
+          setMeasureEntities([]);
+          return;
+        }
+        const entity = pickMeasureEntity(point, faceIndex);
+        setMeasureEntities((prev) => (prev.length >= 2 ? [entity] : [...prev, entity]));
+        return;
+      }
       const root = tracedRef.current?.root;
       if (!root) return;
       if (!point) {
@@ -420,16 +494,26 @@ export default function App() {
         clearSelection();
       }
     },
-    [selectNode, clearSelection, faceRegions]
+    [measureMode, pickMeasureEntity, selectNode, clearSelection, faceRegions]
   );
 
   // Hover highlight: resolve the pointer's triangle to its planar face
   // region and darken it in place on the main mesh — no overlay geometry,
   // so nothing to z-fight (of-4eh.18). Curved surfaces get no highlight,
-  // which keeps hover an honest "you can sketch here" affordance.
+  // which keeps hover an honest "you can sketch here" affordance. In Measure
+  // mode the hover instead previews the snapped entity in the overlay.
   const handleHover = useCallback(
     (point, faceIndex) => {
       const displayed = meshRef.current;
+      if (measureMode) {
+        if (!point || !displayed) {
+          setMeasureHover(null);
+          return;
+        }
+        const entity = pickMeasureEntity(point, faceIndex);
+        setMeasureHover((prev) => (sameEntity(prev, entity) ? prev : entity));
+        return;
+      }
       if (!point || faceIndex === null || !displayed) {
         setHoverFace(null);
         return;
@@ -447,8 +531,84 @@ export default function App() {
           : { meshKey: displayed.key, tris: region.tris }
       );
     },
-    [faceRegions]
+    [measureMode, pickMeasureEntity, sameEntity, faceRegions]
   );
+
+  // Toggle Measure mode: entering clears any body selection/face pick and
+  // closes a sketch (the two modes are mutually exclusive); the entity/hover
+  // state is cleared by the effect below when the mode turns off.
+  const handleMeasureToggle = useCallback(() => {
+    setMeasureMode((v) => {
+      const next = !v;
+      if (next) {
+        clearSelection();
+        setPickedFace(null);
+        setHoverFace(null);
+        setSketchOpen(false);
+        setEditingSketch(null);
+      }
+      return next;
+    });
+  }, [clearSelection]);
+
+  useEffect(() => {
+    if (!measureMode) {
+      setMeasureEntities([]);
+      setMeasureHover(null);
+    }
+  }, [measureMode]);
+
+  // A rebuilt mesh invalidates picked entity coordinates: drop them so the
+  // overlay and readout never reference stale geometry.
+  useEffect(() => {
+    setMeasureEntities([]);
+    setMeasureHover(null);
+  }, [mesh]);
+
+  // Viewport overlay primitives for the current measurement (picked markers,
+  // the two-entity link, and the hover preview).
+  const measureView = useMemo(() => {
+    if (!measureMode) return null;
+    const markers = [];
+    for (const e of measureEntities) {
+      if (e.kind === 'vertex' || e.kind === 'point') {
+        markers.push({ type: 'point', point: e.point });
+      } else if (e.kind === 'edge') {
+        markers.push({ type: 'line', points: e.points });
+        markers.push({ type: 'point', point: e.a });
+        markers.push({ type: 'point', point: e.b });
+      } else if (e.kind === 'circle') {
+        markers.push({ type: 'line', points: e.points });
+        markers.push({ type: 'point', point: e.center });
+      } else if (e.kind === 'face') {
+        markers.push({ type: 'point', point: e.origin });
+      }
+    }
+    const link =
+      measureEntities.length === 2
+        ? [refPoint(measureEntities[0]), refPoint(measureEntities[1])]
+        : null;
+    let hover = null;
+    if (measureHover) {
+      const h = measureHover;
+      if (h.kind === 'vertex' || h.kind === 'point') hover = { type: 'point', point: h.point };
+      else if (h.kind === 'edge' || h.kind === 'circle') hover = { type: 'line', points: h.points };
+      else if (h.kind === 'face') hover = { type: 'point', point: h.origin };
+    }
+    return { markers, link, hover };
+  }, [measureMode, measureEntities, measureHover]);
+
+  // Numbers for the readout panel: whole-body dimensions plus the single- or
+  // two-entity measurement.
+  const measureReadout = useMemo(() => {
+    if (!measureMode) return null;
+    const bbox = mesh?.positions?.length ? boundingBoxDims(mesh.positions) : null;
+    let single = null;
+    let pair = null;
+    if (measureEntities.length === 1) single = measureSingle(measureEntities[0]);
+    else if (measureEntities.length === 2) pair = measurePair(measureEntities[0], measureEntities[1]);
+    return { bbox, single, pair, count: measureEntities.length };
+  }, [measureMode, measureEntities, mesh]);
 
   // SolidWorks Delete gesture: remove the selected body/branch from the tree
   // and commit through the store.
@@ -849,6 +1009,7 @@ export default function App() {
   // of silently sketching on a facet.
   const handleSketchToggle = useCallback(() => {
     if (!sketchOpen) {
+      setMeasureMode(false); // sketching and measuring are mutually exclusive
       if (pickedFace?.planar) {
         setSketchPlane(pickedFace.plane);
         setPickedFace(null);
@@ -915,17 +1076,22 @@ export default function App() {
         // 1-7: standard views in SolidWorks Ctrl+1..7 order (plain digits —
         // browsers reserve Ctrl/Cmd+digit for tab switching).
         viewportRef.current?.snapView(VIEW_SHORTCUTS[event.key]);
+      } else if (event.key === 'm' || event.key === 'M') {
+        handleMeasureToggle();
       } else if (event.key === 'Delete' || event.key === 'Backspace') {
         event.preventDefault();
         handleDeleteSelected();
       } else if (event.key === 'Escape') {
-        if (sweep) cancelSweep();
+        if (measureMode) {
+          setMeasureEntities([]);
+          setMeasureHover(null);
+        } else if (sweep) cancelSweep();
         else clearSelection();
       }
     }
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [clearSelection, sweep, cancelSweep, sketchOpen, handleDeleteSelected]);
+  }, [clearSelection, sweep, cancelSweep, sketchOpen, handleDeleteSelected, measureMode, handleMeasureToggle]);
 
   // Exact booleans rebuild shapes, not just meshes: re-run the script.
   const handleExactBooleansChange = useCallback(
@@ -1062,6 +1228,8 @@ export default function App() {
               : 'Open a sketch and draw a closed profile first'
           }
           onSweep={handleSweepStart}
+          measureActive={measureMode}
+          onMeasureToggle={handleMeasureToggle}
           onView={(name) => viewportRef.current?.snapView(name)}
           onFit={() => viewportRef.current?.zoomToFit()}
           wireframe={wireframe}
@@ -1091,6 +1259,7 @@ export default function App() {
                 : null
             }
             previewMesh={previewMesh}
+            measure={measureView}
             onPick={handlePick}
             onHover={handleHover}
             onTransform={handleTransform}
@@ -1103,6 +1272,13 @@ export default function App() {
           onApply={applySweep}
           onCancel={cancelSweep}
         />
+        {measureMode && measureReadout && (
+          <MeasurePanel
+            readout={measureReadout}
+            onClear={() => setMeasureEntities([])}
+            onClose={handleMeasureToggle}
+          />
+        )}
         {selectedNode && (
           <div className="gizmo-bar">
             <button

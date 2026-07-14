@@ -178,6 +178,12 @@ const PREVIEW_MATERIAL = new THREE.MeshStandardMaterial({
   depthWrite: false,
 });
 
+// Measure overlay colors: picked entities in the selection accent, the hover
+// preview in a warm amber, the two-entity link dashed white. All drawn with
+// depthTest off so markers stay visible through the body (of-fsl.17).
+const MEASURE_ACCENT = 0x4fc3f7;
+const MEASURE_HOVER = 0xffd24a;
+
 const Viewport3D = forwardRef(function Viewport3D(
   {
     mesh,
@@ -191,6 +197,7 @@ const Viewport3D = forwardRef(function Viewport3D(
     hoverFaceTris,
     selectedFaceTris,
     previewMesh,
+    measure,
     onPick,
     onHover,
     onTransform,
@@ -598,6 +605,85 @@ const Viewport3D = forwardRef(function Viewport3D(
       ctx.previewObject.visible = false;
     }
   }, [previewMesh]);
+
+  // Measure overlay (of-fsl.17): draw sphere markers at picked points, the
+  // polylines of picked edges/rims, a dashed link between two entities, and
+  // the amber hover preview. Rebuilt whenever the measure view changes; all
+  // primitives render depth-test-free and on top so nothing hides behind the
+  // body. Marker size scales with the mesh so it reads at any model scale.
+  useEffect(() => {
+    const ctx = sceneRef.current;
+    if (!ctx) return undefined;
+    const scene = ctx.meshObject.parent;
+    const group = new THREE.Group();
+    group.renderOrder = 10;
+
+    const geo = ctx.meshObject.geometry;
+    if (!geo.boundingSphere) geo.computeBoundingSphere();
+    const dotR = Math.max((geo.boundingSphere?.radius || 1) * 0.012, 1e-4);
+
+    const disposables = [];
+    const track = (obj) => {
+      disposables.push(obj);
+      return obj;
+    };
+    const sphereGeo = track(new THREE.SphereGeometry(dotR, 12, 8));
+    const hoverGeo = track(new THREE.SphereGeometry(dotR * 1.3, 12, 8));
+    const dotMat = (color) =>
+      track(
+        new THREE.MeshBasicMaterial({ color, depthTest: false, depthWrite: false, transparent: true })
+      );
+    const lineMat = (color) =>
+      track(new THREE.LineBasicMaterial({ color, depthTest: false, transparent: true }));
+    const accentDot = dotMat(MEASURE_ACCENT);
+    const accentLine = lineMat(MEASURE_ACCENT);
+    const hoverDot = dotMat(MEASURE_HOVER);
+    const hoverLine = lineMat(MEASURE_HOVER);
+
+    const addPoint = (p, mat, g = sphereGeo) => {
+      const m = new THREE.Mesh(g, mat);
+      m.position.set(p[0], p[1], p[2]);
+      group.add(m);
+    };
+    const addLine = (pts, mat) => {
+      const g = track(new THREE.BufferGeometry().setFromPoints(pts.map((p) => new THREE.Vector3(...p))));
+      group.add(new THREE.Line(g, mat));
+    };
+
+    if (measure) {
+      for (const mk of measure.markers ?? []) {
+        if (mk.type === 'point') addPoint(mk.point, accentDot);
+        else if (mk.type === 'line') addLine(mk.points, accentLine);
+      }
+      if (measure.link) {
+        const g = track(
+          new THREE.BufferGeometry().setFromPoints(measure.link.map((p) => new THREE.Vector3(...p)))
+        );
+        const linkMat = track(
+          new THREE.LineDashedMaterial({
+            color: 0xffffff,
+            dashSize: dotR * 2,
+            gapSize: dotR,
+            depthTest: false,
+            transparent: true,
+          })
+        );
+        const line = new THREE.Line(g, linkMat);
+        line.computeLineDistances();
+        group.add(line);
+      }
+      if (measure.hover) {
+        if (measure.hover.type === 'point') addPoint(measure.hover.point, hoverDot, hoverGeo);
+        else if (measure.hover.type === 'line') addLine(measure.hover.points, hoverLine);
+      }
+    }
+
+    scene.add(group);
+    return () => {
+      scene.remove(group);
+      for (const d of disposables) d.dispose();
+    };
+  }, [measure]);
 
   // Face hover/selection: darken the region's triangles in the main mesh's
   // color attribute (selected paints after hover, so it wins on overlap).

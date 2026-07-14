@@ -37,6 +37,12 @@ const Icons = {
       <path d="M12.7 12.6 L10.5 11.5 L12 9.6" />
     </svg>
   ),
+  measure: (
+    <svg {...ICON}>
+      <path d="M2 10 L10 2 L14 6 L6 14 Z" />
+      <path d="M4.5 7.5 L6 9 M7 5 L8.5 6.5 M9.5 2.5 L11 4" />
+    </svg>
+  ),
   fit: (
     <svg {...ICON}>
       <path d="M2 5.5 V2 h3.5 M10.5 2 H14 v3.5 M14 10.5 V14 h-3.5 M5.5 14 H2 v-3.5" />
@@ -120,6 +126,8 @@ export default function MainToolbar({
   canSweep,
   sweepDisabledReason,
   onSweep,
+  measureActive,
+  onMeasureToggle,
   onView,
   onFit,
   wireframe,
@@ -166,6 +174,19 @@ export default function MainToolbar({
           disabledReason={disabled ? notReady : sweepDisabledReason}
           disabled={disabled || !canSweep}
           onClick={() => onSweep('revolve')}
+        />
+      </div>
+      <div className="tool-sep" />
+      <div className="tool-group" aria-label="Inspect">
+        <span className="tool-group-label">Inspect</span>
+        <ToolButton
+          icon="measure"
+          label="Measure"
+          title="Measure distance, angle, radius, or area between picked entities"
+          disabledReason={notReady}
+          active={measureActive}
+          disabled={disabled}
+          onClick={onMeasureToggle}
         />
       </div>
       <div className="tool-sep" />
