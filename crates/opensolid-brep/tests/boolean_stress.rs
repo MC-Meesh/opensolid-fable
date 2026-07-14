@@ -1642,6 +1642,50 @@ fn random_sphere_face_caps_identity() {
     }
 }
 
+/// A sphere dips a shallow cap of depth `h` into one face of a cube, so the
+/// union's sphere face is the whole sphere minus that small imprint — a
+/// near-full-wrap (u spans a full turn) curved face with one wide interior
+/// hole. Ear clipping seeds such a face by bridging the distant outer
+/// rectangle to the wide hole and then force-clips corners across the hole
+/// (its least-reflex fallback ignores the hole ring), leaving flat fill
+/// triangles inside the imprint plane. On the curved sphere chart those fold
+/// back in 3D into two triangles that share a rim chord with the *same*
+/// winding — an orientation non-manifold on the imprint rim (of-6ry). The
+/// constrained-Delaunay seed recovers every ring edge and drops hole/exterior
+/// triangles by parity, so no triangle can bridge the hole and the union
+/// tessellates to a closed manifold. (Bounded-cap *volume* accuracy is the
+/// separate concern of of-s89; this test asserts only manifoldness.)
+#[test]
+fn near_full_sphere_union_face_is_manifold() {
+    // Sweep a few shallow depths and both hi/lo faces, on each axis, so the
+    // imprint lands on the equator and near a uv pole of the sphere chart.
+    let a = 3.155;
+    for axis_k in 0..3 {
+        for &hi in &[false, true] {
+            for &(r, h) in &[(0.472, 0.220), (0.685, 0.176), (0.80, 0.16)] {
+                let mut center = [a * 0.5; 3];
+                center[axis_k] = if hi { a + (r - h) } else { -(r - h) };
+                let context = format!("axis {axis_k} hi {hi} r={r} h={h}");
+                let mut scene = Scene::new();
+                let cube = scene.block([0.0, 0.0, 0.0], [a, a, a]);
+                let ball = scene.sphere(Point3::new(center[0], center[1], center[2]), r);
+                let union = scene
+                    .unite(cube, ball)
+                    .unwrap_or_else(|e| panic!("{context}: unite failed: {e:?}"));
+                let mesh = union
+                    .tessellate()
+                    .unwrap_or_else(|e| panic!("{context}: tessellate failed: {e:?}"));
+                assert!(
+                    mesh.is_closed_manifold(),
+                    "{context}: near-full sphere union face must be a closed manifold \
+                     ({} triangles)",
+                    mesh.triangle_count()
+                );
+            }
+        }
+    }
+}
+
 /// Canonical cap-bite configuration versus the same configuration
 /// rigidly rotated — the sphere rebuilt with the rotated pole axis via
 /// [`Scene::sphere_with_axis`], the block rotated in place. Both frames

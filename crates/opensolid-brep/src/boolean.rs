@@ -4919,6 +4919,225 @@ fn refine_curved_region(
     tris.extend_from_slice(&mesh.tris);
 }
 
+/// Do the open segments `a-b` and `c-d` cross at a point interior to both?
+/// A shared endpoint or a merely-touching (collinear) contact does not count —
+/// only a proper transversal crossing.
+fn seg_properly_intersect(a: (f64, f64), b: (f64, f64), c: (f64, f64), d: (f64, f64)) -> bool {
+    let opp = |x: f64, y: f64| (x > 0.0 && y < 0.0) || (x < 0.0 && y > 0.0);
+    opp(orient2d(a, b, c), orient2d(a, b, d)) && opp(orient2d(c, d, a), orient2d(c, d, b))
+}
+
+/// Constrained Delaunay triangulation of the region bounded by `ring_ranges`
+/// (outer ring first, then holes), using ONLY the given boundary vertices —
+/// no new points. Returns triangles indexing into `verts` that tile exactly
+/// the region (exterior and hole interiors removed), with every ring edge
+/// present as a mesh edge. Every triangle comes out counter-clockwise in
+/// parameter space, matching the ear-clip convention the caller expects.
+///
+/// Returns `None` on a degenerate region, a coincident/blocked ring vertex,
+/// or an unrecoverable constraint edge, so the caller falls back to ear
+/// clipping (no worse than the previous behaviour for those inputs).
+///
+/// This replaces the ear-clip seed on curved charts. The ear-clip least-reflex
+/// fallback force-clips corners without treating the hole ring as a barrier,
+/// bridging flat triangles across a wide imprint hole; on a curved chart those
+/// fills fold in 3D into orientation-non-manifold rim slivers (of-6ry). A CDT
+/// recovers every ring edge as a constraint and removes hole/exterior triangles
+/// by parity, so bridging across a hole is impossible by construction.
+fn boundary_cdt(verts: &[(f64, f64)], ring_ranges: &[(usize, usize)]) -> Option<Vec<[usize; 3]>> {
+    let n = verts.len();
+    if n < 3 || ring_ranges.is_empty() {
+        return None;
+    }
+
+    // Bounding box of all boundary vertices, and an area tolerance scaled to it.
+    let (mut u0, mut u1, mut v0, mut v1) = (
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+    );
+    for &(x, y) in verts {
+        u0 = u0.min(x);
+        u1 = u1.max(x);
+        v0 = v0.min(y);
+        v1 = v1.max(y);
+    }
+    if !(u1 > u0 && v1 > v0) {
+        return None;
+    }
+    let span = (u1 - u0).max(v1 - v0);
+    let eps_area = 1e-12 * span * span;
+
+    // Super-triangle enclosing the whole bbox, its three vertices appended
+    // after the real vertices so region triangles never reference them.
+    let (cx, cy) = (0.5 * (u0 + u1), 0.5 * (v0 + v1));
+    let big = 10.0 * span;
+    let mut pts: Vec<(f64, f64)> = verts.to_vec();
+    pts.push((cx - big, cy - big));
+    pts.push((cx + big, cy - big));
+    pts.push((cx, cy + big));
+    let (s0, s1, s2) = (n, n + 1, n + 2);
+
+    let no_constraints: std::collections::HashSet<(usize, usize)> =
+        std::collections::HashSet::new();
+    let mut mesh = FlipMesh::from_tris(&[[s0, s1, s2]], &pts);
+
+    // Incrementally insert every boundary vertex (Bowyer-Watson via Lawson
+    // legalization). Constraints are empty here, so the intermediate mesh is a
+    // pure Delaunay triangulation of the inserted points.
+    for vi in 0..n {
+        let target = pts[vi];
+        let mut found: Option<(usize, usize)> = None; // (triangle, edge; 3 = strictly inside)
+        for t in 0..mesh.tris.len() {
+            let [a, b, c] = mesh.tris[t];
+            let o = [
+                orient2d(pts[a], pts[b], target),
+                orient2d(pts[b], pts[c], target),
+                orient2d(pts[c], pts[a], target),
+            ];
+            if o[0] > eps_area && o[1] > eps_area && o[2] > eps_area {
+                found = Some((t, 3));
+                break;
+            }
+            // Two orientations near zero ⇒ the point coincides with a vertex
+            // of this triangle: a duplicate ring vertex the CDT can't place.
+            if o.iter().filter(|x| x.abs() <= eps_area).count() >= 2 {
+                return None;
+            }
+            if let Some(k) = (0..3).find(|&k| {
+                o[k].abs() <= eps_area && o[(k + 1) % 3] > eps_area && o[(k + 2) % 3] > eps_area
+            }) {
+                found = Some((t, k));
+                break;
+            }
+        }
+        let (host, k) = found?;
+        if k == 3 {
+            mesh.insert_in_triangle(host, vi, &pts, &no_constraints);
+        } else {
+            if mesh.adj[host][k] == NO_TRI {
+                return None; // on a super-triangle edge — should not happen
+            }
+            mesh.insert_on_edge(host, k, vi, &pts, &no_constraints);
+        }
+    }
+
+    // Ring edges to recover, and the constraint set (undirected, deduped).
+    let mut ring_edges: Vec<(usize, usize)> = Vec::new();
+    for &(start, len) in ring_ranges {
+        for j in 0..len {
+            ring_edges.push((start + j, start + (j + 1) % len));
+        }
+    }
+    let constraints: std::collections::HashSet<(usize, usize)> = ring_edges
+        .iter()
+        .map(|&(a, b)| (a.min(b), a.max(b)))
+        .collect();
+
+    // Recover each ring edge by flipping out the interior edges that cross it
+    // (Sloan). Adjacent boundary samples are usually already Delaunay-joined,
+    // so most edges need no work. Preferring a flip whose new diagonal does
+    // not re-cross the target keeps the crossing count monotone; the guard cap
+    // bails to the ear-clip fallback if an edge cannot be recovered.
+    for &(a, b) in &ring_edges {
+        if a == b {
+            return None;
+        }
+        let mut guard = 0usize;
+        let cap = 8 * mesh.tris.len() + 64;
+        while !mesh.has_edge(a, b) {
+            guard += 1;
+            if guard > cap {
+                return None;
+            }
+            let mut reducing: Option<(usize, usize)> = None;
+            let mut any: Option<(usize, usize)> = None;
+            'scan: for t in 0..mesh.tris.len() {
+                for k in 0..3 {
+                    let nadj = mesh.adj[t][k];
+                    if nadj == NO_TRI {
+                        continue;
+                    }
+                    let (u, w) = (mesh.tris[t][k], mesh.tris[t][(k + 1) % 3]);
+                    if u == a || u == b || w == a || w == b {
+                        continue;
+                    }
+                    if !seg_properly_intersect(pts[a], pts[b], pts[u], pts[w]) {
+                        continue;
+                    }
+                    let p = mesh.tris[t][(k + 2) % 3];
+                    let q = {
+                        let tr = &mesh.tris[nadj];
+                        (0..3)
+                            .map(|i| tr[i])
+                            .find(|&x| x != u && x != w)
+                            .expect("neighbor third vertex")
+                    };
+                    // Only a convex quad can be flipped without overlap.
+                    if orient2d(pts[p], pts[u], pts[q]) <= 0.0
+                        || orient2d(pts[p], pts[q], pts[w]) <= 0.0
+                    {
+                        continue;
+                    }
+                    if any.is_none() {
+                        any = Some((t, k));
+                    }
+                    if !seg_properly_intersect(pts[a], pts[b], pts[p], pts[q]) {
+                        reducing = Some((t, k));
+                        break 'scan;
+                    }
+                }
+            }
+            let Some((t, k)) = reducing.or(any) else {
+                return None; // no flippable crossing edge — stuck
+            };
+            if !mesh.raw_flip(t, k, &pts, &no_constraints) {
+                return None;
+            }
+        }
+    }
+
+    // Two-colour the triangulation: seed OUTSIDE at every triangle touching a
+    // super-triangle vertex, then flood, flipping inside/outside each time a
+    // ring (constraint) edge is crossed. The region interior is inside; hole
+    // interiors and the exterior are outside. Parity is path-independent
+    // because every vertex has an even number of constraint edges (rings are
+    // closed loops), so the colouring is well defined.
+    let mut color: Vec<Option<bool>> = vec![None; mesh.tris.len()];
+    let mut queue: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+    for (t, tri) in mesh.tris.iter().enumerate() {
+        if tri.iter().any(|&v| v >= n) && color[t].is_none() {
+            color[t] = Some(false); // outside
+            queue.push_back(t);
+        }
+    }
+    while let Some(t) = queue.pop_front() {
+        let ct = color[t].expect("queued triangles are coloured");
+        for k in 0..3 {
+            let nb = mesh.adj[t][k];
+            if nb == NO_TRI || color[nb].is_some() {
+                continue;
+            }
+            let (u, w) = (mesh.tris[t][k], mesh.tris[t][(k + 1) % 3]);
+            let crosses_constraint = constraints.contains(&(u.min(w), u.max(w)));
+            color[nb] = Some(if crosses_constraint { !ct } else { ct });
+            queue.push_back(nb);
+        }
+    }
+
+    // Keep the inside triangles (excluding any that still touch a super vertex,
+    // which can only be outside — a belt-and-braces filter).
+    let result: Vec<[usize; 3]> = (0..mesh.tris.len())
+        .filter(|&t| color[t] == Some(true) && mesh.tris[t].iter().all(|&v| v < n))
+        .map(|t| mesh.tris[t])
+        .collect();
+    if result.is_empty() {
+        return None;
+    }
+    Some(result)
+}
+
 fn dist2(a: (f64, f64), b: (f64, f64)) -> f64 {
     let (dx, dy) = (a.0 - b.0, a.1 - b.1);
     dx * dx + dy * dy
