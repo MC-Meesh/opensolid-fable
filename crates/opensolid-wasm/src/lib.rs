@@ -34,15 +34,18 @@ enum PathSeg {
     Line { to: [f64; 2] },
     /// Circular arc to `to` with the DXF `bulge` (`tan(sweep / 4)`).
     Arc { to: [f64; 2], bulge: f64 },
-    /// Elliptical arc: sweep `sweep` radians of eccentric angle on the
-    /// ellipse centred at `center` with semi-axes `rx`/`ry` rotated by
-    /// `rotation` (radians). The current point must lie on that ellipse.
+    /// Elliptical arc to endpoint `to` along the ellipse centred at `center`
+    /// with semi-axes `rx`/`ry` rotated by `rotation` (radians), sweeping
+    /// counter-clockwise when `ccw` else clockwise. Both the current point
+    /// and `to` must lie on that ellipse; the eccentric-angle sweep the
+    /// kernel needs is recovered from the two endpoints at build time.
     Ellipse {
+        to: [f64; 2],
         center: [f64; 2],
         rx: f64,
         ry: f64,
         rotation: f64,
-        sweep: f64,
+        ccw: bool,
     },
     /// Cubic Bézier to `to` with control points `c1`, `c2`.
     Cubic {
@@ -52,13 +55,51 @@ enum PathSeg {
     },
 }
 
+/// Eccentric-angle sweep (radians) taking `a` to `b` along the ellipse
+/// (`center`, semi-axes `rx`/`ry`, rotation `phi` radians) in the `ccw`
+/// direction. Both endpoints are projected onto the ellipse frame to recover
+/// their eccentric angles; the signed difference is wrapped into the half-open
+/// turn matching `ccw` (a coincident `a == b` yields a full ±2π sweep). Feeds
+/// the frep builder's `ellipse_to`, which re-derives the geometry.
+fn ellipse_endpoint_sweep(
+    a: [f64; 2],
+    b: [f64; 2],
+    center: [f64; 2],
+    rx: f64,
+    ry: f64,
+    phi: f64,
+    ccw: bool,
+) -> f64 {
+    let (cphi, sphi) = (phi.cos(), phi.sin());
+    let eccentric = |p: [f64; 2]| {
+        let (dx, dy) = (p[0] - center[0], p[1] - center[1]);
+        let lx = cphi * dx + sphi * dy;
+        let ly = -sphi * dx + cphi * dy;
+        (ly / ry).atan2(lx / rx)
+    };
+    let mut sweep = eccentric(b) - eccentric(a);
+    // Wrap into the turn implied by the direction: CCW → (0, 2π], CW → [-2π, 0).
+    // NaN radii (rejected later by the kernel) fail both comparisons and pass
+    // through unchanged rather than looping forever.
+    if ccw {
+        while sweep <= 0.0 {
+            sweep += std::f64::consts::TAU;
+        }
+    } else {
+        while sweep >= 0.0 {
+            sweep -= std::f64::consts::TAU;
+        }
+    }
+    sweep
+}
+
 /// Closed 2D profile builder for [`WasmShape::extrude`] and
 /// [`WasmShape::revolve`]: start at a point, chain
 /// `lineTo`/`arcTo`/`ellipseArcTo`/`cubicTo`, then `close()`. Arcs use the
 /// DXF bulge convention: `bulge = tan(sweep / 4)`, positive sweeping
-/// counter-clockwise (`1` is a CCW semicircle). Angles for `ellipseArcTo`
-/// are in **degrees** (matching `revolve`/draft), sweep being eccentric
-/// angle (`360` closes a full ellipse, `180` a half).
+/// counter-clockwise (`1` is a CCW semicircle). `ellipseArcTo` takes the
+/// arc's endpoint, ellipse centre/radii, a `rotation` in **degrees**, and a
+/// `ccw` direction flag.
 #[wasm_bindgen]
 pub struct WasmProfile2D {
     start: [f64; 2],
@@ -97,29 +138,32 @@ impl WasmProfile2D {
         }
     }
 
-    /// Elliptical arc from the current point: sweep `sweepDegrees` of
-    /// eccentric angle on the ellipse centred at `(cx, cy)` with semi-axes
-    /// `rx`/`ry` rotated by `rotationDegrees`. The current point must lie on
-    /// that ellipse; the endpoint follows from the sweep. Ignored after
-    /// `close()`.
+    /// Elliptical arc from the current point to endpoint `(x, y)` along the
+    /// ellipse centred at `(cx, cy)` with semi-axes `rx`/`ry` rotated by
+    /// `rotationDegrees`, sweeping counter-clockwise when `ccw` else
+    /// clockwise. Both the current point and `(x, y)` must lie on that
+    /// ellipse. Ignored after `close()`.
     #[wasm_bindgen(js_name = ellipseArcTo)]
     #[allow(clippy::too_many_arguments)]
     pub fn ellipse_arc_to(
         &mut self,
+        x: f64,
+        y: f64,
         cx: f64,
         cy: f64,
         rx: f64,
         ry: f64,
         rotation_degrees: f64,
-        sweep_degrees: f64,
+        ccw: bool,
     ) {
         if !self.closed {
             self.segs.push(PathSeg::Ellipse {
+                to: [x, y],
                 center: [cx, cy],
                 rx,
                 ry,
                 rotation: rotation_degrees.to_radians(),
-                sweep: sweep_degrees.to_radians(),
+                ccw,
             });
         }
     }
@@ -156,18 +200,33 @@ impl WasmProfile2D {
             return Err("profile must be closed before sweeping (call close())".into());
         }
         let mut b = Profile2D::builder(self.start);
+        let mut cursor = self.start;
         for seg in &self.segs {
             b = match *seg {
-                PathSeg::Line { to } => b.line_to(to),
-                PathSeg::Arc { to, bulge } => b.arc_to(to, bulge),
+                PathSeg::Line { to } => {
+                    cursor = to;
+                    b.line_to(to)
+                }
+                PathSeg::Arc { to, bulge } => {
+                    cursor = to;
+                    b.arc_to(to, bulge)
+                }
                 PathSeg::Ellipse {
+                    to,
                     center,
                     rx,
                     ry,
                     rotation,
-                    sweep,
-                } => b.ellipse_to(center, rx, ry, rotation, sweep),
-                PathSeg::Cubic { c1, c2, to } => b.cubic_to(c1, c2, to),
+                    ccw,
+                } => {
+                    let sweep = ellipse_endpoint_sweep(cursor, to, center, rx, ry, rotation, ccw);
+                    cursor = to;
+                    b.ellipse_to(center, rx, ry, rotation, sweep)
+                }
+                PathSeg::Cubic { c1, c2, to } => {
+                    cursor = to;
+                    b.cubic_to(c1, c2, to)
+                }
             };
         }
         b.build().map_err(|e| e.to_string())
@@ -189,7 +248,8 @@ fn polyline_region(edge: &[f64]) -> opensolid_frep::EdgeRegion {
 /// `lineTo`/`arcTo`/`ellipseArcTo`/`cubicTo`, and pass it straight to `rib`
 /// (no `close()` — the path stays open). Arcs use the same DXF bulge
 /// convention as [`WasmProfile2D`]: `bulge = tan(sweep / 4)`, positive
-/// sweeping counter-clockwise. `ellipseArcTo` angles are in degrees.
+/// sweeping counter-clockwise. `ellipseArcTo` takes the same endpoint +
+/// `ccw` form as [`WasmProfile2D::ellipse_arc_to`].
 #[wasm_bindgen]
 pub struct WasmOpenPath2D {
     start: [f64; 2],
@@ -221,27 +281,30 @@ impl WasmOpenPath2D {
         self.segs.push(PathSeg::Arc { to: [x, y], bulge });
     }
 
-    /// Elliptical arc from the current point (see
-    /// [`WasmProfile2D::ellipse_arc_to`]): sweep `sweepDegrees` of eccentric
-    /// angle on the ellipse centred at `(cx, cy)` with semi-axes `rx`/`ry`
-    /// rotated by `rotationDegrees`.
+    /// Elliptical arc from the current point to endpoint `(x, y)` (see
+    /// [`WasmProfile2D::ellipse_arc_to`]): along the ellipse centred at
+    /// `(cx, cy)` with semi-axes `rx`/`ry` rotated by `rotationDegrees`,
+    /// sweeping counter-clockwise when `ccw` else clockwise.
     #[wasm_bindgen(js_name = ellipseArcTo)]
     #[allow(clippy::too_many_arguments)]
     pub fn ellipse_arc_to(
         &mut self,
+        x: f64,
+        y: f64,
         cx: f64,
         cy: f64,
         rx: f64,
         ry: f64,
         rotation_degrees: f64,
-        sweep_degrees: f64,
+        ccw: bool,
     ) {
         self.segs.push(PathSeg::Ellipse {
+            to: [x, y],
             center: [cx, cy],
             rx,
             ry,
             rotation: rotation_degrees.to_radians(),
-            sweep: sweep_degrees.to_radians(),
+            ccw,
         });
     }
 
@@ -264,18 +327,33 @@ impl WasmOpenPath2D {
     /// (no segments, coincident endpoints, non-finite input).
     fn build(&self) -> Result<OpenPath2D, String> {
         let mut b = OpenPath2D::builder(self.start);
+        let mut cursor = self.start;
         for seg in &self.segs {
             b = match *seg {
-                PathSeg::Line { to } => b.line_to(to),
-                PathSeg::Arc { to, bulge } => b.arc_to(to, bulge),
+                PathSeg::Line { to } => {
+                    cursor = to;
+                    b.line_to(to)
+                }
+                PathSeg::Arc { to, bulge } => {
+                    cursor = to;
+                    b.arc_to(to, bulge)
+                }
                 PathSeg::Ellipse {
+                    to,
                     center,
                     rx,
                     ry,
                     rotation,
-                    sweep,
-                } => b.ellipse_to(center, rx, ry, rotation, sweep),
-                PathSeg::Cubic { c1, c2, to } => b.cubic_to(c1, c2, to),
+                    ccw,
+                } => {
+                    let sweep = ellipse_endpoint_sweep(cursor, to, center, rx, ry, rotation, ccw);
+                    cursor = to;
+                    b.ellipse_to(center, rx, ry, rotation, sweep)
+                }
+                PathSeg::Cubic { c1, c2, to } => {
+                    cursor = to;
+                    b.cubic_to(c1, c2, to)
+                }
             };
         }
         b.build().map_err(|e| e.to_string())
