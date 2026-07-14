@@ -434,13 +434,28 @@ enum Chart {
         major_radius: f64,
         minor_radius: f64,
     },
+    /// Chart of a circular cone: `u` is the angle (radians, period 2π)
+    /// about `axis`, `v` the signed axial distance from `origin`. The local
+    /// radius is `rho(v) = radius + v·tan(half_angle)`, so the `u`-circle
+    /// widens along `+axis` and collapses at the apex
+    /// (`v = -radius/tan(half_angle)`), which is a pole-like degeneracy
+    /// where longitude is undefined — see [`Chart::param`]. Frustum faces
+    /// (both radii `> 0`) never reach it.
+    Cone {
+        origin: Point3,
+        axis: Vector3,
+        e_u: Vector3,
+        e_v: Vector3,
+        half_angle: f64,
+        radius: f64,
+    },
 }
 
 impl Chart {
     /// Build the parameter chart for any analytic surface OpenSolid can
-    /// invert. Spheres and tori are admitted (the of-7ld promotion);
-    /// cones are rejected with [`CoreError::NotImplemented`] so they
-    /// route through the F-Rep fallback.
+    /// invert. Spheres and tori are admitted (the of-7ld promotion); cones
+    /// are admitted (the of-dtj promotion) — a boolean whose cone SSI is
+    /// still unsupported simply falls back to F-Rep from a later stage.
     fn build(surface: &Surface3) -> CoreResult<Self> {
         match surface {
             Surface3::Plane { origin, normal } => {
@@ -496,9 +511,22 @@ impl Chart {
                     minor_radius: *minor_radius,
                 })
             }
-            Surface3::Cone { .. } => Err(CoreError::NotImplemented {
-                feature: "boolean parameter chart for cones",
-            }),
+            Surface3::Cone {
+                origin,
+                axis,
+                half_angle,
+                radius,
+            } => {
+                let (e_u, e_v) = plane_basis(axis);
+                Ok(Chart::Cone {
+                    origin: *origin,
+                    axis: *axis,
+                    e_u,
+                    e_v,
+                    half_angle: *half_angle,
+                    radius: *radius,
+                })
+            }
         }
     }
 
@@ -574,6 +602,29 @@ impl Chart {
                 let v = unwrap_angle(z.atan2(w), hint.map(|(_, v)| v));
                 (u, v)
             }
+            Chart::Cone {
+                origin,
+                axis,
+                e_u,
+                e_v,
+                radius,
+                ..
+            } => {
+                let d = p - origin;
+                let v = d.dot(axis);
+                let (x, y) = (d.dot(e_u), d.dot(e_v));
+                // Apex: the local radius collapses and longitude is undefined
+                // — inherit the hint's u for a continuous crossing, mirroring
+                // the sphere-pole convention. The floor scales with the
+                // reference (v = 0) radius, so a frustum face (radius > 0)
+                // reads a pole only within a hair of the true apex.
+                let u = if x.hypot(y) <= radius.abs() * POLE_REL_EPS {
+                    hint.map(|(u, _)| u).unwrap_or(0.0)
+                } else {
+                    unwrap_angle(y.atan2(x), hint.map(|(u, _)| u))
+                };
+                (u, v)
+            }
         }
     }
 
@@ -587,6 +638,20 @@ impl Chart {
             Chart::Sphere { e_u, e_v, axis, .. } | Chart::Torus { e_u, e_v, axis, .. } => {
                 let radial = e_u * u.cos() + e_v * u.sin();
                 radial * v.cos() + axis * v.sin()
+            }
+            Chart::Cone {
+                e_u,
+                e_v,
+                axis,
+                half_angle,
+                ..
+            } => {
+                // Outward `du × dv` normalized: tilts off the radial toward
+                // `-axis` by the half-angle, independent of `v` on the near
+                // nappe (radius > 0).
+                let radial = e_u * u.cos() + e_v * u.sin();
+                let (sin_a, cos_a) = half_angle.sin_cos();
+                radial * cos_a - axis * sin_a
             }
         }
     }
@@ -602,6 +667,9 @@ impl Chart {
     ///   toward the poles (scale → 0 there), latitude is uniform.
     /// - Torus: `(major + minor·cos v, minor)` — the major circle's radius
     ///   breathes with the minor angle; the minor circle is uniform.
+    /// - Cone: `(radius + v·tan α, 1/cos α)` — the `u`-circle radius grows
+    ///   linearly with `v` (→ 0 at the apex); `v` is axial length, whose
+    ///   slant step `1/cos α` accounts for the surface tilt.
     fn uv_scale(&self, v: f64) -> (f64, f64) {
         match self {
             Chart::Plane { .. } => (1.0, 1.0),
@@ -612,6 +680,9 @@ impl Chart {
                 minor_radius,
                 ..
             } => (major_radius + minor_radius * v.cos(), *minor_radius),
+            Chart::Cone {
+                radius, half_angle, ..
+            } => (radius + v * half_angle.tan(), 1.0 / half_angle.cos()),
         }
     }
 
@@ -1147,7 +1218,7 @@ fn broad_phase_face_box(
 
 /// Signed implicit residual of `p` against a primitive's locus: zero on
 /// the surface, smooth nearby. Used to polish marched clip endpoints onto
-/// exact face-boundary junctions. Cones are outside the marched MVP.
+/// exact face-boundary junctions.
 fn surface_residual(s: &Surface3, p: &Point3) -> Option<f64> {
     match *s {
         Surface3::Plane { origin, normal } => Some(normal.dot(&(p - origin))),
@@ -1171,7 +1242,21 @@ fn surface_residual(s: &Surface3, p: &Point3) -> Option<f64> {
             let rho = (d - axis * h).norm();
             Some((rho - major_radius).hypot(h) - minor_radius)
         }
-        Surface3::Cone { .. } => None,
+        Surface3::Cone {
+            origin,
+            axis,
+            half_angle,
+            radius,
+        } => {
+            // Orthogonal distance to the (infinite double) cone: the radial
+            // excess over the local radius, projected onto the surface normal
+            // by cos α. Positive outside the near nappe.
+            let d = p - origin;
+            let h = axis.dot(&d);
+            let rho = (d - axis * h).norm();
+            let (sin_a, cos_a) = half_angle.sin_cos();
+            Some((rho - radius) * cos_a - h * sin_a)
+        }
     }
 }
 
@@ -1205,7 +1290,22 @@ fn surface_residual_gradient(s: &Surface3, p: &Point3) -> Option<Vector3> {
             }
             unit((radial / rho) * (rho - major_radius) + axis * h)
         }
-        Surface3::Cone { .. } => None,
+        Surface3::Cone {
+            origin,
+            axis,
+            half_angle,
+            ..
+        } => {
+            let d = p - origin;
+            let h = axis.dot(&d);
+            let radial = d - axis * h;
+            let rho = radial.norm();
+            if rho <= f64::MIN_POSITIVE {
+                return None;
+            }
+            let (sin_a, cos_a) = half_angle.sin_cos();
+            Some((radial / rho) * cos_a - axis * sin_a)
+        }
     }
 }
 
@@ -3352,6 +3452,18 @@ fn chart_point(chart: &Chart, uv: (f64, f64)) -> Point3 {
                 + radial * (major_radius + minor_radius * uv.1.cos())
                 + axis * (minor_radius * uv.1.sin())
         }
+        Chart::Cone {
+            origin,
+            axis,
+            e_u,
+            e_v,
+            half_angle,
+            radius,
+        } => {
+            let radial = e_u * uv.0.cos() + e_v * uv.0.sin();
+            let rho = radius + uv.1 * half_angle.tan();
+            origin + radial * rho + axis * uv.1
+        }
     }
 }
 
@@ -3413,7 +3525,43 @@ fn ray_surface_hits(surface: &Surface3, p: &Point3, dir: &Vector3) -> Vec<f64> {
             major_radius,
             minor_radius,
         } => ray_torus_hits(center, axis, *major_radius, *minor_radius, p, dir),
-        Surface3::Cone { .. } => Vec::new(),
+        Surface3::Cone {
+            origin,
+            axis,
+            half_angle,
+            radius,
+        } => {
+            // Double-cone quadratic about the apex q:
+            //   F(x) = (axis·(x−q))² − cos²α·|x−q|² = 0.
+            // Substituting x = p + t·dir gives a·t² + b·t + c = 0. Roots on
+            // the non-physical nappe (axis·(x−q) < 0) are dropped so parity
+            // counts only the solid's single-nappe boundary.
+            let apex = origin - axis * (radius / half_angle.tan());
+            let k = half_angle.cos().powi(2);
+            let m = p - apex;
+            let ad = axis.dot(dir);
+            let am = axis.dot(&m);
+            let qa = ad * ad - k * dir.norm_squared();
+            let qb = 2.0 * (ad * am - k * m.dot(dir));
+            let qc = am * am - k * m.norm_squared();
+            let on_nappe = |t: f64| am + t * ad >= 0.0;
+            if qa.abs() < 1e-15 {
+                if qb.abs() < 1e-15 {
+                    return Vec::new();
+                }
+                let t = -qc / qb;
+                return if on_nappe(t) { vec![t] } else { Vec::new() };
+            }
+            let disc = qb * qb - 4.0 * qa * qc;
+            if disc <= 0.0 {
+                return Vec::new();
+            }
+            let sq = disc.sqrt();
+            [(-qb - sq) / (2.0 * qa), (-qb + sq) / (2.0 * qa)]
+                .into_iter()
+                .filter(|&t| on_nappe(t))
+                .collect()
+        }
     }
 }
 
@@ -4019,6 +4167,15 @@ fn triangulate_mesh_face(mf: &MeshFace, weld_eps: f64) -> CoreResult<(Vec<Triang
             minor_radius,
             ..
         } => Some((pitch, (major_radius + minor_radius, minor_radius))),
+        // Row spacing and u arc-scale from the reference (v = 0) radius. The
+        // true u-circle radius varies along v; deriving the per-face widest
+        // radius is a refinement follow-up (of-dtj sub-bead). A face left too
+        // coarse by this estimate diverts to the F-Rep fallback via the mesh
+        // deviation gate, so this is quality-only, never a correctness risk.
+        Chart::Cone { radius, .. } => {
+            let r = radius.abs();
+            (r > 0.0).then_some((r * pitch, (r, 1.0)))
+        }
         Chart::Plane { .. } => None,
     };
     if let Some((pitch_v, scale)) = lattice {
@@ -4723,6 +4880,7 @@ mod tests {
 
     const PI: f64 = std::f64::consts::PI;
     const FRAC_PI_2: f64 = std::f64::consts::FRAC_PI_2;
+    const FRAC_PI_4_CONST: f64 = std::f64::consts::FRAC_PI_4;
 
     /// A general (non-axis-aligned) tilt, so tests exercise the `e_u`/`e_v`
     /// basis rather than accidentally passing on coordinate symmetry.
@@ -4749,18 +4907,16 @@ mod tests {
     }
 
     #[test]
-    fn chart_build_admits_sphere_and_torus_but_rejects_cone() {
-        // Spheres and tori are in the boolean pipeline (of-7ld.4
-        // promotion); cones still route through the F-Rep fallback.
+    fn chart_build_admits_sphere_torus_and_cone() {
+        // Spheres and tori (of-7ld.4) and cones (of-dtj) are all in the
+        // boolean pipeline; a cone boolean whose SSI is still unsupported
+        // falls back to F-Rep from a later stage, not at chart build.
         let sphere = Surface3::sphere(Point3::origin(), Vector3::z(), 2.0).unwrap();
         let torus = Surface3::torus(Point3::origin(), Vector3::z(), 3.0, 1.0).unwrap();
         let cone = Surface3::cone(Point3::origin(), Vector3::z(), 0.5, 1.0).unwrap();
         assert!(matches!(Chart::build(&sphere), Ok(Chart::Sphere { .. })));
         assert!(matches!(Chart::build(&torus), Ok(Chart::Torus { .. })));
-        assert!(matches!(
-            Chart::build(&cone),
-            Err(CoreError::NotImplemented { .. })
-        ));
+        assert!(matches!(Chart::build(&cone), Ok(Chart::Cone { .. })));
     }
 
     // -----------------------------------------------------------------
@@ -5050,6 +5206,176 @@ mod tests {
             let tube_center = center + radial * major;
             let outward = (p - tube_center) / minor;
             assert!((n - outward).norm() < 1e-9, "normal away from tube axis");
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Cone charts (of-dtj)
+    // -----------------------------------------------------------------
+
+    fn cone_chart(origin: Point3, half_angle: f64, radius: f64) -> Chart {
+        Chart::build(&Surface3::cone(origin, tilted_axis(), half_angle, radius).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn cone_chart_period_helpers_match_cylinder_like_topology() {
+        // u wraps every 2π; v is an unbounded axial length, so aperiodic.
+        let chart = cone_chart(Point3::origin(), FRAC_PI_4_CONST, 1.0);
+        assert_eq!((chart.period_u(), chart.period_v()), (Some(TWO_PI), None));
+        // No poles: the apex is not a chart pole point (frustum-first).
+        assert!(chart.pole_points().is_none());
+    }
+
+    #[test]
+    fn cone_param_round_trips_off_apex() {
+        let origin = Point3::new(1.0, -0.5, 2.0);
+        let (half_angle, radius) = (0.35, 1.2);
+        let chart = cone_chart(origin, half_angle, radius);
+        for &u in &[0.0, 0.7, 2.0, PI, 4.5, TWO_PI - 0.3] {
+            for &v in &[-0.4, 0.0, 0.8, 2.5] {
+                let p = chart_point(&chart, (u, v));
+                let (u2, v2) = chart.param(&p, Some((u, v)));
+                assert!((u2 - u).abs() < 1e-9, "u {u} -> {u2}");
+                assert!((v2 - v).abs() < 1e-9, "v {v} -> {v2}");
+            }
+        }
+    }
+
+    #[test]
+    fn cone_chart_point_lies_on_the_surface() {
+        let origin = Point3::new(-2.0, 1.0, 0.0);
+        let (half_angle, radius) = (0.5, 0.8);
+        let surface = Surface3::cone(origin, tilted_axis(), half_angle, radius).unwrap();
+        let chart = Chart::build(&surface).unwrap();
+        for &(u, v) in &[(0.3, 0.2), (2.5, 1.1), (5.0, -0.3), (PI, 3.0)] {
+            let cp = chart_point(&chart, (u, v));
+            let sp = surface.point(u, v);
+            assert!((cp - sp).norm() < 1e-12, "chart_point matches surface");
+        }
+    }
+
+    #[test]
+    fn cone_longitude_unwraps_toward_hint() {
+        let chart = cone_chart(Point3::origin(), 0.4, 1.0);
+        let p = chart_point(&chart, (0.1, 0.5));
+        let (u, _) = chart.param(&p, Some((TWO_PI, 0.5)));
+        assert!(
+            (u - (TWO_PI + 0.1)).abs() < 1e-9,
+            "expected ~2π+0.1, got {u}"
+        );
+    }
+
+    #[test]
+    fn cone_apex_inherits_hint_longitude() {
+        // A true cone (radius = 0 at v = 0): the apex sits at the origin,
+        // where longitude is undefined and must inherit the hint.
+        let chart = cone_chart(Point3::origin(), 0.4, 0.0);
+        let apex = chart_point(&chart, (0.0, 0.0));
+        for &hint_u in &[0.0, 1.3, PI, 5.0] {
+            let (u, _) = chart.param(&apex, Some((hint_u, 0.0)));
+            assert!((u - hint_u).abs() < 1e-12, "apex kept hint u, got {u}");
+        }
+        // No hint defaults to 0 — a well-defined param, no zero-width wedge.
+        let (u, _) = chart.param(&apex, None);
+        assert_eq!(u, 0.0);
+    }
+
+    #[test]
+    fn cone_uv_scale_grows_with_v_and_slants() {
+        let (half_angle, radius) = (0.6_f64, 1.5);
+        let chart = cone_chart(Point3::origin(), half_angle, radius);
+        let tan_a = half_angle.tan();
+        for &v in &[-0.5, 0.0, 1.0, 3.0] {
+            let (us, vs) = chart.uv_scale(v);
+            assert!(
+                (us - (radius + v * tan_a)).abs() < 1e-12,
+                "u scale = rho(v)"
+            );
+            assert!(
+                (vs - 1.0 / half_angle.cos()).abs() < 1e-12,
+                "v scale = 1/cos α"
+            );
+        }
+    }
+
+    #[test]
+    fn cone_normal_is_unit_and_matches_the_surface() {
+        let origin = Point3::new(0.5, -2.0, 1.0);
+        let (half_angle, radius) = (0.45, 1.1);
+        let surface = Surface3::cone(origin, tilted_axis(), half_angle, radius).unwrap();
+        let chart = Chart::build(&surface).unwrap();
+        // Stay on the near nappe (v so that rho > 0).
+        for &(u, v) in &[(0.3, 0.5), (2.5, 1.4), (5.0, 3.0)] {
+            let n = chart.normal(u, v);
+            assert!((n.norm() - 1.0).abs() < 1e-12, "unit normal");
+            let sn = surface.normal(u, v).unwrap();
+            assert!(
+                (n - sn).norm() < 1e-9,
+                "chart normal matches surface normal"
+            );
+            // Outward: leans away from the axis (positive radial component).
+            let Chart::Cone { e_u, e_v, .. } = &chart else {
+                unreachable!()
+            };
+            let radial = e_u * u.cos() + e_v * u.sin();
+            assert!(n.dot(&radial) > 0.0, "normal points outward");
+        }
+    }
+
+    #[test]
+    fn cone_ray_hits_keep_only_the_physical_nappe() {
+        // True cone, apex at origin, opening along +z, half-angle 45° (so
+        // the locus is x²+y² = z²). A ray parallel to the axis but offset
+        // by 1 in x crosses both nappes: z = +1 (physical, +z) and z = −1
+        // (mirror nappe). The single-nappe filter keeps only z = +1.
+        let surface = Surface3::cone(Point3::origin(), Vector3::z(), FRAC_PI_4_CONST, 0.0).unwrap();
+        let start = Point3::new(1.0, 0.0, -10.0);
+        let hits = ray_surface_hits(&surface, &start, &Vector3::z());
+        assert_eq!(hits.len(), 1, "single-nappe: {hits:?}");
+        // z = +1 is reached at t = 11; the z = −1 hit (t = 9) is filtered.
+        assert!(
+            (hits[0] - 11.0).abs() < 1e-9,
+            "physical hit at t=11, got {}",
+            hits[0]
+        );
+    }
+
+    #[test]
+    fn cone_ray_hits_cross_frustum_twice() {
+        // A ray crossing a frustum cone perpendicular to its axis, offset so
+        // it passes through the interior, hits the (single) nappe twice.
+        let axis = Vector3::z();
+        let surface = Surface3::cone(Point3::origin(), axis, FRAC_PI_4_CONST, 2.0).unwrap();
+        // At z = 0 the radius is 2; a ray along +x from x = -5 at z = 0.
+        let start = Point3::new(-5.0, 0.0, 0.0);
+        let mut hits = ray_surface_hits(&surface, &start, &Vector3::x());
+        hits.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(hits.len(), 2, "two nappe crossings: {hits:?}");
+        // Entry at x = -2 (t = 3), exit at x = +2 (t = 7).
+        assert!((hits[0] - 3.0).abs() < 1e-9, "entry t, got {}", hits[0]);
+        assert!((hits[1] - 7.0).abs() < 1e-9, "exit t, got {}", hits[1]);
+    }
+
+    #[test]
+    fn cone_surface_residual_is_zero_on_and_signed_off_the_surface() {
+        let origin = Point3::new(1.0, 0.0, -1.0);
+        let (half_angle, radius) = (0.5, 1.0);
+        let surface = Surface3::cone(origin, Vector3::z(), half_angle, radius).unwrap();
+        for &(u, v) in &[(0.4, 0.3), (3.0, 1.5), (5.5, 2.0)] {
+            let on = surface.point(u, v);
+            assert!(
+                surface_residual(&surface, &on).unwrap().abs() < 1e-9,
+                "zero on surface"
+            );
+            // Step outward along the surface normal: residual grows positive
+            // by the step length (it is an orthogonal signed distance).
+            let n = surface.normal(u, v).unwrap();
+            let out = on + n * 0.1;
+            let r = surface_residual(&surface, &out).unwrap();
+            assert!((r - 0.1).abs() < 1e-6, "outward residual ≈ step, got {r}");
+            // Gradient at the surface is the outward unit normal.
+            let g = surface_residual_gradient(&surface, &on).unwrap();
+            assert!((g - n).norm() < 1e-9, "gradient is the surface normal");
         }
     }
 
