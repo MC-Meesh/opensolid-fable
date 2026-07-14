@@ -9,6 +9,11 @@ const ICON_PATHS = {
   primitive: 'M2.5 4.5 L6 2.5 l3.5 2 v3.5 L6 10 l-3.5 -2 Z M2.5 4.5 L6 6.5 l3.5 -2 M6 6.5 V10',
   boolean: 'M4.5 7.5 a3 3 0 1 1 3 -3 M7.5 4.5 a3 3 0 1 1 -3 3',
   transform: 'M6 1.5 v9 M6 1.5 l-1.5 2 M6 1.5 l1.5 2 M1.5 6 h9 M10.5 6 l-2 -1.5 M10.5 6 l-2 1.5',
+  // Reference geometry (of-fsl.14): a tilted datum quad, an axis, a point, a triad.
+  plane: 'M2 4 l5 -2 l3 2 l-5 2 Z',
+  axis: 'M2 10 L10 2 M10 2 l-2.6 0.3 l0.9 2.4 Z',
+  point: 'M6 2 v8 M2 6 h8 M6 6 m-1.4 0 a1.4 1.4 0 1 0 2.8 0 a1.4 1.4 0 1 0 -2.8 0',
+  csys: 'M6 10 V3 M6 3 l-1.3 1.6 M6 3 l1.3 1.6 M6 10 h6.5 M6 10 L2 7.5',
 };
 
 function FeatureIcon({ kind }) {
@@ -65,6 +70,9 @@ function FeatureRow({
 }) {
   const [renaming, setRenaming] = useState(false);
   const isSketch = feature.kind === 'sketch';
+  // Reference geometry (of-fsl.14) has no suppress semantics — it is not part
+  // of the construction tree, only a visibility toggle and delete.
+  const isReference = feature.reference === true;
   const flagged = rebuildState && rebuildState.status !== 'ok';
 
   const commitRename = (value) => {
@@ -135,17 +143,19 @@ function FeatureRow({
       <RebuildBadge state={rebuildState} />
       {!isSketch && (
         <span className="feature-actions">
-          <button
-            className="feature-action"
-            title={suppressed ? `Unsuppress ${feature.name}` : `Suppress ${feature.name}`}
-            disabled={disabled}
-            onClick={(event) => {
-              event.stopPropagation();
-              onToggleSuppress(feature.key);
-            }}
-          >
-            {suppressed ? '▶' : '⏸'}
-          </button>
+          {!isReference && (
+            <button
+              className="feature-action"
+              title={suppressed ? `Unsuppress ${feature.name}` : `Suppress ${feature.name}`}
+              disabled={disabled}
+              onClick={(event) => {
+                event.stopPropagation();
+                onToggleSuppress(feature.key);
+              }}
+            >
+              {suppressed ? '▶' : '⏸'}
+            </button>
+          )}
           <button
             className="feature-action delete"
             title={`Delete ${feature.name}`}
@@ -262,7 +272,9 @@ export default function FeatureTree({
             <FeatureRow
               key={feature.key}
               feature={feature}
-              selected={feature.kind !== 'sketch' && feature.id === selectedId}
+              selected={
+                feature.kind !== 'sketch' && !feature.reference && feature.id === selectedId
+              }
               hidden={hiddenKeys.has(feature.key)}
               suppressed={suppressedKeys.has(feature.key)}
               rebuildState={rebuildState?.get(feature.key)}

@@ -39,9 +39,14 @@ describe('MainToolbar', () => {
     expect(html).toContain('Features');
     expect(html).toContain('View');
     expect(html).toContain('Export');
-    for (const label of ['Extrude', 'Revolve', 'Fit', 'Front', 'Top', 'Right', 'Iso', 'Wireframe', 'Section', 'STL', 'STEP']) {
+    for (const label of ['Extrude', 'Revolve', 'Reference', 'Fit', 'Front', 'Top', 'Right', 'Iso', 'Wireframe', 'Section', 'STL', 'STEP']) {
       expect(html).toContain(label);
     }
+  });
+
+  it('marks the Reference button active when the panel is open', () => {
+    const html = render({ referenceOpen: true });
+    expect(html).toMatch(/<button[^>]*aria-pressed="true"[^>]*aria-label="Reference"/);
   });
 
   it('explains faceted export of organic shapes in the STEP tooltip', () => {

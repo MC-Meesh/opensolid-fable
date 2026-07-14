@@ -93,6 +93,12 @@ const Icons = {
       <path d="M1.5 7.5 H11.5" />
     </svg>
   ),
+  reference: (
+    <svg {...ICON}>
+      <path d="M2.5 6 L8 3 L13.5 6 L8 9 Z" fill="currentColor" fillOpacity="0.22" />
+      <path d="M8 9 V14 M8 14 L6 12.5 M8 14 L10 12.5" />
+    </svg>
+  ),
   stl: (
     <svg {...ICON}>
       <path d="M8 2 v7.5 M5.2 6.8 L8 9.5 L10.8 6.8" />
@@ -152,6 +158,8 @@ export default function MainToolbar({
   onWireframeChange,
   section,
   onSectionToggle,
+  referenceOpen = false,
+  onReferenceToggle,
   onDownloadStl,
   onDownloadStep,
   exactBooleans,
@@ -216,6 +224,15 @@ export default function MainToolbar({
           disabledReason={disabled ? notReady : sweepDisabledReason}
           disabled={disabled || !canSweep}
           onClick={() => onSweep('revolve')}
+        />
+        <ToolButton
+          icon="reference"
+          label="Reference"
+          title="Reference geometry: datum planes, axes, points, coordinate systems"
+          disabledReason={notReady}
+          active={referenceOpen}
+          disabled={disabled}
+          onClick={onReferenceToggle}
         />
       </div>
       <div className="tool-sep" />

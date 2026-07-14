@@ -34,15 +34,31 @@ export function isFacePlane(plane) {
   return typeof plane === 'object' && plane !== null;
 }
 
-/** Short display name of a sketch plane ('XY' … or 'Face'). */
+/**
+ * A persistent reference (datum) plane — a plane object carrying the
+ * `reference: true` marker set by lib/referenceGeometry.js. It has the same
+ * `{ origin, normal, u, v, extent }` shape as an ephemeral face pick but,
+ * unlike one, survives across sketches: a face pick is reset to XY when a new
+ * sketch opens, a reference plane is kept.
+ */
+export function isReferencePlane(plane) {
+  return isFacePlane(plane) && plane.reference === true;
+}
+
+/**
+ * Short display name of a sketch plane: the named plane ('XY' …) for the world
+ * planes, a reference plane's own `name` (falling back to 'Plane'), or 'Face'
+ * for an ephemeral picked-face plane.
+ */
 export function planeLabel(plane) {
+  if (isReferencePlane(plane)) return plane.name || 'Plane';
   return isFacePlane(plane) ? 'Face' : plane;
 }
 
 /**
  * Axis names for the sketch (u, v) axis lines. Named planes label the world
  * axes they map to (on YZ the horizontal axis line is world Z since u = -z);
- * face planes have no world-axis identity, so they read U/V.
+ * reference and face planes have no world-axis identity, so they read U/V.
  */
 export function planeAxisLabels(plane) {
   if (isFacePlane(plane)) return ['U', 'V'];

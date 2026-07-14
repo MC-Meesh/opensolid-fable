@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { buildFeatures, pruneTree, resolveKeys } from './featureTree.js';
+import {
+  buildFeatures,
+  buildReferenceFeatures,
+  pruneTree,
+  resolveKeys,
+} from './featureTree.js';
 
 // Plain construction-tree nodes (the shape sceneTree's tracer produces),
 // with ids in creation order.
@@ -143,5 +148,51 @@ describe('pruneTree', () => {
     const pruned = pruneTree(sub, new Set([2]));
     expect(pruned).toBe(ext);
     expect(pruned.profile).toBe(profile);
+  });
+});
+
+describe('buildReferenceFeatures', () => {
+  it('returns an empty list for no items', () => {
+    expect(buildReferenceFeatures()).toEqual([]);
+    expect(buildReferenceFeatures([])).toEqual([]);
+  });
+
+  it('numbers each kind independently with SolidWorks-style names', () => {
+    const items = [
+      { id: 'a', kind: 'plane', geom: { kind: 'plane' } },
+      { id: 'b', kind: 'plane', geom: { kind: 'plane' } },
+      { id: 'c', kind: 'axis', geom: { kind: 'axis' } },
+      { id: 'd', kind: 'point', geom: { kind: 'point' } },
+      { id: 'e', kind: 'csys', geom: { kind: 'csys' } },
+    ];
+    const rows = buildReferenceFeatures(items);
+    expect(rows.map((r) => r.name)).toEqual(['Plane1', 'Plane2', 'Axis1', 'Point1', 'CSys1']);
+    expect(rows.map((r) => r.type)).toEqual(['Plane', 'Plane', 'Axis', 'Point', 'CSys']);
+    expect(rows.every((r) => r.reference === true && r.depth === 0)).toBe(true);
+  });
+
+  it('uses a stable ref:<id> key and carries the geom through', () => {
+    const geom = { kind: 'plane', origin: [0, 0, 1] };
+    const [row] = buildReferenceFeatures([{ id: 'xyz', kind: 'plane', geom }]);
+    expect(row.key).toBe('ref:xyz');
+    expect(row.id).toBe('xyz');
+    expect(row.geom).toBe(geom);
+  });
+
+  it('honors a user rename over the ordinal default', () => {
+    const [row] = buildReferenceFeatures([
+      { id: 'a', kind: 'plane', name: 'Top datum', geom: {} },
+    ]);
+    expect(row.name).toBe('Top datum');
+    expect(row.defaultName).toBe('Plane1');
+  });
+
+  it('skips items of an unknown kind rather than crashing', () => {
+    const rows = buildReferenceFeatures([
+      { id: 'a', kind: 'plane', geom: {} },
+      { id: 'b', kind: 'bogus', geom: {} },
+    ]);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].kind).toBe('plane');
   });
 });

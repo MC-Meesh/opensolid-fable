@@ -47,6 +47,18 @@ const SKETCH_PLANES = {
 
 const FACE_PLANE_COLOR = 0xf2a65a;
 
+// Reference-geometry glyph colors (of-fsl.14): a distinct datum palette so
+// planes/axes/points read apart from sketch planes; coordinate systems use the
+// conventional R/G/B axis triad.
+const REFERENCE_COLORS = {
+  plane: 0x9a86f5,
+  axis: 0xf5b942,
+  point: 0xff5d9e,
+  csysX: 0xef6f6f,
+  csysY: 0x5fdf8a,
+  csysZ: 0x4f9cf9,
+};
+
 /** A named plane the viewport knows, or a picked face plane; else null. */
 function validSketchPlane(plane) {
   if (!plane) return null;
@@ -298,6 +310,7 @@ const Viewport3D = forwardRef(function Viewport3D(
     selectedFaceTris,
     previewMesh,
     section,
+    referenceGeometry,
     onSectionOffsetChange,
     onPick,
     onHover,
@@ -991,6 +1004,113 @@ const Viewport3D = forwardRef(function Viewport3D(
       edgeMaterial.dispose();
     };
   }, [sketchPlane, mesh]);
+
+  // Reference-geometry glyphs (of-fsl.14): render each datum plane / axis /
+  // point / coordinate system as a translucent aid. These are not Shapes and
+  // never mesh — purely a visual layer, rebuilt when the collection changes.
+  useEffect(() => {
+    const ctx = sceneRef.current;
+    if (!ctx || !referenceGeometry || referenceGeometry.length === 0) return undefined;
+    const scene = ctx.meshObject.parent;
+
+    // A scene-relative default size for datums that carry no extent of their
+    // own (axes, points, coordinate systems).
+    const meshGeometry = ctx.meshObject.geometry;
+    if (!meshGeometry.boundingSphere) meshGeometry.computeBoundingSphere();
+    const sphere = meshGeometry.boundingSphere;
+    const baseSize =
+      sphere && Number.isFinite(sphere.radius) && sphere.radius > 0 ? sphere.radius * 1.5 : 5;
+
+    const root = new THREE.Group();
+    const disposables = [];
+    const track = (obj) => {
+      disposables.push(obj);
+      return obj;
+    };
+
+    for (const item of referenceGeometry) {
+      const g = item.geom;
+      if (!g) continue;
+      if (item.kind === 'plane') {
+        const size = Math.max((g.extent ?? 0) * 2.5, baseSize);
+        const grp = new THREE.Group();
+        grp.quaternion.setFromRotationMatrix(
+          new THREE.Matrix4().makeBasis(
+            new THREE.Vector3(...g.u),
+            new THREE.Vector3(...g.v),
+            new THREE.Vector3(...g.normal)
+          )
+        );
+        grp.position.set(...g.origin);
+        const fill = track(new THREE.PlaneGeometry(size, size));
+        const fillMat = track(
+          new THREE.MeshBasicMaterial({
+            color: REFERENCE_COLORS.plane,
+            transparent: true,
+            opacity: 0.1,
+            side: THREE.DoubleSide,
+            depthWrite: false,
+          })
+        );
+        grp.add(new THREE.Mesh(fill, fillMat));
+        const edges = track(new THREE.EdgesGeometry(fill));
+        const edgeMat = track(
+          new THREE.LineBasicMaterial({ color: REFERENCE_COLORS.plane, transparent: true, opacity: 0.6 })
+        );
+        grp.add(new THREE.LineSegments(edges, edgeMat));
+        root.add(grp);
+      } else if (item.kind === 'axis') {
+        const half = ((g.extent ?? 0) > 0 ? g.extent : baseSize) * 1.2;
+        const a = [
+          g.origin[0] - g.direction[0] * half,
+          g.origin[1] - g.direction[1] * half,
+          g.origin[2] - g.direction[2] * half,
+        ];
+        const b = [
+          g.origin[0] + g.direction[0] * half,
+          g.origin[1] + g.direction[1] * half,
+          g.origin[2] + g.direction[2] * half,
+        ];
+        const geo = track(new THREE.BufferGeometry().setFromPoints([
+          new THREE.Vector3(...a),
+          new THREE.Vector3(...b),
+        ]));
+        const mat = track(new THREE.LineBasicMaterial({ color: REFERENCE_COLORS.axis }));
+        root.add(new THREE.Line(geo, mat));
+      } else if (item.kind === 'point') {
+        const geo = track(new THREE.SphereGeometry(baseSize * 0.04, 12, 8));
+        const mat = track(new THREE.MeshBasicMaterial({ color: REFERENCE_COLORS.point }));
+        const dot = new THREE.Mesh(geo, mat);
+        dot.position.set(...g.position);
+        root.add(dot);
+      } else if (item.kind === 'csys') {
+        const len = baseSize * 0.6;
+        for (const [dirKey, color] of [
+          ['x', REFERENCE_COLORS.csysX],
+          ['y', REFERENCE_COLORS.csysY],
+          ['z', REFERENCE_COLORS.csysZ],
+        ]) {
+          const d = g[dirKey];
+          const geo = track(new THREE.BufferGeometry().setFromPoints([
+            new THREE.Vector3(...g.origin),
+            new THREE.Vector3(
+              g.origin[0] + d[0] * len,
+              g.origin[1] + d[1] * len,
+              g.origin[2] + d[2] * len
+            ),
+          ]));
+          const mat = track(new THREE.LineBasicMaterial({ color }));
+          root.add(new THREE.Line(geo, mat));
+        }
+      }
+    }
+
+    scene.add(root);
+    return () => {
+      scene.remove(root);
+      for (const d of disposables) d.dispose();
+    };
+  }, [referenceGeometry, mesh]);
 
   useEffect(() => {
     const ctx = sceneRef.current;

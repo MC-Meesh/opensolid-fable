@@ -814,6 +814,84 @@ button.main-tool svg { flex: none; }
 }
 .section-flip input { accent-color: var(--accent); }
 
+/* Reference-geometry creation panel (of-fsl.14): datum planes/axes/points/csys. */
+.reference-panel {
+  position: absolute;
+  top: 46px;
+  right: 10px;
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  width: 248px;
+  padding: 10px 12px;
+  background: color-mix(in srgb, var(--panel) 94%, transparent);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 12.5px;
+  backdrop-filter: blur(6px);
+}
+.reference-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 13px;
+  font-weight: 600;
+}
+.reference-close {
+  padding: 0 6px;
+  font-size: 16px;
+  line-height: 1;
+  background: none;
+  border: none;
+  color: var(--muted);
+  cursor: pointer;
+}
+.reference-close:hover { color: var(--text); }
+.reference-kinds { display: flex; gap: 6px; }
+.reference-kinds button {
+  flex: 1;
+  padding: 5px 0;
+  font-size: 11.5px;
+  font-weight: 600;
+}
+.reference-kinds button.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #06121f;
+}
+.reference-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  color: var(--muted);
+}
+.reference-field select,
+.reference-field input {
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 4px 6px;
+  font-size: 12px;
+}
+.reference-vec { display: flex; gap: 5px; }
+.reference-vec input { width: 100%; min-width: 0; }
+.reference-error {
+  color: var(--danger, #ef6f6f);
+  font-size: 11.5px;
+  line-height: 1.35;
+}
+.reference-create {
+  margin-top: 2px;
+  padding: 6px 0;
+  font-weight: 600;
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #06121f;
+  cursor: pointer;
+}
+
 /* Transient notice (e.g. "sketch on curved faces not supported yet"). */
 .toast {
   position: absolute;
