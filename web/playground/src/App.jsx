@@ -11,6 +11,7 @@ import PropertyPanel from './components/PropertyPanel.jsx';
 import SketchCanvas from './components/SketchCanvas.jsx';
 import DrawingCanvas from './components/DrawingCanvas.jsx';
 import SweepPanel from './components/SweepPanel.jsx';
+import FilletPanel from './components/FilletPanel.jsx';
 import SectionPanel from './components/SectionPanel.jsx';
 import MeasurePanel from './components/MeasurePanel.jsx';
 import ReferencePanel from './components/ReferencePanel.jsx';
@@ -42,6 +43,8 @@ import { boundingBoxDims, measurePair, measureSingle, triListArea } from './lib/
 import { isFacePlane, isReferencePlane } from './lib/sketch/profile.js';
 import { faceBoundaryLoopsUV } from './lib/sketch/edit.js';
 import { opsHaveCurvedSegs } from './lib/sketch/fromOps.js';
+import { createEdgePickIndex } from './lib/edgePick.js';
+import { buildFilletShape, filletTreeNode, findBlendTarget } from './lib/fillet.js';
 import { faceRefFromPlane, planarRegionsOf, resolveRefs } from './lib/persistentRef.js';
 import { computeRebuildState } from './lib/rebuildState.js';
 import {
@@ -174,6 +177,11 @@ export default function App() {
   // edits live, applied as a unary node wrapping the selected body.
   const [feature, setFeature] = useState(null);
   const [featureError, setFeatureError] = useState(null);
+  // Pending edge fillet/chamfer: `{ mode, radius, range, edge, segments, seed,
+  // targetId }`. `edge` is null until the user clicks a feature edge; `targetId`
+  // is the union-family node whose crease is being blended (see lib/fillet.js).
+  const [fillet, setFillet] = useState(null);
+  const [filletError, setFilletError] = useState(null);
   const [previewMesh, setPreviewMesh] = useState(null);
   // Hovered planar face: `{ meshKey, tris }` — triangle indices into the
   // displayed mesh, shown as an in-place darkening (of-4eh.18). meshKey
@@ -642,6 +650,36 @@ export default function App() {
       }
       const root = tracedRef.current?.root;
       if (!root) return;
+      // Edge fillet/chamfer mode: a click resolves to the nearest CSG feature
+      // edge (crease polyline) and the union-family node whose crease it is,
+      // rather than selecting a body. Empty-space clicks keep the tool open.
+      if (fillet) {
+        if (!point) return;
+        const displayed = meshRef.current;
+        if (!displayed?.indices?.length) return;
+        const picked = createEdgePickIndex(displayed.positions, displayed.indices).pickAt(point);
+        if (!picked) {
+          setToast('No feature edge here — click closer to a CSG edge');
+          return;
+        }
+        const target = findBlendTarget(root, picked.seed);
+        if (!target) {
+          setToast('That edge is not a fillet-able boolean edge');
+          return;
+        }
+        setFillet((f) =>
+          f
+            ? {
+                ...f,
+                edge: picked.polyline,
+                segments: picked.segments,
+                seed: picked.seed,
+                targetId: target.node.id,
+              }
+            : f
+        );
+        return;
+      }
       const region = point && faceIndex !== null ? faceRegions()?.regionAt(faceIndex) : null;
       // While an "up to face" extrude is pending, a planar-face click picks
       // that face as the terminating plane instead of selecting a body.
@@ -681,7 +719,16 @@ export default function App() {
         clearSelection();
       }
     },
-    [selectNode, clearSelection, faceRegions, sweep, surfaceNormalAt, measureMode, handleMeasurePick]
+    [
+      selectNode,
+      clearSelection,
+      faceRegions,
+      sweep,
+      fillet,
+      surfaceNormalAt,
+      measureMode,
+      handleMeasurePick,
+    ]
   );
 
   // Hover highlight: resolve the pointer's triangle to its planar face
@@ -1172,6 +1219,8 @@ export default function App() {
       setFeatureError(null);
       setSweepError(null);
       setSketchOpen(false);
+      setFillet(null);
+      setFilletError(null);
       setSweep(
         kind === 'extrude'
           ? {
@@ -1268,6 +1317,8 @@ export default function App() {
       setSweep(null);
       setSweepError(null);
       setFeatureError(null);
+      setFillet(null);
+      setFilletError(null);
       const base = { kind, targetId: target.id, targetNode: target, picked: Boolean(picked) };
       if (kind === 'linearPattern') {
         const span = Math.max(size[0], size[1], size[2], 0.5) * 1.6;
@@ -1318,7 +1369,8 @@ export default function App() {
   // remesh whenever its parameters change.
   useEffect(() => {
     if (!feature || !wasm) {
-      if (!sweep) setPreviewMesh(null);
+      // Leave the preview alone while another tool owns it (sweep, fillet).
+      if (!sweep && !fillet) setPreviewMesh(null);
       return;
     }
     const source = feature.targetNode?.shape;
@@ -1337,7 +1389,111 @@ export default function App() {
     } finally {
       shape?.free?.();
     }
-  }, [feature, wasm, sweep]);
+  }, [feature, wasm, sweep, fillet]);
+
+  // ---- edge fillet / chamfer workflow -------------------------------------
+
+  // Toggle the edge-blend tool. Entering starts a pending fillet with no edge
+  // yet (the user then clicks a feature edge); leaving discards it. Radius
+  // defaults and the slider range scale to the current model size.
+  const handleFilletToggle = useCallback(() => {
+    setFillet((current) => {
+      if (current) {
+        setFilletError(null);
+        setPreviewMesh(null);
+        return null;
+      }
+      clearSelection();
+      setSweep(null);
+      setSweepError(null);
+      setFeature(null);
+      setFeatureError(null);
+      setSketchOpen(false);
+      const scale = meshRadius(meshRef.current?.positions) || 1;
+      setToast('Click a feature edge to round or bevel');
+      return {
+        mode: 'fillet',
+        radius: scale * 0.1,
+        range: scale,
+        edge: null,
+        segments: 0,
+        seed: null,
+        targetId: null,
+      };
+    });
+  }, [clearSelection]);
+
+  const handleFilletChange = useCallback((radius) => {
+    setFillet((current) => (current ? { ...current, radius } : current));
+  }, []);
+
+  const handleFilletField = useCallback((patch) => {
+    setFillet((current) => (current ? { ...current, ...patch } : current));
+  }, []);
+
+  const cancelFillet = useCallback(() => {
+    setFillet(null);
+    setFilletError(null);
+    setPreviewMesh(null);
+  }, []);
+
+  // Commit the pending fillet: rewrite the target union node into a
+  // filletEdge/chamferEdge over its two operands and commit through the store.
+  const applyFillet = useCallback(() => {
+    if (!fillet?.edge || fillet.targetId == null) return;
+    const root = tracedRef.current?.root;
+    if (!root) return;
+    let newRoot;
+    try {
+      newRoot = filletTreeNode(root, {
+        targetId: fillet.targetId,
+        mode: fillet.mode,
+        radius: fillet.radius,
+        edge: fillet.edge,
+      });
+    } catch (err) {
+      setFilletError(String(err));
+      return;
+    }
+    setFillet(null);
+    setFilletError(null);
+    setPreviewMesh(null);
+    commitTree(newRoot);
+  }, [fillet, commitTree]);
+
+  // Live preview: rebuild the blend of the two picked operands whenever the
+  // edge, mode, or radius changes. The operand shapes are read from the target
+  // node in the live traced tree (stable while the tool is open).
+  useEffect(() => {
+    if (!fillet?.edge || fillet.targetId == null || !wasm) {
+      if (fillet) setPreviewMesh(null);
+      return;
+    }
+    const root = tracedRef.current?.root;
+    const path = root ? pathTo(root, fillet.targetId) : null;
+    const target = path !== null ? nodeAt(root, path) : null;
+    const [a, b] = target?.children ?? [];
+    if (!a?.shape || !b?.shape) {
+      setPreviewMesh(null);
+      setFilletError('The blended edge no longer exists');
+      return;
+    }
+    let shape = null;
+    try {
+      shape = buildFilletShape(a.shape, b.shape, {
+        mode: fillet.mode,
+        radius: fillet.radius,
+        edge: fillet.edge,
+      });
+      setPreviewMesh(meshShape(shape));
+      setFilletError(null);
+    } catch (err) {
+      setPreviewMesh(null);
+      setFilletError(String(err));
+    } finally {
+      shape?.free?.();
+    }
+  }, [fillet, wasm]);
 
   // SolidWorks entry gesture: with a face picked, Sketch opens ON that face
   // (of-4eh.16). A planar face sketches on its plane; a curved face sketches
@@ -1698,13 +1854,21 @@ export default function App() {
           onAddFeature={handleAddFeature}
           canShell={Boolean(tree) && !sketchOpen}
           onShell={handleShell}
-          canPattern={Boolean(selectedNode) && !sketchOpen && !sweep && !feature}
+          canPattern={Boolean(selectedNode) && !sketchOpen && !sweep && !feature && !fillet}
           patternDisabledReason={
             sketchOpen
               ? 'Finish or exit the sketch first'
               : 'Select a body in the viewport or tree first'
           }
           onPattern={handleFeatureStart}
+          filletActive={Boolean(fillet)}
+          canFillet={Boolean(mesh?.indices?.length) && !sketchOpen && !sweep && !feature}
+          filletDisabledReason={
+            sketchOpen || sweep || feature
+              ? 'Finish the current sketch or feature first'
+              : 'Build a body with a boolean edge first'
+          }
+          onFilletToggle={handleFilletToggle}
           onView={(name) => viewportRef.current?.snapView(name)}
           onFit={() => viewportRef.current?.zoomToFit()}
           wireframe={wireframe}
@@ -1757,6 +1921,14 @@ export default function App() {
           onField={handleSweepField}
           onApply={applySweep}
           onCancel={cancelSweep}
+        />
+        <FilletPanel
+          fillet={fillet}
+          error={filletError}
+          onChange={handleFilletChange}
+          onField={handleFilletField}
+          onApply={applyFillet}
+          onCancel={cancelFillet}
         />
         {section && sectionRange && (
           <SectionPanel

@@ -107,6 +107,12 @@ const Icons = {
       <path d="M10 4 L13.5 8 L10 12 Z" opacity="0.55" />
     </svg>
   ),
+  fillet: (
+    <svg {...ICON}>
+      <path d="M3 13 V7 c0 -2.2 1.8 -4 4 -4 H13" />
+      <path d="M3 13 H3.02 M13 3 H13.02" strokeWidth="2.4" />
+    </svg>
+  ),
   fit: (
     <svg {...ICON}>
       <path d="M2 5.5 V2 h3.5 M10.5 2 H14 v3.5 M14 10.5 V14 h-3.5 M5.5 14 H2 v-3.5" />
@@ -220,6 +226,10 @@ export default function MainToolbar({
   canPattern,
   patternDisabledReason,
   onPattern,
+  filletActive = false,
+  canFillet = false,
+  filletDisabledReason,
+  onFilletToggle,
   onView,
   onFit,
   wireframe,
@@ -342,6 +352,15 @@ export default function MainToolbar({
           disabledReason={disabled ? notReady : patternDisabledReason}
           disabled={disabled || !canPattern}
           onClick={() => onPattern('mirror')}
+        />
+        <ToolButton
+          icon="fillet"
+          label={filletActive ? 'Exit Fillet' : 'Fillet'}
+          title="Round or bevel a picked feature edge (click an edge, then set the radius)"
+          disabledReason={disabled ? notReady : filletDisabledReason}
+          active={filletActive}
+          disabled={disabled || (!filletActive && !canFillet)}
+          onClick={onFilletToggle}
         />
         <ToolButton
           icon="reference"

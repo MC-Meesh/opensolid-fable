@@ -69,6 +69,12 @@ class FakeShape {
   smoothUnion(other, radius) {
     return new FakeShape(['smoothUnion', this.desc, other.desc, radius]);
   }
+  filletEdge(other, radius, edge) {
+    return new FakeShape(['filletEdge', this.desc, other.desc, radius, edge.slice()]);
+  }
+  chamferEdge(other, radius, edge) {
+    return new FakeShape(['chamferEdge', this.desc, other.desc, radius, edge.slice()]);
+  }
 }
 
 // Stand-in for WasmProfile2D: records calls so tests can assert delegation.
@@ -507,5 +513,58 @@ describe('profileSegStatement', () => {
   it('emits cubicTo with control points first', () => {
     const seg = { kind: 'spline', x: 0, y: 1, c1x: 1, c1y: 2, c2x: 3, c2y: 4 };
     expect(profileSegStatement('p', seg)).toBe('p.cubicTo(1, 2, 3, 4, 0, 1);');
+  });
+});
+
+describe('edge blends (filletEdge / chamferEdge)', () => {
+  const SOURCE = `
+    const a = Shape.box3(1, 1, 1);
+    const b = Shape.box3(1, 1, 1).translate(1, 0, 0);
+    return a.filletEdge(b, 0.1, [1, -1, 1, 1, 1, 1]);
+  `;
+
+  it('traces the edge blend with radius + polyline args and two children', () => {
+    const { root } = runTracedScript(SOURCE, FakeShape, FakeProfile);
+    expect(root.op).toBe('filletEdge');
+    expect(root.args).toEqual([0.1, [1, -1, 1, 1, 1, 1]]);
+    expect(root.children).toHaveLength(2);
+    expect(root.shape.desc[0]).toBe('filletEdge');
+    expect(root.shape.desc[3]).toBe(0.1);
+    expect(root.shape.desc[4]).toEqual([1, -1, 1, 1, 1, 1]);
+  });
+
+  it('serializes the polyline as an array literal and round-trips', () => {
+    const { root } = runTracedScript(SOURCE, FakeShape, FakeProfile);
+    const script = serializeTree(root);
+    expect(script).toContain(
+      '.filletEdge(Shape.box3(1, 1, 1).translate(1, 0, 0), 0.1, [1, -1, 1, 1, 1, 1])'
+    );
+    const again = runTracedScript(script, FakeShape, FakeProfile);
+    expect(serializeTree(again.root)).toBe(script);
+    expect(skeleton(again.root)).toEqual(skeleton(root));
+  });
+
+  it('labels an edge blend with just its radius', () => {
+    const { root } = runTracedScript(SOURCE, FakeShape, FakeProfile);
+    expect(nodeLabel(root)).toBe('Fillet Edge [0.1]');
+  });
+
+  it('supports chamferEdge too', () => {
+    const source = SOURCE.replace('filletEdge', 'chamferEdge');
+    const { root } = runTracedScript(source, FakeShape, FakeProfile);
+    expect(root.op).toBe('chamferEdge');
+    expect(nodeLabel(root)).toBe('Chamfer Edge [0.1]');
+    expect(serializeTree(root)).toContain('.chamferEdge(');
+    expect(serializeTree(root)).toContain(', 0.1, [1, -1, 1, 1, 1, 1])');
+  });
+
+  it('rejects a non-shape first argument', () => {
+    const bad = 'return Shape.box3(1,1,1).filletEdge(5, 0.1, [0,0,0,1,0,0]);';
+    expect(() => runTracedScript(bad, FakeShape, FakeProfile)).toThrow(/expects a Shape/);
+  });
+
+  it('rejects a missing edge polyline', () => {
+    const bad = 'const b = Shape.box3(1,1,1); return Shape.box3(1,1,1).filletEdge(b, 0.1, 3);';
+    expect(() => runTracedScript(bad, FakeShape, FakeProfile)).toThrow(/edge polyline/);
   });
 });

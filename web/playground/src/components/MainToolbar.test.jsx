@@ -41,9 +41,24 @@ describe('MainToolbar', () => {
     expect(html).toContain('View');
     expect(html).toContain('Drawing');
     expect(html).toContain('Export');
-    for (const label of ['Extrude', 'Revolve', 'Sweep', 'Loft', 'Shell', 'Reference', 'Fit', 'Front', 'Top', 'Right', 'Iso', 'Wireframe', 'Section', 'STL', 'STEP']) {
+    for (const label of ['Extrude', 'Revolve', 'Sweep', 'Loft', 'Shell', 'Reference', 'Fillet', 'Fit', 'Front', 'Top', 'Right', 'Iso', 'Wireframe', 'Section', 'STL', 'STEP']) {
       expect(html).toContain(label);
     }
+  });
+
+  it('gates the Fillet edge-blend button on an existing body and reflects its active state', () => {
+    // No body yet → disabled with its explanatory reason.
+    const idle = render({ canFillet: false, filletDisabledReason: 'Build a body with a boolean edge first' });
+    expect(idle).toMatch(/disabled[^>]*aria-label="Fillet"/);
+    expect(idle).toContain('Build a body with a boolean edge first');
+    // A body exists → enabled (no disabled attribute on the Fillet button).
+    const ready = render({ canFillet: true });
+    expect(ready).toContain('aria-label="Fillet"');
+    expect(ready).not.toMatch(/disabled[^>]*aria-label="Fillet"/);
+    // Active tool stays clickable (to exit) and relabels.
+    const active = render({ filletActive: true, canFillet: false });
+    expect(active).toContain('Exit Fillet');
+    expect(active).not.toMatch(/disabled[^>]*aria-label="Exit Fillet"/);
   });
 
   it('makes sketch and drawing mutually exclusive', () => {

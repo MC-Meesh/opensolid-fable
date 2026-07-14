@@ -45,6 +45,13 @@ export const UNARY_OPS = [
 // Two children: the receiver, then the other shape.
 export const BINARY_OPS = ['union', 'intersect', 'subtract', 'smoothUnion'];
 
+// Edge-selective blends: `a.filletEdge(b, radius, [x0,y0,z0, …])`. Two children
+// (receiver, other) like a binary op, but the trailing arg is a flat polyline
+// of the picked feature edge, so tracing and serialization treat it specially
+// (a plain-numeric arg map would stringify the array wrong). See
+// docs/design/edge-fillet-chamfer.md and lib/edgePick.js.
+export const EDGE_BLEND_OPS = ['filletEdge', 'chamferEdge'];
+
 // Static constructors sweeping a 2D profile (a `Profile` instance, then
 // numeric args). No children; the node carries a `profile` snapshot:
 // `{ start: [x, y], segs: [{ x, y, bulge }] }`.
@@ -85,7 +92,11 @@ const OP_LABELS = {
   revolve: 'Revolve',
   sweep: 'Sweep',
   loft: 'Loft',
+  filletEdge: 'Fillet Edge',
+  chamferEdge: 'Chamfer Edge',
 };
+
+const edgeBlendSet = new Set(EDGE_BLEND_OPS);
 
 function formatArg(value) {
   if (typeof value === 'number' && Number.isFinite(value)) {
@@ -98,6 +109,8 @@ function formatArg(value) {
 /** Display label for a node, e.g. 'Box3 [1, 0.55, 0.8]' or 'Subtract'. */
 export function nodeLabel(node) {
   const name = OP_LABELS[node.op] ?? node.op;
+  // Edge blends carry a long polyline arg; show only the radius.
+  if (edgeBlendSet.has(node.op)) return `${name} [${formatArg(node.args[0])}]`;
   if (node.args.length === 0) return name;
   return `${name} [${node.args.map(formatArg).join(', ')}]`;
 }
@@ -261,6 +274,26 @@ export function createTracer(ShapeClass, ProfileClass, PathClass) {
     };
   }
 
+  for (const op of EDGE_BLEND_OPS) {
+    TracingShape.prototype[op] = function (other, radius, edge) {
+      if (!(other instanceof TracingShape)) {
+        throw new Error(`.${op}(...) expects a Shape as its first argument`);
+      }
+      if (!Array.isArray(edge) && !ArrayBuffer.isView(edge)) {
+        throw new Error(`.${op}(...) expects an edge polyline array`);
+      }
+      // Keep the polyline as a plain number[] so the node serializes and can be
+      // freely re-emitted; args = [radius, polyline].
+      const polyline = Array.from(edge);
+      return record(
+        op,
+        [radius, polyline],
+        [this.node, other.node],
+        this.node.shape[op](other.node.shape, radius, polyline)
+      );
+    };
+  }
+
   return { TracingShape, TracingProfile, TracingPath, nodes, profiles };
 }
 
@@ -399,8 +432,23 @@ export function serializeTree(root, { header = '' } = {}) {
 
   const exprOf = (node) => {
     if (names.has(node.id)) return names.get(node.id);
-    const args = node.args.map(String);
     let text;
+    if (edgeBlendSet.has(node.op)) {
+      // a.filletEdge(b, radius, [x0, y0, z0, …]) — the polyline is a literal
+      // array so the picked edge round-trips through re-evaluation.
+      const [receiver, other] = node.children;
+      const [radius, polyline] = node.args;
+      const flat = `[${(polyline ?? []).map(String).join(', ')}]`;
+      text = `${exprOf(receiver)}.${node.op}(${exprOf(other)}, ${String(radius)}, ${flat})`;
+      if (node !== root) {
+        const name = `s${names.size + 1}`;
+        names.set(node.id, name);
+        lines.push(`const ${name} = ${text};`);
+        return name;
+      }
+      return text;
+    }
+    const args = node.args.map(String);
     if (node.op === 'loft') {
       const bottom = emitProfile(node.profile);
       const top = emitProfile(node.profile2);
