@@ -31,16 +31,20 @@
 //!   loops), but faces with inner loops (holes) are still rejected with
 //!   [`CoreError::NotImplemented`]. Full constrained Delaunay triangulation
 //!   (hole bridging, as in [`crate::boolean`]) is a later pass.
-//! - Quadric faces must cover their surface's **full angular range** (the
-//!   full `u` period, and the full `v` domain/period for spheres and tori),
-//!   as the primitive and sweep constructors produce. Violations are
-//!   *detected* and rejected with [`CoreError::NotImplemented`] instead of
-//!   silently gridding the whole surface (of-q6u): cylinder/cone boundaries
-//!   must cover the `u` period (checked by projecting boundary samples),
-//!   and sphere/torus boundaries must consist purely of seams (every edge
-//!   traversed with net-zero sense). Trimmed quadric faces (from booleans)
-//!   arrive with the CDT pass ([`crate::boolean::BooleanOutput::tessellate`]
-//!   already handles them).
+//! - Cylinder/cone faces cover either their **full `u` period** (primitive and
+//!   sweep walls) or a **partial arc that is a clean iso-parameter rectangle**
+//!   (`[u_lo, u_hi] × [v_lo, v_hi]`, e.g. a quarter-cylinder notch from a
+//!   boolean, of-2i3) — both recovered by projecting boundary samples onto the
+//!   surface. A trim whose boundary is *not* such a rectangle (a slanted planar
+//!   cut, or a face with inner loops) is *detected* and rejected with
+//!   [`CoreError::NotImplemented`] instead of silently gridding it wrong
+//!   (of-q6u); it arrives with the CDT pass
+//!   ([`crate::boolean::BooleanOutput::tessellate`] already handles it).
+//! - Sphere/torus faces must cover the **full `v` domain/period**: their
+//!   boundary must consist purely of seams (every edge traversed with net-zero
+//!   sense), as the primitive constructors and STEP reader produce. Trimmed
+//!   sphere/torus faces (caps, zones, wedges) are likewise rejected for the CDT
+//!   pass.
 //! - The only fidelity control is [`TessellationOptions::angular_step`];
 //!   chord tolerance, edge-length bounds, and adaptive refinement are
 //!   deferred.
@@ -88,8 +92,19 @@ impl TessellationOptions {
 
 /// Segment count for sweeping an angular range at the configured step.
 /// At least 3, so closed circles always produce a real polygon.
+///
+/// The count is `ceil(sweep / step)`, but a sweep within floating tolerance of
+/// an exact multiple of the step snaps down to that multiple: a quarter, half,
+/// or full revolution lands on an integer count, and two adjacent faces that
+/// recover the *same* shared arc's sweep with independent rounding noise (the
+/// wall projecting boundary samples, the cap reading its edge's parameter span)
+/// must agree on the count, or their rim vertices land on different sample
+/// positions and fail to weld (of-2i3). Snapping only nudges values already
+/// within `1e-9` of an integer, well above float noise (~1e-14) yet far below
+/// any sweep difference that changes fidelity.
 fn angular_segments(sweep: f64, options: &TessellationOptions) -> usize {
-    ((sweep.abs() / options.angular_step).ceil() as usize).max(3)
+    let raw = sweep.abs() / options.angular_step;
+    ((raw - 1e-9).ceil() as usize).max(3)
 }
 
 /// Tessellate every face of `body` into one welded mesh.
@@ -181,22 +196,35 @@ fn tessellate_face_into(
             fan_planar_face(store, geo, face_id, face, surface, flip, options, mesh)
         }
         Surface3::Cylinder { .. } | Surface3::Cone { .. } => {
-            let (u_anchor, v_lo, v_hi) = boundary_param_range(store, geo, face_id, face, surface)?;
-            grid_face(surface, u_anchor, v_lo, v_hi, false, 1, flip, options, mesh);
+            let (u_span, v_lo, v_hi) = boundary_param_range(store, geo, face_id, face, surface)?;
+            let period = surface.period_u().expect("quadric surfaces are u-periodic");
+            let (u_lo, u_hi, wrap_u) = match u_span {
+                QuadricUSpan::Full { u_anchor } => (u_anchor, u_anchor + period, true),
+                QuadricUSpan::PartialRect { u_lo, u_hi } => (u_lo, u_hi, false),
+            };
+            grid_face(
+                surface, u_lo, u_hi, wrap_u, v_lo, v_hi, false, 1, flip, options, mesh,
+            );
             Ok(())
         }
         Surface3::Sphere { .. } => {
             require_seam_closed_boundary(store, face_id, face)?;
+            let period = surface.period_u().expect("sphere is u-periodic");
             let (v_lo, v_hi) = surface.domain_v();
             let n_v = angular_segments(v_hi - v_lo, options);
-            grid_face(surface, 0.0, v_lo, v_hi, false, n_v, flip, options, mesh);
+            grid_face(
+                surface, 0.0, period, true, v_lo, v_hi, false, n_v, flip, options, mesh,
+            );
             Ok(())
         }
         Surface3::Torus { .. } => {
             require_seam_closed_boundary(store, face_id, face)?;
-            let period = surface.period_v().expect("torus is v-periodic");
-            let n_v = angular_segments(period, options);
-            grid_face(surface, 0.0, 0.0, period, true, n_v, flip, options, mesh);
+            let period_u = surface.period_u().expect("torus is u-periodic");
+            let period_v = surface.period_v().expect("torus is v-periodic");
+            let n_v = angular_segments(period_v, options);
+            grid_face(
+                surface, 0.0, period_u, true, 0.0, period_v, true, n_v, flip, options, mesh,
+            );
             Ok(())
         }
     }
@@ -376,36 +404,52 @@ fn require_seam_closed_boundary(
     Ok(())
 }
 
-/// The `u` anchor and `v` range spanned by a face's boundary, recovered by
-/// projecting boundary-edge samples onto the surface (for surfaces with an
-/// unbounded `v` domain: cylinders and cones).
+/// How a cylinder/cone face maps onto its surface's `u` period, recovered
+/// from boundary samples by [`boundary_param_range`].
+enum QuadricUSpan {
+    /// The boundary covers the full period (primitive/sweep walls): grid the
+    /// whole revolution with wrap, columns starting at `u_anchor`. The `u`
+    /// columns of a transformed body must start at the same arbitrary anchor
+    /// angle its rims were re-anchored to ([`crate::transform`]) so rim
+    /// vertices coincide with the adjacent faces' samples and weld watertight.
+    Full { u_anchor: f64 },
+    /// The boundary is a clean iso-parameter rectangle spanning a partial arc
+    /// `[u_lo, u_hi]` (`u_hi` may exceed the period if the arc straddles the
+    /// seam): grid that rectangle without `u` wrap. Boolean-trimmed walls such
+    /// as a quarter-cylinder notch arrive this way (of-2i3).
+    PartialRect { u_lo: f64, u_hi: f64 },
+}
+
+/// Classify how a cylinder/cone face maps onto its `u` period and recover the
+/// `v` range its boundary spans, by projecting boundary-edge samples onto the
+/// surface (cylinders and cones have an unbounded `v` domain).
 ///
-/// The anchor is the `u` of the first non-singular boundary sample — a rim
-/// vertex. The boundary circles of a transformed body are re-anchored to
-/// start at an arbitrary angle ([`crate::transform`]), so the grid's `u`
-/// columns must start at the same angle for its rim vertices to coincide
-/// with the adjacent faces' boundary samples and weld watertight.
+/// A boundary covering the full period (to within [`MIN_PERIOD_COVERAGE`],
+/// measured as the largest circular gap between samples) is a whole-revolution
+/// wall — [`QuadricUSpan::Full`]. A boundary covering materially less is a
+/// trimmed face; if it is a clean iso-parameter rectangle (every fin a rim arc
+/// at `v_lo`/`v_hi` or an axial ruling at `u_lo`/`u_hi`) it grids faithfully as
+/// [`QuadricUSpan::PartialRect`] (of-2i3). A trim whose boundary is *not* such
+/// a rectangle — a slanted or otherwise curved-in-`uv` cut — cannot be gridded
+/// without hole bridging and is rejected for the CDT pass (of-q6u).
 ///
-/// Also guards the tessellator's full-period assumption: the samples' `u`
-/// values must cover the period to within [`MIN_PERIOD_COVERAGE`] (largest
-/// circular gap as the uncovered arc). A trimmed wedge fails this and is
-/// rejected instead of silently gridding the whole surface (of-q6u).
-/// Samples at parameterization singularities (cone apex) are excluded —
-/// their `u` is arbitrary.
+/// Samples at parameterization singularities (cone apex) are excluded from the
+/// `u` analysis — their `u` is arbitrary — but still bound the `v` range.
 ///
 /// # Errors
-/// [`CoreError::NotImplemented`] if the boundary covers materially less
-/// than the full `u` period.
+/// [`CoreError::NotImplemented`] if the boundary is trimmed and not a clean
+/// iso-parameter rectangle.
 fn boundary_param_range(
     store: &TopologyStore,
     geo: &GeometryStore,
     face_id: EntityId<Face>,
     face: &Face,
     surface: &Surface3,
-) -> CoreResult<(f64, f64, f64)> {
+) -> CoreResult<(QuadricUSpan, f64, f64)> {
     let period = surface.period_u().expect("quadric surfaces are u-periodic");
     let mut u_anchor = None;
-    let mut us = Vec::new();
+    // (u wrapped into [0, period), v) for every non-singular boundary sample.
+    let mut samples: Vec<(f64, f64)> = Vec::new();
     let mut lo = f64::INFINITY;
     let mut hi = f64::NEG_INFINITY;
     for loop_id in face
@@ -424,7 +468,7 @@ fn boundary_param_range(
                     if u_anchor.is_none() {
                         u_anchor = Some(projected.u);
                     }
-                    us.push(projected.u.rem_euclid(period));
+                    samples.push((projected.u.rem_euclid(period), projected.v));
                 }
             }
         }
@@ -435,36 +479,74 @@ fn boundary_param_range(
             "boundary does not span a v range on its unbounded surface",
         ));
     }
+    let u_anchor = u_anchor.expect("v range implies samples");
 
-    // Largest angular arc between consecutive boundary samples (including
-    // the wrap-around from last back to first) is the uncovered span.
+    // Largest angular arc between consecutive samples (including the
+    // wrap-around from last back to first) is the uncovered span; record where
+    // it sits so the covered arc's ends can be recovered. `gap_after` indexes
+    // the sample the gap starts at; `n - 1` denotes the wrap gap.
+    let mut us: Vec<f64> = samples.iter().map(|&(u, _)| u).collect();
     us.sort_unstable_by(f64::total_cmp);
-    let mut max_gap = match (us.first(), us.last()) {
-        (Some(first), Some(last)) => period - last + first,
-        _ => period,
+    let n = us.len();
+    let mut max_gap = period - us[n - 1] + us[0];
+    let mut gap_after = n - 1;
+    for i in 0..n - 1 {
+        let gap = us[i + 1] - us[i];
+        if gap > max_gap {
+            max_gap = gap;
+            gap_after = i;
+        }
+    }
+
+    if period - max_gap >= MIN_PERIOD_COVERAGE * period {
+        return Ok((QuadricUSpan::Full { u_anchor }, lo, hi));
+    }
+
+    // Trimmed. The covered arc runs from the sample just after the gap around
+    // to the one just before it; if the gap is the wrap, that is simply
+    // [min, max].
+    let (u_lo, u_hi) = if gap_after == n - 1 {
+        (us[0], us[n - 1])
+    } else {
+        (us[gap_after + 1], us[gap_after] + period)
     };
-    for pair in us.windows(2) {
-        max_gap = max_gap.max(pair[1] - pair[0]);
+
+    // Only a clean parameter rectangle [u_lo, u_hi] × [lo, hi] grids faithfully
+    // without hole bridging: every boundary sample must lie on the rectangle's
+    // border (each fin iso-parametric). A diagonal or curved-in-uv boundary
+    // fails this and is deferred to the CDT pass (of-2i3).
+    let tol_u = 1e-6 * (u_hi - u_lo) + 1e-9;
+    let tol_v = 1e-6 * (hi - lo) + 1e-9;
+    for &(u, v) in &samples {
+        let u = if u < u_lo - tol_u { u + period } else { u };
+        let inside = u >= u_lo - tol_u && u <= u_hi + tol_u;
+        let on_border = (u - u_lo).abs() <= tol_u
+            || (u - u_hi).abs() <= tol_u
+            || (v - lo).abs() <= tol_v
+            || (v - hi).abs() <= tol_v;
+        if !inside || !on_border {
+            return Err(CoreError::NotImplemented {
+                feature: "tessellating non-rectangular trimmed cylinder/cone faces \
+                          (boundary is not an iso-parameter rectangle; needs the CDT pass)",
+            });
+        }
     }
-    if period - max_gap < MIN_PERIOD_COVERAGE * period {
-        return Err(CoreError::NotImplemented {
-            feature: "tessellating trimmed cylinder/cone faces \
-                      (boundary covers less than the full u period; needs the CDT pass)",
-        });
-    }
-    Ok((u_anchor.expect("v range implies samples"), lo, hi))
+    Ok((QuadricUSpan::PartialRect { u_lo, u_hi }, lo, hi))
 }
 
-/// Tessellate a quadric face over its parameter rectangle:
-/// `u` over the full period starting at `u_anchor` (wrapped by index), `v`
-/// over `[v_lo, v_hi]` with `n_v` segments (wrapped if `wrap_v`). Singular
-/// rows (sphere poles, cone apex) collapse to a single vertex. `flip`
-/// reverses emitted normals and winding, for Negative-sense faces whose
-/// outward direction opposes the surface normal.
+/// Tessellate a quadric face over its parameter rectangle: `u` over
+/// `[u_lo, u_hi]` with `n_u = angular_segments(u_hi - u_lo)` segments (wrapped
+/// by index if `wrap_u`, for a full-period revolution), `v` over `[v_lo, v_hi]`
+/// with `n_v` segments (wrapped if `wrap_v`). Singular rows (sphere poles, cone
+/// apex) collapse to a single vertex. `flip` reverses emitted normals and
+/// winding, for Negative-sense faces whose outward direction opposes the
+/// surface normal.
 #[allow(clippy::too_many_arguments)]
 fn grid_face(
     surface: &Surface3,
-    u_anchor: f64,
+    u_lo: f64,
+    u_hi: f64,
+    wrap_u: bool,
     v_lo: f64,
     v_hi: f64,
     wrap_v: bool,
@@ -473,8 +555,8 @@ fn grid_face(
     options: &TessellationOptions,
     mesh: &mut TriangleMesh,
 ) {
-    let period = surface.period_u().expect("quadric surfaces are u-periodic");
-    let n_u = angular_segments(period, options);
+    let n_u = angular_segments(u_hi - u_lo, options);
+    let col_count = if wrap_u { n_u } else { n_u + 1 };
     let row_count = if wrap_v { n_v } else { n_v + 1 };
 
     // rows[j] holds one vertex index per u column, or exactly one index for
@@ -486,11 +568,15 @@ fn grid_face(
         } else {
             v_lo + (v_hi - v_lo) * j as f64 / n_v as f64
         };
-        let singular = surface.is_singular(u_anchor, v);
-        let columns = if singular { 1 } else { n_u };
+        let singular = surface.is_singular(u_lo, v);
+        let columns = if singular { 1 } else { col_count };
         let mut row = Vec::with_capacity(columns);
         for i in 0..columns {
-            let u = u_anchor + period * i as f64 / n_u as f64;
+            let u = if !wrap_u && i == n_u {
+                u_hi // exact endpoint, no accumulation error
+            } else {
+                u_lo + (u_hi - u_lo) * i as f64 / n_u as f64
+            };
             row.push(mesh.positions.len());
             mesh.positions.push(surface.point(u, v));
             let normal = grid_normal(surface, u, v, v_lo, v_hi);
@@ -576,6 +662,61 @@ mod tests {
             (actual - expected).abs() <= expected.abs() * fraction,
             "{what}: {actual} vs expected {expected} (>{:.1}%)",
             fraction * 100.0
+        );
+    }
+
+    /// A boolean that leaves a partially-trimmed quadric wall — block minus a
+    /// corner cylinder, whose kept wall is a quarter-cylinder (a clean
+    /// parameter rectangle) — must now tessellate to a closed manifold with the
+    /// right volume, matching [`crate::boolean::BooleanOutput::tessellate`]
+    /// (of-2i3). Previously the full-period assumption rejected it (of-q6u).
+    #[test]
+    fn quarter_cylinder_notch_is_watertight() {
+        use opensolid_core::Transform3;
+        use opensolid_core::tolerance::ToleranceContext;
+        let mut store = TopologyStore::new();
+        let mut geo = GeometryStore::new();
+        let block = primitives::block(&mut store, &mut geo, 2.0, 2.0, 2.0).unwrap();
+        let tool = primitives::cylinder(&mut store, &mut geo, 0.4, 3.0).unwrap();
+        // Center the tool on the block's vertical corner edge (1, 1): only a
+        // quarter of the tube lies inside the block, so the kept cylinder wall
+        // is a quarter-arc — a partial-period, iso-rectangular quadric face.
+        crate::transform::transform_body(
+            &mut store,
+            &mut geo,
+            tool,
+            &Transform3::translation(1.0, 1.0, 0.0),
+        )
+        .unwrap();
+        let out = crate::boolean::subtract(&store, &geo, block, tool, &ToleranceContext::default())
+            .expect("subtract");
+        assert!(
+            out.check().is_empty(),
+            "boolean output invalid: {:?}",
+            out.check()
+        );
+        let reference = out.tessellate().expect("BooleanOutput::tessellate");
+
+        let mesh = tessellate_body(
+            &out.store,
+            &out.geo,
+            out.body,
+            &TessellationOptions::default(),
+        )
+        .expect("tessellate_body must grid the quarter-cylinder wall (of-2i3)");
+        assert!(
+            mesh.is_closed_manifold(),
+            "notch mesh must be watertight, got {} tris",
+            mesh.triangle_count()
+        );
+        // Block volume 8 minus a quarter-cylinder r=0.4 h=2: 8 - πr²h/4 ≈ 7.749.
+        let expected = 8.0 - std::f64::consts::PI * 0.4 * 0.4 * 2.0 / 4.0;
+        assert_within(signed_volume(&mesh), expected, 0.02, "notch volume");
+        assert_within(
+            signed_volume(&mesh),
+            signed_volume(&reference),
+            0.02,
+            "notch volume vs BooleanOutput::tessellate",
         );
     }
 
@@ -1002,10 +1143,12 @@ mod tests {
             );
         }
 
-        /// A half-period cylinder wedge (two half-rims and two axial sides)
-        /// must be rejected, not silently rendered as the full cylinder.
+        /// A half-period cylinder wedge (two half-rims and two axial sides) is
+        /// a clean iso-parameter rectangle `[0, π] × [0, h]`, so it grids
+        /// faithfully as a partial arc (of-2i3) rather than being rejected or
+        /// rendered as the full cylinder.
         #[test]
-        fn rejects_half_cylinder_wedge() {
+        fn accepts_half_cylinder_wedge() {
             let mut store = TopologyStore::new();
             let mut geo = GeometryStore::new();
             let (r, h) = (1.0, 2.0);
@@ -1039,6 +1182,72 @@ mod tests {
                     (e_side1, FinSense::Forward),
                     (e_top, FinSense::Reversed),
                     (e_side0, FinSense::Reversed),
+                ],
+            );
+
+            let mesh = tessellate_face(&store, &geo, face, &TessellationOptions::default())
+                .expect("iso-rectangular half-cylinder wedge must grid (of-2i3)");
+            // Half of the lateral surface: π·r·h, not the full TAU·r·h.
+            assert_within(
+                mesh.total_area(),
+                PI * r * h,
+                0.05,
+                "half-cylinder wedge area",
+            );
+        }
+
+        /// A trimmed cylinder face whose boundary is *not* an iso-parameter
+        /// rectangle — a diagonal edge running across the surface in both `u`
+        /// and `v` at once (as a slanted cut leaves) — cannot be gridded on the
+        /// `u × v` lattice without hole bridging, and must defer to the CDT pass
+        /// (of-2i3) rather than being gridded wrong.
+        #[test]
+        fn rejects_diagonal_cylinder_trim() {
+            let mut store = TopologyStore::new();
+            let mut geo = GeometryStore::new();
+            let (r, h) = (1.0, 2.0);
+            let axis = Vector3::z();
+            let face = face_on(
+                &mut store,
+                &mut geo,
+                Surface3::cylinder(Point3::origin(), axis, r).unwrap(),
+            );
+
+            // Right-triangle patch: a quarter rim arc (v = 0, u ∈ [0, π/2]), an
+            // axial side (u = π/2, v ∈ [0, h]), and a diagonal hypotenuse whose
+            // interior samples fall inside the parameter rectangle, not on its
+            // border.
+            let va = Point3::new(r, 0.0, 0.0); // u = 0,    v = 0
+            let vb = Point3::new(0.0, r, 0.0); // u = π/2,  v = 0
+            let vc = Point3::new(0.0, r, h); //   u = π/2,  v = h
+
+            let arc = geo.add_curve(Curve3::circle(Point3::origin(), axis, r).unwrap());
+            let side = geo.add_curve(Curve3::line(vb, axis).unwrap());
+            let hyp = geo.add_curve(Curve3::line(vc, va - vc).unwrap());
+
+            let vid_a = store.create_vertex(va, SYSTEM_RESOLUTION);
+            let vid_b = store.create_vertex(vb, SYSTEM_RESOLUTION);
+            let vid_c = store.create_vertex(vc, SYSTEM_RESOLUTION);
+
+            let e_arc =
+                store.create_edge_with_curve(vid_a, vid_b, SYSTEM_RESOLUTION, arc, 0.0, PI / 2.0);
+            let e_side =
+                store.create_edge_with_curve(vid_b, vid_c, SYSTEM_RESOLUTION, side, 0.0, h);
+            let e_hyp = store.create_edge_with_curve(
+                vid_c,
+                vid_a,
+                SYSTEM_RESOLUTION,
+                hyp,
+                0.0,
+                (va - vc).norm(),
+            );
+            store.create_loop(
+                face,
+                LoopType::Outer,
+                &[
+                    (e_arc, FinSense::Forward),
+                    (e_side, FinSense::Forward),
+                    (e_hyp, FinSense::Forward),
                 ],
             );
 

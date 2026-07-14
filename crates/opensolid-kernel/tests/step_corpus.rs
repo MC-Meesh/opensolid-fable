@@ -37,10 +37,11 @@
 //! - of-as6 (fixed): `tessellate_body` ignored `FaceSense::Negative`, so
 //!   planar boolean outputs (L-shape subtract) meshed with inward-wound
 //!   tool faces and failed the manifold check even though
-//!   `BooleanOutput::tessellate()` was closed. Trimmed quadric faces
-//!   (cylinder edge notch) still tessellate over the full period — of-2i3
-//!   — which is why the volume half of the round-trip gate stays
-//!   conditional.
+//!   `BooleanOutput::tessellate()` was closed. Iso-rectangular trimmed
+//!   quadric faces (cylinder edge notch) now tessellate faithfully as
+//!   partial arcs — of-2i3 (fixed). The volume half of the round-trip gate
+//!   stays conditional because non-rectangular trims and sphere/torus caps
+//!   still defer to the CDT pass.
 //! - of-kb8: the reader duplicates shared geometry instances (one
 //!   `Curve3`/`Surface3` per referencing edge/face), so `write ∘ read` is
 //!   only byte-identical from the second write onwards when the source
@@ -151,8 +152,9 @@ fn assert_counts_equal(
 }
 
 /// Volume via the standalone store tessellator, only when it produces a
-/// closed manifold (see of-2i3 for why it does not on boolean outputs
-/// with trimmed quadric faces).
+/// closed manifold — it may not, on bodies with non-rectangular trimmed
+/// quadric faces or sphere/torus caps that still defer to the CDT pass
+/// (of-2i3 handled the iso-rectangular cylinder/cone case).
 fn closed_volume(store: &TopologyStore, geo: &GeometryStore, body: EntityId<Body>) -> Option<f64> {
     let mesh = tessellate_body(store, geo, body, &TessellationOptions::default()).ok()?;
     mass_properties(&mesh).ok().map(|mp| mp.volume)
@@ -161,7 +163,7 @@ fn closed_volume(store: &TopologyStore, geo: &GeometryStore, body: EntityId<Body
 /// The full round-trip gate: write → read (exact B-Rep, no error
 /// diagnostics, clean check) → identical Euler counts → write again and
 /// require the byte-identical file (fixed point). Volume is compared when
-/// the tessellator can measure both sides (of-2i3 gates the rest).
+/// the tessellator can measure both sides (the CDT-pass cases gate the rest).
 fn assert_round_trip(
     store: &TopologyStore,
     geo: &GeometryStore,
