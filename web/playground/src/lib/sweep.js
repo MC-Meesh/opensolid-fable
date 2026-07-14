@@ -329,6 +329,60 @@ export function sweepTreeNode(root, sweep) {
   return { id: id--, op: boolOp, args: [], children: [root, node] };
 }
 
+/**
+ * A ready-to-edit default Sweep feature: a small disk swept along an elbow
+ * path (up, then across). Plain node data (see `sweepTreeNode`) — the Features
+ * toolbar grafts it onto the tree, then the user edits the profile/path in the
+ * regenerated script. Sweep takes a `profile` and a `path` snapshot.
+ */
+export function defaultSweepNode() {
+  return {
+    op: 'sweep',
+    args: [],
+    children: [],
+    profile: {
+      start: [-0.25, 0],
+      segs: [
+        { x: 0.25, y: 0, bulge: 1 },
+        { x: -0.25, y: 0, bulge: 1 },
+      ],
+    },
+    path: [
+      [0, 0, 0],
+      [0, 1, 0],
+      [1, 1, 0],
+    ],
+  };
+}
+
+/**
+ * A ready-to-edit default Loft feature: a square base (y = 0) morphing to a
+ * round top (y = 1). Loft carries `profile` (bottom) and `profile2` (top)
+ * snapshots plus a height arg.
+ */
+export function defaultLoftNode() {
+  return {
+    op: 'loft',
+    args: [1],
+    children: [],
+    profile: {
+      start: [-0.5, -0.5],
+      segs: [
+        { x: 0.5, y: -0.5, bulge: 0 },
+        { x: 0.5, y: 0.5, bulge: 0 },
+        { x: -0.5, y: 0.5, bulge: 0 },
+      ],
+    },
+    profile2: {
+      start: [-0.6, 0],
+      segs: [
+        { x: 0.6, y: 0, bulge: 1 },
+        { x: -0.6, y: 0, bulge: 1 },
+      ],
+    },
+  };
+}
+
 /** Axis-aligned bounding box `{ min: [u, v], max: [u, v] }` of profile ops
  * vertices (arc bulges may extend slightly past it; good enough for UI
  * defaults). */

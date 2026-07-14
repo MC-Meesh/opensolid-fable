@@ -113,6 +113,31 @@ fn polyline_region(edge: &[f64]) -> opensolid_frep::EdgeRegion {
     opensolid_frep::EdgeRegion::from_polyline(&points)
 }
 
+/// 3D polyline path builder for [`WasmShape::sweep`]: start at a point, chain
+/// `lineTo` for each subsequent vertex. Unlike a profile it is not closed —
+/// it is an open path the profile is swept along.
+#[wasm_bindgen]
+pub struct WasmPath3D {
+    points: Vec<[f64; 3]>,
+}
+
+#[wasm_bindgen]
+impl WasmPath3D {
+    /// Start a path at `(x, y, z)`.
+    #[wasm_bindgen(constructor)]
+    pub fn new(x: f64, y: f64, z: f64) -> WasmPath3D {
+        WasmPath3D {
+            points: vec![[x, y, z]],
+        }
+    }
+
+    /// Extend the path with a straight segment to `(x, y, z)`.
+    #[wasm_bindgen(js_name = lineTo)]
+    pub fn line_to(&mut self, x: f64, y: f64, z: f64) {
+        self.points.push([x, y, z]);
+    }
+}
+
 /// Mesh buffers for JS consumption: xyz-interleaved positions and normals
 /// (`Float32Array`), and flat triangle indices (`Uint32Array`), three per
 /// triangle, wound counter-clockwise seen from outside.
@@ -311,6 +336,32 @@ impl WasmShape {
     pub fn revolve(profile: &WasmProfile2D, angle_degrees: f64) -> Result<WasmShape, String> {
         let p = profile.build()?;
         BoundedShape::revolve(p, angle_degrees.to_radians())
+            .map(WasmShape::sdf_only)
+            .map_err(|e| e.to_string())
+    }
+
+    /// The closed profile swept along the polyline `path`. The profile's
+    /// local `(x, y)` origin rides on the path, kept twist-free (constant
+    /// orientation) along each segment; joints are mitred by the union of the
+    /// per-segment prisms. MVP: constant profile, no twist.
+    pub fn sweep(profile: &WasmProfile2D, path: &WasmPath3D) -> Result<WasmShape, String> {
+        let p = profile.build()?;
+        BoundedShape::sweep(p, &path.points)
+            .map(WasmShape::sdf_only)
+            .map_err(|e| e.to_string())
+    }
+
+    /// A loft between two closed profiles on parallel planes: `bottom` on
+    /// `y = 0` and `top` on `y = height`, blended by linearly morphing their
+    /// signed distances along `y`. MVP: parallel planes only, linear morph.
+    pub fn loft(
+        bottom: &WasmProfile2D,
+        top: &WasmProfile2D,
+        height: f64,
+    ) -> Result<WasmShape, String> {
+        let b = bottom.build()?;
+        let t = top.build()?;
+        BoundedShape::loft(b, t, height)
             .map(WasmShape::sdf_only)
             .map_err(|e| e.to_string())
     }
@@ -892,6 +943,67 @@ mod tests {
         p.arc_to(9.0, 9.0, 1.0);
         let shape = WasmShape::extrude(&p, 1.0, None).expect("valid extrude");
         assert_eq!(shape.bounds(), vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0]);
+    }
+
+    fn closed_disk(r: f64) -> WasmProfile2D {
+        let mut p = WasmProfile2D::new(-r, 0.0);
+        p.arc_to(r, 0.0, 1.0);
+        p.arc_to(-r, 0.0, 1.0);
+        p.close();
+        p
+    }
+
+    #[test]
+    fn sweep_straight_and_bent_via_wasm_api() {
+        // Straight sweep of a disk = a cylinder spanning y ∈ [0, 1].
+        let mut path = WasmPath3D::new(0.0, 0.0, 0.0);
+        path.line_to(0.0, 1.0, 0.0);
+        let shape = WasmShape::sweep(&closed_disk(0.3), &path).expect("valid sweep");
+        let b = shape.bounds();
+        assert!(
+            (b[1]).abs() < 1e-9 && (b[4] - 1.0).abs() < 1e-9,
+            "y span: {b:?}"
+        );
+        assert_valid(&shape.mesh(40, None));
+
+        // Bent path still meshes.
+        let mut bent = WasmPath3D::new(0.0, 0.0, 0.0);
+        bent.line_to(0.0, 0.8, 0.0);
+        bent.line_to(0.8, 0.8, 0.0);
+        let bent_shape = WasmShape::sweep(&closed_disk(0.2), &bent).expect("valid sweep");
+        assert_valid(&bent_shape.mesh(48, None));
+    }
+
+    #[test]
+    fn loft_via_wasm_api() {
+        let shape = WasmShape::loft(&closed_disk(0.3), &closed_square(), 1.0).expect("valid loft");
+        let b = shape.bounds();
+        // y spans [0, 1]; xz spans the square (half-extent to 1 in +).
+        assert!((b[1]).abs() < 1e-9 && (b[4] - 1.0).abs() < 1e-9);
+        assert_valid(&shape.mesh(40, None));
+    }
+
+    #[test]
+    fn sweep_and_loft_errors_surface_as_strings() {
+        // Unclosed profile is rejected before path handling.
+        let mut open = WasmProfile2D::new(0.0, 0.0);
+        open.line_to(1.0, 0.0);
+        open.line_to(1.0, 1.0);
+        let single = WasmPath3D::new(0.0, 0.0, 0.0);
+        assert!(WasmShape::sweep(&open, &single).is_err());
+        // Single-point path (no segment) is rejected.
+        assert!(WasmShape::sweep(&closed_disk(0.3), &single).is_err());
+        // Bad loft height.
+        assert!(WasmShape::loft(&closed_square(), &closed_square(), 0.0).is_err());
+    }
+
+    #[test]
+    fn swept_path_shapes_compose_with_csg() {
+        let mut path = WasmPath3D::new(0.0, 0.0, 0.0);
+        path.line_to(0.0, 1.0, 0.0);
+        let post = WasmShape::sweep(&closed_disk(0.4), &path).expect("valid sweep");
+        let hole = WasmShape::cylinder(0.2, 2.0).translate(0.0, 0.5, 0.0);
+        assert_valid(&post.subtract(&hole).mesh(40, None));
     }
 
     #[test]

@@ -21,8 +21,15 @@ import { deleteNode } from './lib/deleteNode.js';
 import { VIEW_SHORTCUTS } from './lib/views.js';
 import { buildFeatures, pruneTree, resolveKeys } from './lib/featureTree.js';
 import { PALETTE } from './lib/shapeGraph.js';
-import { addPrimitiveNode, assertStoreConsistency } from './lib/storeSync.js';
-import { buildSweepShape, opsBounds, profileToOps, sweepTreeNode } from './lib/sweep.js';
+import { addFeatureNode, addPrimitiveNode, assertStoreConsistency } from './lib/storeSync.js';
+import {
+  buildSweepShape,
+  defaultLoftNode,
+  defaultSweepNode,
+  opsBounds,
+  profileToOps,
+  sweepTreeNode,
+} from './lib/sweep.js';
 import { createFaceRegionIndex } from './lib/facePlane.js';
 import { isFacePlane } from './lib/sketch/profile.js';
 import { faceRefFromPlane, planarRegionsOf, resolveRefs } from './lib/persistentRef.js';
@@ -287,7 +294,7 @@ export default function App() {
     api.WasmShape.setExactBooleans?.(exactBooleansRef.current);
     let traced;
     try {
-      traced = runTracedScript(scriptRef.current, api.WasmShape, api.WasmProfile2D);
+      traced = runTracedScript(scriptRef.current, api.WasmShape, api.WasmProfile2D, api.WasmPath3D);
     } catch (err) {
       setError(String(err?.stack || err));
       return;
@@ -413,6 +420,17 @@ export default function App() {
   const handleAddShape = useCallback(
     (ctor, args) => {
       commitTree(addPrimitiveNode(tracedRef.current?.root ?? null, ctor, args));
+    },
+    [commitTree]
+  );
+
+  // Sweep/Loft toolbar: graft a ready-to-edit default feature onto the tree
+  // (these need a 3D path / two profiles the sketch canvas can't yet capture,
+  // so they seed an editable feature instead of consuming the active sketch).
+  const handleAddFeature = useCallback(
+    (kind) => {
+      const node = kind === 'loft' ? defaultLoftNode() : defaultSweepNode();
+      commitTree(addFeatureNode(tracedRef.current?.root ?? null, node));
     },
     [commitTree]
   );
@@ -678,7 +696,7 @@ export default function App() {
     }
     let traced;
     try {
-      traced = runTracedScript(serializeTree(pruned), api.WasmShape, api.WasmProfile2D);
+      traced = runTracedScript(serializeTree(pruned), api.WasmShape, api.WasmProfile2D, api.WasmPath3D);
     } catch (err) {
       setError(`Recomputing without hidden features failed: ${String(err)}`);
       displayRef.current = { mode: 'full' };
@@ -1204,6 +1222,7 @@ export default function App() {
               : 'Open a sketch and draw a closed profile first'
           }
           onSweep={handleSweepStart}
+          onAddFeature={handleAddFeature}
           onView={(name) => viewportRef.current?.snapView(name)}
           onFit={() => viewportRef.current?.zoomToFit()}
           wireframe={wireframe}
