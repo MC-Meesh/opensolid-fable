@@ -58,6 +58,18 @@ function exportFile(model_id, format, path) {
   return JSON.parse(res.content[0].text);
 }
 
+// Like exportFile but records the tool's own error result instead of throwing,
+// so a genuine export limitation shows up in the manifest verbatim.
+function tryExport(model_id, format, path) {
+  const res = tools.call('export', { model_id, format, path });
+  if (res.isError) {
+    console.error(`  ERR export ${format}: ${res.content[0].text}`);
+    return { format, error: res.content[0].text };
+  }
+  console.error(`  ok  export ${format}`);
+  return JSON.parse(res.content[0].text);
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // 1. Angle bracket with four mounting holes
 // ─────────────────────────────────────────────────────────────────────────
@@ -191,9 +203,10 @@ return bottle.subtract(Shape.revolve(cavity, 360));
 `.trim();
   const m = createModel({ script, name: 'bottle' });
   const shots = [screenshot(m.model_id, 'bottle-front.png', 'front'), screenshot(m.model_id, 'bottle-iso.png', 'iso')];
-  const step = exportFile(m.model_id, 'step', 'bottle.step');
+  const step = tryExport(m.model_id, 'step', 'bottle.step');   // organic revolve: STEP may decline
   const stl = exportFile(m.model_id, 'stl', 'bottle.stl');
-  manifest.push({ example: 'bottle', script, create: m, mass: measure(m.model_id, 'mass'), shots, step, stl });
+  const obj = exportFile(m.model_id, 'obj', 'bottle.obj');
+  manifest.push({ example: 'bottle', script, create: m, validate: validate(m.model_id), mass: measure(m.model_id, 'mass'), shots, step, stl, obj });
 }
 
 writeFileSync(resolve(outputDir, 'manifest.json'), JSON.stringify(manifest, null, 2));
