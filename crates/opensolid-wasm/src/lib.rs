@@ -159,14 +159,55 @@ impl WasmOpenPath2D {
     }
 }
 
+/// Dihedral threshold (radians) above which a mesh edge counts as a crease
+/// when populating [`MeshData::feature_edges`]. 40° keeps genuine CSG/box
+/// edges while ignoring the shallow facet seams of a tessellated curved
+/// surface.
+const FEATURE_EDGE_DIHEDRAL: f64 = 40.0 * std::f64::consts::PI / 180.0;
+
+/// Flatten a list of 3D edge segments into the `[x0,y0,z0, x1,y1,z1, …]`
+/// buffer JS consumes (two points per edge), the same convention as the
+/// `filletEdge`/`chamferEdge` polyline input.
+fn flatten_edges(edges: &[[Point3; 2]]) -> Vec<f32> {
+    edges
+        .iter()
+        .flat_map(|[a, b]| {
+            [
+                a.x as f32, a.y as f32, a.z as f32, b.x as f32, b.y as f32, b.z as f32,
+            ]
+        })
+        .collect()
+}
+
+/// Build a [`MeshData`] from a mesh, including its crease/boundary feature
+/// edges at [`FEATURE_EDGE_DIHEDRAL`].
+fn mesh_data(mesh: &TriangleMesh) -> MeshData {
+    let flat = flatten_mesh(mesh);
+    MeshData {
+        positions: flat.positions,
+        normals: flat.normals,
+        indices: flat.indices,
+        feature_edges: flatten_edges(&mesh.feature_edges(FEATURE_EDGE_DIHEDRAL)),
+    }
+}
+
 /// Mesh buffers for JS consumption: xyz-interleaved positions and normals
 /// (`Float32Array`), and flat triangle indices (`Uint32Array`), three per
 /// triangle, wound counter-clockwise seen from outside.
+///
+/// `feature_edges` (JS `featureEdges`) is the raw drawing line-work source:
+/// crease/boundary edges of the tessellated solid as a flat
+/// `[x0,y0,z0, x1,y1,z1, …]` segment buffer (two points per edge), the same
+/// convention `filletEdge`/`chamferEdge` take as input. Coplanar facet seams
+/// are excluded; silhouette (outline) edges are view-dependent and come from
+/// [`WasmShape::silhouette_edges`] instead.
 #[wasm_bindgen(getter_with_clone)]
 pub struct MeshData {
     pub positions: Vec<f32>,
     pub normals: Vec<f32>,
     pub indices: Vec<u32>,
+    #[wasm_bindgen(js_name = featureEdges)]
+    pub feature_edges: Vec<f32>,
 }
 
 /// Runtime-composable SDF shape. Methods never mutate: each returns a new
@@ -602,14 +643,9 @@ impl WasmShape {
         } else {
             None
         };
-        let flat = match exact_mesh {
-            Some(mesh) => flatten_mesh(mesh),
-            None => flatten_mesh(&self.inner.mesh(resolution as usize, bound)),
-        };
-        MeshData {
-            positions: flat.positions,
-            normals: flat.normals,
-            indices: flat.indices,
+        match exact_mesh {
+            Some(mesh) => mesh_data(mesh),
+            None => mesh_data(&self.inner.mesh(resolution as usize, bound)),
         }
     }
 
@@ -660,15 +696,31 @@ impl WasmShape {
         } else {
             None
         };
-        let flat = match exact_mesh {
-            Some(mesh) => flatten_mesh(mesh),
-            None => flatten_mesh(&self.inner.mesh_adaptive(accuracy, bound)),
-        };
-        MeshData {
-            positions: flat.positions,
-            normals: flat.normals,
-            indices: flat.indices,
+        match exact_mesh {
+            Some(mesh) => mesh_data(mesh),
+            None => mesh_data(&self.inner.mesh_adaptive(accuracy, bound)),
         }
+    }
+
+    /// Silhouette (outline) edges of the shape for an orthographic view along
+    /// `(vx, vy, vz)`: the mesh edges where the surface turns away from the
+    /// view (adjacent faces flip front/back), the view-dependent companion to
+    /// [`MeshData::feature_edges`]. Returned as a flat
+    /// `[x0,y0,z0, x1,y1,z1, …]` segment buffer (two points per edge), the
+    /// same convention as `feature_edges`/`filletEdge`.
+    ///
+    /// Computed against the same mesh measurement uses — the validated exact
+    /// tessellation when the exact mode resolves one, otherwise an adaptive
+    /// SDF mesh at `accuracy` (same knob as `meshAdaptive`; omitted or invalid
+    /// falls back to 0.5% of the shape's extent). Silhouettes are
+    /// view-dependent — recompute per view. `(vx, vy, vz)` need not be
+    /// normalized.
+    #[wasm_bindgen(js_name = silhouetteEdges)]
+    pub fn silhouette_edges(&self, vx: f64, vy: f64, vz: f64, accuracy: Option<f64>) -> Vec<f32> {
+        let view_dir = Vector3::new(vx, vy, vz);
+        self.with_measure_mesh(accuracy, |mesh| {
+            flatten_edges(&mesh.silhouette_edges(view_dir))
+        })
     }
 
     /// Mass properties of the enclosed solid, as a JSON object string:
@@ -794,6 +846,47 @@ mod tests {
         assert_eq!(data.indices.len() % 3, 0);
         let vertex_count = (data.positions.len() / 3) as u32;
         assert!(data.indices.iter().all(|&i| i < vertex_count));
+        // Feature edges are two 3D points per segment: a multiple of 6 floats.
+        assert_eq!(data.feature_edges.len() % 6, 0);
+    }
+
+    #[test]
+    fn box_mesh_exports_feature_edges() {
+        // A box's crease edges are its 12 sharp edges; the mesh path recovers
+        // them (count varies with the tessellation, but there must be some,
+        // and every segment is two finite points).
+        let data = WasmShape::box3(1.0, 1.0, 1.0).mesh(24, None);
+        assert_valid(&data);
+        assert!(
+            !data.feature_edges.is_empty(),
+            "box should surface crease edges"
+        );
+        assert!(data.feature_edges.iter().all(|f| f.is_finite()));
+    }
+
+    #[test]
+    fn sphere_has_no_sharp_feature_edges() {
+        // A smooth sphere has no crease steeper than 40°: its facet seams are
+        // all shallow, so the feature-edge buffer is empty.
+        let data = WasmShape::sphere(1.0).mesh(32, None);
+        assert_valid(&data);
+        assert!(
+            data.feature_edges.is_empty(),
+            "sphere facet seams leaked as feature edges"
+        );
+    }
+
+    #[test]
+    fn box_silhouette_is_view_dependent() {
+        let shape = WasmShape::box3(1.0, 1.0, 1.0);
+        let front = shape.silhouette_edges(0.0, 0.0, 1.0, Some(0.02));
+        let side = shape.silhouette_edges(1.0, 0.0, 0.0, Some(0.02));
+        // Two 3D points per edge segment.
+        assert_eq!(front.len() % 6, 0);
+        assert!(!front.is_empty(), "box has an outline from +z");
+        assert!(front.iter().all(|f| f.is_finite()));
+        // A different view yields a different outline set.
+        assert_ne!(front, side, "silhouette must depend on view direction");
     }
 
     #[test]

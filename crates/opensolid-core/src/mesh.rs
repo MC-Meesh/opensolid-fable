@@ -1,7 +1,7 @@
 //! Shared indexed triangle mesh: the interchange type between F-Rep meshing,
 //! B-Rep tessellation, and exporters.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::types::{BoundingBox3, Point3, Vector3};
 
@@ -240,6 +240,101 @@ impl TriangleMesh {
             })
             .sum()
     }
+
+    /// Geometric (position-derived) unit normal of a triangle, or `None`
+    /// when the triangle is degenerate (near-zero area). Independent of the
+    /// stored per-vertex normals so feature/silhouette walks see the actual
+    /// facet orientation.
+    fn face_normal(&self, tri: &[usize; 3]) -> Option<Vector3> {
+        let a = self.positions[tri[0]];
+        let e1 = self.positions[tri[1]] - a;
+        let e2 = self.positions[tri[2]] - a;
+        let n = e1.cross(&e2);
+        let len = n.norm();
+        if len > 1e-12 { Some(n / len) } else { None }
+    }
+
+    /// Map each undirected edge (min-index, max-index) to the triangles that
+    /// use it. Deterministic order (BTreeMap) so downstream edge buffers are
+    /// reproducible. Operates on index topology, so coincident-but-unshared
+    /// vertices break adjacency — [`weld`](Self::weld) a soup first.
+    fn edge_adjacency(&self) -> BTreeMap<(usize, usize), Vec<usize>> {
+        let mut adjacency: BTreeMap<(usize, usize), Vec<usize>> = BTreeMap::new();
+        for (fi, tri) in self.indices.iter().enumerate() {
+            for e in 0..3 {
+                let a = tri[e];
+                let b = tri[(e + 1) % 3];
+                adjacency.entry((a.min(b), a.max(b))).or_default().push(fi);
+            }
+        }
+        adjacency
+    }
+
+    /// Crease (feature) edges: the drawing solid-line source. Returns the
+    /// endpoint positions of every undirected edge whose two adjacent faces
+    /// meet at a dihedral angle of at least `min_dihedral` radians, together
+    /// with boundary edges (used by a single face) and non-manifold edges
+    /// (used by three or more), which are always creases. Coplanar
+    /// tessellation seams (dihedral below the threshold) are dropped.
+    ///
+    /// The dihedral test compares geometric face normals: two faces are a
+    /// crease when `n0 · n1 <= cos(min_dihedral)`. Operates on index
+    /// topology (see [`edge_adjacency`](Self::edge_adjacency)).
+    pub fn feature_edges(&self, min_dihedral: f64) -> Vec<[Point3; 2]> {
+        let cos_threshold = min_dihedral.cos();
+        let mut out = Vec::new();
+        for (&(a, b), faces) in &self.edge_adjacency() {
+            let is_feature = match faces.as_slice() {
+                [f0, f1] => match (
+                    self.face_normal(&self.indices[*f0]),
+                    self.face_normal(&self.indices[*f1]),
+                ) {
+                    (Some(n0), Some(n1)) => n0.dot(&n1) <= cos_threshold,
+                    // A degenerate neighbour has no reliable orientation;
+                    // treat the shared edge as a crease rather than smoothing
+                    // over a hole in the topology.
+                    _ => true,
+                },
+                // Boundary (single face) or non-manifold (3+): always a crease.
+                _ => true,
+            };
+            if is_feature {
+                out.push([self.positions[a], self.positions[b]]);
+            }
+        }
+        out
+    }
+
+    /// Silhouette (outline) edges for an orthographic view along `view_dir`:
+    /// the endpoint positions of every undirected edge whose two adjacent
+    /// faces face opposite ways relative to the view — the sign of
+    /// `face_normal · view_dir` flips across the edge — plus boundary edges,
+    /// which always bound the outline. This is the mesh-resolution
+    /// approximation of the smooth-surface silhouette locus `n·view_dir = 0`;
+    /// it is view-dependent and must be recomputed per view. `view_dir` need
+    /// not be normalized. Operates on index topology.
+    pub fn silhouette_edges(&self, view_dir: Vector3) -> Vec<[Point3; 2]> {
+        let mut out = Vec::new();
+        for (&(a, b), faces) in &self.edge_adjacency() {
+            let is_silhouette = match faces.as_slice() {
+                [f0, f1] => match (
+                    self.face_normal(&self.indices[*f0]),
+                    self.face_normal(&self.indices[*f1]),
+                ) {
+                    (Some(n0), Some(n1)) => (n0.dot(&view_dir) > 0.0) != (n1.dot(&view_dir) > 0.0),
+                    _ => false,
+                },
+                // Boundary edge: part of the outline for any view.
+                [_] => true,
+                // Non-manifold: no well-defined front/back pair; skip.
+                _ => false,
+            };
+            if is_silhouette {
+                out.push([self.positions[a], self.positions[b]]);
+            }
+        }
+        out
+    }
 }
 
 #[cfg(test)]
@@ -457,6 +552,147 @@ mod tests {
         mesh.normals.push(unit_normal());
         let bbox = mesh.bounding_box().unwrap();
         assert_eq!(bbox.max, Point3::new(1.0, 1.0, 0.0));
+    }
+
+    /// Canonicalize an edge segment set into an order-independent set of
+    /// sorted endpoint-index pairs, resolving positions back to `mesh`
+    /// vertices by exact coordinate match.
+    fn edge_key_set(mesh: &TriangleMesh, edges: &[[Point3; 2]]) -> Vec<(usize, usize)> {
+        let index_of = |p: &Point3| mesh.positions.iter().position(|q| q == p).unwrap();
+        let mut keys: Vec<(usize, usize)> = edges
+            .iter()
+            .map(|[a, b]| {
+                let (ia, ib) = (index_of(a), index_of(b));
+                (ia.min(ib), ia.max(ib))
+            })
+            .collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    /// A unit cube centered at the origin as a welded, closed manifold: 8
+    /// shared vertices, 12 triangles. Outward-wound, geometric face normals
+    /// axis-aligned.
+    fn cube() -> TriangleMesh {
+        let v = [
+            Point3::new(-1.0, -1.0, -1.0),
+            Point3::new(1.0, -1.0, -1.0),
+            Point3::new(1.0, 1.0, -1.0),
+            Point3::new(-1.0, 1.0, -1.0),
+            Point3::new(-1.0, -1.0, 1.0),
+            Point3::new(1.0, -1.0, 1.0),
+            Point3::new(1.0, 1.0, 1.0),
+            Point3::new(-1.0, 1.0, 1.0),
+        ];
+        // Outward-wound (CCW seen from outside) two triangles per face.
+        let indices = vec![
+            [0, 3, 2],
+            [0, 2, 1], // -z (bottom)
+            [4, 5, 6],
+            [4, 6, 7], // +z (top)
+            [0, 1, 5],
+            [0, 5, 4], // -y
+            [2, 3, 7],
+            [2, 7, 6], // +y
+            [1, 2, 6],
+            [1, 6, 5], // +x
+            [0, 4, 7],
+            [0, 7, 3], // -x
+        ];
+        TriangleMesh {
+            positions: v.to_vec(),
+            normals: vec![Vector3::z(); 8],
+            indices,
+        }
+    }
+
+    #[test]
+    fn cube_is_closed_manifold() {
+        assert!(cube().is_closed_manifold());
+    }
+
+    #[test]
+    fn feature_edges_are_the_cube_wireframe() {
+        let mesh = cube();
+        // A 90° dihedral between the box faces; the coplanar face-diagonal
+        // seams (0°) must be dropped, leaving exactly the 12 cube edges.
+        let edges = mesh.feature_edges(45.0_f64.to_radians());
+        assert_eq!(edges.len(), 12, "expected the 12 cube edges");
+        let keys = edge_key_set(&mesh, &edges);
+        // No face-diagonal (a seam like 0-2) survives.
+        assert!(
+            !keys.contains(&(0, 2)) && !keys.contains(&(4, 6)),
+            "coplanar seam leaked into feature edges"
+        );
+        // All emitted edges are real cube edges (length 2), never diagonals.
+        for [a, b] in &edges {
+            assert!(((a - b).norm() - 2.0).abs() < 1e-9, "edge is a diagonal");
+        }
+    }
+
+    #[test]
+    fn feature_edges_threshold_above_ninety_drops_everything() {
+        // With a threshold steeper than any real dihedral (90°), no crease
+        // qualifies — a fully smooth read of the surface.
+        let mesh = cube();
+        assert!(mesh.feature_edges(91.0_f64.to_radians()).is_empty());
+    }
+
+    #[test]
+    fn feature_edges_include_open_boundary() {
+        // A single triangle: all three edges are boundary edges, hence
+        // features regardless of dihedral threshold.
+        let mesh = TriangleMesh::from_triangles(&[tri(
+            Point3::origin(),
+            Point3::new(1.0, 0.0, 0.0),
+            Point3::new(0.0, 1.0, 0.0),
+        )]);
+        assert_eq!(mesh.feature_edges(45.0_f64.to_radians()).len(), 3);
+    }
+
+    #[test]
+    fn silhouette_edges_ring_the_cube_outline() {
+        let mesh = cube();
+        // Looking straight down +z: only the top (+z) faces are back-facing
+        // (n·dir > 0); the bottom and (edge-on) side faces are not. The sign
+        // flips exactly around the top rim, which projects to the square
+        // outline — 4 edges.
+        let keys = edge_key_set(&mesh, &mesh.silhouette_edges(Vector3::z()));
+        assert_eq!(keys, vec![(4, 5), (4, 7), (5, 6), (6, 7)]);
+        // No vertical edge (e.g. 0-4, along z) flips.
+        assert!(!keys.contains(&(0, 4)));
+    }
+
+    #[test]
+    fn silhouette_edges_corner_view_is_a_hexagon() {
+        // Viewed corner-on (1,1,1), three faces are back-facing and three
+        // front-facing; the outline is the classic 6-edge hexagon.
+        let mesh = cube();
+        let keys = edge_key_set(&mesh, &mesh.silhouette_edges(Vector3::new(1.0, 1.0, 1.0)));
+        assert_eq!(keys, vec![(1, 2), (1, 5), (2, 3), (3, 7), (4, 5), (4, 7)]);
+    }
+
+    #[test]
+    fn silhouette_edges_flip_with_view_direction() {
+        // The +x outline (4 edges around the +x face) differs from the +z
+        // outline (top rim) — silhouettes are view-dependent.
+        let mesh = cube();
+        let sx = edge_key_set(&mesh, &mesh.silhouette_edges(Vector3::x()));
+        let sz = edge_key_set(&mesh, &mesh.silhouette_edges(Vector3::z()));
+        assert_eq!(sx.len(), 4);
+        assert_eq!(sz.len(), 4);
+        assert_ne!(sx, sz, "silhouette must be view-dependent");
+    }
+
+    #[test]
+    fn silhouette_edges_include_open_boundary() {
+        let mesh = TriangleMesh::from_triangles(&[tri(
+            Point3::origin(),
+            Point3::new(1.0, 0.0, 0.0),
+            Point3::new(0.0, 1.0, 0.0),
+        )]);
+        // A lone triangle's three edges are all boundary — always silhouette.
+        assert_eq!(mesh.silhouette_edges(Vector3::z()).len(), 3);
     }
 
     #[test]
