@@ -161,13 +161,26 @@
 //! polylines are hosted as `Curve3::Polyline` imprints. The five of-yet
 //! tests (oblique plane-torus, non-coaxial torus-torus, cylinder-sphere)
 //! run live; 3 remain `#[ignore]`d (of-2ql residual slivers).
+//!
+//! Section (9) is the cone/frustum campaign (of-fsl.23), written BEFORE
+//! cones are admitted to the exact path (`Chart::build` still rejects
+//! `Surface3::Cone`, boolean.rs:499). Following the sphere/torus precedent
+//! (commit 567930a, tests-first-ignored), every cone case starts
+//! `#[ignore]`d citing the promotion blocker of-dtj; each is un-ignored
+//! only once green after the gate lifts. The one live cone test asserts
+//! the pipeline never PANICS on cone inputs — today every cone boolean
+//! returns a structured `NotImplemented` (F-Rep fallback), which the
+//! no-panic guard accepts exactly as it will accept the eventual valid
+//! solids. Run the ignored cone cases with
+//! `cargo test --test boolean_stress -- --ignored`.
 
 use nalgebra::{Rotation3, Unit};
 use opensolid_brep::boolean::{intersect, subtract, unite};
 use opensolid_brep::curve::plane_basis;
 use opensolid_brep::{
     Body, BodyType, BooleanOutput, Curve3, FaceSense, FinSense, GeometryStore, LoopType,
-    SYSTEM_RESOLUTION, ShellOrientation, Surface3, TopologyStore, primitives, translate_body,
+    SYSTEM_RESOLUTION, ShellOrientation, Surface3, TopologyStore, primitives, rotate_body,
+    translate_body,
 };
 use opensolid_core::EntityId;
 use opensolid_core::error::{CoreError, CoreResult};
@@ -216,6 +229,14 @@ fn sphere_lens_volume(r1: f64, r2: f64, d: f64) -> f64 {
 
 fn torus_volume(major: f64, minor: f64) -> f64 {
     2.0 * PI * PI * major * minor * minor
+}
+
+/// Volume of a conical frustum of height `h` between circular caps of
+/// radii `r1` and `r2`: `π h (r1² + r1·r2 + r2²) / 3`. A pointed cone is
+/// the `r2 = 0` special case (`π h r1² / 3`); a cylinder the `r1 = r2`
+/// case (`π h r²`). Used for every closed-form cone volume in section (9).
+fn frustum_volume(r1: f64, r2: f64, h: f64) -> f64 {
+    PI * h * (r1 * r1 + r1 * r2 + r2 * r2) / 3.0
 }
 
 /// Volume of the part of a torus (axis +Z, centered at z = 0) below the
@@ -434,6 +455,55 @@ impl Scene {
             ],
         );
 
+        body
+    }
+
+    /// Cone/frustum about +Z whose bottom cap (radius `radius_bottom`) is
+    /// centered at `base`, of `height`, tapering to `radius_top` at the top
+    /// cap. A zero `radius_top` (or `radius_bottom`) yields a pointed apex
+    /// there. Built with the tested [`primitives::cone`] — which centers the
+    /// axis on the origin (bottom cap at `z = -height/2`) — then translated,
+    /// so the wall's cone surface, generator seam, and cap circles match the
+    /// exact boolean chart by construction (the same reuse-the-primitive
+    /// strategy [`Scene::sphere`]/[`Scene::torus`] use).
+    fn cone(
+        &mut self,
+        base: Point3,
+        radius_bottom: f64,
+        radius_top: f64,
+        height: f64,
+    ) -> EntityId<Body> {
+        let body = primitives::cone(
+            &mut self.store,
+            &mut self.geo,
+            radius_bottom,
+            radius_top,
+            height,
+        )
+        .expect("valid cone");
+        let offset = (base - Point3::origin()) + Vector3::z() * (height / 2.0);
+        translate_body(&mut self.store, &mut self.geo, body, offset).expect("finite offset");
+        body
+    }
+
+    /// [`Scene::cone`] tilted by `angle` radians about the line through
+    /// `base` with direction `tilt_axis`. Uses the tested [`rotate_body`],
+    /// which re-anchors the cap circles to their rotated parameterization
+    /// and rotates the cone/plane surfaces covariantly, so the tilted body
+    /// stays chart-consistent (unlike a hand-rotated frame, cf.
+    /// [`Scene::cylinder`]'s note on `Curve3::Circle` reference drift).
+    fn cone_tilted(
+        &mut self,
+        base: Point3,
+        radius_bottom: f64,
+        radius_top: f64,
+        height: f64,
+        tilt_axis: Vector3,
+        angle: f64,
+    ) -> EntityId<Body> {
+        let body = self.cone(base, radius_bottom, radius_top, height);
+        rotate_body(&mut self.store, &mut self.geo, body, base, tilt_axis, angle)
+            .expect("valid rotation");
         body
     }
 
@@ -2259,6 +2329,278 @@ fn no_panics_on_awkward_configurations() {
             }
             Err(e) => {
                 // Structured refusal is fine for these near-degenerate pokes.
+                let _ = format!("{name}: rejected with {e:?}");
+            }
+        }
+    }
+}
+
+// =====================================================================
+// (9) Cone / frustum operands (of-fsl.23 campaign)
+//
+// Written before `Chart::build` admits `Surface3::Cone`; every case here
+// is `#[ignore]`d citing the promotion blocker of-dtj (tests-first-
+// ignored, precedent 567930a). Un-ignore a case only once it is green
+// after the gate lifts. Volumes use `frustum_volume` closed forms
+// (`π h (r1² + r1·r2 + r2²)/3`); tilted/overlap cases fall back to the
+// scale-free inclusion–exclusion identity `vol(A)+vol(B)=vol(∪)+vol(∩)`.
+// =====================================================================
+
+/// A frustum tool passing entirely through a slab (both caps outside)
+/// bores a tapered through-hole (genus 1). Removed material is the
+/// frustum section between the two slab faces — the direct analog of the
+/// cylinder `through_hole` case, exercising the cone wall and its two
+/// circular plane-cone SSIs with no apex and no tool cap involved.
+#[test]
+#[ignore = "of-dtj: Chart::build rejects Surface3::Cone (exact-path promotion pending)"]
+fn frustum_through_slab() {
+    let context = "slab minus tapered frustum (through-hole)";
+    let mut scene = Scene::new();
+    let slab = scene.block([0.0, 0.0, 0.0], [6.0, 6.0, 2.0]);
+    // radius(z) = 0.5 + (z + 1)/2 → 1.0 at z = 0, 2.0 at z = 2.
+    let tool = scene.cone(Point3::new(3.0, 3.0, -1.0), 0.5, 2.5, 4.0);
+    let out = scene
+        .subtract(slab, tool)
+        .unwrap_or_else(|e| panic!("{context}: subtract failed: {e:?}"));
+    let counts = out.store.euler_counts(out.body);
+    assert_eq!(
+        counts.genus, 1,
+        "{context}: tapered through hole is genus 1"
+    );
+    let vol = volume(&out, context);
+    let removed = frustum_volume(1.0, 2.0, 2.0);
+    assert_close(vol, 72.0 - removed, CYL_VOLUME_RTOL, context);
+}
+
+/// A pointed cone poking up through the slab's top face cuts a conical
+/// countersink pit (genus 0, single shell). The tool's apex sits inside
+/// the slab, so the removed region is a cone from the apex up to the top
+/// face — the apex (a pole-like `u`-circle collapse) is exercised on
+/// every run, mirroring `sphere_cap_bite`'s pole coverage.
+fn cone_countersink(scale: f64) {
+    let context = format!("slab minus conical countersink at {scale}× scale");
+    let s = scale;
+    let mut scene = Scene::new();
+    let slab = scene.block([0.0, 0.0, 0.0], [6.0 * s, 6.0 * s, 2.0 * s]);
+    // Apex at z = 0.5s inside the slab; radius(z) = (z − 0.5s)/2 → 0.75s
+    // at the top face z = 2s. Top cap (r = 2s) sits above the slab.
+    let tool = scene.cone(
+        Point3::new(3.0 * s, 3.0 * s, 0.5 * s),
+        0.0,
+        2.0 * s,
+        4.0 * s,
+    );
+    let out = scene
+        .subtract(slab, tool)
+        .unwrap_or_else(|e| panic!("{context}: subtract failed: {e:?}"));
+    let counts = out.store.euler_counts(out.body);
+    assert_eq!(counts.genus, 0, "{context}: a blind pit adds no genus");
+    assert_eq!(out.shell_count(), 1, "{context}: single shell expected");
+    let vol = volume(&out, &context);
+    let s3 = s * s * s;
+    let removed = frustum_volume(0.0, 0.75, 1.5) * s3;
+    assert_close(vol, 72.0 * s3 - removed, CURVED_VOLUME_RTOL, &context);
+}
+
+#[test]
+#[ignore = "of-dtj: Chart::build rejects Surface3::Cone (exact-path promotion pending)"]
+fn cone_countersink_bite() {
+    cone_countersink(1.0);
+}
+
+#[test]
+#[ignore = "of-dtj: Chart::build rejects Surface3::Cone (exact-path promotion pending)"]
+fn cone_bite_at_scale_0_001() {
+    cone_countersink(0.001);
+}
+
+#[test]
+#[ignore = "of-dtj: Chart::build rejects Surface3::Cone (exact-path promotion pending)"]
+fn cone_bite_at_scale_1000() {
+    cone_countersink(1000.0);
+}
+
+/// Two coaxial cones opposed apex-to-base overlap in a lens whose
+/// intersection is a bicone (two cones meeting base-to-base at the height
+/// where their radii coincide). Exercises coaxial cone-cone SSI (a single
+/// full-wrap circle at z = 2) and closed-form intersection volume.
+#[test]
+#[ignore = "of-dtj: Chart::build rejects Surface3::Cone (exact-path promotion pending)"]
+fn opposed_cones_intersection() {
+    let context = "opposed coaxial cones intersection (bicone)";
+    let mut scene = Scene::new();
+    // A: widest at z = 0 (r = 2), apex at z = 3.  radius_A(z) = 2(1 − z/3).
+    let cone_a = scene.cone(Point3::new(0.0, 0.0, 0.0), 2.0, 0.0, 3.0);
+    // B: apex at z = 1, widening to r = 2 at z = 4.  radius_B(z) = 2(z − 1)/3.
+    let cone_b = scene.cone(Point3::new(0.0, 0.0, 1.0), 0.0, 2.0, 3.0);
+    let out = scene
+        .intersect(cone_a, cone_b)
+        .unwrap_or_else(|e| panic!("{context}: intersect failed: {e:?}"));
+    // Radii coincide at z = 2 (both 2/3); ∩ is two cones of height 1 there.
+    let want = 2.0 * frustum_volume(0.0, 2.0 / 3.0, 1.0);
+    let vol = volume(&out, context);
+    assert_close(vol, want, CURVED_VOLUME_RTOL, context);
+}
+
+/// Inclusion–exclusion identity for a full cone body and a block it
+/// pierces: `vol(A) + vol(B) == vol(A∪B) + vol(A∩B)`, robust to the messy
+/// (non-closed-form) overlap geometry. Exercises all three ops on cone
+/// inputs at once.
+#[test]
+#[ignore = "of-dtj: Chart::build rejects Surface3::Cone (exact-path promotion pending)"]
+fn cone_block_inclusion_exclusion() {
+    let context = "cone ∪/∩ block inclusion–exclusion";
+    let mut scene = Scene::new();
+    let block = scene.block([0.0, 0.0, 0.0], [4.0, 4.0, 4.0]);
+    let cone = scene.cone(Point3::new(2.0, 2.0, -1.0), 1.5, 0.5, 6.0);
+    let union = scene
+        .unite(block, cone)
+        .unwrap_or_else(|e| panic!("{context}: unite failed: {e:?}"));
+    let inter = scene
+        .intersect(block, cone)
+        .unwrap_or_else(|e| panic!("{context}: intersect failed: {e:?}"));
+    let vol_union = volume(&union, &format!("{context}: union"));
+    let vol_inter = volume(&inter, &format!("{context}: intersection"));
+    let vol_cone = frustum_volume(1.5, 0.5, 6.0);
+    assert_close(
+        vol_union + vol_inter,
+        64.0 + vol_cone,
+        CURVED_VOLUME_RTOL,
+        &format!("{context}: identity"),
+    );
+}
+
+/// Two interpenetrating coaxial frustums: the inclusion–exclusion
+/// identity must hold across their cone-cone wall intersection in the
+/// overlap band. Closed-form operand volumes, identity for the overlap.
+#[test]
+#[ignore = "of-dtj: Chart::build rejects Surface3::Cone (exact-path promotion pending)"]
+fn coaxial_frustums_union_identity() {
+    let context = "coaxial frustums union/intersection identity";
+    let mut scene = Scene::new();
+    let lower = scene.cone(Point3::new(0.0, 0.0, 0.0), 2.0, 1.0, 3.0);
+    let upper = scene.cone(Point3::new(0.0, 0.0, 1.5), 1.5, 0.5, 3.0);
+    let union = scene
+        .unite(lower, upper)
+        .unwrap_or_else(|e| panic!("{context}: unite failed: {e:?}"));
+    let inter = scene
+        .intersect(lower, upper)
+        .unwrap_or_else(|e| panic!("{context}: intersect failed: {e:?}"));
+    let vol_union = volume(&union, &format!("{context}: union"));
+    let vol_inter = volume(&inter, &format!("{context}: intersection"));
+    let vol_lower = frustum_volume(2.0, 1.0, 3.0);
+    let vol_upper = frustum_volume(1.5, 0.5, 3.0);
+    assert_close(
+        vol_union + vol_inter,
+        vol_lower + vol_upper,
+        CURVED_VOLUME_RTOL,
+        &format!("{context}: identity"),
+    );
+}
+
+/// A cone tilted 20° off the block's axes, subtracted from a block: the
+/// oblique cone wall stresses the tilted-frame chart and generic
+/// plane-cone SSI. No closed form for the removed volume, so the
+/// scale-free inclusion–exclusion identity is the invariant.
+#[test]
+#[ignore = "of-dtj: Chart::build rejects Surface3::Cone (exact-path promotion pending)"]
+fn tilted_cone_block_identity() {
+    let context = "tilted cone ∪/∩ block inclusion–exclusion";
+    let mut scene = Scene::new();
+    let block = scene.block([0.0, 0.0, 0.0], [4.0, 4.0, 4.0]);
+    let cone = scene.cone_tilted(
+        Point3::new(2.0, 2.0, 2.0),
+        1.3,
+        0.4,
+        3.0,
+        Vector3::new(1.0, 0.0, 0.0),
+        20.0_f64.to_radians(),
+    );
+    let union = scene
+        .unite(block, cone)
+        .unwrap_or_else(|e| panic!("{context}: unite failed: {e:?}"));
+    let inter = scene
+        .intersect(block, cone)
+        .unwrap_or_else(|e| panic!("{context}: intersect failed: {e:?}"));
+    let vol_union = volume(&union, &format!("{context}: union"));
+    let vol_inter = volume(&inter, &format!("{context}: intersection"));
+    let vol_cone = frustum_volume(1.3, 0.4, 3.0);
+    assert_close(
+        vol_union + vol_inter,
+        64.0 + vol_cone,
+        CURVED_VOLUME_RTOL,
+        &format!("{context}: identity"),
+    );
+}
+
+/// Rigid-motion invariance: the conical countersink bite's volume must be
+/// identical after rotating BOTH operands by the same rotation (via the
+/// geometry-complete [`rotate_body`]). Catches frame-dependent chart or
+/// SSI bugs the axis-aligned cases would miss.
+#[test]
+#[ignore = "of-dtj: Chart::build rejects Surface3::Cone (exact-path promotion pending)"]
+fn rotated_frustum_bite_invariance() {
+    // Baseline: axis-aligned countersink bite.
+    let mut base_scene = Scene::new();
+    let base_slab = base_scene.block([0.0, 0.0, 0.0], [6.0, 6.0, 2.0]);
+    let base_tool = base_scene.cone(Point3::new(3.0, 3.0, 0.5), 0.0, 2.0, 4.0);
+    let base_out = base_scene
+        .subtract(base_slab, base_tool)
+        .expect("baseline countersink subtract");
+    let base_vol = volume(&base_out, "baseline countersink");
+
+    // Same configuration, both operands rotated 0.4 rad about a skew axis
+    // through the slab center.
+    let pivot = Point3::new(3.0, 3.0, 1.0);
+    let axis = Vector3::new(1.0, 1.0, 0.0);
+    let angle = 0.4;
+    let mut scene = Scene::new();
+    let slab = scene.block([0.0, 0.0, 0.0], [6.0, 6.0, 2.0]);
+    let tool = scene.cone(Point3::new(3.0, 3.0, 0.5), 0.0, 2.0, 4.0);
+    for body in [slab, tool] {
+        rotate_body(&mut scene.store, &mut scene.geo, body, pivot, axis, angle)
+            .expect("valid rotation");
+    }
+    let out = scene
+        .subtract(slab, tool)
+        .expect("rotated countersink subtract");
+    let vol = volume(&out, "rotated countersink");
+    assert_close(
+        vol,
+        base_vol,
+        CURVED_VOLUME_RTOL,
+        "countersink bite volume is rotation-invariant",
+    );
+}
+
+/// Cone inputs must never PANIC the boolean pipeline. Today every cone
+/// boolean returns a structured `NotImplemented` (the F-Rep fallback,
+/// `Chart::build` gate closed); once cones are promoted these return
+/// valid solids. Both outcomes are accepted — only a panic or an invalid
+/// `Ok` is a bug — so this guard stays live across the promotion. (This
+/// is the one un-ignored cone test.)
+#[test]
+fn no_panics_on_cone_configurations() {
+    let mut scene = Scene::new();
+    let slab = scene.block([0.0, 0.0, 0.0], [6.0, 6.0, 2.0]);
+    let through = scene.cone(Point3::new(3.0, 3.0, -1.0), 0.5, 2.5, 4.0);
+    let pit = scene.cone(Point3::new(3.0, 3.0, 0.5), 0.0, 2.0, 4.0);
+    let block = scene.block([0.0, 0.0, 0.0], [4.0, 4.0, 4.0]);
+    let coneful = scene.cone(Point3::new(2.0, 2.0, -1.0), 1.5, 0.5, 6.0);
+    let cases: Vec<(&str, CoreResult<BooleanOutput>)> = vec![
+        ("frustum through slab", scene.subtract(slab, through)),
+        ("conical countersink bite", scene.subtract(slab, pit)),
+        ("cone ∪ block", scene.unite(block, coneful)),
+        ("cone ∩ block", scene.intersect(block, coneful)),
+    ];
+    for (name, result) in cases {
+        match result {
+            Ok(out) => {
+                // If the pipeline claims success it must be a valid solid.
+                assert_valid(&out, name);
+            }
+            Err(e) => {
+                // Structured fallback (NotImplemented today) is acceptable.
                 let _ = format!("{name}: rejected with {e:?}");
             }
         }

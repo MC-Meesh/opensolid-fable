@@ -59,4 +59,4 @@ pub use topology::{
     Body, BodyType, Curve, Edge, Face, FaceSense, Fin, FinSense, Loop, LoopType, SYSTEM_RESOLUTION,
     Shell, ShellOrientation, TopologyStore, Vertex,
 };
-pub use transform::translate_body;
+pub use transform::{rotate_body, translate_body};
