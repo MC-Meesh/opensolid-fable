@@ -46,6 +46,35 @@ describe('SketchCanvas', () => {
     expect(html).toContain('sketch-hint');
   });
 
+  it('renders the edit tools: Trim, Extend, Offset, and Convert', () => {
+    const html = renderToString(
+      <SketchCanvas
+        open
+        plane="XY"
+        onPlaneChange={() => {}}
+        onProfileChange={() => {}}
+      />
+    );
+    for (const label of ['Trim', 'Extend', 'Offset', 'Convert']) {
+      expect(html).toContain(label);
+    }
+    // Convert is unavailable on a named plane (no face outline captured).
+    expect(html).toContain('Convert Entities needs a sketch opened on a face');
+  });
+
+  it('enables Convert when a face outline was captured', () => {
+    const html = renderToString(
+      <SketchCanvas
+        open
+        plane={{ origin: [0, 0, 0], normal: [0, 0, 1], u: [1, 0, 0], v: [0, 1, 0] }}
+        onPlaneChange={() => {}}
+        onProfileChange={() => {}}
+        faceLoops={[[[0, 0], [1, 0], [1, 1], [0, 1], [0, 0]]]}
+      />
+    );
+    expect(html).toContain('Project the sketched-on face outline into this sketch');
+  });
+
   it('renders hidden when closed', () => {
     const html = renderToString(
       <SketchCanvas

@@ -32,6 +32,12 @@ import {
 } from '../lib/sketch/snap.js';
 import { arcSweep, normalizeAngle } from '../lib/sketch/geom.js';
 import {
+  offsetEntity,
+  trimEntityAt,
+  extendEntityAt,
+  convertEntities,
+} from '../lib/sketch/edit.js';
+import {
   extractProfile,
   isFacePlane,
   planeAxisLabels,
@@ -100,6 +106,18 @@ const TOOLS = [
     key: 'A',
     hint: 'Click center, start, then end (drag direction sets the sweep)',
   },
+  {
+    id: 'trim',
+    label: 'Trim',
+    key: 'T',
+    hint: 'Click the part of a line/arc/circle to remove — it trims back to the nearest crossings',
+  },
+  {
+    id: 'extend',
+    label: 'Extend',
+    key: 'X',
+    hint: 'Click near the end of a line/arc to extend it to the next crossing',
+  },
   { id: 'pan', label: 'Pan', key: 'P', hint: 'Drag to pan (middle-drag works with any tool)' },
 ];
 
@@ -115,6 +133,11 @@ function wrapToPi(a) {
   while (a > Math.PI) a -= 2 * Math.PI;
   while (a < -Math.PI) a += 2 * Math.PI;
   return a;
+}
+
+/** Whether a sketch changed relative to a pre-mutation snapshot. */
+function changed(before, sketch) {
+  return JSON.stringify(before) !== JSON.stringify(sketch);
 }
 
 function arcScreenGeometry(sketch, entity) {
@@ -183,6 +206,9 @@ export default forwardRef(function SketchCanvas(
     // orientation wrappers, so changing it here would lie).
     editing = null,
     onApplyEdit,
+    // Face outline (array of [u, v] loops) for Convert Entities, captured when
+    // the sketch opened on a face; null when sketching on a named plane.
+    faceLoops = null,
   },
   ref
 ) {
@@ -205,6 +231,7 @@ export default forwardRef(function SketchCanvas(
   const [gridOn, setGridOn] = useState(true);
   const [snapOn, setSnapOn] = useState(true);
   const [dimValue, setDimValue] = useState('');
+  const [offsetValue, setOffsetValue] = useState('1');
   const [dimEntry, setDimEntry] = useState(null); // typed exact dimension while drafting
   const dimEntryRef = useRef(null);
   dimEntryRef.current = dimEntry;
@@ -750,6 +777,33 @@ export default forwardRef(function SketchCanvas(
           commitArc(Math.atan2(world.y - c.y, world.x - c.x));
           return;
         }
+        case 'trim': {
+          const tol = HIT_PX / view.scale;
+          const hit = hitTest(s, world.x, world.y, tol, tol);
+          if (!hit || hit.kind !== 'entity') return;
+          const before = takeBefore();
+          trimEntityAt(s, hit.id, world.x, world.y);
+          if (changed(before, s)) {
+            setSelection([]);
+            runSolve();
+            commitRecord(before);
+          }
+          return;
+        }
+        case 'extend': {
+          const tol = HIT_PX / view.scale;
+          const hit = hitTest(s, world.x, world.y, tol, tol);
+          if (!hit || hit.kind !== 'entity') return;
+          const before = takeBefore();
+          if (extendEntityAt(s, hit.id, world.x, world.y)) {
+            setSelection([]);
+            runSolve();
+            commitRecord(before);
+          } else {
+            setMessage('Nothing to extend to');
+          }
+          return;
+        }
         default:
       }
     },
@@ -764,6 +818,8 @@ export default forwardRef(function SketchCanvas(
       commitCircle,
       commitArc,
       takeBefore,
+      runSolve,
+      commitRecord,
     ]
   );
 
@@ -956,6 +1012,45 @@ export default forwardRef(function SketchCanvas(
     }
     applyConstraint(constraints);
   }, [dimValue, selLines, selCurves, applyConstraint]);
+
+  // Offset every selected entity by the signed distance. Negative flips the
+  // side (left of a line's direction / inward on a circle or arc).
+  const applyOffset = useCallback(() => {
+    const dist = Number(offsetValue);
+    if (!Number.isFinite(dist) || dist === 0) {
+      setMessage('Enter a non-zero offset distance');
+      return;
+    }
+    const s = sketchRef.current;
+    const before = takeBefore();
+    const created = [];
+    for (const e of selEntities) {
+      const id = offsetEntity(s, e.id, dist);
+      if (id) created.push({ kind: 'entity', id });
+    }
+    if (created.length === 0) {
+      setMessage('Nothing to offset (a circle cannot shrink past its center)');
+      return;
+    }
+    setSelection(created);
+    runSolve();
+    commitRecord(before);
+  }, [offsetValue, selEntities, takeBefore, runSolve, commitRecord]);
+
+  // Convert Entities: drop the sketched-on face's outline into the sketch.
+  const applyConvert = useCallback(() => {
+    if (!faceLoops || faceLoops.length === 0) return;
+    const s = sketchRef.current;
+    const before = takeBefore();
+    const created = convertEntities(s, faceLoops);
+    if (created.length === 0) {
+      setMessage('Nothing to convert');
+      return;
+    }
+    setSelection(created.map((id) => ({ kind: 'entity', id })));
+    runSolve();
+    commitRecord(before);
+  }, [faceLoops, takeBefore, runSolve, commitRecord]);
 
   const deleteSelection = useCallback(() => {
     if (selection.length === 0) return;
@@ -1831,6 +1926,40 @@ export default forwardRef(function SketchCanvas(
             onClick={applyDimension}
           >
             Set
+          </button>
+        </div>
+        <div className="group">
+          <span className="group-label">Edit</span>
+          <input
+            className="dim-input"
+            type="number"
+            step="any"
+            placeholder="dist"
+            value={offsetValue}
+            onChange={(e) => setOffsetValue(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') applyOffset();
+            }}
+          />
+          <button
+            className="tool-btn"
+            disabled={selEntities.length === 0}
+            title="Offset selected entities by the distance (negative flips side)"
+            onClick={applyOffset}
+          >
+            Offset
+          </button>
+          <button
+            className="tool-btn"
+            disabled={!faceLoops || faceLoops.length === 0}
+            title={
+              faceLoops && faceLoops.length > 0
+                ? 'Project the sketched-on face outline into this sketch'
+                : 'Convert Entities needs a sketch opened on a face'
+            }
+            onClick={applyConvert}
+          >
+            Convert
           </button>
         </div>
         <div className="group">

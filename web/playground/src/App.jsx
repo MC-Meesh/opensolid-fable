@@ -23,6 +23,7 @@ import { PALETTE } from './lib/shapeGraph.js';
 import { addPrimitiveNode, assertStoreConsistency } from './lib/storeSync.js';
 import { buildSweepShape, opsBounds, profileToOps, sweepTreeNode } from './lib/sweep.js';
 import { createFaceRegionIndex } from './lib/facePlane.js';
+import { faceBoundaryLoops } from './lib/faceBoundary.js';
 import { isFacePlane } from './lib/sketch/profile.js';
 import { faceRefFromPlane, planarRegionsOf, resolveRefs } from './lib/persistentRef.js';
 import { computeRebuildState } from './lib/rebuildState.js';
@@ -121,6 +122,10 @@ export default function App() {
   // usable). Cleared on miss clicks and whenever the mesh is rebuilt, and
   // consumed when a sketch opens on it.
   const [pickedFace, setPickedFace] = useState(null);
+  // Sketch-plane face outline (2D loops) captured at entry, for "Convert
+  // Entities" — the boundary of the face being sketched on, projected into the
+  // sketch's (u, v) frame. Null when sketching on a named plane.
+  const [faceLoops, setFaceLoops] = useState(null);
   const [toast, setToast] = useState(null);
   const profileRef = useRef(null);
   const viewportRef = useRef(null);
@@ -891,8 +896,22 @@ export default function App() {
     if (!sketchOpen) {
       if (pickedFace?.planar) {
         setSketchPlane(pickedFace.plane);
+        // Capture the face outline now — pickedFace is about to be cleared —
+        // so Convert Entities can project it onto the fresh sketch.
+        const displayed = meshRef.current;
+        setFaceLoops(
+          displayed
+            ? faceBoundaryLoops(
+                displayed.positions,
+                displayed.indices,
+                pickedFace.tris,
+                pickedFace.plane
+              )
+            : null
+        );
         setPickedFace(null);
       } else {
+        setFaceLoops(null);
         if (pickedFace) {
           setToast(
             pickedFace.reason === 'face is curved'
@@ -1223,6 +1242,7 @@ export default function App() {
             onExit={handleSketchExit}
             editing={editingSketch ? { name: editingSketch.name } : null}
             onApplyEdit={handleApplySketchEdit}
+            faceLoops={faceLoops}
           />
         </ErrorBoundary>
         {toast && <div className="toast">{toast}</div>}
