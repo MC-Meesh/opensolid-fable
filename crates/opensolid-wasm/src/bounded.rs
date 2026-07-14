@@ -17,7 +17,7 @@ use opensolid_frep::primitives::{
 use opensolid_frep::refine::{RefineOptions, refine_mesh};
 use opensolid_frep::{
     BlendMode, BooleanKind, EdgeRegion, Extrude, Loft, OpenPath2D, Profile2D, Revolve, Rib,
-    RibSide, SdfTransformExt, Shape, Sweep,
+    RibSide, SdfTransformExt, Shape, Shell, Sweep,
 };
 
 /// Depth bounds for accuracy-driven adaptive meshing: the ceiling keeps the
@@ -451,6 +451,20 @@ impl BoundedShape {
                 .blend_edge(other.shape.clone(), kind, mode, radius, region),
             bounds: BoundingBox3::new(base.min - pad, base.max + pad),
         }
+    }
+
+    /// Hollow the shape into a shell of total wall `thickness`, centered on
+    /// the surface (extending `thickness / 2` to each side). The tracked box
+    /// grows by `thickness / 2` to cover the outward half of the wall.
+    ///
+    /// # Errors
+    /// Propagates [`Shell::new`] validation (`thickness > 0` and finite).
+    pub fn shell(&self, thickness: f64) -> CoreResult<Self> {
+        let shelled = Shell::new(self.shape.clone(), thickness)?;
+        Ok(Self {
+            shape: Shape::new(shelled),
+            bounds: self.bounds.dilate(thickness / 2.0),
+        })
     }
 
     /// Signed distance from `point` to the surface: negative inside,
@@ -897,6 +911,31 @@ mod tests {
         let expected_pad = 0.25 * (0.1 * 3.2);
         assert!((d.bounds.max.x - (plain.bounds.max.x + expected_pad)).abs() < 1e-12);
         assert_meshes_cleanly(&d);
+    }
+
+    #[test]
+    fn shell_hollows_and_grows_bounds() {
+        let hollow = BoundedShape::sphere(1.0).shell(0.4).unwrap();
+
+        // Wall is centered on the r = 1 surface: core removed, wall material
+        // spans r ∈ (0.8, 1.2), outer skin at r = 1.2.
+        assert!(hollow.distance(Point3::origin()) > 0.0);
+        assert!(hollow.distance(Point3::new(1.0, 0.0, 0.0)) < 0.0);
+        assert!(hollow.distance(Point3::new(1.2, 0.0, 0.0)).abs() < 1e-12);
+
+        // Tracked box grows by thickness / 2 to cover the outward wall.
+        assert_eq!(hollow.bounds.min, Point3::new(-1.2, -1.2, -1.2));
+        assert_eq!(hollow.bounds.max, Point3::new(1.2, 1.2, 1.2));
+
+        // A closed uniform shell stays a watertight manifold.
+        assert_meshes_cleanly(&hollow);
+    }
+
+    #[test]
+    fn shell_rejects_nonpositive_thickness() {
+        assert!(BoundedShape::sphere(1.0).shell(0.0).is_err());
+        assert!(BoundedShape::sphere(1.0).shell(-0.2).is_err());
+        assert!(BoundedShape::sphere(1.0).shell(f64::NAN).is_err());
     }
 
     #[test]

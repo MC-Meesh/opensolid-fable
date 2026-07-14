@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { applyTranslate, applyRotate, applyScale, pathTo, nodeAt } from './transformEdit.js';
+import { applyTranslate, applyRotate, applyScale, applyShell, pathTo, nodeAt } from './transformEdit.js';
 
 function node(id, op, args = [], children = []) {
   return { id, op, args, children, shape: null };
@@ -106,6 +106,52 @@ describe('applyScale', () => {
   it('returns root unchanged for missing id', () => {
     const root = node(1, 'sphere', [1]);
     expect(applyScale(root, 99, [2, 2, 2], [0, 0, 0])).toBe(root);
+  });
+});
+
+describe('applyShell', () => {
+  it('wraps the target in a new shell node', () => {
+    const root = node(1, 'union', [], [
+      node(2, 'sphere', [1]),
+      node(3, 'box3', [1, 1, 1]),
+    ]);
+    const result = applyShell(root, 2, 0.1);
+    const wrapped = result.children[0];
+    expect(wrapped.op).toBe('shell');
+    expect(wrapped.args).toEqual([0.1]);
+    expect(wrapped.children[0].op).toBe('sphere');
+    expect(result.children[1]).toBe(root.children[1]);
+  });
+
+  it('wraps the whole model when the root is the target', () => {
+    const root = node(1, 'subtract', [], [
+      node(2, 'box3', [1, 1, 1]),
+      node(3, 'cylinder', [0.3, 2]),
+    ]);
+    const result = applyShell(root, 1, 0.2);
+    expect(result.op).toBe('shell');
+    expect(result.args).toEqual([0.2]);
+    expect(result.children[0]).toBe(root);
+  });
+
+  it('nests rather than merges when applied twice', () => {
+    const root = node(1, 'sphere', [1]);
+    const once = applyShell(root, 1, 0.1);
+    const twice = applyShell(once, once.id, 0.05);
+    expect(twice.op).toBe('shell');
+    expect(twice.children[0].op).toBe('shell');
+    expect(twice.children[0].children[0].op).toBe('sphere');
+  });
+
+  it('rounds thickness to 4 decimals', () => {
+    const root = node(1, 'sphere', [1]);
+    const result = applyShell(root, 1, 0.1 + 0.2);
+    expect(result.args[0]).toBe(0.3);
+  });
+
+  it('returns root unchanged for missing id', () => {
+    const root = node(1, 'sphere', [1]);
+    expect(applyShell(root, 99, 0.1)).toBe(root);
   });
 });
 

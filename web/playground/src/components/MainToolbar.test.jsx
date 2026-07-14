@@ -41,7 +41,7 @@ describe('MainToolbar', () => {
     expect(html).toContain('View');
     expect(html).toContain('Drawing');
     expect(html).toContain('Export');
-    for (const label of ['Extrude', 'Revolve', 'Sweep', 'Loft', 'Reference', 'Fit', 'Front', 'Top', 'Right', 'Iso', 'Wireframe', 'Section', 'STL', 'STEP']) {
+    for (const label of ['Extrude', 'Revolve', 'Sweep', 'Loft', 'Shell', 'Reference', 'Fit', 'Front', 'Top', 'Right', 'Iso', 'Wireframe', 'Section', 'STL', 'STEP']) {
       expect(html).toContain(label);
     }
   });
@@ -66,6 +66,21 @@ describe('MainToolbar', () => {
     // ...but they do disable while the kernel is still loading.
     const loading = render({ disabled: true });
     expect(loading).toMatch(/disabled[^>]*aria-label="Sweep"/);
+  });
+
+  it('gates Shell on there being a body to hollow', () => {
+    // Shell consumes an existing solid, so unlike Sweep/Loft a ready kernel is
+    // not enough — with no body it stays disabled and says why.
+    const empty = render({ canShell: false });
+    expect(empty).toMatch(/<button[^>]*disabled[^>]*aria-label="Shell"/);
+    expect(empty).toContain('Run a script that produces a solid first');
+    expect(render({ canShell: true })).not.toMatch(
+      /<button[^>]*disabled[^>]*aria-label="Shell"/
+    );
+    // ...and it still defers to the kernel still loading.
+    expect(render({ canShell: true, disabled: true })).toMatch(
+      /<button[^>]*disabled[^>]*aria-label="Shell"/
+    );
   });
 
   it('renders the Measure (Inspect) toggle with its shortcut tooltip', () => {

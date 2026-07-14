@@ -78,6 +78,13 @@ const Icons = {
       <path d="M4.5 4.5 V6.5 M7 4.5 V6.5 M9.5 4.5 V6.5 M12 4.5 V6.5" />
     </svg>
   ),
+  shell: (
+    // A hollowed body: the outer solid with the scooped-out void inside it.
+    <svg {...ICON}>
+      <path d="M2.5 5 L8 2.2 L13.5 5 V11 L8 13.8 L2.5 11 Z" />
+      <path d="M5 6.4 L8 4.9 L11 6.4 V9.6 L8 11.1 L5 9.6 Z" />
+    </svg>
+  ),
   fit: (
     <svg {...ICON}>
       <path d="M2 5.5 V2 h3.5 M10.5 2 H14 v3.5 M14 10.5 V14 h-3.5 M5.5 14 H2 v-3.5" />
@@ -186,6 +193,8 @@ export default function MainToolbar({
   sweepDisabledReason,
   onSweep,
   onAddFeature,
+  canShell,
+  onShell,
   onView,
   onFit,
   wireframe,
@@ -276,6 +285,14 @@ export default function MainToolbar({
           disabledReason={notReady}
           disabled={disabled}
           onClick={() => onAddFeature('loft')}
+        />
+        <ToolButton
+          icon="shell"
+          label="Shell"
+          title="Hollow the selected body (or the whole model) to a uniform wall thickness"
+          disabledReason={disabled ? notReady : 'Run a script that produces a solid first'}
+          disabled={disabled || !canShell}
+          onClick={onShell}
         />
         <ToolButton
           icon="reference"

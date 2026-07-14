@@ -29,7 +29,7 @@ export const PRIMITIVE_OPS = [
 ];
 
 // Instance methods taking only numeric args. One child: the receiver.
-export const UNARY_OPS = ['translate', 'rotate', 'scale', 'uniformScale', 'taper'];
+export const UNARY_OPS = ['translate', 'rotate', 'scale', 'uniformScale', 'taper', 'shell'];
 
 // Instance methods taking another shape (plus optional numeric args).
 // Two children: the receiver, then the other shape.
@@ -63,6 +63,7 @@ const OP_LABELS = {
   scale: 'Scale',
   uniformScale: 'Uniform Scale',
   taper: 'Draft',
+  shell: 'Shell',
   union: 'Union',
   intersect: 'Intersect',
   subtract: 'Subtract',

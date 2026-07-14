@@ -30,6 +30,8 @@ export const DEFAULT_SCRIPT = `// Build a shape with the OpenSolid API and retur
 //   .taper(px,py,pz, nx,ny,nz, deg)     draft: tilt walls about the neutral
 //                                       plane through (nx,ny,nz) with pull
 //                                       axis (px,py,pz), by deg degrees
+//   .shell(thickness)                   hollow to a uniform wall, centered
+//                                       on the surface
 // Booleans (each returns a new shape):
 //   .union(other)  .intersect(other)  .subtract(other)
 //   .smoothUnion(other, radius?)        blended union; radius defaults to

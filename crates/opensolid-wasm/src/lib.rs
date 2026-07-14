@@ -837,6 +837,19 @@ impl WasmShape {
         ))
     }
 
+    /// Hollow the shape into a shell of total wall `thickness`, centered on
+    /// the surface (extending `thickness / 2` to each side). Organic:
+    /// SDF-only, no exact companion.
+    ///
+    /// # Errors
+    /// `thickness` must be positive and finite.
+    pub fn shell(&self, thickness: f64) -> Result<WasmShape, String> {
+        self.inner
+            .shell(thickness)
+            .map(WasmShape::sdf_only)
+            .map_err(|e| e.to_string())
+    }
+
     /// Signed distance from `(x, y, z)` to the surface: negative inside,
     /// positive outside. After smooth blends or anisotropic scaling this is
     /// not an exact Euclidean distance, but the sign and zero set stay
@@ -1178,6 +1191,33 @@ mod tests {
                 .taper(0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 90.0)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn shell_via_wasm_api() {
+        // Hollow a 2×2×2 cube to a 0.3-thick wall straddling the old surface.
+        let t = 0.3;
+        let hollow = WasmShape::box3(1.0, 1.0, 1.0)
+            .shell(t)
+            .expect("valid shell");
+        assert_valid(&hollow.mesh(64, None));
+        // The wall is centered on the original boundary at x = 1: the old
+        // surface sits mid-wall, and each face of the wall is t/2 away.
+        assert!((hollow.distance(1.0, 0.0, 0.0) + t / 2.0).abs() < 1e-6);
+        assert!(hollow.distance(1.0 - t / 2.0, 0.0, 0.0).abs() < 1e-6);
+        assert!(hollow.distance(1.0 + t / 2.0, 0.0, 0.0).abs() < 1e-6);
+        // The deep interior is hollowed out — that is the whole point.
+        assert!(hollow.distance(0.0, 0.0, 0.0) > 0.0, "interior not hollow");
+        // The hollowed body still tessellates to a closed, oriented solid.
+        let report = hollow.validate(Some(0.01));
+        assert!(
+            report.contains("\"closedManifold\":true") && report.contains("\"valid\":true"),
+            "shell failed validation: {report}"
+        );
+        // A non-positive or non-finite wall is rejected, not silently clamped.
+        assert!(WasmShape::box3(1.0, 1.0, 1.0).shell(0.0).is_err());
+        assert!(WasmShape::box3(1.0, 1.0, 1.0).shell(-0.2).is_err());
+        assert!(WasmShape::box3(1.0, 1.0, 1.0).shell(f64::NAN).is_err());
     }
 
     #[test]

@@ -156,6 +156,32 @@ export function applyScale(root, id, factors, pivot) {
   return replaceById(root, id, wrapped);
 }
 
+// Wrap the node `id` with a `.shell(thickness)` modifier — the SolidWorks
+// Shell feature: hollow the body to a uniform wall. Unlike translate, shells
+// never merge; a second call nests a fresh shell wrapper.
+export function applyShell(root, id, thickness) {
+  function findNode(node) {
+    if (node.id === id) return node;
+    for (const c of node.children) {
+      const found = findNode(c);
+      if (found) return found;
+    }
+    return null;
+  }
+
+  const target = findNode(root);
+  if (!target) return root;
+
+  const wrapper = {
+    id: maxId(root) + 1,
+    op: 'shell',
+    args: [round4(thickness)],
+    children: [target],
+    shape: null,
+  };
+  return replaceById(root, id, wrapper);
+}
+
 export function pathTo(root, targetId) {
   if (root.id === targetId) return [];
   for (let i = 0; i < root.children.length; i++) {

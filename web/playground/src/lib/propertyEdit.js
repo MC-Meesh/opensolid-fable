@@ -170,6 +170,11 @@ export const OP_SPECS = {
       },
     ],
   },
+  shell: {
+    kind: 'modifier',
+    title: 'Shell',
+    groups: [{ label: 'Wall', fields: [size(0, 't')] }],
+  },
   union: { kind: 'boolean', title: 'Boolean', groups: [] },
   intersect: { kind: 'boolean', title: 'Boolean', groups: [] },
   subtract: { kind: 'boolean', title: 'Boolean', groups: [] },

@@ -454,6 +454,7 @@ export const PARAM_NAMES = {
   torus: ['R', 'r'],
   capsule: ['x1', 'y1', 'z1', 'x2', 'y2', 'z2', 'r'],
   translate: ['x', 'y', 'z'],
+  shell: ['t'],
   smoothUnion: ['other', 'r'],
   union: ['other'],
   intersect: ['other'],

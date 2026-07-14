@@ -18,7 +18,7 @@ import { DEFAULT_SCRIPT } from './lib/defaultScript.js';
 import { freeNodes, nodeLabel, runTracedScript, scriptHeader, serializeTree } from './lib/sceneTree.js';
 import { buildBinaryStl } from './lib/stl.js';
 import { pickCandidates, pickNodeAt } from './lib/picking.js';
-import { applyTranslate, applyRotate, applyScale, pathTo, nodeAt, replaceById } from './lib/transformEdit.js';
+import { applyTranslate, applyRotate, applyScale, applyShell, pathTo, nodeAt, replaceById } from './lib/transformEdit.js';
 import { setNodeArg, setBooleanOp } from './lib/propertyEdit.js';
 import { deleteNode } from './lib/deleteNode.js';
 import { DEFAULT_LENGTH_UNIT, normalizeUnit, UNIT_STORAGE_KEY } from './lib/units.js';
@@ -779,6 +779,32 @@ export default function App() {
     },
     [applyTreeEdit]
   );
+
+  // SolidWorks Shell: hollow the selected body — or the whole model when
+  // nothing is selected — into a uniform wall, wrapping the target node with
+  // a `.shell(t)` modifier. The default thickness is 10% of the target's
+  // largest extent; selection lands on the shell so its wall is editable in
+  // the property panel.
+  const handleShell = useCallback(() => {
+    const root = tracedRef.current?.root;
+    if (!root) return;
+    const target = selectedNode ?? root;
+    const shape = target.shape ?? root.shape;
+    let thickness = 0.1;
+    if (shape) {
+      try {
+        const b = shape.bounds();
+        const ext = Math.max(b[3] - b[0], b[4] - b[1], b[5] - b[2]);
+        if (Number.isFinite(ext) && ext > 0) thickness = Math.round(ext * 1000) / 10000;
+      } catch {
+        // Fall back to the fixed default when bounds are unavailable.
+      }
+    }
+    const path = pathTo(root, target.id);
+    const newRoot = applyShell(root, target.id, thickness);
+    if (newRoot === root) return;
+    commitTree(newRoot, { selectPath: path });
+  }, [selectedNode, commitTree]);
 
   // ---- feature tree --------------------------------------------------------
 
@@ -1574,6 +1600,8 @@ export default function App() {
           }
           onSweep={handleSweepStart}
           onAddFeature={handleAddFeature}
+          canShell={Boolean(tree) && !sketchOpen}
+          onShell={handleShell}
           onView={(name) => viewportRef.current?.snapView(name)}
           onFit={() => viewportRef.current?.zoomToFit()}
           wireframe={wireframe}

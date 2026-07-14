@@ -66,6 +66,17 @@ describe('buildFeatures', () => {
     expect(sketch.node).toBe(ext);
   });
 
+  it('lists a Shell as a named feature rather than a raw op name', () => {
+    // Without a FEATURE_META entry the row would fall back to the op name
+    // ('shell1', kind 'unknown'); it is a real feature and reads like one.
+    const box = node(1, 'box3', [1, 1, 1]);
+    const shell = node(2, 'shell', [0.1], [box]);
+    const features = buildFeatures(shell);
+    expect(features.map((f) => f.name)).toEqual(['Box1', 'Shell1']);
+    expect(features[1].kind).toBe('modifier');
+    expect(features[1].key).toBe('shell:1');
+  });
+
   it('applies user renames by key and keeps the default name', () => {
     const { union } = sampleTree();
     const features = buildFeatures(union, { 'box:1': 'Base plate' });
@@ -124,6 +135,12 @@ describe('pruneTree', () => {
     const { union, sphere } = sampleTree();
     // Hiding the box leaves translate with nothing to act on.
     expect(pruneTree(union, new Set([1]))).toBe(sphere);
+  });
+
+  it('suppressing a Shell falls back to the solid body it hollowed', () => {
+    const box = node(1, 'box3', [1, 1, 1]);
+    const shell = node(2, 'shell', [0.1], [box]);
+    expect(pruneTree(shell, new Set([2]))).toBe(box);
   });
 
   it('returns null when nothing remains', () => {

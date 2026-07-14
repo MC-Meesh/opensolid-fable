@@ -37,6 +37,7 @@ export const FEATURE_META = {
   rotate: { kind: 'transform', type: 'Rotate' },
   scale: { kind: 'transform', type: 'Scale' },
   uniformScale: { kind: 'transform', type: 'Scale' },
+  shell: { kind: 'modifier', type: 'Shell' },
 };
 
 function metaFor(op) {
