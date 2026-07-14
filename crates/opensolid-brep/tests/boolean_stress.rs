@@ -2424,16 +2424,42 @@ fn cone_bite_at_scale_1000() {
     cone_countersink(1000.0);
 }
 
+/// Two coaxial FRUSTUMS whose lateral walls cross once (no apex, both radii
+/// positive): the clean end-to-end exercise of coaxial cone-cone SSI on the
+/// exact path. Their axial extents are staggered so no cap planes coincide
+/// (coplanar caps would trip the coincident-face MVP limit, not the SSI):
+///   A widens  r 1→4 over z∈[0,3]  (wall ρ = 1 + z)
+///   B narrows r 4→1 over z∈[1,4]  (wall ρ = 5 − z)
+/// The walls cross at z = 2, ρ = 3 — the coaxial cone-cone circle. The
+/// intersection is the barrel min(ρₐ, ρ_b) over z∈[1,3], bounded below by B's
+/// bottom cap and above by A's top cap (both clipped to ρ = 2), with the
+/// wall-cap circles coming from plane-cone SSI. No apex pole is involved, so
+/// this promotes on the SSI alone (of-dtj.4), unlike the true-cone
+/// `opposed_cones_intersection` (apex machinery, of-dtj.5).
+#[test]
+fn crossing_frustums_intersection() {
+    let context = "coaxial crossing frustums intersection (barrel)";
+    let mut scene = Scene::new();
+    let widen = scene.cone(Point3::new(0.0, 0.0, 0.0), 1.0, 4.0, 3.0);
+    let narrow = scene.cone(Point3::new(0.0, 0.0, 1.0), 4.0, 1.0, 3.0);
+    let out = scene
+        .intersect(widen, narrow)
+        .unwrap_or_else(|e| panic!("{context}: intersect failed: {e:?}"));
+    // Two stacked frustums: r 2→3 over z∈[1,2] and r 3→2 over z∈[2,3].
+    let want = frustum_volume(2.0, 3.0, 1.0) + frustum_volume(3.0, 2.0, 1.0);
+    let vol = volume(&out, context);
+    assert_close(vol, want, CURVED_VOLUME_RTOL, context);
+}
+
 /// Two coaxial cones opposed apex-to-base overlap in a lens whose
 /// intersection is a bicone (two cones meeting base-to-base at the height
 /// where their radii coincide). Exercises coaxial cone-cone SSI (a single
 /// full-wrap circle at z = 2) and closed-form intersection volume.
 #[test]
-#[ignore = "of-dtj.4: no analytic/marched SSI for cone-cone pairs yet \
-            (NotImplemented 'analytic SSI for cone pairs other than \
-            plane-cone') — of-dtj.2 delivered sphere-cone/torus-cone only \
-            and explicitly defers the unbounded cone-cone pair to of-dtj.4 \
-            — analytic.rs:121"]
+#[ignore = "of-dtj.5: coaxial cone-cone SSI now yields the z=2 circle (of-dtj.4), \
+            but the bicone intersection's two apex poles (true cones, r→0) need \
+            the apex pole-imprint reconstruction of of-dtj.5; today the exact \
+            pipeline builds a SolidWithoutShells at the apexes"]
 fn opposed_cones_intersection() {
     let context = "opposed coaxial cones intersection (bicone)";
     let mut scene = Scene::new();
