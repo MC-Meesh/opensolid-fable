@@ -1086,17 +1086,22 @@ mod tests {
     /// rebuilding shapes; primitives alone never claim exactness.
     #[test]
     fn exact_mode_toggle_reroutes_meshing() {
-        let part;
-        {
-            let _mode = exact_mode_on();
-            part = WasmShape::box3(1.0, 1.0, 1.0)
-                .subtract(&WasmShape::box3(0.5, 0.5, 0.5).translate(1.0, 1.0, 1.0));
-            assert!(part.is_exact());
-            assert!(!WasmShape::sphere(1.0).is_exact());
-            let exact_mesh = part.mesh(64, None);
-            let sdf_mesh_len = part.inner.mesh(64, None).positions.len() * 3;
-            assert_ne!(exact_mesh.positions.len(), sdf_mesh_len);
-        }
+        // Hold the serialization guard for the WHOLE test: `is_exact()` reads
+        // the process-global exact flag, so the off-mode assertion must run
+        // while the lock is still held — otherwise a concurrent exact-mode
+        // test flips the global back on between the guard drop and the check.
+        let _mode = exact_mode_on();
+        let part = WasmShape::box3(1.0, 1.0, 1.0)
+            .subtract(&WasmShape::box3(0.5, 0.5, 0.5).translate(1.0, 1.0, 1.0));
+        assert!(part.is_exact());
+        assert!(!WasmShape::sphere(1.0).is_exact());
+        let exact_mesh = part.mesh(64, None);
+        let sdf_mesh_len = part.inner.mesh(64, None).positions.len() * 3;
+        assert_ne!(exact_mesh.positions.len(), sdf_mesh_len);
+
+        // Flip the mode off explicitly (still under the lock) and confirm the
+        // meshing reverts to the SDF path; the guard's drop restores "off".
+        WasmShape::set_exact_booleans(false);
         assert!(!part.is_exact(), "mode off: no exact claim");
         assert_valid(&part.mesh(24, None));
     }
