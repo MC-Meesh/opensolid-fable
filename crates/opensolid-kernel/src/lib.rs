@@ -52,8 +52,9 @@ pub use opensolid_frep as frep;
 pub use opensolid_core::bvh;
 
 pub use assembly::{
-    Assembly, AssemblyError, AssemblyMassProperties, Instance, InterferenceReport,
-    Part as AssemblyPart,
+    Assembly, AssemblyError, AssemblyMassProperties, Feature, FeatureRef, Instance,
+    InterferenceReport, Mate, MateError, MateKind, Part as AssemblyPart, SolveOptions, SolveResult,
+    SolveStatus, seat_concentric_coincident, solve_mates,
 };
 pub use builder::{Part, shape};
 pub use convert::{MeshSdf, SdfToBrepOptions, sdf_to_brep};

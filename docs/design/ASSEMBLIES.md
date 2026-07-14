@@ -289,9 +289,16 @@ MVP phases filed as children of this bead (of-fsl.25):
 1. **Kernel: instancing + interference + mass-property aggregation** — assembly
    data model, `Transformed`-backed instances, `max<0` clash detection, inertia
    composition. Pure kernel, fully testable.
-2. **Mate solver** — 6-DOF rigid-body Gauss–Newton/LM over coincident /
-   concentric / distance residuals, with closed-form concentric+coincident and
-   over-constrained detection.
+2. **Mate solver** *(landed, of-fsl.25.2)* — 6-DOF rigid-body Levenberg–Marquardt
+   over coincident / concentric / distance residuals, with closed-form
+   concentric+coincident and over-constrained detection. Lives in the landed
+   assembly module (`crates/opensolid-kernel/src/assembly/{mates,solver}.rs`):
+   the solver works on instance *poses* (`Transform3` + `fixed`) and abstract
+   `Feature`s, decoupled from part geometry, and `Assembly::solve` reads poses
+   out of the MVP-1 instances. The LM step is taken in the Jacobian's SVD basis
+   so the rank-deficiency of under-constrained parts (free DOF) is handled
+   exactly — null directions get zero step and damping can relax to a full
+   Gauss–Newton step.
 3. **Script/module system + WASM binding** — multiple named models per session,
    `Assembly` / `insert` / `mate` API, instance-handle feature refs.
 4. **GUI** — assembly tree, insert-part flow, face/edge-pick mate creation, live

@@ -41,6 +41,15 @@ use opensolid_frep::transform::Transformed;
 use crate::massprops::{MassProperties, MassPropertiesError, mass_properties};
 use crate::mesh::{MeshOptions, mesh_sdf_indexed};
 
+pub mod mates;
+pub mod solver;
+
+pub use mates::{Feature, FeatureRef, Mate, MateError, MateKind};
+pub use solver::{
+    SolveOptions, SolveResult, SolveStatus, seat_concentric_coincident, solve_mates,
+    solve_mates_with,
+};
+
 /// Number of interval-subdivision cells along the longest axis of an
 /// overlap box when estimating clash volume / testing interference. The
 /// interval pruning is exact for the yes/no question at any resolution;
@@ -216,11 +225,14 @@ pub struct InterferenceReport {
     pub volume: f64,
 }
 
-/// An assembly: a set of placed [`Instance`]s. Mates and the rigid-body
-/// solver arrive in MVP 2; this MVP fixes poses at insertion time.
+/// An assembly: a set of placed [`Instance`]s plus the [`Mate`]s that
+/// constrain their poses. Instances are fixed at insertion time until
+/// [`solve`](Self::solve) resolves the floating poses from the mates (MVP 2,
+/// of-fsl.25.2).
 #[derive(Clone, Default)]
 pub struct Assembly {
     instances: Vec<Instance>,
+    mates: Vec<Mate>,
 }
 
 impl Assembly {
@@ -230,10 +242,22 @@ impl Assembly {
     }
 
     /// Insert an instance; returns its index (stable for the assembly's
-    /// lifetime — instances are never removed by this MVP).
+    /// lifetime — instances are never removed by this MVP). Use the index in
+    /// the [`FeatureRef`]s of mates that reference this instance.
     pub fn insert(&mut self, instance: Instance) -> usize {
         self.instances.push(instance);
         self.instances.len() - 1
+    }
+
+    /// Add a mate constraining two instances' features. Returns its index.
+    pub fn add_mate(&mut self, mate: Mate) -> usize {
+        self.mates.push(mate);
+        self.mates.len() - 1
+    }
+
+    /// The mates, in insertion order.
+    pub fn mates(&self) -> &[Mate] {
+        &self.mates
     }
 
     /// The instances, in insertion order.
@@ -249,6 +273,28 @@ impl Assembly {
     /// True if the assembly has no instances.
     pub fn is_empty(&self) -> bool {
         self.instances.is_empty()
+    }
+
+    /// Solve the mates for the floating instances' poses, returning the
+    /// resolved poses and diagnostics *without* mutating the assembly. Fixed
+    /// instances are held constant; floating ones move to satisfy the mates.
+    /// See [`SolveStatus`] for how conflicting and under-constrained systems
+    /// are reported (neither panics). Use [`solve_in_place`](Self::solve_in_place)
+    /// to write the result back.
+    pub fn solve(&self) -> SolveResult {
+        let poses: Vec<Transform3> = self.instances.iter().map(|i| i.transform).collect();
+        let fixed: Vec<bool> = self.instances.iter().map(|i| i.fixed).collect();
+        solver::solve_mates(&poses, &fixed, &self.mates)
+    }
+
+    /// Solve the mates and write the resolved poses back into the instances,
+    /// returning the same [`SolveResult`].
+    pub fn solve_in_place(&mut self) -> SolveResult {
+        let result = self.solve();
+        for (inst, &t) in self.instances.iter_mut().zip(&result.transforms) {
+            inst.transform = t;
+        }
+        result
     }
 
     /// Mesh the whole assembly as the concatenation of per-instance meshes
