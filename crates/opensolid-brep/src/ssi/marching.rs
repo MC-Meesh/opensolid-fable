@@ -696,14 +696,20 @@ fn march_primitives(
 /// - cylinder-sphere (general quartic)
 /// - plane-torus (general oblique quartic / spiric sections)
 /// - cylinder-torus, sphere-torus, torus-torus (degree 8 in general)
+/// - sphere-cone, torus-cone (general quartic / degree 8): the cone rides
+///   as the clipped partner against the compact sphere or torus, whose
+///   finite domain seeds the grid
 ///
 /// Special configurations of these pairs that *do* have closed forms
 /// (coaxial arrangements, tangencies) are classified exactly by
 /// [`super::intersect`]; this entry point marches whatever it is given and
 /// is the fallback when that returns `NotImplemented` for a general
 /// position. All other pairs are rejected: plane/sphere/cylinder
-/// combinations always have conic closed forms in [`super::intersect`],
-/// and cones are out of the MVP entirely.
+/// combinations always have conic closed forms in [`super::intersect`], and
+/// the cone pairs whose *both* surfaces are unbounded — plane-cone,
+/// cylinder-cone, cone-cone — carry no compact partner to seed the grid, so
+/// they march through [`intersect_marched_bounded`] with an explicit region
+/// of interest instead.
 ///
 /// **Representation choice (cylinder-sphere)**: the general cylinder-sphere
 /// curve admits a closed-form parameterization by cylinder angle — on the
@@ -736,24 +742,30 @@ pub fn intersect_marched(
     match (a, b) {
         // Canonical orders: grid over the compact primitive (the torus when
         // both are compact — unlike the sphere it has no parameterization
-        // poles for seeds to land on).
-        (Sphere { .. }, Cylinder { .. })
-        | (Torus { .. }, Plane { .. } | Cylinder { .. } | Sphere { .. } | Torus { .. }) => {
+        // poles for seeds to land on). A cone is never the gridded primitive
+        // here (it is unbounded); it rides as the clipped partner against a
+        // compact sphere or torus.
+        (Sphere { .. }, Cylinder { .. } | Cone { .. })
+        | (
+            Torus { .. },
+            Plane { .. } | Cylinder { .. } | Sphere { .. } | Torus { .. } | Cone { .. },
+        ) => {
             if let (Torus { .. }, Plane { .. }) = (a, b) {
                 villarceau_check(b, a, tol)?;
             }
             march_primitives(a, b, tol)
         }
         // Swapped orders re-enter canonically and swap the preimages back.
-        (Cylinder { .. }, Sphere { .. })
-        | (Plane { .. } | Cylinder { .. } | Sphere { .. }, Torus { .. }) => {
+        (Cylinder { .. } | Cone { .. }, Sphere { .. })
+        | (Plane { .. } | Cylinder { .. } | Sphere { .. } | Cone { .. }, Torus { .. }) => {
             Ok(swap_params(intersect_marched(b, a, tol)?))
         }
         _ => Err(CoreError::NotImplemented {
             feature: "marched SSI for this surface pair (plane/sphere/cylinder \
                       combinations have closed forms in ssi::intersect; the \
-                      unbounded plane-cone parabola/hyperbola sections march \
-                      through ssi::intersect_marched_bounded)",
+                      unbounded cone pairs — plane-cone, cylinder-cone, \
+                      cone-cone — march through ssi::intersect_marched_bounded, \
+                      not here)",
         }),
     }
 }
@@ -1569,6 +1581,119 @@ mod tests {
         };
         let result = intersect_marched(&s1, &s2, &default_tol());
         assert!(matches!(result, Err(CoreError::NotImplemented { .. })));
+    }
+
+    // ── marched cone pairs with a compact partner (intersect_marched) ───
+
+    /// Cone about +z, half-angle 30°, radius 1 at `v = 0`; apex below at
+    /// `z = -1/tan30° ≈ -1.732`.
+    fn cone3() -> Surface3 {
+        Surface3::cone(Point3::origin(), Vector3::z(), 30f64.to_radians(), 1.0).unwrap()
+    }
+
+    #[test]
+    fn marched_sphere_cone_bite_closed_loop() {
+        // Sphere just outside the cone wall on the +y side (u = π/2, clear of
+        // the u = 0 seam): its near cap pokes through the nappe, so the
+        // intersection is a single closed cap loop, apex-free and comfortably
+        // inside the clipped axial window.
+        let cone = cone3();
+        // Cone radius at z = 2 is 1 + 2·tan30° ≈ 2.1547; sit the center 0.4
+        // beyond the wall so only a cap intersects.
+        let center = Point3::new(0.0, 1.0 + 2.0 * 30f64.to_radians().tan() + 0.4, 2.0);
+        let sph = Surface3::sphere(center, Vector3::z(), 0.8).unwrap();
+        let curves = intersect_marched(&sph, &cone, &default_tol()).unwrap();
+        assert_eq!(curves.len(), 1, "one bite loop expected");
+        assert!(curves[0].closed, "the bite must close");
+        assert_marched_on_both(&curves, &sph, &cone);
+        // The loop hugs the +y side of the cone, on the sphere's near cap.
+        for p in &curves[0].points {
+            assert!(p.y > 1.0, "loop strayed off the +y wall: {p:?}");
+            assert!(
+                (p - center).norm() < 0.85,
+                "vertex not on the 0.8 sphere: {p:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn marched_torus_cone_coaxial_rings() {
+        // Coaxial tube around the cone: the axial-plane line (cone) cuts the
+        // tube circle at two points, each sweeping a full ring about the
+        // axis — two horizontal circles at z ≈ 1.80 and 2.50.
+        let cone = cone3();
+        let torus = torus3(Point3::new(0.0, 0.0, 2.0), 2.5, 0.5);
+        let curves = intersect_marched(&torus, &cone, &default_tol()).unwrap();
+        assert_marched_on_both(&curves, &torus, &cone);
+        // Group by mean height: one ring below z = 2.15, one above.
+        let mut mean_z: Vec<f64> = curves
+            .iter()
+            .map(|c| c.points.iter().map(|p| p.z).sum::<f64>() / c.points.len() as f64)
+            .collect();
+        mean_z.sort_by(f64::total_cmp);
+        assert_eq!(mean_z.len(), 2, "two rings expected");
+        assert!(
+            (mean_z[0] - 1.803).abs() < 0.05 && (mean_z[1] - 2.496).abs() < 0.05,
+            "ring heights off the analytic crossings: {mean_z:?}"
+        );
+        // Each ring wraps the full torus angle (seam-to-seam over one period).
+        for curve in &curves {
+            assert_full_period(curve.params_a.iter().map(|&(u, _)| u), 0.3);
+        }
+    }
+
+    #[test]
+    fn marched_cone_swapped_orders_agree() {
+        // (Cone, Sphere) re-enters as (Sphere, Cone) and swaps the preimages
+        // back: the point sets must match the canonical order.
+        let cone = cone3();
+        let center = Point3::new(0.0, 1.0 + 2.0 * 30f64.to_radians().tan() + 0.4, 2.0);
+        let sph = Surface3::sphere(center, Vector3::z(), 0.8).unwrap();
+        let canon = intersect_marched(&sph, &cone, &default_tol()).unwrap();
+        let swapped = intersect_marched(&cone, &sph, &default_tol()).unwrap();
+        assert_eq!(canon.len(), swapped.len());
+        assert_marched_on_both(&swapped, &cone, &sph);
+        // Same loop, same vertices (order preserved by the shared driver).
+        assert_eq!(canon[0].points, swapped[0].points);
+    }
+
+    #[test]
+    fn marched_cone_disjoint_is_empty() {
+        // Small sphere floating well inside the nappe: no contact.
+        let cone = cone3();
+        let sph = Surface3::sphere(Point3::new(0.0, 0.0, 3.0), Vector3::z(), 0.3).unwrap();
+        let curves = intersect_marched(&sph, &cone, &default_tol()).unwrap();
+        assert!(curves.is_empty(), "interior sphere must not touch the cone");
+    }
+
+    #[test]
+    fn marched_unbounded_cone_pairs_rejected() {
+        // Neither surface is compact, so these carry no partner to seed the
+        // grid and are not handled by intersect_marched (they march through
+        // intersect_marched_bounded instead).
+        let cone = cone3();
+        let plane = Surface3::plane(Point3::new(0.0, 0.0, 1.0), Vector3::x()).unwrap();
+        let cyl = Surface3::cylinder(Point3::new(2.0, 0.0, 0.0), Vector3::z(), 0.5).unwrap();
+        let cone2 = Surface3::cone(
+            Point3::new(0.0, 0.0, 4.0),
+            -Vector3::z(),
+            30f64.to_radians(),
+            1.0,
+        )
+        .unwrap();
+        for (a, b) in [(&cone, &plane), (&cone, &cyl), (&cone, &cone2)] {
+            assert!(
+                matches!(
+                    intersect_marched(a, b, &default_tol()),
+                    Err(CoreError::NotImplemented { .. })
+                ),
+                "unbounded cone pair should be NotImplemented"
+            );
+            assert!(matches!(
+                intersect_marched(b, a, &default_tol()),
+                Err(CoreError::NotImplemented { .. })
+            ));
+        }
     }
 
     /// Fixture for the boundary-point polish: unit sphere and an offset

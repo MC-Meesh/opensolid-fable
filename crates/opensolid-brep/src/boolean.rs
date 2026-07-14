@@ -1318,13 +1318,16 @@ fn marched_ssi_supported(a: &Surface3, b: &Surface3) -> bool {
     use Surface3::*;
     matches!(
         (a, b),
-        (Sphere { .. }, Cylinder { .. })
-            | (Cylinder { .. }, Sphere { .. })
+        (Sphere { .. }, Cylinder { .. } | Cone { .. })
+            | (Cylinder { .. } | Cone { .. }, Sphere { .. })
             | (
                 Torus { .. },
-                Plane { .. } | Cylinder { .. } | Sphere { .. } | Torus { .. }
+                Plane { .. } | Cylinder { .. } | Sphere { .. } | Torus { .. } | Cone { .. }
             )
-            | (Plane { .. } | Cylinder { .. } | Sphere { .. }, Torus { .. })
+            | (
+                Plane { .. } | Cylinder { .. } | Sphere { .. } | Cone { .. },
+                Torus { .. }
+            )
     )
 }
 
@@ -4909,6 +4912,26 @@ mod tests {
 
     fn tol() -> ToleranceContext {
         ToleranceContext::default()
+    }
+
+    #[test]
+    fn marched_ssi_supported_covers_compact_partner_cone_pairs() {
+        let cone = Surface3::cone(Point3::origin(), Vector3::z(), 0.5, 1.0).unwrap();
+        let sphere = Surface3::sphere(Point3::new(0.0, 2.0, 0.0), Vector3::z(), 1.0).unwrap();
+        let torus = Surface3::torus(Point3::origin(), Vector3::z(), 3.0, 1.0).unwrap();
+        let plane = Surface3::plane(Point3::origin(), Vector3::z()).unwrap();
+        let cyl = Surface3::cylinder(Point3::new(2.0, 0.0, 0.0), Vector3::z(), 0.5).unwrap();
+        // Cone against a compact partner marches (both orders).
+        for (a, b) in [(&cone, &sphere), (&cone, &torus)] {
+            assert!(marched_ssi_supported(a, b), "cone/compact must march");
+            assert!(marched_ssi_supported(b, a), "compact/cone must march");
+        }
+        // Cone against an unbounded partner does not (no compact seed): those
+        // route through intersect_marched_bounded, not this predicate.
+        for (a, b) in [(&cone, &plane), (&cone, &cyl), (&cone, &cone)] {
+            assert!(!marched_ssi_supported(a, b), "unbounded cone pair must not");
+            assert!(!marched_ssi_supported(b, a));
+        }
     }
 
     #[test]
