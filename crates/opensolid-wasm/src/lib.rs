@@ -100,6 +100,17 @@ impl WasmProfile2D {
     }
 }
 
+/// Build an [`EdgeRegion`](opensolid_frep::EdgeRegion) from a flat
+/// `[x, y, z, …]` polyline. A trailing partial point (length not a multiple
+/// of 3) is dropped; fewer than two points yields an empty region (no blend).
+fn polyline_region(edge: &[f64]) -> opensolid_frep::EdgeRegion {
+    let points: Vec<Point3> = edge
+        .chunks_exact(3)
+        .map(|c| Point3::new(c[0], c[1], c[2]))
+        .collect();
+    opensolid_frep::EdgeRegion::from_polyline(&points)
+}
+
 /// Mesh buffers for JS consumption: xyz-interleaved positions and normals
 /// (`Float32Array`), and flat triangle indices (`Uint32Array`), three per
 /// triangle, wound counter-clockwise seen from outside.
@@ -313,6 +324,37 @@ impl WasmShape {
     #[wasm_bindgen(js_name = smoothUnion)]
     pub fn smooth_union(&self, other: &WasmShape, radius: Option<f64>) -> WasmShape {
         WasmShape::sdf_only(self.inner.smooth_union(&other.inner, radius))
+    }
+
+    /// Edge-selective **fillet**: a rounded blend of `radius` applied only
+    /// along the selected edge of the union of `self` and `other`. `edge` is
+    /// a flat `[x0, y0, z0, x1, y1, z1, …]` polyline of the picked feature
+    /// edge (the CSG-edge points the mesher recovers); other edges stay
+    /// sharp. SDF-only, no exact companion.
+    #[wasm_bindgen(js_name = filletEdge)]
+    pub fn fillet_edge(&self, other: &WasmShape, radius: f64, edge: Vec<f64>) -> WasmShape {
+        WasmShape::sdf_only(self.inner.blend_edge(
+            &other.inner,
+            opensolid_frep::BooleanKind::Union,
+            opensolid_frep::BlendMode::Fillet,
+            radius,
+            polyline_region(&edge),
+        ))
+    }
+
+    /// Edge-selective **chamfer**: a planar bevel of setback `radius` applied
+    /// only along the selected edge of the union of `self` and `other`.
+    /// `edge` is a flat `[x0, y0, z0, …]` polyline; other edges stay sharp.
+    /// SDF-only, no exact companion.
+    #[wasm_bindgen(js_name = chamferEdge)]
+    pub fn chamfer_edge(&self, other: &WasmShape, radius: f64, edge: Vec<f64>) -> WasmShape {
+        WasmShape::sdf_only(self.inner.blend_edge(
+            &other.inner,
+            opensolid_frep::BooleanKind::Union,
+            opensolid_frep::BlendMode::Chamfer,
+            radius,
+            polyline_region(&edge),
+        ))
     }
 
     /// Signed distance from `(x, y, z)` to the surface: negative inside,

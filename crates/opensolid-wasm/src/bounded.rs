@@ -12,7 +12,9 @@ use opensolid_frep::mesh::{MeshOptions, mesh_sdf_indexed};
 use opensolid_frep::mesh_adaptive::{AdaptiveMeshOptions, mesh_sdf_adaptive_indexed};
 use opensolid_frep::primitives::{Box3, Capsule, Cylinder, RoundedBox, Sdf, Sphere, Torus};
 use opensolid_frep::refine::{RefineOptions, refine_mesh};
-use opensolid_frep::{Extrude, Profile2D, Revolve, SdfTransformExt, Shape};
+use opensolid_frep::{
+    BlendMode, BooleanKind, EdgeRegion, Extrude, Profile2D, Revolve, SdfTransformExt, Shape,
+};
 
 /// Depth bounds for accuracy-driven adaptive meshing: the ceiling keeps the
 /// finest lattice at 512³ virtual cells so interactive remeshing stays
@@ -273,6 +275,35 @@ impl BoundedShape {
         Self {
             shape: self.shape.clone().smooth_union(other.shape.clone(), radius),
             bounds: BoundingBox3::new(combined.min - pad, combined.max + pad),
+        }
+    }
+
+    /// Edge-selective fillet/chamfer: the boolean `kind` of `self` and
+    /// `other`, with its sharp edge rounded (fillet) or beveled (chamfer)
+    /// only within `radius`-scaled reach of the selected edge `region`.
+    /// Untouched edges stay sharp. The blend perturbs the surface by at most
+    /// ~`radius` near the edge, so the boolean's tracked box is padded by
+    /// that much for meshing/framing headroom.
+    pub fn blend_edge(
+        &self,
+        other: &Self,
+        kind: BooleanKind,
+        mode: BlendMode,
+        radius: f64,
+        region: EdgeRegion,
+    ) -> Self {
+        let base = match kind {
+            BooleanKind::Union => self.bounds.union(&other.bounds),
+            BooleanKind::Intersection => bounds_intersection(&self.bounds, &other.bounds),
+            BooleanKind::Subtraction => self.bounds,
+        };
+        let pad = Vector3::repeat(0.5 * radius.max(0.0));
+        Self {
+            shape: self
+                .shape
+                .clone()
+                .blend_edge(other.shape.clone(), kind, mode, radius, region),
+            bounds: BoundingBox3::new(base.min - pad, base.max + pad),
         }
     }
 
@@ -840,5 +871,34 @@ mod tests {
         let mesh = part.mesh(RES, None);
         assert!(!mesh.is_empty());
         assert!(mesh.is_closed_manifold());
+    }
+
+    /// An edge-selective fillet on the union of two overlapping boxes must
+    /// mesh watertight and actually round the selected edge: along the picked
+    /// edge the filleted surface bulges inward relative to the sharp union,
+    /// while a box corner far from the edge is left untouched.
+    #[test]
+    fn blend_edge_fillet_localizes_and_meshes() {
+        let a = BoundedShape::box3(1.0, 1.0, 1.0);
+        let b = BoundedShape::box3(1.0, 1.0, 1.0).translate(Vector3::new(1.0, 0.0, 0.0));
+        // The two unit cubes share the plane x = 1 over y,z ∈ [-1, 1]; the
+        // convex edge picked is the vertical edge at (1, 1, z).
+        let edge =
+            EdgeRegion::from_polyline(&[Point3::new(1.0, 1.0, -1.0), Point3::new(1.0, 1.0, 1.0)]);
+        let sharp = a.union(&b);
+        let filleted = a.blend_edge(&b, BooleanKind::Union, BlendMode::Fillet, 0.3, edge);
+
+        // On the selected edge the fillet fills the concave notch: the field
+        // is strictly more negative (inside) than the sharp union.
+        let on_edge = Point3::new(1.0, 1.0, 0.0);
+        assert!(filleted.distance(on_edge) < sharp.distance(on_edge) - 1e-6);
+
+        // A corner far from the edge is untouched (sharp == filleted).
+        let far = Point3::new(-1.0, -1.0, -1.0);
+        assert!((filleted.distance(far) - sharp.distance(far)).abs() < 1e-9);
+
+        let mesh = filleted.mesh_adaptive(0.01, None);
+        assert!(!mesh.is_empty());
+        assert!(mesh.is_closed_manifold(), "filleted union not manifold");
     }
 }

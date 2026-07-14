@@ -1,5 +1,6 @@
 use crate::blend::SmoothUnion;
 use crate::csg::{Intersection, Subtraction, Union};
+use crate::fillet::{BlendMode, BooleanKind, EdgeBlend, EdgeRegion};
 use crate::primitives::Sdf;
 use opensolid_core::interval::Interval;
 use opensolid_core::types::{BoundingBox3, Point3, Vector3};
@@ -35,6 +36,39 @@ impl Shape {
             b: other,
             radius,
         })
+    }
+
+    /// Boolean of `self` and `other` whose sharp edge is filleted or
+    /// chamfered only within `region` (the selected feature-edge polyline).
+    /// Elsewhere it is exactly the sharp boolean, so untouched edges stay
+    /// crisp. `radius` is the fillet radius / chamfer setback.
+    pub fn blend_edge(
+        self,
+        other: Shape,
+        kind: BooleanKind,
+        mode: BlendMode,
+        radius: f64,
+        region: EdgeRegion,
+    ) -> Shape {
+        Shape::new(EdgeBlend::new(self, other, kind, mode, radius, region))
+    }
+
+    /// Convenience: a rounded fillet on the edge produced by unioning `self`
+    /// with `other`, localized to `region`.
+    pub fn fillet_edge(self, other: Shape, radius: f64, region: EdgeRegion) -> Shape {
+        self.blend_edge(other, BooleanKind::Union, BlendMode::Fillet, radius, region)
+    }
+
+    /// Convenience: a planar chamfer on the edge produced by unioning `self`
+    /// with `other`, localized to `region`.
+    pub fn chamfer_edge(self, other: Shape, radius: f64, region: EdgeRegion) -> Shape {
+        self.blend_edge(
+            other,
+            BooleanKind::Union,
+            BlendMode::Chamfer,
+            radius,
+            region,
+        )
     }
 
     /// True if both handles refer to the same underlying SDF instance.
