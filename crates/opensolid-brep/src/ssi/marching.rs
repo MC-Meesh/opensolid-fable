@@ -645,7 +645,10 @@ fn clipped_domains(
             let (cu, cv) = (e_u.dot(&d), e_v.dot(&d));
             [(cu - reach, cu + reach), (cv - reach, cv + reach)]
         }
-        Surface3::Cylinder { origin, axis, .. } => {
+        Surface3::Cylinder { origin, axis, .. } | Surface3::Cone { origin, axis, .. } => {
+            // The axial band reaching the partner's sphere; the apex-side of
+            // a cone is clipped the same way (the parabola/hyperbola branch
+            // never touches the apex, so no singular `v` is forced in).
             let t = axis.dot(&(center - origin));
             [(0.0, TWO_PI), (t - reach, t + reach)]
         }
@@ -748,9 +751,81 @@ pub fn intersect_marched(
         }
         _ => Err(CoreError::NotImplemented {
             feature: "marched SSI for this surface pair (plane/sphere/cylinder \
-                      combinations have closed forms in ssi::intersect; cones \
-                      are unsupported)",
+                      combinations have closed forms in ssi::intersect; the \
+                      unbounded plane-cone parabola/hyperbola sections march \
+                      through ssi::intersect_marched_bounded)",
         }),
+    }
+}
+
+/// Marched intersection of two *unbounded* analytic primitives within an
+/// explicit region of interest — the plane-cone parabola/hyperbola sections.
+///
+/// Unlike [`intersect_marched`], where one partner is always compact and
+/// bounds the seeding grid, neither a plane nor a cone is bounded, so the
+/// caller supplies the region as a bounding sphere `bounds = (center,
+/// radius)`. The boolean pipeline derives it from the joint extent of the
+/// two clipped faces; only the section inside that region is traced (the
+/// full parabola/hyperbola runs to infinity). Both infinite parameter
+/// directions are clipped to the sphere's reach exactly as
+/// [`intersect_marched`] clips a plane against a compact partner.
+///
+/// Seeding grids over the cone's clipped axial band × full angle and
+/// refines against the plane. Vertices lie on both surfaces within
+/// `tol.linear`, curves are transversal by construction, and a section
+/// crossing the cone's angular seam comes back as open fragments meeting on
+/// it (welded downstream), exactly like the periodic seam handling in
+/// [`intersect_marched`].
+///
+/// Only the parabola/hyperbola branch is routed here; plane-cone circles,
+/// ellipses, the generator-line pair and the apex-only contact are exact in
+/// [`super::intersect`], which returns `NotImplemented` for precisely this
+/// branch.
+///
+/// # Errors
+/// [`CoreError::NotImplemented`] for any pair other than plane-cone, and for
+/// a tangential contact detected while marching (transversal MVP).
+pub fn intersect_marched_bounded(
+    a: &Surface3,
+    b: &Surface3,
+    bounds: (Point3, f64),
+    tol: &ToleranceContext,
+) -> CoreResult<Vec<MarchedCurve>> {
+    use Surface3::*;
+    match (a, b) {
+        // Grid over the cone: its axial parameterization covers the whole
+        // section, whereas a plane grid would need the same clip and gains
+        // nothing.
+        (Cone { .. }, Plane { .. }) => march_bounded_pair(a, b, bounds, tol),
+        (Plane { .. }, Cone { .. }) => {
+            Ok(swap_params(intersect_marched_bounded(b, a, bounds, tol)?))
+        }
+        _ => Err(CoreError::NotImplemented {
+            feature: "bounded marched SSI for this surface pair (only the \
+                      unbounded plane-cone sections are marched with an \
+                      explicit region; every other pair is closed-form in \
+                      ssi::intersect or compact-bounded in intersect_marched)",
+        }),
+    }
+}
+
+/// Grid-seed over `a`, refine against `b`, both clipped to the region-of-
+/// interest sphere `bounds`. Mirrors [`march_primitives`] but takes the
+/// bound explicitly because neither primitive is compact.
+fn march_bounded_pair(
+    a: &Surface3,
+    b: &Surface3,
+    bounds: (Point3, f64),
+    tol: &ToleranceContext,
+) -> CoreResult<Vec<MarchedCurve>> {
+    let [au, av] = clipped_domains(a, bounds, tol);
+    let [bu, bv] = clipped_domains(b, bounds, tol);
+    match march_boxed(a, b, [au, av, bu, bv], tol) {
+        Err(CoreError::Degenerate { .. }) => Err(CoreError::NotImplemented {
+            feature: "marched plane-cone SSI across a tangential contact \
+                      (transversal MVP)",
+        }),
+        other => other,
     }
 }
 
@@ -1198,7 +1273,19 @@ mod tests {
                 let rho = (d - axis * h).norm();
                 ((rho - major_radius).hypot(h) - minor_radius).abs()
             }
-            Surface3::Cone { .. } => unreachable!("no cone marched tests"),
+            Surface3::Cone {
+                origin,
+                axis,
+                half_angle,
+                radius,
+            } => {
+                // Radial deviation from the cone's rho(v) = radius + v·tan α,
+                // scaled by cos α to a true perpendicular distance.
+                let d = p - origin;
+                let v = axis.dot(&d);
+                let rho = (d - axis * v).norm();
+                ((rho - (radius + v * half_angle.tan())) * half_angle.cos()).abs()
+            }
         }
     }
 
@@ -1301,6 +1388,42 @@ mod tests {
         for curve in &curves {
             assert_full_period(curve.params_a.iter().map(|&(u, _)| u), 0.3);
         }
+    }
+
+    #[test]
+    fn marched_bounded_plane_cone_hyperbola() {
+        // Cone widening upward from radius 1 at z = 0, half-angle 30°; apex
+        // below at z = -1/tan30° ≈ -1.732. A vertical plane parallel to the
+        // axis (normal +y) offset 0.5 from it cuts a hyperbola on the upper
+        // nappe: x² = (1 + z·tan30°)² − 0.25 on y = 0.5. The plane sits away
+        // from the cone's +x seam, so the branch traces as one open fragment.
+        let half_angle = 30.0_f64.to_radians();
+        let cone = Surface3::Cone {
+            origin: Point3::origin(),
+            axis: Vector3::z(),
+            half_angle,
+            radius: 1.0,
+        };
+        let plane = Surface3::Plane {
+            origin: Point3::new(0.0, 0.5, 0.0),
+            normal: Vector3::y(),
+        };
+        let bounds = (Point3::new(0.0, 0.5, 1.0), 2.0);
+        let curves = intersect_marched_bounded(&cone, &plane, bounds, &default_tol()).unwrap();
+        assert_eq!(curves.len(), 1, "one open hyperbola branch");
+        assert!(!curves[0].closed, "a hyperbola section is open");
+        assert_marched_on_both(&curves, &cone, &plane);
+        // The branch spreads well out in x within the region of interest.
+        let x_reach = curves[0]
+            .points
+            .iter()
+            .map(|p| p.x.abs())
+            .fold(0.0, f64::max);
+        assert!(x_reach >= 0.8, "hyperbola too short in x: {x_reach}");
+        // Swapped argument order re-enters canonically and swaps preimages.
+        let swapped = intersect_marched_bounded(&plane, &cone, bounds, &default_tol()).unwrap();
+        assert_eq!(swapped.len(), 1);
+        assert_marched_on_both(&swapped, &plane, &cone);
     }
 
     #[test]

@@ -53,7 +53,7 @@ use crate::geometry::GeometryStore;
 use crate::project::CurveProject;
 use crate::ssi::{
     IntersectionKind, MarchedCurve, SurfaceIntersection, intersect as ssi_intersect,
-    intersect_marched,
+    intersect_marched, intersect_marched_bounded,
     marching::{pin_intersection_point, tighten_boundary_point},
 };
 use crate::surface::{Surface3, SurfaceEval};
@@ -1328,6 +1328,20 @@ fn marched_ssi_supported(a: &Surface3, b: &Surface3) -> bool {
     )
 }
 
+/// Whether the pair is plane-cone (either order): the only surfaces marched
+/// through [`intersect_marched_bounded`], whose unbounded parabola/hyperbola
+/// sections have no [`Curve3`] closed form. Every other plane-cone
+/// configuration (circle, ellipse, generator lines, apex-only contact) is
+/// exact in [`ssi_intersect`], so this arm is reached only for the
+/// not-yet-representable branch.
+fn is_plane_cone(a: &Surface3, b: &Surface3) -> bool {
+    use Surface3::*;
+    matches!(
+        (a, b),
+        (Plane { .. }, Cone { .. }) | (Cone { .. }, Plane { .. })
+    )
+}
+
 /// Boolean pipeline entry point.
 fn boolean(
     op: BooleanOp,
@@ -1460,6 +1474,21 @@ impl<'a> Pipeline<'a> {
                 // does not cover keep the analytic error.
                 Err(CoreError::NotImplemented { .. }) if marched_ssi_supported(sa, sb) => {
                     for mc in intersect_marched(sa, sb, &self.tol)? {
+                        for curve in self.marched_polylines(mc, sa, sb) {
+                            self.clip_imprint(&curve, fa, fb, box_a, box_b);
+                        }
+                    }
+                }
+                // Plane-cone parabola/hyperbola sections: unbounded, no
+                // Curve3 closed form, so analytic SSI reports NotImplemented.
+                // Both faces are finite, so their box overlap bounds the
+                // section actually needed here — march only that region
+                // (of-dtj.1). An axis-parallel box wall cutting the cone is
+                // exactly this case.
+                Err(CoreError::NotImplemented { .. }) if is_plane_cone(sa, sb) => {
+                    let joint = box_a.intersection(box_b);
+                    let bounds = (joint.center(), 0.5 * joint.extents().norm());
+                    for mc in intersect_marched_bounded(sa, sb, bounds, &self.tol)? {
                         for curve in self.marched_polylines(mc, sa, sb) {
                             self.clip_imprint(&curve, fa, fb, box_a, box_b);
                         }

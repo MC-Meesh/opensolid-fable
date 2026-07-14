@@ -168,13 +168,14 @@
 //! (of-dtj), so the cases whose SSIs are already exact now run live
 //! (of-fsl.27 promotion pass): the pure plane-cone bites — conical
 //! countersink at 1×/0.001×/1000× scale — and the tilted-cone-block
-//! inclusion–exclusion identity. Five cases stay `#[ignore]`d on the
-//! remaining exact-SSI gaps, now citing their specific open blockers rather
-//! than the resolved gate bead:
-//!   • of-dtj.1 (plane-cone parabola/hyperbola/generator sections):
-//!     `frustum_through_slab`, `cone_block_inclusion_exclusion`,
-//!     `rotated_frustum_bite_invariance` — an axis-parallel (or generator-
-//!     aligned) planar face cuts the cone as a hyperbola, not yet a `Curve3`.
+//! inclusion–exclusion identity. The plane-cone parabola/hyperbola bites are
+//! now live too (of-dtj.1): axis-parallel (or generator-aligned) planar faces
+//! cut the cone as hyperbolae with no `Curve3` closed form, so those sections
+//! are marched inside the joint face extent
+//! (`ssi::intersect_marched_bounded`) — `frustum_through_slab`,
+//! `cone_block_inclusion_exclusion`,
+//! `rotated_frustum_bite_invariance` un-ignored. Two cases stay `#[ignore]`d
+//! on the remaining exact-SSI gap:
 //!   • of-dtj.2 (analytic cone-cone SSI / marched cone path):
 //!     `opposed_cones_intersection`, `coaxial_frustums_union_identity`.
 //! The no-panic guard `no_panics_on_cone_configurations` stays live across
@@ -2360,9 +2361,6 @@ fn no_panics_on_awkward_configurations() {
 /// cylinder `through_hole` case, exercising the cone wall and its two
 /// circular plane-cone SSIs with no apex and no tool cap involved.
 #[test]
-#[ignore = "of-dtj.1: plane-cone SSI returns NotImplemented for parabola/\
-            hyperbola/generator-line sections (axis-parallel slab faces cut \
-            the cone as hyperbolae) — analytic.rs:321"]
 fn frustum_through_slab() {
     let context = "slab minus tapered frustum (through-hole)";
     let mut scene = Scene::new();
@@ -2456,9 +2454,6 @@ fn opposed_cones_intersection() {
 /// (non-closed-form) overlap geometry. Exercises all three ops on cone
 /// inputs at once.
 #[test]
-#[ignore = "of-dtj.1: plane-cone SSI returns NotImplemented for parabola/\
-            hyperbola/generator-line sections (block faces parallel to the \
-            cone axis cut it as hyperbolae) — analytic.rs:321"]
 fn cone_block_inclusion_exclusion() {
     let context = "cone ∪/∩ block inclusion–exclusion";
     let mut scene = Scene::new();
@@ -2550,9 +2545,6 @@ fn tilted_cone_block_identity() {
 /// geometry-complete [`rotate_body`]). Catches frame-dependent chart or
 /// SSI bugs the axis-aligned cases would miss.
 #[test]
-#[ignore = "of-dtj.1: plane-cone SSI returns NotImplemented for parabola/\
-            hyperbola/generator-line sections (a rotated slab face aligns with \
-            a cone generator) — analytic.rs:321"]
 fn rotated_frustum_bite_invariance() {
     // Baseline: axis-aligned countersink bite.
     let mut base_scene = Scene::new();

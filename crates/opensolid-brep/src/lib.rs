@@ -50,7 +50,7 @@ pub use nurbs::{KnotVector, NurbsCurve, NurbsError, NurbsSurface};
 pub use project::{CurveProject, CurveProjection, SurfaceProject, SurfaceProjection};
 pub use ssi::{
     IntersectionCurve, IntersectionKind, MarchedCurve, SurfaceIntersection, intersect,
-    intersect_marched, intersect_nurbs,
+    intersect_marched, intersect_marched_bounded, intersect_nurbs,
 };
 pub use surface::{Surface3, SurfaceEval};
 pub use sweep::{Profile, ProfileSegment, SweptBody, extrude, revolve};

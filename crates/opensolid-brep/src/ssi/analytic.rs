@@ -316,7 +316,8 @@ fn plane_cone(
     // The section is an ellipse iff the plane is steeper to the axis than
     // the generators: (angle of n to axis) + half_angle < π/2. At equality
     // the section is a parabola, beyond it a hyperbola — not representable
-    // as Curve3 yet.
+    // as Curve3, so this stays `NotImplemented`; the boolean pipeline marches
+    // these unbounded sections instead (`ssi::intersect_marched_bounded`).
     let ellipse_margin = cos_n * half_angle.cos() - sin_n * half_angle.sin();
     if ellipse_margin <= angular_tol(tol) {
         return Err(CoreError::NotImplemented {
