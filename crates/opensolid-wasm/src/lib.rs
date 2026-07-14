@@ -24,16 +24,45 @@ use opensolid_kernel::mass_properties;
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 
+/// One queued segment of a WASM profile/path builder, replayed onto the
+/// frep [`Profile2DBuilder`](opensolid_frep::Profile2DBuilder) /
+/// [`OpenPath2DBuilder`](opensolid_frep::OpenPath2DBuilder) at `build()` time.
+/// Each continues from the previous segment's endpoint.
+#[derive(Clone, Copy)]
+enum PathSeg {
+    /// Straight segment to `to`.
+    Line { to: [f64; 2] },
+    /// Circular arc to `to` with the DXF `bulge` (`tan(sweep / 4)`).
+    Arc { to: [f64; 2], bulge: f64 },
+    /// Elliptical arc: sweep `sweep` radians of eccentric angle on the
+    /// ellipse centred at `center` with semi-axes `rx`/`ry` rotated by
+    /// `rotation` (radians). The current point must lie on that ellipse.
+    Ellipse {
+        center: [f64; 2],
+        rx: f64,
+        ry: f64,
+        rotation: f64,
+        sweep: f64,
+    },
+    /// Cubic Bézier to `to` with control points `c1`, `c2`.
+    Cubic {
+        c1: [f64; 2],
+        c2: [f64; 2],
+        to: [f64; 2],
+    },
+}
+
 /// Closed 2D profile builder for [`WasmShape::extrude`] and
-/// [`WasmShape::revolve`]: start at a point, chain `lineTo`/`arcTo`, then
-/// `close()`. Arcs use the DXF bulge convention: `bulge = tan(sweep / 4)`,
-/// positive sweeping counter-clockwise (`1` is a CCW semicircle).
+/// [`WasmShape::revolve`]: start at a point, chain
+/// `lineTo`/`arcTo`/`ellipseArcTo`/`cubicTo`, then `close()`. Arcs use the
+/// DXF bulge convention: `bulge = tan(sweep / 4)`, positive sweeping
+/// counter-clockwise (`1` is a CCW semicircle). Angles for `ellipseArcTo`
+/// are in **degrees** (matching `revolve`/draft), sweep being eccentric
+/// angle (`360` closes a full ellipse, `180` a half).
 #[wasm_bindgen]
 pub struct WasmProfile2D {
-    points: Vec<[f64; 2]>,
-    /// Bulge of the segment leaving `points[i]`; `len == points.len() - 1`
-    /// until `close()` completes the loop.
-    bulges: Vec<f64>,
+    start: [f64; 2],
+    segs: Vec<PathSeg>,
     closed: bool,
 }
 
@@ -43,8 +72,8 @@ impl WasmProfile2D {
     #[wasm_bindgen(constructor)]
     pub fn new(x: f64, y: f64) -> WasmProfile2D {
         WasmProfile2D {
-            points: vec![[x, y]],
-            bulges: Vec::new(),
+            start: [x, y],
+            segs: Vec::new(),
             closed: false,
         }
     }
@@ -53,7 +82,9 @@ impl WasmProfile2D {
     /// `close()`.
     #[wasm_bindgen(js_name = lineTo)]
     pub fn line_to(&mut self, x: f64, y: f64) {
-        self.arc_to(x, y, 0.0);
+        if !self.closed {
+            self.segs.push(PathSeg::Line { to: [x, y] });
+        }
     }
 
     /// Circular arc from the current point to `(x, y)` with the given
@@ -62,8 +93,48 @@ impl WasmProfile2D {
     #[wasm_bindgen(js_name = arcTo)]
     pub fn arc_to(&mut self, x: f64, y: f64, bulge: f64) {
         if !self.closed {
-            self.points.push([x, y]);
-            self.bulges.push(bulge);
+            self.segs.push(PathSeg::Arc { to: [x, y], bulge });
+        }
+    }
+
+    /// Elliptical arc from the current point: sweep `sweepDegrees` of
+    /// eccentric angle on the ellipse centred at `(cx, cy)` with semi-axes
+    /// `rx`/`ry` rotated by `rotationDegrees`. The current point must lie on
+    /// that ellipse; the endpoint follows from the sweep. Ignored after
+    /// `close()`.
+    #[wasm_bindgen(js_name = ellipseArcTo)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn ellipse_arc_to(
+        &mut self,
+        cx: f64,
+        cy: f64,
+        rx: f64,
+        ry: f64,
+        rotation_degrees: f64,
+        sweep_degrees: f64,
+    ) {
+        if !self.closed {
+            self.segs.push(PathSeg::Ellipse {
+                center: [cx, cy],
+                rx,
+                ry,
+                rotation: rotation_degrees.to_radians(),
+                sweep: sweep_degrees.to_radians(),
+            });
+        }
+    }
+
+    /// Cubic Bézier from the current point to `(x, y)` with control points
+    /// `(c1x, c1y)` and `(c2x, c2y)`. Ignored after `close()`.
+    #[wasm_bindgen(js_name = cubicTo)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn cubic_to(&mut self, c1x: f64, c1y: f64, c2x: f64, c2y: f64, x: f64, y: f64) {
+        if !self.closed {
+            self.segs.push(PathSeg::Cubic {
+                c1: [c1x, c1y],
+                c2: [c2x, c2y],
+                to: [x, y],
+            });
         }
     }
 
@@ -77,28 +148,29 @@ impl WasmProfile2D {
 
 impl WasmProfile2D {
     /// Assemble the validated frep profile. Fails if the profile is not
-    /// closed or violates [`Profile2D::new`]'s constraints.
+    /// closed or violates the [`Profile2DBuilder`](opensolid_frep::Profile2DBuilder)
+    /// constraints. The builder closes the loop with a straight segment
+    /// back to the start (a no-op if the path already ends there).
     fn build(&self) -> Result<Profile2D, String> {
         if !self.closed {
             return Err("profile must be closed before sweeping (call close())".into());
         }
-        let mut verts = self.points.clone();
-        let mut bulges = self.bulges.clone();
-        // Drop an explicit return to the start point; otherwise the
-        // implicit closing segment is a straight line (bulge 0).
-        let n = verts.len();
-        if n >= 2 {
-            let first = verts[0];
-            let last = verts[n - 1];
-            if (last[0] - first[0]).hypot(last[1] - first[1]) < 1e-9 {
-                verts.pop();
-            } else {
-                bulges.push(0.0);
-            }
-        } else {
-            bulges.push(0.0);
+        let mut b = Profile2D::builder(self.start);
+        for seg in &self.segs {
+            b = match *seg {
+                PathSeg::Line { to } => b.line_to(to),
+                PathSeg::Arc { to, bulge } => b.arc_to(to, bulge),
+                PathSeg::Ellipse {
+                    center,
+                    rx,
+                    ry,
+                    rotation,
+                    sweep,
+                } => b.ellipse_to(center, rx, ry, rotation, sweep),
+                PathSeg::Cubic { c1, c2, to } => b.cubic_to(c1, c2, to),
+            };
         }
-        Profile2D::new(verts, bulges).map_err(|e| e.to_string())
+        b.build().map_err(|e| e.to_string())
     }
 }
 
@@ -114,14 +186,14 @@ fn polyline_region(edge: &[f64]) -> opensolid_frep::EdgeRegion {
 }
 
 /// Open 2D path builder for [`WasmShape::rib`]: start at a point, chain
-/// `lineTo`/`arcTo`, and pass it straight to `rib` (no `close()` — the path
-/// stays open). Arcs use the same DXF bulge convention as [`WasmProfile2D`]:
-/// `bulge = tan(sweep / 4)`, positive sweeping counter-clockwise.
+/// `lineTo`/`arcTo`/`ellipseArcTo`/`cubicTo`, and pass it straight to `rib`
+/// (no `close()` — the path stays open). Arcs use the same DXF bulge
+/// convention as [`WasmProfile2D`]: `bulge = tan(sweep / 4)`, positive
+/// sweeping counter-clockwise. `ellipseArcTo` angles are in degrees.
 #[wasm_bindgen]
 pub struct WasmOpenPath2D {
-    points: Vec<[f64; 2]>,
-    /// Bulge of the segment leaving `points[i]`; `len == points.len() - 1`.
-    bulges: Vec<f64>,
+    start: [f64; 2],
+    segs: Vec<PathSeg>,
 }
 
 #[wasm_bindgen]
@@ -130,15 +202,15 @@ impl WasmOpenPath2D {
     #[wasm_bindgen(constructor)]
     pub fn new(x: f64, y: f64) -> WasmOpenPath2D {
         WasmOpenPath2D {
-            points: vec![[x, y]],
-            bulges: Vec::new(),
+            start: [x, y],
+            segs: Vec::new(),
         }
     }
 
     /// Straight segment from the current point to `(x, y)`.
     #[wasm_bindgen(js_name = lineTo)]
     pub fn line_to(&mut self, x: f64, y: f64) {
-        self.arc_to(x, y, 0.0);
+        self.segs.push(PathSeg::Line { to: [x, y] });
     }
 
     /// Circular arc from the current point to `(x, y)` with the given bulge
@@ -146,16 +218,67 @@ impl WasmOpenPath2D {
     /// line).
     #[wasm_bindgen(js_name = arcTo)]
     pub fn arc_to(&mut self, x: f64, y: f64, bulge: f64) {
-        self.points.push([x, y]);
-        self.bulges.push(bulge);
+        self.segs.push(PathSeg::Arc { to: [x, y], bulge });
+    }
+
+    /// Elliptical arc from the current point (see
+    /// [`WasmProfile2D::ellipse_arc_to`]): sweep `sweepDegrees` of eccentric
+    /// angle on the ellipse centred at `(cx, cy)` with semi-axes `rx`/`ry`
+    /// rotated by `rotationDegrees`.
+    #[wasm_bindgen(js_name = ellipseArcTo)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn ellipse_arc_to(
+        &mut self,
+        cx: f64,
+        cy: f64,
+        rx: f64,
+        ry: f64,
+        rotation_degrees: f64,
+        sweep_degrees: f64,
+    ) {
+        self.segs.push(PathSeg::Ellipse {
+            center: [cx, cy],
+            rx,
+            ry,
+            rotation: rotation_degrees.to_radians(),
+            sweep: sweep_degrees.to_radians(),
+        });
+    }
+
+    /// Cubic Bézier from the current point to `(x, y)` with control points
+    /// `(c1x, c1y)` and `(c2x, c2y)`.
+    #[wasm_bindgen(js_name = cubicTo)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn cubic_to(&mut self, c1x: f64, c1y: f64, c2x: f64, c2y: f64, x: f64, y: f64) {
+        self.segs.push(PathSeg::Cubic {
+            c1: [c1x, c1y],
+            c2: [c2x, c2y],
+            to: [x, y],
+        });
     }
 }
 
 impl WasmOpenPath2D {
-    /// Assemble the validated frep open path. Fails per [`OpenPath2D::new`]
-    /// (fewer than two vertices, coincident vertices, non-finite input).
+    /// Assemble the validated frep open path. Fails per the
+    /// [`OpenPath2DBuilder`](opensolid_frep::OpenPath2DBuilder) constraints
+    /// (no segments, coincident endpoints, non-finite input).
     fn build(&self) -> Result<OpenPath2D, String> {
-        OpenPath2D::new(self.points.clone(), self.bulges.clone()).map_err(|e| e.to_string())
+        let mut b = OpenPath2D::builder(self.start);
+        for seg in &self.segs {
+            b = match *seg {
+                PathSeg::Line { to } => b.line_to(to),
+                PathSeg::Arc { to, bulge } => b.arc_to(to, bulge),
+                PathSeg::Ellipse {
+                    center,
+                    rx,
+                    ry,
+                    rotation,
+                    sweep,
+                } => b.ellipse_to(center, rx, ry, rotation, sweep),
+                PathSeg::Cubic { c1, c2, to } => b.cubic_to(c1, c2, to),
+            };
+        }
+        b.build().map_err(|e| e.to_string())
     }
 }
 
@@ -1240,6 +1363,9 @@ mod tests {
         let mut p = closed_square();
         p.line_to(5.0, 5.0);
         p.arc_to(9.0, 9.0, 1.0);
+        // Curved segments after close() are dropped too.
+        p.ellipse_arc_to(20.0, 20.0, 3.0, 3.0, 0.0, 180.0);
+        p.cubic_to(30.0, 30.0, 31.0, 31.0, 32.0, 32.0);
         let shape = WasmShape::extrude(&p, 1.0, None).expect("valid extrude");
         assert_eq!(shape.bounds(), vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0]);
     }
@@ -1303,6 +1429,69 @@ mod tests {
         let post = WasmShape::sweep(&closed_disk(0.4), &path).expect("valid sweep");
         let hole = WasmShape::cylinder(0.2, 2.0).translate(0.0, 0.5, 0.0);
         assert_valid(&post.subtract(&hole).mesh(40, None));
+    }
+
+    #[test]
+    fn extrude_ellipse_profile_via_wasm_api() {
+        // A full axis-aligned ellipse rx=1.5, ry=0.6 from two half-arcs
+        // (eccentric sweep 180° each), extruded and meshed.
+        let mut p = WasmProfile2D::new(1.5, 0.0);
+        p.ellipse_arc_to(0.0, 0.0, 1.5, 0.6, 0.0, 180.0);
+        p.ellipse_arc_to(0.0, 0.0, 1.5, 0.6, 0.0, 180.0);
+        p.close();
+        let shape = WasmShape::extrude(&p, 0.8, None).expect("valid ellipse extrude");
+        let b = shape.bounds();
+        // Bounds span the ellipse axes: x ∈ [-1.5, 1.5], z ∈ [-0.6, 0.6],
+        // y ∈ [0, 0.8]. The axis extremes are captured even though only the
+        // two arc endpoints are explicit vertices.
+        assert!(
+            (b[0] + 1.5).abs() < 1e-6 && (b[3] - 1.5).abs() < 1e-6,
+            "x: {b:?}"
+        );
+        assert!(
+            (b[2] + 0.6).abs() < 1e-6 && (b[5] - 0.6).abs() < 1e-6,
+            "z: {b:?}"
+        );
+        assert!((b[1]).abs() < 1e-9 && (b[4] - 0.8).abs() < 1e-9, "y: {b:?}");
+        assert_valid(&shape.mesh(40, None));
+    }
+
+    #[test]
+    fn extrude_cubic_profile_via_wasm_api() {
+        // A teardrop: two cubic Béziers bowing out from a sharp corner at
+        // the origin, extruded and meshed.
+        let mut p = WasmProfile2D::new(0.0, 0.0);
+        p.cubic_to(0.9, 0.2, 0.6, 0.9, 0.0, 1.0);
+        p.cubic_to(-0.6, 0.9, -0.9, 0.2, 0.0, 0.0);
+        p.close();
+        let shape = WasmShape::extrude(&p, 0.7, None).expect("valid cubic extrude");
+        assert_valid(&shape.mesh(44, None));
+    }
+
+    #[test]
+    fn rib_with_cubic_path_via_wasm_api() {
+        // Open path with a cubic wiggle, thickened into a rib and meshed.
+        let mut path = WasmOpenPath2D::new(0.1, 0.1);
+        path.cubic_to(0.4, 0.5, 0.6, -0.3, 0.9, 0.2);
+        let shape = WasmShape::rib(&path, 0.15, 0.6, "both").expect("valid cubic rib");
+        assert_valid(&shape.mesh(40, None));
+    }
+
+    #[test]
+    fn curved_builder_errors_surface_as_strings() {
+        // Ellipse with a zero radius is rejected at build time.
+        let mut bad = WasmProfile2D::new(1.0, 0.0);
+        bad.ellipse_arc_to(0.0, 0.0, 0.0, 1.0, 0.0, 180.0);
+        bad.ellipse_arc_to(0.0, 0.0, 1.0, 1.0, 0.0, 180.0);
+        bad.close();
+        assert!(WasmShape::extrude(&bad, 1.0, None).is_err());
+
+        // A non-finite cubic control point is rejected.
+        let mut nan = WasmProfile2D::new(0.0, 0.0);
+        nan.cubic_to(f64::NAN, 0.5, 0.75, 0.5, 1.0, 0.0);
+        nan.line_to(0.0, 0.0);
+        nan.close();
+        assert!(WasmShape::extrude(&nan, 1.0, None).is_err());
     }
 
     #[test]
