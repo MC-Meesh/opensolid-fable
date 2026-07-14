@@ -1,0 +1,20 @@
+{
+  "name": "opensolid-mcp-server",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "MCP server exposing the OpenSolid kernel as an agentic CAD API surface",
+  "bin": {
+    "opensolid-mcp": "src/server.js"
+  },
+  "scripts": {
+    "build": "node scripts/build-wasm.mjs",
+    "prestart": "node scripts/check-pkg.mjs",
+    "start": "node src/server.js",
+    "pretest": "node scripts/check-pkg.mjs",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

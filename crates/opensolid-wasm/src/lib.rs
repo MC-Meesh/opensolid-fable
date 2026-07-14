@@ -16,9 +16,11 @@ pub mod step;
 
 use bounded::{BoundedShape, flatten_mesh};
 use exact::{ExactPrim, ExactRep, ExactSpec};
+use opensolid_core::mesh::TriangleMesh;
 use opensolid_core::types::{Point3, Vector3};
 use opensolid_frep::Profile2D;
 use opensolid_kernel::brep::BooleanOp;
+use opensolid_kernel::mass_properties;
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 
@@ -167,6 +169,52 @@ impl WasmShape {
         let (a, b) = (self.exact.as_ref()?, other.exact.as_ref()?);
         exact::exact_boolean(op, a, b).map(|out| ExactRep::Boolean(Rc::new(out)))
     }
+
+    /// Whether `measure`/`validate` will read the validated exact
+    /// tessellation rather than an adaptive SDF mesh.
+    fn measured_exact(&self) -> bool {
+        exact::exact_enabled()
+            && self
+                .exact
+                .as_ref()
+                .is_some_and(|r| r.exact_mesh().is_some())
+    }
+
+    /// Run `f` over the mesh that measurement should use: the validated
+    /// exact tessellation when this shape resolves to one (see
+    /// [`measured_exact`](Self::measured_exact)), otherwise an adaptive SDF
+    /// mesh at `accuracy` (non-finite/non-positive/absent falls back to 0.5%
+    /// of the shape's extent — the same default as STEP export).
+    fn with_measure_mesh<R>(&self, accuracy: Option<f64>, f: impl FnOnce(&TriangleMesh) -> R) -> R {
+        if exact::exact_enabled() {
+            if let Some(mesh) = self.exact.as_ref().and_then(|r| r.exact_mesh()) {
+                return f(mesh);
+            }
+        }
+        let size = self.inner.bounds.max - self.inner.bounds.min;
+        let extent = size.x.max(size.y).max(size.z).max(1e-9);
+        let accuracy = match accuracy {
+            Some(a) if a.is_finite() && a > 0.0 => a,
+            _ => 5e-3 * extent,
+        };
+        f(&self.inner.mesh_adaptive(accuracy, None))
+    }
+}
+
+/// Format a float as a JSON number, emitting `null` for non-finite values
+/// (JSON has no NaN/Infinity literal).
+fn json_num(x: f64) -> String {
+    if x.is_finite() {
+        format!("{x}")
+    } else {
+        "null".to_string()
+    }
+}
+
+/// Escape a string for embedding as a JSON string literal (backslash and
+/// quote only — kernel error messages contain no control characters).
+fn json_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 #[wasm_bindgen]
@@ -463,6 +511,117 @@ impl WasmShape {
             indices: flat.indices,
         }
     }
+
+    /// Mass properties of the enclosed solid, as a JSON object string:
+    /// `{ volume, surfaceArea, centroid:[x,y,z], inertia:[[…],[…],[…]],
+    /// boundingBox:{min,max,size}, triangles, vertices, exact }`.
+    ///
+    /// Volume, centroid, and inertia (about the centroid, unit density) are
+    /// exact polyhedral integrals over the measured mesh — the validated
+    /// exact tessellation when [`isExact`](Self::is_exact), otherwise an
+    /// adaptive SDF mesh at `accuracy` (same knob as `meshAdaptive`,
+    /// defaulting to 0.5% of the shape's extent). When the mesh does not
+    /// bound a finite non-zero volume those fields are `null` and
+    /// `massError` explains why; the bounding box is always present.
+    pub fn measure(&self, accuracy: Option<f64>) -> String {
+        let bounds = &self.inner.bounds;
+        let (min, max) = (bounds.min, bounds.max);
+        let bbox = format!(
+            "\"boundingBox\":{{\"min\":[{},{},{}],\"max\":[{},{},{}],\"size\":[{},{},{}]}}",
+            json_num(min.x),
+            json_num(min.y),
+            json_num(min.z),
+            json_num(max.x),
+            json_num(max.y),
+            json_num(max.z),
+            json_num(max.x - min.x),
+            json_num(max.y - min.y),
+            json_num(max.z - min.z),
+        );
+        let exact = self.measured_exact();
+        self.with_measure_mesh(accuracy, |mesh| {
+            let counts = format!(
+                "\"triangles\":{},\"vertices\":{},\"exact\":{}",
+                mesh.triangle_count(),
+                mesh.vertex_count(),
+                exact,
+            );
+            match mass_properties(mesh) {
+                Ok(mp) => {
+                    let i = &mp.inertia;
+                    format!(
+                        "{{\"volume\":{},\"surfaceArea\":{},\"centroid\":[{},{},{}],\
+                         \"inertia\":[[{},{},{}],[{},{},{}],[{},{},{}]],{},{}}}",
+                        json_num(mp.volume),
+                        json_num(mp.surface_area),
+                        json_num(mp.centroid.x),
+                        json_num(mp.centroid.y),
+                        json_num(mp.centroid.z),
+                        json_num(i[(0, 0)]),
+                        json_num(i[(0, 1)]),
+                        json_num(i[(0, 2)]),
+                        json_num(i[(1, 0)]),
+                        json_num(i[(1, 1)]),
+                        json_num(i[(1, 2)]),
+                        json_num(i[(2, 0)]),
+                        json_num(i[(2, 1)]),
+                        json_num(i[(2, 2)]),
+                        bbox,
+                        counts,
+                    )
+                }
+                Err(e) => format!(
+                    "{{\"volume\":null,\"surfaceArea\":null,\"centroid\":null,\
+                     \"inertia\":null,{},{},\"massError\":\"{}\"}}",
+                    bbox,
+                    counts,
+                    json_escape(&e.to_string()),
+                ),
+            }
+        })
+    }
+
+    /// A structural check report for the shape's measured mesh, as a JSON
+    /// object string: `{ valid, closedManifold, triangles, vertices, volume,
+    /// exact, issues:[…] }`. `valid` is true exactly when the mesh is
+    /// non-empty, a closed and consistently oriented 2-manifold, and encloses
+    /// a finite non-zero volume; otherwise `issues` names each failure.
+    pub fn validate(&self, accuracy: Option<f64>) -> String {
+        let exact = self.measured_exact();
+        self.with_measure_mesh(accuracy, |mesh| {
+            let mut issues: Vec<String> = Vec::new();
+            if mesh.triangle_count() == 0 {
+                issues.push("mesh is empty".to_string());
+            }
+            let closed = mesh.is_closed_manifold();
+            if !closed {
+                issues.push("mesh is not a closed, consistently oriented manifold".to_string());
+            }
+            let volume = match mass_properties(mesh) {
+                Ok(mp) => json_num(mp.volume),
+                Err(e) => {
+                    issues.push(e.to_string());
+                    "null".to_string()
+                }
+            };
+            let issues_json = issues
+                .iter()
+                .map(|s| format!("\"{}\"", json_escape(s)))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(
+                "{{\"valid\":{},\"closedManifold\":{},\"triangles\":{},\"vertices\":{},\
+                 \"volume\":{},\"exact\":{},\"issues\":[{}]}}",
+                issues.is_empty(),
+                closed,
+                mesh.triangle_count(),
+                mesh.vertex_count(),
+                volume,
+                exact,
+                issues_json,
+            )
+        })
+    }
 }
 
 #[cfg(test)]
@@ -537,6 +696,51 @@ mod tests {
         assert!((s.distance(4.0, 0.0, 0.0) - 1.0).abs() < 1e-12);
         assert!(s.distance(3.0, 0.0, 0.0).abs() < 1e-12);
         assert!(s.distance(2.0, 0.0, 0.0) < 0.0);
+    }
+
+    /// Pull `"<key>":<number>` out of a JSON object string (no braces or
+    /// nested arrays around the value). Returns `None` for `null`.
+    fn json_field(json: &str, key: &str) -> Option<f64> {
+        let needle = format!("\"{key}\":");
+        let start = json.find(&needle)? + needle.len();
+        let rest = &json[start..];
+        let end = rest.find([',', '}', ']']).unwrap_or(rest.len());
+        rest[..end].trim().parse().ok()
+    }
+
+    #[test]
+    fn measure_reports_box_volume_and_centroid() {
+        // Half-extents (1, 0.5, 0.75) → 2×1×1.5 box, volume 3, centroid at
+        // the origin. Adaptive SDF meshing, exact booleans off (the default).
+        let json = WasmShape::box3(1.0, 0.5, 0.75).measure(None);
+        let volume = json_field(&json, "volume").expect("volume present");
+        assert!(
+            (volume - 3.0).abs() < 0.05,
+            "volume {volume} ≉ 3.0 in {json}"
+        );
+        assert!(json.contains("\"boundingBox\""));
+        assert!(json.contains("\"exact\":false"));
+        // Translating the box shifts the centroid but not the volume.
+        let moved = WasmShape::box3(1.0, 0.5, 0.75)
+            .translate(4.0, 0.0, 0.0)
+            .measure(None);
+        assert!((json_field(&moved, "volume").unwrap() - 3.0).abs() < 0.05);
+    }
+
+    #[test]
+    fn validate_accepts_solid_and_reports_boolean_result() {
+        let sphere = WasmShape::sphere(1.0).validate(None);
+        assert!(sphere.contains("\"valid\":true"), "{sphere}");
+        assert!(sphere.contains("\"closedManifold\":true"));
+        let volume = json_field(&sphere, "volume").expect("volume present");
+        // Sphere volume 4/3·π ≈ 4.19; adaptive mesh is a slight under-estimate.
+        assert!((volume - 4.18879).abs() < 0.1, "sphere volume {volume}");
+
+        // A boolean difference still validates as a watertight solid.
+        let part = WasmShape::box3(1.0, 1.0, 1.0)
+            .subtract(&WasmShape::cylinder(0.4, 2.0))
+            .validate(None);
+        assert!(part.contains("\"valid\":true"), "{part}");
     }
 
     #[test]
