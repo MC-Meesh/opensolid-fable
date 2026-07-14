@@ -1191,7 +1191,7 @@ export default forwardRef(function SketchCanvas(
         setTool('select');
         const { min, max } = opsBounds(ops);
         const extent = Math.max(max[0] - min[0], max[1] - min[1]) || 1;
-        setView((v) => ({
+        onViewChangeRef.current?.({
           cx: (min[0] + max[0]) / 2,
           cy: (min[1] + max[1]) / 2,
           scale:
@@ -1201,8 +1201,8 @@ export default forwardRef(function SketchCanvas(
                 MIN_SCALE,
                 (0.6 * Math.min(size.w || 800, size.h || 600)) / extent
               )
-            ) || v.scale,
-        }));
+            ) || viewRef.current.scale,
+        });
         touch();
       },
     }),
