@@ -100,6 +100,14 @@ export const OP_SPECS = {
       { label: 'Size', fields: [size(6, 'r')] },
     ],
   },
+  halfSpace: {
+    kind: 'primitive',
+    title: 'Half space',
+    groups: [
+      { label: 'Point', fields: xyz(coord) },
+      { label: 'Normal', fields: xyz(axis, 3) },
+    ],
+  },
   translate: {
     kind: 'transform',
     title: 'Translate',

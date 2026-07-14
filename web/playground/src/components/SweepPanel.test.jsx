@@ -13,27 +13,70 @@ describe('SweepPanel', () => {
   it('renders nothing without a pending sweep', () => {
     expect(
       renderToString(
-        <SweepPanel sweep={null} error={null} onChange={noop} onApply={noop} onCancel={noop} />
+        <SweepPanel
+          sweep={null}
+          error={null}
+          onChange={noop}
+          onField={noop}
+          onApply={noop}
+          onCancel={noop}
+        />
       )
     ).toBe('');
   });
 
-  it('renders extrude with a height field and actions', () => {
+  it('renders extrude with mode, end, height, draft, and actions', () => {
     const html = renderToString(
       <SweepPanel
         sweep={{ kind: 'extrude', plane: 'XY', ops: null, value: 2, range: 8 }}
         error={null}
         onChange={noop}
+        onField={noop}
         onApply={noop}
         onCancel={noop}
       />
     );
     expect(html).toContain('Extrude');
     expect(html).toMatch(/<span class="sweep-plane">XY/);
+    expect(html).toContain('Boss');
+    expect(html).toContain('Cut');
+    expect(html).toContain('Through all');
     expect(html).toContain('Height');
+    expect(html).toContain('Draft');
     expect(html).toContain('Flip direction');
     expect(html).toContain('Apply');
     expect(html).toContain('Cancel');
+  });
+
+  it('hides the height field and prompts for a face when up-to-face', () => {
+    const html = renderToString(
+      <SweepPanel
+        sweep={{ kind: 'extrude', plane: 'XY', ops: null, value: 2, range: 8, end: 'toFace' }}
+        error={null}
+        onChange={noop}
+        onField={noop}
+        onApply={noop}
+        onCancel={noop}
+      />
+    );
+    expect(html).not.toContain('Height');
+    expect(html).toContain('Click a flat face to terminate');
+    // Centered/derived end conditions do not offer Flip direction.
+    expect(html).not.toContain('Flip direction');
+  });
+
+  it('reflects the cut mode selection', () => {
+    const html = renderToString(
+      <SweepPanel
+        sweep={{ kind: 'extrude', plane: 'XY', ops: null, value: 2, range: 8, mode: 'cut' }}
+        error={null}
+        onChange={noop}
+        onField={noop}
+        onApply={noop}
+        onCancel={noop}
+      />
+    );
+    expect(html).toMatch(/aria-checked="true"[^>]*>Cut/);
   });
 
   it('shows the magnitude and checks Flip for reverse extrudes', () => {
@@ -42,6 +85,7 @@ describe('SweepPanel', () => {
         sweep={{ kind: 'extrude', plane: 'XY', ops: null, value: -2, range: 8 }}
         error={null}
         onChange={noop}
+        onField={noop}
         onApply={noop}
         onCancel={noop}
       />
@@ -63,6 +107,7 @@ describe('SweepPanel', () => {
         sweep={{ kind: 'extrude', plane: face, ops: null, value: 2, range: 8 }}
         error={null}
         onChange={noop}
+        onField={noop}
         onApply={noop}
         onCancel={noop}
       />
@@ -70,18 +115,21 @@ describe('SweepPanel', () => {
     expect(html).toMatch(/<span class="sweep-plane">Face/);
   });
 
-  it('renders revolve with an angle field and shows errors', () => {
+  it('renders revolve with an angle field, no extrude controls, and shows errors', () => {
     const html = renderToString(
       <SweepPanel
         sweep={{ kind: 'revolve', plane: 'XZ', ops: null, value: 360, range: 360 }}
         error="revolve profile must lie in u >= 0"
         onChange={noop}
+        onField={noop}
         onApply={noop}
         onCancel={noop}
       />
     );
     expect(html).toContain('Revolve');
     expect(html).toContain('Angle');
+    expect(html).not.toContain('Boss');
+    expect(html).not.toContain('Draft');
     expect(html).toContain('u &gt;= 0');
     // Apply is disabled while the sweep is invalid.
     expect(html).toMatch(/<button[^>]*disabled[^>]*>Apply<\/button>/);

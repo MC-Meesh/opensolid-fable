@@ -10,7 +10,9 @@ use opensolid_core::mesh::TriangleMesh;
 use opensolid_core::types::{BoundingBox3, Point3, Transform3, Vector3};
 use opensolid_frep::mesh::{MeshOptions, mesh_sdf_indexed};
 use opensolid_frep::mesh_adaptive::{AdaptiveMeshOptions, mesh_sdf_adaptive_indexed};
-use opensolid_frep::primitives::{Box3, Capsule, Cylinder, RoundedBox, Sdf, Sphere, Torus};
+use opensolid_frep::primitives::{
+    Box3, Capsule, Cylinder, HalfSpace, RoundedBox, Sdf, Sphere, Torus,
+};
 use opensolid_frep::refine::{RefineOptions, refine_mesh};
 use opensolid_frep::{
     BlendMode, BooleanKind, EdgeRegion, Extrude, Profile2D, Revolve, SdfTransformExt, Shape,
@@ -141,15 +143,49 @@ impl BoundedShape {
     /// # Errors
     /// Propagates [`Extrude::new`] validation (`height > 0` and finite).
     pub fn extrude(profile: Profile2D, height: f64) -> CoreResult<Self> {
+        Self::extrude_draft(profile, height, 0.0)
+    }
+
+    /// The profile swept along +Y with a `draft` angle (radians): the section
+    /// tapers inward (positive) or flares outward (negative) with height. See
+    /// [`Extrude::with_draft`].
+    ///
+    /// # Errors
+    /// Propagates [`Extrude::with_draft`] validation (`height > 0` and finite,
+    /// `|draft| < `[`opensolid_frep::MAX_DRAFT`]).
+    pub fn extrude_draft(profile: Profile2D, height: f64, draft: f64) -> CoreResult<Self> {
+        // Build first so an invalid draft/height errors before we touch the
+        // profile bounds.
+        let shape = Extrude::with_draft(profile.clone(), height, draft)?;
         let (min, max) = profile.bounds();
+        // A negative draft flares the top out past the base profile by up to
+        // |tan(draft)|·height; pad the lateral box so the mesher's derived
+        // grid still contains the whole solid. Positive draft only shrinks.
+        let pad = (-draft.tan() * height).max(0.0);
         let bounds = BoundingBox3::new(
-            Point3::new(min[0], 0.0, min[1]),
-            Point3::new(max[0], height, max[1]),
+            Point3::new(min[0] - pad, 0.0, min[1] - pad),
+            Point3::new(max[0] + pad, height, max[1] + pad),
         );
         Ok(Self {
-            shape: Shape::new(Extrude::new(profile, height)?),
+            shape: Shape::new(shape),
             bounds,
         })
+    }
+
+    /// A half-space: the closed set on the negative side of the plane through
+    /// `point` with unit-ish outward `normal` (interior where
+    /// `normal · (p − point) ≤ 0`). Unbounded, so its tracked box is a large
+    /// finite cube — intended only as an operand of `intersect` (e.g. the
+    /// "up to face" extrude terminator), where the result inherits the other
+    /// operand's finite bounds.
+    pub fn half_space(point: Point3, normal: Vector3) -> Self {
+        let n = normal.try_normalize(1e-12).unwrap_or_else(Vector3::y);
+        let offset = n.dot(&point.coords);
+        const FAR: f64 = 1.0e6;
+        Self {
+            shape: Shape::new(HalfSpace { normal: n, offset }),
+            bounds: BoundingBox3::new(Point3::new(-FAR, -FAR, -FAR), Point3::new(FAR, FAR, FAR)),
+        }
     }
 
     /// The profile revolved around the Y axis through `angle` radians,
@@ -835,10 +871,82 @@ mod tests {
         assert_meshes_cleanly(&partial);
     }
 
+    fn unit_square() -> Profile2D {
+        Profile2D::new(
+            vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+            vec![0.0; 4],
+        )
+        .expect("valid square")
+    }
+
+    /// Signed volume enclosed by a closed mesh via the divergence theorem:
+    /// (1/6) Σ v0 · (v1 × v2) over outward-oriented triangles.
+    fn mesh_volume(mesh: &TriangleMesh) -> f64 {
+        let mut v = 0.0;
+        for [i, j, k] in &mesh.indices {
+            let a = mesh.positions[*i].coords;
+            let b = mesh.positions[*j].coords;
+            let c = mesh.positions[*k].coords;
+            v += a.dot(&b.cross(&c));
+        }
+        v / 6.0
+    }
+
+    #[test]
+    fn draft_orders_volume_and_meshes() {
+        // Positive draft narrows the section (less volume than the prism);
+        // negative draft flares it (more). All three mesh watertight.
+        let straight = BoundedShape::extrude(unit_square(), 1.0).expect("valid");
+        let inward = BoundedShape::extrude_draft(unit_square(), 1.0, 0.2).expect("valid");
+        let outward = BoundedShape::extrude_draft(unit_square(), 1.0, -0.2).expect("valid");
+        let vol = |s: &BoundedShape| mesh_volume(&assert_meshes_cleanly(s)).abs();
+        let (vi, vs, vo) = (vol(&inward), vol(&straight), vol(&outward));
+        assert!(vi < vs, "inward draft {vi} !< straight {vs}");
+        assert!(vs < vo, "straight {vs} !< outward draft {vo}");
+    }
+
+    #[test]
+    fn positive_draft_matches_frustum_volume() {
+        // A unit square drafted by tan(draft)=0.2 over height 1 is a square
+        // frustum: base side 1, each wall inset by 0.2 → top side 0.6.
+        // V = (H/3)(A_b + A_t + sqrt(A_b·A_t)).
+        let draft = 0.2_f64.atan();
+        let s = BoundedShape::extrude_draft(unit_square(), 1.0, draft).expect("valid");
+        let mesh = s.mesh_adaptive(0.004, None);
+        let (a_b, a_t) = (1.0_f64, 0.6_f64 * 0.6);
+        let expected = (1.0 / 3.0) * (a_b + a_t + (a_b * a_t).sqrt());
+        let got = mesh_volume(&mesh).abs();
+        assert!(
+            (got - expected).abs() < 0.03 * expected,
+            "frustum volume {got} vs expected {expected}"
+        );
+    }
+
+    #[test]
+    fn half_space_clips_extrude_up_to_face() {
+        // "Up to face": a through-all extrude (height 2) intersected with the
+        // half-space below y = 0.5 terminates the solid at that plane. Volume
+        // = base area (1) × 0.5.
+        let tall = BoundedShape::extrude(unit_square(), 2.0).expect("valid");
+        let stop =
+            BoundedShape::half_space(Point3::new(0.0, 0.5, 0.0), Vector3::new(0.0, 1.0, 0.0));
+        let clipped = tall.intersect(&stop);
+        // The intersection inherits the extrude's finite bounds (not FAR).
+        assert!(clipped.bounds.max.y <= 2.0 + 1e-9);
+        let mesh = clipped.mesh_adaptive(0.004, None);
+        assert!(mesh.is_closed_manifold(), "clipped solid not watertight");
+        let got = mesh_volume(&mesh).abs();
+        assert!((got - 0.5).abs() < 0.02, "clipped volume {got} vs 0.5");
+        // Top cap sits on the terminating plane.
+        assert!(clipped.shape.eval(&Point3::new(0.5, 0.5, 0.5)).abs() < 1e-9);
+    }
+
     #[test]
     fn extrude_and_revolve_reject_bad_input() {
         assert!(BoundedShape::extrude(l_profile(), 0.0).is_err());
         assert!(BoundedShape::extrude(l_profile(), -1.0).is_err());
+        assert!(BoundedShape::extrude_draft(l_profile(), 1.0, f64::NAN).is_err());
+        assert!(BoundedShape::extrude_draft(l_profile(), 1.0, 1.5).is_err());
         assert!(BoundedShape::revolve(l_profile(), 0.0).is_err());
         assert!(BoundedShape::revolve(l_profile(), 7.0).is_err());
         // Profile crossing to negative u cannot be revolved.

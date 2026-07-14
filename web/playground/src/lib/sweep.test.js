@@ -8,6 +8,7 @@ import {
   sweepPostOps,
   sweepTreeNode,
 } from './sweep.js';
+import { extrudePlan } from './sweep.js';
 import { serializeTree } from './sceneTree.js';
 import { planeNormal, planeToWorld } from './sketch/profile.js';
 import { facePlaneBasis } from './facePlane.js';
@@ -520,6 +521,188 @@ describe('sweepTreeNode', () => {
     walk(node);
     expect(ids.filter((id) => id < 0)).toHaveLength(ids.length - 1);
     expect(new Set(ids).size).toBe(ids.length);
+  });
+});
+
+describe('extrudePlan (end conditions)', () => {
+  const base = { kind: 'extrude', plane: 'XY', ops: null, value: 2 };
+
+  it('blind carries the signed height and no extras', () => {
+    expect(extrudePlan({ ...base, end: 'blind', value: -3, draft: 0 })).toEqual({
+      param: -3,
+      height: 3,
+      draft: 0,
+      postExtra: [],
+      clip: null,
+    });
+  });
+
+  it('symmetric extrudes forward then re-centers on the plane', () => {
+    const plan = extrudePlan({ ...base, end: 'symmetric', value: 2, draft: 5 });
+    expect(plan.param).toBe(2);
+    expect(plan.height).toBe(2);
+    expect(plan.draft).toBe(5);
+    expect(plan.postExtra[0].op).toBe('translate');
+    expect(plan.postExtra[0].args.map((c) => c + 0)).toEqual([0, 0, -1]);
+    expect(plan.clip).toBeNull();
+  });
+
+  it('through all sizes from the scene reach, centered', () => {
+    const plan = extrudePlan({ ...base, end: 'through', value: 2, reach: 10 });
+    expect(plan.height).toBe(10);
+    expect(plan.param).toBe(10);
+    expect(plan.postExtra[0].args.map((c) => c + 0)).toEqual([0, 0, -5]);
+  });
+
+  it('up-to-face extrudes toward the target and clips at its plane', () => {
+    const target = { origin: [0, 0, 4], normal: [0, 0, 1] };
+    const plan = extrudePlan({ ...base, end: 'toFace', reach: 10, target });
+    // Target is on +z, so the extrude goes forward and clips keeping z <= 4.
+    expect(plan.param).toBe(10);
+    expect(plan.clip).toEqual({ point: [0, 0, 4], normal: [0, 0, 1] });
+  });
+
+  it('up-to-face flips direction and keep-side for a target below the plane', () => {
+    const target = { origin: [0, 0, -4], normal: [0, 0, 1] };
+    const plan = extrudePlan({ ...base, end: 'toFace', reach: 10, target });
+    expect(plan.param).toBe(-10);
+    // Normalize -0 to 0 for a stable comparison.
+    expect(plan.clip.normal.map((c) => c + 0)).toEqual([0, 0, -1]);
+  });
+
+  it('up-to-face without a target is an error', () => {
+    expect(() => extrudePlan({ ...base, end: 'toFace' })).toThrow(/target face/);
+  });
+});
+
+// Richer stand-in adding the CSG + halfSpace surface the extrude modes use.
+class CsgShape {
+  constructor(desc) {
+    this.desc = desc;
+    this.freed = false;
+  }
+  free() {
+    this.freed = true;
+  }
+  static extrude(profile, height, draft) {
+    return new CsgShape(['extrude', profile.trace.slice(), height, draft]);
+  }
+  static halfSpace(px, py, pz, nx, ny, nz) {
+    return new CsgShape(['halfSpace', px, py, pz, nx, ny, nz]);
+  }
+  translate(x, y, z) {
+    return new CsgShape(['translate', this.desc, x, y, z]);
+  }
+  rotate(ax, ay, az, angle) {
+    return new CsgShape(['rotate', this.desc, ax, ay, az, angle]);
+  }
+  intersect(other) {
+    return new CsgShape(['intersect', this.desc, other.desc]);
+  }
+}
+
+class CsgProfile {
+  constructor(x, y) {
+    this.trace = [['new', x, y]];
+  }
+  arcTo(x, y, bulge) {
+    this.trace.push(['arcTo', x, y, bulge]);
+  }
+  close() {
+    this.trace.push(['close']);
+  }
+  free() {}
+}
+
+describe('buildSweepShape (modes)', () => {
+  const ops = profileToOps(SQUARE);
+
+  it('passes the draft angle through to Shape.extrude', () => {
+    const shape = buildSweepShape(CsgShape, CsgProfile, {
+      kind: 'extrude',
+      plane: 'XZ',
+      ops,
+      value: 2,
+      end: 'blind',
+      draft: 7,
+    });
+    // XZ blind forward: no post-ops, so the extrude is the shape itself.
+    expect(shape.desc[0]).toBe('extrude');
+    expect(shape.desc[2]).toBe(2);
+    expect(shape.desc[3]).toBe(7);
+  });
+
+  it('intersects a through-all extrude with a half-space for up-to-face', () => {
+    const shape = buildSweepShape(CsgShape, CsgProfile, {
+      kind: 'extrude',
+      plane: 'XY',
+      ops,
+      value: 2,
+      end: 'toFace',
+      reach: 10,
+      target: { origin: [0, 0, 4], normal: [0, 0, 1] },
+    });
+    expect(shape.desc[0]).toBe('intersect');
+    // Second operand is the terminating half-space at the target plane.
+    expect(shape.desc[2]).toEqual(['halfSpace', 0, 0, 4, 0, 0, 1]);
+  });
+});
+
+describe('sweepTreeNode (modes)', () => {
+  const ops = profileToOps(SQUARE);
+
+  it('subtracts a cut extrude from the existing root', () => {
+    const root = { id: 7, op: 'sphere', args: [1], children: [] };
+    const node = sweepTreeNode(root, {
+      kind: 'extrude',
+      plane: 'XY',
+      ops,
+      value: 2,
+      mode: 'cut',
+      end: 'blind',
+    });
+    expect(node.op).toBe('subtract');
+    expect(serializeTree(node)).toContain(
+      'return Shape.sphere(1).subtract('
+    );
+  });
+
+  it('serializes a draft angle as a third extrude argument', () => {
+    const node = sweepTreeNode(null, {
+      kind: 'extrude',
+      plane: 'XZ',
+      ops,
+      value: 2,
+      draft: 5,
+    });
+    expect(serializeTree(node)).toContain('Shape.extrude(p1, 2, 5)');
+  });
+
+  it('serializes a symmetric extrude with the centering translate', () => {
+    const node = sweepTreeNode(null, {
+      kind: 'extrude',
+      plane: 'XZ',
+      ops,
+      value: 2,
+      end: 'symmetric',
+    });
+    // XZ normal is +Y; centering slides back half the height.
+    expect(serializeTree(node)).toContain('Shape.extrude(p1, 2).translate(0, -1, 0)');
+  });
+
+  it('serializes an up-to-face extrude as an intersect with a half-space', () => {
+    const node = sweepTreeNode(null, {
+      kind: 'extrude',
+      plane: 'XY',
+      ops,
+      value: 2,
+      end: 'toFace',
+      reach: 8,
+      target: { origin: [0, 0, 3], normal: [0, 0, 1] },
+    });
+    const script = serializeTree(node);
+    expect(script).toContain('Shape.halfSpace(0, 0, 3, 0, 0, 1)');
+    expect(script).toMatch(/\.intersect\(Shape\.halfSpace/);
   });
 });
 

@@ -7,10 +7,13 @@ export const DEFAULT_SCRIPT = `// Build a shape with the OpenSolid API and retur
 //   Shape.cylinder(r, halfHeight)       axis along y
 //   Shape.torus(major, minor)           ring in the xz plane
 //   Shape.capsule(x1,y1,z1, x2,y2,z2, r)
+//   Shape.halfSpace(px,py,pz, nx,ny,nz)  solid side of a plane; intersect it
+//                                       to terminate an extrude "up to face"
 // Sweeps (build a closed 2D profile, then sweep it):
 //   const p = new Profile(x, y);        start point
 //   p.lineTo(x, y)  p.arcTo(x, y, bulge)  p.close()
-//   Shape.extrude(p, height)            profile (x,y)->(x,z), swept along +y
+//   Shape.extrude(p, height, draft?)    profile (x,y)->(x,z), swept along +y;
+//                                       optional draft angle (deg) tapers it
 //   Shape.revolve(p, angleDegrees)      around the y axis, x is the radius
 // Transforms (each returns a new shape):
 //   .translate(x, y, z)

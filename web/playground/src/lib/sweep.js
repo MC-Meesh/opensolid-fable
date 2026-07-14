@@ -18,8 +18,28 @@
 // stand-in Shape/Profile classes (same pattern as sceneTree.js).
 
 import { arcSweep } from './sketch/geom.js';
-import { isFacePlane, segmentEnd2D, segmentStart2D } from './sketch/profile.js';
+import {
+  isFacePlane,
+  planeNormal,
+  planeToWorld,
+  segmentEnd2D,
+  segmentStart2D,
+} from './sketch/profile.js';
 import { axisAngleFromBasis } from './facePlane.js';
+
+/** Extrude end conditions (SolidWorks parity). `blind` is the default: a
+ * signed height on one side of the sketch plane. `symmetric` centers the
+ * same height on the plane; `through` fills the whole scene both ways;
+ * `toFace` terminates the extrude at a target plane (a picked face). */
+export const END_CONDITIONS = ['blind', 'symmetric', 'through', 'toFace'];
+
+/** Extrude modes: `boss` adds material (union with the scene), `cut`
+ * removes it (subtract from the scene). */
+export const EXTRUDE_MODES = ['boss', 'cut'];
+
+const dot3 = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+const scale3 = (a, s) => [a[0] * s, a[1] * s, a[2] * s];
+const sub3 = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
 
 /**
  * Convert a closed extracted profile (`extractProfile` output) into profile
@@ -165,52 +185,148 @@ function sweepArg(kind, value) {
 }
 
 /**
- * Build the swept, plane-oriented shape for `{ kind, plane, ops, value }`
- * (signed extrude height or revolve angle in degrees). Frees the profile
- * and every intermediate shape; the caller owns the returned shape.
+ * Resolve an extrude's end condition into the concrete pieces the shared
+ * builders consume:
+ *   - `param`: the signed value fed to `sweepPostOps` (its magnitude is the
+ *     kernel height, its sign the sweep direction).
+ *   - `height`: the kernel extrude height (always `> 0`).
+ *   - `draft`: draft angle in degrees (passed to `Shape.extrude`).
+ *   - `postExtra`: post-ops appended after `sweepPostOps`, e.g. the centering
+ *     translate that turns a one-sided extrude into a symmetric one.
+ *   - `clip`: an optional terminating half-space `{ point, normal }` (the
+ *     "up to face" cap), intersected with the extrude after orientation.
+ *
+ * `blind` (the default) keeps the historical behavior exactly. `symmetric`
+ * and `through` extrude forward and re-center on the sketch plane; `through`
+ * uses `sweep.reach` (the scene span along the normal). `toFace` extrudes
+ * toward `sweep.target` (a plane `{ origin, normal }`, typically a picked
+ * face) far enough to cross it, then clips at that plane.
+ */
+export function extrudePlan(sweep) {
+  const end = sweep.end ?? 'blind';
+  const value = sweep.value;
+  const draft = sweep.draft ?? 0;
+  const n = planeNormal(sweep.plane);
+  const origin = planeToWorld(sweep.plane, 0, 0);
+
+  if (end === 'blind') {
+    return { param: value, height: Math.abs(value), draft, postExtra: [], clip: null };
+  }
+  if (end === 'symmetric' || end === 'through') {
+    // Extrude forward, then slide back half the height so the span straddles
+    // the sketch plane. `through` spans the whole scene along the normal.
+    const height = end === 'through' ? sweep.reach ?? Math.abs(value) : Math.abs(value);
+    return {
+      param: height,
+      height,
+      draft,
+      postExtra: [{ op: 'translate', args: scale3(n, -0.5 * height) }],
+      clip: null,
+    };
+  }
+  if (end === 'toFace') {
+    const target = sweep.target;
+    if (!target) throw new Error('up-to-face extrude needs a target face');
+    const height = sweep.reach ?? Math.abs(value) * 4;
+    // Extrude toward whichever side of the sketch plane the target lies on.
+    const dir = dot3(sub3(target.origin, origin), n) >= 0 ? 1 : -1;
+    // Keep the half-space on the sketch-plane side of the target plane: the
+    // kernel's half-space is interior where keepNormal·(p − point) ≤ 0, so we
+    // want keepNormal·(origin − target) ≤ 0.
+    const tn = target.normal;
+    const keep = dot3(sub3(origin, target.origin), tn) <= 0 ? 1 : -1;
+    return {
+      param: dir * height,
+      height,
+      draft,
+      postExtra: [],
+      clip: { point: target.origin, normal: scale3(tn, keep) },
+    };
+  }
+  throw new Error(`unknown end condition: ${end}`);
+}
+
+/** Extrude op args: `[height]`, or `[height, draftDegrees]` when drafted. */
+function extrudeArgs(height, draft) {
+  return draft ? [height, draft] : [height];
+}
+
+/**
+ * Build the swept, plane-oriented shape for a sweep descriptor. Extrudes
+ * honor `mode`/`end`/`draft`/`target`/`reach` (see `extrudePlan`); revolves
+ * take a signed angle in degrees. Frees the profile and every intermediate
+ * shape; the caller owns the returned shape.
  */
 export function buildSweepShape(ShapeClass, ProfileClass, sweep) {
   const { kind, plane, value } = sweep;
   const ops = nativeSweepOps(sweep.ops, plane, kind);
+  const plan = kind === 'extrude' ? extrudePlan(sweep) : null;
+  const param = plan ? plan.param : value;
   const profile = new ProfileClass(ops.start[0], ops.start[1]);
   let shape;
   try {
     for (const seg of ops.segs) profile.arcTo(seg.x, seg.y, seg.bulge);
     profile.close();
-    shape = ShapeClass[kind](profile, sweepArg(kind, value));
+    shape = plan
+      ? ShapeClass.extrude(profile, ...extrudeArgs(plan.height, plan.draft))
+      : ShapeClass[kind](profile, sweepArg(kind, value));
   } finally {
     profile.free?.();
   }
-  for (const post of sweepPostOps(plane, kind, value)) {
-    const next = shape[post.op](...post.args);
+  const apply = (next) => {
     shape.free?.();
     shape = next;
+  };
+  for (const post of sweepPostOps(plane, kind, param)) apply(shape[post.op](...post.args));
+  if (plan) {
+    for (const post of plan.postExtra) apply(shape[post.op](...post.args));
+    if (plan.clip) {
+      const { point, normal } = plan.clip;
+      const half = ShapeClass.halfSpace(...point, ...normal);
+      const next = shape.intersect(half);
+      half.free?.();
+      apply(next);
+    }
   }
   return shape;
 }
 
 /**
  * Graft a sweep onto an existing construction tree as plain node data (no
- * retained shapes): the sweep node wrapped in its plane post-ops, unioned
- * with `root` when one exists. Synthetic ids are negative so they can't
- * collide with traced ids; the tree is only serialized, then re-evaluated.
+ * retained shapes): the sweep node wrapped in its plane post-ops, combined
+ * with `root` when one exists — unioned for a boss, subtracted for a cut.
+ * Synthetic ids are negative so they can't collide with traced ids; the tree
+ * is only serialized, then re-evaluated.
  */
 export function sweepTreeNode(root, sweep) {
   const { kind, plane, value } = sweep;
   const ops = nativeSweepOps(sweep.ops, plane, kind);
+  const plan = kind === 'extrude' ? extrudePlan(sweep) : null;
+  const param = plan ? plan.param : value;
   let id = -1;
   let node = {
     id: id--,
     op: kind,
-    args: [sweepArg(kind, value)],
+    args: plan ? extrudeArgs(plan.height, plan.draft) : [sweepArg(kind, value)],
     children: [],
     profile: { start: [...ops.start], segs: ops.segs.map((s) => ({ ...s })) },
   };
-  for (const post of sweepPostOps(plane, kind, value)) {
+  for (const post of sweepPostOps(plane, kind, param)) {
     node = { id: id--, op: post.op, args: post.args, children: [node] };
   }
+  if (plan) {
+    for (const post of plan.postExtra) {
+      node = { id: id--, op: post.op, args: post.args, children: [node] };
+    }
+    if (plan.clip) {
+      const { point, normal } = plan.clip;
+      const half = { id: id--, op: 'halfSpace', args: [...point, ...normal], children: [] };
+      node = { id: id--, op: 'intersect', args: [], children: [node, half] };
+    }
+  }
   if (!root) return node;
-  return { id: id--, op: 'union', args: [], children: [root, node] };
+  const boolOp = kind === 'extrude' && sweep.mode === 'cut' ? 'subtract' : 'union';
+  return { id: id--, op: boolOp, args: [], children: [root, node] };
 }
 
 /** Axis-aligned bounding box `{ min: [u, v], max: [u, v] }` of profile ops

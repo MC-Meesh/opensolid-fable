@@ -88,6 +88,16 @@ function meshRadius(positions) {
   return Math.hypot(max[0] - min[0], max[1] - min[1], max[2] - min[2]) / 2;
 }
 
+// How far a "through all" extrude must reach to clear the whole scene from
+// either side of the sketch plane: twice the scene's bounding diagonal plus
+// the profile extent, with a profile-only fallback when the scene is empty.
+function sceneReach(root, extent) {
+  const b = root?.shape?.bounds?.();
+  if (!b || b.length < 6) return extent * 8;
+  const diag = Math.hypot(b[3] - b[0], b[4] - b[1], b[5] - b[2]);
+  return Math.max(diag, extent) * 2 + extent;
+}
+
 export default function App() {
   // The WASM lifecycle lives in one store (src/wasm/loader.js, surfaced via
   // WasmContext) — App only reads status and the bound API classes.
@@ -443,6 +453,18 @@ export default function App() {
     (point, faceIndex) => {
       const root = tracedRef.current?.root;
       if (!root) return;
+      const region = point && faceIndex !== null ? faceRegions()?.regionAt(faceIndex) : null;
+      // While an "up to face" extrude is pending, a planar-face click picks
+      // that face as the terminating plane instead of selecting a body.
+      if (sweep?.kind === 'extrude' && sweep.end === 'toFace') {
+        if (region?.planar) {
+          const { origin, normal } = region.plane;
+          setSweep((s) => (s ? { ...s, target: { origin, normal } } : s));
+        } else if (point) {
+          setToast('Click a flat face to terminate the extrude');
+        }
+        return;
+      }
       if (!point) {
         clearSelection();
         setPickedFace(null);
@@ -450,7 +472,6 @@ export default function App() {
       }
       // Remember the clicked mesh face (independent of the body-selection
       // toggle) so "Sketch" can open on it and the viewport can tint it.
-      const region = faceIndex !== null ? faceRegions()?.regionAt(faceIndex) : null;
       setPickedFace(region ? { ...region, meshKey: meshRef.current.key } : null);
       const candidates = pickCandidates(root);
       const picked = pickNodeAt(candidates, point);
@@ -460,7 +481,7 @@ export default function App() {
         clearSelection();
       }
     },
-    [selectNode, clearSelection, faceRegions]
+    [selectNode, clearSelection, faceRegions, sweep]
   );
 
   // Hover highlight: resolve the pointer's triangle to its planar face
@@ -831,7 +852,19 @@ export default function App() {
       setSketchOpen(false);
       setSweep(
         kind === 'extrude'
-          ? { kind, plane: profile.plane, ops, value: extent, range: extent * 4 }
+          ? {
+              kind,
+              plane: profile.plane,
+              ops,
+              value: extent,
+              range: extent * 4,
+              // SolidWorks-parity controls (see SweepPanel / lib/sweep.js).
+              mode: 'boss',
+              end: 'blind',
+              draft: 0,
+              reach: sceneReach(tracedRef.current?.root, extent),
+              target: null,
+            }
           : { kind, plane: profile.plane, ops, value: 360, range: 360 }
       );
     },
@@ -840,6 +873,17 @@ export default function App() {
 
   const handleSweepChange = useCallback((value) => {
     setSweep((current) => (current ? { ...current, value } : current));
+  }, []);
+
+  // Update one or more extrude-mode fields (mode/end/draft) on the pending
+  // sweep. Switching away from "up to face" drops any captured target.
+  const handleSweepField = useCallback((patch) => {
+    setSweep((current) => {
+      if (!current) return current;
+      const next = { ...current, ...patch };
+      if (patch.end && patch.end !== 'toFace') next.target = null;
+      return next;
+    });
   }, []);
 
   const cancelSweep = useCallback(() => {
@@ -1163,6 +1207,7 @@ export default function App() {
           sweep={sweep}
           error={sweepError}
           onChange={handleSweepChange}
+          onField={handleSweepField}
           onApply={applySweep}
           onCancel={cancelSweep}
         />

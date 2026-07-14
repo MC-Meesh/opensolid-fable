@@ -23,6 +23,8 @@ export const PRIMITIVE_OPS = [
   'cylinder',
   'torus',
   'capsule',
+  // The terminating half-space of an "up to face" extrude (Shape.halfSpace).
+  'halfSpace',
 ];
 
 // Instance methods taking only numeric args. One child: the receiver.
@@ -44,6 +46,7 @@ const OP_LABELS = {
   cylinder: 'Cylinder',
   torus: 'Torus',
   capsule: 'Capsule',
+  halfSpace: 'Half Space',
   translate: 'Translate',
   rotate: 'Rotate',
   scale: 'Scale',

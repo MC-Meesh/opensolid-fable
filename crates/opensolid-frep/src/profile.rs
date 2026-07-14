@@ -8,8 +8,13 @@
 //!
 //! # Field exactness
 //!
-//! - [`Extrude`] is an exact signed distance field (the 2D profile distance
-//!   is exact and the linear-sweep combination preserves exactness).
+//! - [`Extrude`] with no draft is an exact signed distance field (the 2D
+//!   profile distance is exact and the linear-sweep combination preserves
+//!   exactness). With a draft angle the walls tilt: each wall term is the
+//!   *exact* perpendicular distance to that tilted plane, so the field stays
+//!   sign-correct and Lipschitz ≤ 1 (the default `eval_interval` remains
+//!   valid), but like all `min`/`max` CSG the magnitude near tapered corners
+//!   underestimates the true distance.
 //! - [`Revolve`] over the full turn is exact. A partial revolve is the
 //!   intersection (`max`) of the full solid of revolution with an exact
 //!   wedge field: sign-correct everywhere, Lipschitz ≤ 1 (so the default
@@ -18,7 +23,8 @@
 
 use crate::primitives::Sdf;
 use opensolid_core::error::{CoreError, CoreResult};
-use opensolid_core::types::Point3;
+use opensolid_core::interval::Interval;
+use opensolid_core::types::{BoundingBox3, Point3};
 use std::f64::consts::{FRAC_PI_2, PI, TAU};
 
 /// Chord length below which a segment is rejected as degenerate.
@@ -337,38 +343,94 @@ impl Profile2D {
     }
 }
 
+/// Draft angles beyond this magnitude (~80°) are rejected: `tan` explodes
+/// toward 90° and the taper stops being a meaningful wall angle.
+pub const MAX_DRAFT: f64 = 1.4;
+
 /// A profile swept linearly along +Y: profile `(u, v)` maps to world
 /// `(x, z) = (u, v)` and the solid spans `y ∈ [0, height]`.
 ///
-/// Exact signed distance field (given the exact profile distance).
+/// An optional `draft` angle tapers the walls along the sweep: the
+/// cross-section at height `y` is the base profile inset radially by
+/// `tan(draft)·y`. A positive draft shrinks the section toward the top cap
+/// (the standard mold-release taper); a negative draft flares it outward.
+/// Zero draft is the exact prism; see the [module docs](self) on exactness.
 pub struct Extrude {
     profile: Profile2D,
     height: f64,
+    /// `tan(draft)`: radial inset applied per unit height. Zero = straight
+    /// walls.
+    taper: f64,
+    /// `cos(draft)` — scales the tapered-wall term to the exact perpendicular
+    /// distance to the tilted plane, which keeps the field Lipschitz ≤ 1.
+    /// Always positive for `|draft| < π/2`.
+    wall_scale: f64,
 }
 
 impl Extrude {
+    /// A straight-walled extrusion (no draft).
+    ///
     /// # Errors
     /// [`CoreError::InvalidArgument`] if `height` is not positive and finite.
     pub fn new(profile: Profile2D, height: f64) -> CoreResult<Self> {
+        Self::with_draft(profile, height, 0.0)
+    }
+
+    /// An extrusion with a `draft` angle in radians (see [`Extrude`]).
+    ///
+    /// # Errors
+    /// [`CoreError::InvalidArgument`] if `height` is not positive and finite,
+    /// or `draft` is not finite with `|draft| < `[`MAX_DRAFT`].
+    pub fn with_draft(profile: Profile2D, height: f64, draft: f64) -> CoreResult<Self> {
         if !(height.is_finite() && height > 0.0) {
             return Err(invalid(
                 "height",
                 format!("must be positive and finite, got {height}"),
             ));
         }
-        Ok(Self { profile, height })
+        if !(draft.is_finite() && draft.abs() < MAX_DRAFT) {
+            return Err(invalid(
+                "draft",
+                format!("must be finite with |draft| < {MAX_DRAFT} rad (~80°), got {draft}"),
+            ));
+        }
+        Ok(Self {
+            profile,
+            height,
+            taper: draft.tan(),
+            wall_scale: draft.cos(),
+        })
     }
 }
 
 impl Sdf for Extrude {
     fn eval(&self, p: &Point3) -> f64 {
-        let d = self.profile.signed_distance(p.x, p.z);
+        // Tapered wall: the section at height y is the profile inset by
+        // taper·y, so (profile_distance + taper·y) is the in-plane clearance
+        // and multiplying by cos(draft) turns it into the exact perpendicular
+        // distance to the tilted wall (an identity for a single plane; the
+        // `min` over walls keeps it Lipschitz ≤ 1). taper = 0 recovers the
+        // exact prism.
+        let d = (self.profile.signed_distance(p.x, p.z) + self.taper * p.y) * self.wall_scale;
         let half = 0.5 * self.height;
         let w = (p.y - half).abs() - half;
-        // Standard exact combination of a 2D SDF with a slab: interior
-        // takes the larger (closer-to-boundary) term, exterior the
-        // Euclidean combination of the positive parts.
+        // Standard combination of a 2D SDF with a slab: interior takes the
+        // larger (closer-to-boundary) term, exterior the Euclidean
+        // combination of the positive parts.
         d.max(w).min(0.0) + d.max(0.0).hypot(w.max(0.0))
+    }
+
+    fn eval_interval(&self, b: &BoundingBox3) -> Interval {
+        // The wall term is unit-gradient, but where the exterior hypot pairs a
+        // tilted wall (which gains a ±sin(draft) component along +Y) with the
+        // horizontal cap, the gradients reinforce and the field is Lipschitz
+        // L = sqrt(1 + |sin(draft)|). taper = 0 gives L = 1 (the exact prism),
+        // recovering the default bound. Widen the half-diagonal by L so the
+        // interval stays conservative for octree pruning.
+        let sin_draft = (self.taper * self.wall_scale).abs(); // |tan·cos| = |sin|
+        let d = self.eval(&b.center());
+        let r = 0.5 * (1.0 + sin_draft).sqrt() * b.extents().norm();
+        Interval::new(d - r, d + r)
     }
 }
 
@@ -644,6 +706,96 @@ mod tests {
         for h in [0.0, -1.0, f64::NAN, f64::INFINITY] {
             assert!(Extrude::new(unit_square(), h).is_err(), "height {h}");
         }
+    }
+
+    #[test]
+    fn zero_draft_matches_plain_extrude() {
+        // with_draft(.., 0.0) must be identical to the straight extrude.
+        let plain = Extrude::new(unit_square(), 2.0).expect("valid");
+        let drafted = Extrude::with_draft(unit_square(), 2.0, 0.0).expect("valid");
+        for p in [
+            Point3::new(0.5, 1.0, 0.5),
+            Point3::new(2.0, 3.0, -1.0),
+            Point3::new(0.5, 0.25, 0.5),
+        ] {
+            assert_eq!(plain.eval(&p), drafted.eval(&p), "at {p:?}");
+        }
+    }
+
+    #[test]
+    fn draft_wall_distance_is_exact() {
+        // A tall unit-square extrude with positive draft: the left wall tilts
+        // inward as y grows. For a point just outside that wall, well clear of
+        // the other walls and both caps, the field is the exact perpendicular
+        // distance to the tilted plane: (profile_dist + tan(draft)·y)·cos.
+        let draft = 0.3_f64;
+        let e = Extrude::with_draft(unit_square(), 4.0, draft).expect("valid");
+        let p = Point3::new(-0.1, 2.0, 0.5);
+        let expected = (0.1 + draft.tan() * 2.0) * draft.cos();
+        assert!(
+            (e.eval(&p) - expected).abs() < 1e-12,
+            "{} vs {expected}",
+            e.eval(&p)
+        );
+    }
+
+    #[test]
+    fn positive_draft_narrows_toward_top() {
+        // Near the top, positive draft insets the section: a point that is
+        // inside the straight prism sits outside the drafted one.
+        let plain = Extrude::new(unit_square(), 1.0).expect("valid");
+        let drafted = Extrude::with_draft(unit_square(), 1.0, 0.3).expect("valid");
+        let p = Point3::new(0.05, 0.9, 0.5);
+        assert!(plain.eval(&p) < 0.0, "inside the prism");
+        assert!(drafted.eval(&p) > 0.0, "outside the drafted top");
+    }
+
+    #[test]
+    fn negative_draft_flares_toward_top() {
+        // Negative draft flares the section outward: a point outside the base
+        // wall is captured by the wider top.
+        let drafted = Extrude::with_draft(unit_square(), 1.0, -0.3).expect("valid");
+        let p = Point3::new(1.2, 0.9, 0.5);
+        assert!(drafted.eval(&p) < 0.0, "inside the flared top");
+        // Same point at the base (y≈0) is still outside — the base is the
+        // untapered profile.
+        assert!(drafted.eval(&Point3::new(1.2, 0.02, 0.5)) > 0.0);
+    }
+
+    #[test]
+    fn extrude_rejects_bad_draft() {
+        for d in [
+            f64::NAN,
+            f64::INFINITY,
+            MAX_DRAFT,
+            MAX_DRAFT + 0.1,
+            -MAX_DRAFT,
+        ] {
+            assert!(
+                Extrude::with_draft(unit_square(), 1.0, d).is_err(),
+                "draft {d}"
+            );
+        }
+        // Well within range is accepted.
+        assert!(Extrude::with_draft(unit_square(), 1.0, 0.5).is_ok());
+        assert!(Extrude::with_draft(unit_square(), 1.0, -0.5).is_ok());
+    }
+
+    #[test]
+    fn drafted_extrude_interval_containment() {
+        // The default eval_interval relies on Lipschitz ≤ 1; the drafted
+        // field must satisfy it for the octree mesher to stay sound.
+        let e = Extrude::with_draft(
+            Profile2D::new(
+                vec![[-0.6, -0.4], [0.6, -0.4], [0.6, 0.4], [-0.6, 0.4]],
+                vec![0.0, 0.5, 0.0, -0.3],
+            )
+            .expect("valid profile"),
+            1.2,
+            0.4,
+        )
+        .expect("valid extrude");
+        crate::test_util::assert_interval_containment(&e, 61);
     }
 
     #[test]

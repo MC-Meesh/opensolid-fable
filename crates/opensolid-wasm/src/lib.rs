@@ -274,12 +274,34 @@ impl WasmShape {
     }
 
     /// The closed profile swept along +Y over `y ∈ [0, height]`; profile
-    /// `(x, y)` coordinates map to world `(x, z)`.
-    pub fn extrude(profile: &WasmProfile2D, height: f64) -> Result<WasmShape, String> {
+    /// `(x, y)` coordinates map to world `(x, z)`. The optional `draftDegrees`
+    /// tapers the walls along the sweep — positive narrows toward the top
+    /// cap (mold-release draft), negative flares outward; omitted or `0` is a
+    /// straight prism. `|draft|` must stay under ~80°.
+    #[wasm_bindgen(js_name = extrude)]
+    pub fn extrude(
+        profile: &WasmProfile2D,
+        height: f64,
+        draft_degrees: Option<f64>,
+    ) -> Result<WasmShape, String> {
         let p = profile.build()?;
-        BoundedShape::extrude(p, height)
+        let draft = draft_degrees.unwrap_or(0.0).to_radians();
+        BoundedShape::extrude_draft(p, height, draft)
             .map(WasmShape::sdf_only)
             .map_err(|e| e.to_string())
+    }
+
+    /// A half-space for terminating an "up to face" extrude: the solid half
+    /// on the negative side of the plane through `(px, py, pz)` with outward
+    /// normal `(nx, ny, nz)`. Unbounded on its own — intersect it with a
+    /// through-all extrude to clip the extrude at that plane.
+    #[wasm_bindgen(js_name = halfSpace)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn half_space(px: f64, py: f64, pz: f64, nx: f64, ny: f64, nz: f64) -> WasmShape {
+        WasmShape::sdf_only(BoundedShape::half_space(
+            Point3::new(px, py, pz),
+            Vector3::new(nx, ny, nz),
+        ))
     }
 
     /// The closed profile revolved around the Y axis through
@@ -799,7 +821,7 @@ mod tests {
 
     #[test]
     fn extrude_square_via_wasm_api() {
-        let shape = WasmShape::extrude(&closed_square(), 2.0).expect("valid extrude");
+        let shape = WasmShape::extrude(&closed_square(), 2.0, None).expect("valid extrude");
         assert_eq!(shape.bounds(), vec![0.0, 0.0, 0.0, 1.0, 2.0, 1.0]);
         assert_valid(&shape.mesh(32, None));
     }
@@ -813,7 +835,7 @@ mod tests {
         p.line_to(-0.5, 0.25);
         p.arc_to(-0.5, -0.25, 1.0); // explicit arc back to the start
         p.close();
-        let shape = WasmShape::extrude(&p, 0.5).expect("valid extrude");
+        let shape = WasmShape::extrude(&p, 0.5, None).expect("valid extrude");
         let b = shape.bounds();
         // Semicircular caps extend the x reach by their radius 0.25.
         assert!((b[0] + 0.75).abs() < 1e-9 && (b[3] - 0.75).abs() < 1e-9);
@@ -841,7 +863,7 @@ mod tests {
         let mut open = WasmProfile2D::new(0.0, 0.0);
         open.line_to(1.0, 0.0);
         open.line_to(1.0, 1.0);
-        let err = match WasmShape::extrude(&open, 1.0) {
+        let err = match WasmShape::extrude(&open, 1.0, None) {
             Ok(_) => panic!("must require close()"),
             Err(e) => e,
         };
@@ -850,10 +872,10 @@ mod tests {
         // Too few segments.
         let mut tiny = WasmProfile2D::new(0.0, 0.0);
         tiny.close();
-        assert!(WasmShape::extrude(&tiny, 1.0).is_err());
+        assert!(WasmShape::extrude(&tiny, 1.0, None).is_err());
 
         // Bad height / angle / negative-x revolve profile.
-        assert!(WasmShape::extrude(&closed_square(), 0.0).is_err());
+        assert!(WasmShape::extrude(&closed_square(), 0.0, None).is_err());
         assert!(WasmShape::revolve(&closed_square(), 0.0).is_err());
         assert!(WasmShape::revolve(&closed_square(), 400.0).is_err());
         let mut neg = WasmProfile2D::new(-1.0, 0.0);
@@ -868,13 +890,13 @@ mod tests {
         let mut p = closed_square();
         p.line_to(5.0, 5.0);
         p.arc_to(9.0, 9.0, 1.0);
-        let shape = WasmShape::extrude(&p, 1.0).expect("valid extrude");
+        let shape = WasmShape::extrude(&p, 1.0, None).expect("valid extrude");
         assert_eq!(shape.bounds(), vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0]);
     }
 
     #[test]
     fn swept_shapes_compose_with_csg() {
-        let plate = WasmShape::extrude(&closed_square(), 0.3).expect("valid extrude");
+        let plate = WasmShape::extrude(&closed_square(), 0.3, None).expect("valid extrude");
         let hole = WasmShape::cylinder(0.2, 1.0).translate(0.5, 0.15, 0.5);
         assert_valid(&plate.subtract(&hole).mesh(40, None));
     }
