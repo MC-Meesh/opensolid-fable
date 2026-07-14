@@ -163,15 +163,23 @@
 //! run live; 3 remain `#[ignore]`d (of-2ql residual slivers).
 //!
 //! Section (9) is the cone/frustum campaign (of-fsl.23), written BEFORE
-//! cones are admitted to the exact path (`Chart::build` still rejects
-//! `Surface3::Cone`, boolean.rs:499). Following the sphere/torus precedent
-//! (commit 567930a, tests-first-ignored), every cone case starts
-//! `#[ignore]`d citing the promotion blocker of-dtj; each is un-ignored
-//! only once green after the gate lifts. The one live cone test asserts
-//! the pipeline never PANICS on cone inputs — today every cone boolean
-//! returns a structured `NotImplemented` (F-Rep fallback), which the
-//! no-panic guard accepts exactly as it will accept the eventual valid
-//! solids. Run the ignored cone cases with
+//! cones were admitted to the exact path (tests-first-ignored, sphere/torus
+//! precedent, commit 567930a). The `Chart::build` gate has since lifted
+//! (of-dtj), so the cases whose SSIs are already exact now run live
+//! (of-fsl.27 promotion pass): the pure plane-cone bites — conical
+//! countersink at 1×/0.001×/1000× scale — and the tilted-cone-block
+//! inclusion–exclusion identity. Five cases stay `#[ignore]`d on the
+//! remaining exact-SSI gaps, now citing their specific open blockers rather
+//! than the resolved gate bead:
+//!   • of-dtj.1 (plane-cone parabola/hyperbola/generator sections):
+//!     `frustum_through_slab`, `cone_block_inclusion_exclusion`,
+//!     `rotated_frustum_bite_invariance` — an axis-parallel (or generator-
+//!     aligned) planar face cuts the cone as a hyperbola, not yet a `Curve3`.
+//!   • of-dtj.2 (analytic cone-cone SSI / marched cone path):
+//!     `opposed_cones_intersection`, `coaxial_frustums_union_identity`.
+//! The no-panic guard `no_panics_on_cone_configurations` stays live across
+//! the promotion — it accepts both a valid exact solid and the structured
+//! `NotImplemented` F-Rep fallback. Run the still-ignored cone cases with
 //! `cargo test --test boolean_stress -- --ignored`.
 
 use nalgebra::{Rotation3, Unit};
@@ -2352,7 +2360,9 @@ fn no_panics_on_awkward_configurations() {
 /// cylinder `through_hole` case, exercising the cone wall and its two
 /// circular plane-cone SSIs with no apex and no tool cap involved.
 #[test]
-#[ignore = "of-dtj: Chart::build rejects Surface3::Cone (exact-path promotion pending)"]
+#[ignore = "of-dtj.1: plane-cone SSI returns NotImplemented for parabola/\
+            hyperbola/generator-line sections (axis-parallel slab faces cut \
+            the cone as hyperbolae) — analytic.rs:321"]
 fn frustum_through_slab() {
     let context = "slab minus tapered frustum (through-hole)";
     let mut scene = Scene::new();
@@ -2403,19 +2413,16 @@ fn cone_countersink(scale: f64) {
 }
 
 #[test]
-#[ignore = "of-dtj: Chart::build rejects Surface3::Cone (exact-path promotion pending)"]
 fn cone_countersink_bite() {
     cone_countersink(1.0);
 }
 
 #[test]
-#[ignore = "of-dtj: Chart::build rejects Surface3::Cone (exact-path promotion pending)"]
 fn cone_bite_at_scale_0_001() {
     cone_countersink(0.001);
 }
 
 #[test]
-#[ignore = "of-dtj: Chart::build rejects Surface3::Cone (exact-path promotion pending)"]
 fn cone_bite_at_scale_1000() {
     cone_countersink(1000.0);
 }
@@ -2425,7 +2432,9 @@ fn cone_bite_at_scale_1000() {
 /// where their radii coincide). Exercises coaxial cone-cone SSI (a single
 /// full-wrap circle at z = 2) and closed-form intersection volume.
 #[test]
-#[ignore = "of-dtj: Chart::build rejects Surface3::Cone (exact-path promotion pending)"]
+#[ignore = "of-dtj.2: no analytic SSI for cone-cone pairs (NotImplemented \
+            'analytic SSI for cone pairs other than plane-cone') — needs the \
+            marched cone path — analytic.rs:121"]
 fn opposed_cones_intersection() {
     let context = "opposed coaxial cones intersection (bicone)";
     let mut scene = Scene::new();
@@ -2447,7 +2456,9 @@ fn opposed_cones_intersection() {
 /// (non-closed-form) overlap geometry. Exercises all three ops on cone
 /// inputs at once.
 #[test]
-#[ignore = "of-dtj: Chart::build rejects Surface3::Cone (exact-path promotion pending)"]
+#[ignore = "of-dtj.1: plane-cone SSI returns NotImplemented for parabola/\
+            hyperbola/generator-line sections (block faces parallel to the \
+            cone axis cut it as hyperbolae) — analytic.rs:321"]
 fn cone_block_inclusion_exclusion() {
     let context = "cone ∪/∩ block inclusion–exclusion";
     let mut scene = Scene::new();
@@ -2474,7 +2485,9 @@ fn cone_block_inclusion_exclusion() {
 /// identity must hold across their cone-cone wall intersection in the
 /// overlap band. Closed-form operand volumes, identity for the overlap.
 #[test]
-#[ignore = "of-dtj: Chart::build rejects Surface3::Cone (exact-path promotion pending)"]
+#[ignore = "of-dtj.2: no analytic SSI for cone-cone pairs (NotImplemented \
+            'analytic SSI for cone pairs other than plane-cone') — needs the \
+            marched cone path — analytic.rs:121"]
 fn coaxial_frustums_union_identity() {
     let context = "coaxial frustums union/intersection identity";
     let mut scene = Scene::new();
@@ -2503,7 +2516,6 @@ fn coaxial_frustums_union_identity() {
 /// plane-cone SSI. No closed form for the removed volume, so the
 /// scale-free inclusion–exclusion identity is the invariant.
 #[test]
-#[ignore = "of-dtj: Chart::build rejects Surface3::Cone (exact-path promotion pending)"]
 fn tilted_cone_block_identity() {
     let context = "tilted cone ∪/∩ block inclusion–exclusion";
     let mut scene = Scene::new();
@@ -2538,7 +2550,9 @@ fn tilted_cone_block_identity() {
 /// geometry-complete [`rotate_body`]). Catches frame-dependent chart or
 /// SSI bugs the axis-aligned cases would miss.
 #[test]
-#[ignore = "of-dtj: Chart::build rejects Surface3::Cone (exact-path promotion pending)"]
+#[ignore = "of-dtj.1: plane-cone SSI returns NotImplemented for parabola/\
+            hyperbola/generator-line sections (a rotated slab face aligns with \
+            a cone generator) — analytic.rs:321"]
 fn rotated_frustum_bite_invariance() {
     // Baseline: axis-aligned countersink bite.
     let mut base_scene = Scene::new();
