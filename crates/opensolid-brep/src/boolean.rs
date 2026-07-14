@@ -4092,18 +4092,54 @@ fn orient2d(a: (f64, f64), b: (f64, f64), c: (f64, f64)) -> f64 {
     (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0)
 }
 
-/// True iff `d` is strictly inside the circumcircle of the CCW triangle
-/// `(a, b, c)`. Used to decide Delaunay edge flips.
+/// True iff `d` is strictly and *reliably* inside the circumcircle of the
+/// CCW triangle `(a, b, c)`. Used to decide Delaunay edge flips.
+///
+/// The raw incircle determinant catastrophically cancels on the
+/// extreme-aspect quads that curved-face refinement produces (a hair-thin
+/// seed sliver against a normal neighbour): the sign is then float noise,
+/// and `make_delaunay` cycles A→B→A on such an edge until it hits its sweep
+/// cap. This is Shewchuk's a-priori filter: compute the determinant with an
+/// error bound on its own round-off, and only trust the sign when the
+/// magnitude clears the bound. When it doesn't — near-cocircular, the noisy
+/// case — report "not inside" so the edge is left unflipped. That keeps the
+/// mesh valid (a hair off Delaunay at worst) and, crucially, makes the flip
+/// loop monotone instead of cyclic.
 fn in_circle(a: (f64, f64), b: (f64, f64), c: (f64, f64), d: (f64, f64)) -> bool {
-    let (ax, ay) = (a.0 - d.0, a.1 - d.1);
-    let (bx, by) = (b.0 - d.0, b.1 - d.1);
-    let (cx, cy) = (c.0 - d.0, c.1 - d.1);
-    let det = (ax * ax + ay * ay) * (bx * cy - cx * by) - (bx * bx + by * by) * (ax * cy - cx * ay)
-        + (cx * cx + cy * cy) * (ax * by - bx * ay);
-    // Strict: exactly-cocircular points (e.g. lattice squares) never flip,
-    // which keeps the mesh valid and the flip loop terminating.
-    det > 0.0
+    let (adx, ady) = (a.0 - d.0, a.1 - d.1);
+    let (bdx, bdy) = (b.0 - d.0, b.1 - d.1);
+    let (cdx, cdy) = (c.0 - d.0, c.1 - d.1);
+
+    let bdxcdy = bdx * cdy;
+    let cdxbdy = cdx * bdy;
+    let cdxady = cdx * ady;
+    let adxcdy = adx * cdy;
+    let adxbdy = adx * bdy;
+    let bdxady = bdx * ady;
+
+    let alift = adx * adx + ady * ady;
+    let blift = bdx * bdx + bdy * bdy;
+    let clift = cdx * cdx + cdy * cdy;
+
+    let det = alift * (bdxcdy - cdxbdy) + blift * (cdxady - adxcdy) + clift * (adxbdy - bdxady);
+
+    // Shewchuk's incircle A-permanent: an upper bound on the accumulated
+    // round-off in `det`, scaled by machine epsilon. Sign is trustworthy iff
+    // |det| exceeds this.
+    let permanent = (bdxcdy.abs() + cdxbdy.abs()) * alift
+        + (cdxady.abs() + adxcdy.abs()) * blift
+        + (adxbdy.abs() + bdxady.abs()) * clift;
+    let errbound = ICC_ERRBOUND_A * permanent;
+    if det.abs() > errbound {
+        return det > 0.0;
+    }
+    // Uncertain / near-cocircular (e.g. lattice squares): never flip.
+    false
 }
+
+/// A-priori round-off bound coefficient for [`in_circle`] (Shewchuk):
+/// `(10 + 96·ε)·ε`.
+const ICC_ERRBOUND_A: f64 = (10.0 + 96.0 * f64::EPSILON) * f64::EPSILON;
 
 impl FlipMesh {
     /// Build from an existing triangulation (indices into a shared vertex
@@ -4316,18 +4352,23 @@ impl FlipMesh {
 
     /// Flip the whole mesh toward constrained Delaunay: sweep every edge
     /// until a full pass makes no flip. This catches long chords left by the
-    /// seed triangulation that no point insertion happened to touch.
+    /// seed triangulation that no point insertion happened to touch. Returns
+    /// the number of sweeps run — with the robust [`in_circle`] this settles
+    /// in a handful; the old raw determinant cycled to the cap on every
+    /// curved face (of-yud).
     fn make_delaunay(
         &mut self,
         verts: &[(f64, f64)],
         constraints: &std::collections::HashSet<(usize, usize)>,
-    ) {
+    ) -> usize {
         // Each sweep is O(edges); a constrained-Delaunay mesh over this many
         // near-lattice points converges in a handful of sweeps. The cap is a
         // safety valve — the mesh stays valid (just possibly a hair off
         // Delaunay) if flips ever fail to settle.
         let max_sweeps = 256;
+        let mut used = 0;
         for _ in 0..max_sweeps {
+            used += 1;
             let mut flipped = false;
             for t in 0..self.tris.len() {
                 for k in 0..3 {
@@ -4340,6 +4381,7 @@ impl FlipMesh {
                 break;
             }
         }
+        used
     }
 }
 
@@ -4561,7 +4603,12 @@ fn refine_curved_region(
 
     // Insertion legalizes only locally; sweep the whole mesh to Delaunay so
     // any long seed chord no inserted point touched (e.g. on a thin band with
-    // a single interior row) is flipped away too.
+    // a single interior row) is flipped away too. The sweep converges in a
+    // handful of passes now that `in_circle` is a robust filtered predicate
+    // (of-yud): the old raw determinant returned float-noise signs on the
+    // extreme-aspect quads a curved face produces, so a Delaunay-neutral edge
+    // flipped A→B→A every pass and the loop ran to its 256-sweep cap on every
+    // curved face.
     mesh.make_delaunay(all_uv, &constraints);
 
     // Read back. Insertion and flips only ever retriangulate the same point
@@ -6746,6 +6793,111 @@ mod tests {
         assert!((area - 1.0).abs() < 1e-12, "area changed: {area}");
         // Every triangle uses the inserted vertex.
         assert!(mesh.tris.iter().all(|t| t.contains(&4)));
+    }
+
+    /// of-yud: the incircle predicate is correct on well-conditioned inputs
+    /// and *stable* on the extreme-aspect cocircular quads a curved face's
+    /// refinement produces — where the raw determinant is float noise. A
+    /// cocircular point must read "not strictly inside" from every rotation,
+    /// so neither diagonal of the quad is ever preferred and the Delaunay
+    /// sweep cannot flip A→B→A forever.
+    #[test]
+    fn in_circle_filter_correct_and_stable() {
+        // Well-conditioned: circumcircle of (0,0),(4,0),(0,4) is centred at
+        // (2,2), radius √8 ≈ 2.83.
+        let (a, b, c) = ((0.0, 0.0), (4.0, 0.0), (0.0, 4.0));
+        assert!(in_circle(a, b, c, (1.0, 1.0)), "interior point is inside");
+        assert!(!in_circle(a, b, c, (10.0, 10.0)), "far point is outside");
+        // A vertex of the triangle sits exactly on the circle: not strictly
+        // inside.
+        assert!(!in_circle(a, b, c, (4.0, 4.0)), "cocircular 4th corner");
+
+        // Extreme-aspect cocircular rectangle (1 wide, 1e-9 tall). Every
+        // rotation is CCW and every test point is the rectangle's own 4th
+        // corner, hence exactly on the circle. The raw determinant here is
+        // ~1e-9 swamped by cancellation; the filtered predicate must report
+        // `false` for all four so the flip loop stays put.
+        let e = 1e-9;
+        let quad = [(0.0, 0.0), (1.0, 0.0), (1.0, e), (0.0, e)];
+        for r in 0..4 {
+            let p0 = quad[r];
+            let p1 = quad[(r + 1) % 4];
+            let p2 = quad[(r + 2) % 4];
+            let p3 = quad[(r + 3) % 4];
+            assert!(
+                orient2d(p0, p1, p2) > 0.0,
+                "rotation {r} must present a CCW triangle"
+            );
+            assert!(
+                !in_circle(p0, p1, p2, p3),
+                "rotation {r}: cocircular corner must not read strictly inside"
+            );
+        }
+    }
+
+    /// of-yud: `make_delaunay` must converge in a handful of sweeps — not run
+    /// to its 256-sweep cap — on a strip of extreme-aspect cocircular quads,
+    /// the configuration a curved-face band tessellates into. With the raw
+    /// incircle determinant these near-degenerate quads flip-cycled on float
+    /// noise; the filtered predicate leaves them alone, so the sweep settles
+    /// at once and the mesh stays a valid, area-preserving triangulation.
+    #[test]
+    fn make_delaunay_converges_on_extreme_aspect_strip() {
+        let m = 16usize;
+        let e = 1e-9;
+        // Bottom vertex i -> index 2i at (i, 0); top vertex i -> 2i+1 at (i, e).
+        let mut verts: Vec<(f64, f64)> = Vec::with_capacity(2 * (m + 1));
+        for i in 0..=m {
+            verts.push((i as f64, 0.0));
+            verts.push((i as f64, e));
+        }
+        // Seed each thin cell with the same diagonal (bottom_i -> top_{i+1}).
+        let mut seed = Vec::with_capacity(2 * m);
+        for i in 0..m {
+            seed.push([2 * i, 2 * i + 2, 2 * i + 3]);
+            seed.push([2 * i, 2 * i + 3, 2 * i + 1]);
+        }
+        let mut mesh = FlipMesh::from_tris(&seed, &verts);
+        // Constrain the whole boundary; only the interior cell diagonals are
+        // free to flip.
+        let mut constraints: std::collections::HashSet<(usize, usize)> =
+            std::collections::HashSet::new();
+        for i in 0..m {
+            constraints.insert((2 * i, 2 * i + 2)); // bottom
+            constraints.insert((2 * i + 1, 2 * i + 3)); // top
+        }
+        constraints.insert((0, 1)); // left end
+        constraints.insert((2 * m, 2 * m + 1)); // right end
+
+        let sweeps = mesh.make_delaunay(&verts, &constraints);
+        assert!(
+            sweeps <= 4,
+            "make_delaunay ran {sweeps} sweeps — flip cycling is back"
+        );
+
+        // Mesh is still a valid triangulation: no inverted triangle, mutual
+        // adjacency, total area unchanged (m thin rectangles of area e).
+        let mut area = 0.0;
+        for (ti, tri) in mesh.tris.iter().enumerate() {
+            let o = orient2d(verts[tri[0]], verts[tri[1]], verts[tri[2]]);
+            assert!(o >= 0.0, "triangle {ti} {tri:?} inverted (orient {o})");
+            area += 0.5 * o;
+            for k in 0..3 {
+                let n = mesh.adj[ti][k];
+                if n != NO_TRI {
+                    let (x, y) = (tri[k], tri[(k + 1) % 3]);
+                    let back = mesh
+                        .edge_index(n, x, y)
+                        .unwrap_or_else(|| panic!("neighbor {n} misses edge ({x},{y})"));
+                    assert_eq!(mesh.adj[n][back], ti, "adjacency not mutual");
+                }
+            }
+        }
+        assert!(
+            (area - m as f64 * e).abs() < 1e-18,
+            "strip area changed: {area} vs {}",
+            m as f64 * e
+        );
     }
 
     /// of-2ql regression: sphere minus coaxial through-cylinder (napkin
