@@ -21,6 +21,15 @@ function fail(message) {
   return { content: [{ type: 'text', text: `Error: ${message}` }], isError: true };
 }
 
+// Extract a human-readable message from a thrown value. wasm-bindgen rejects a
+// Rust `Result::Err(String)` by throwing the *raw string* (not an Error), so
+// `err.message` is `undefined` for kernel-side failures — the useful text lives
+// in the value itself. Read `.message` when present, otherwise stringify.
+function errMessage(err) {
+  if (err && typeof err.message === 'string') return err.message;
+  return String(err);
+}
+
 /** Resolve where an export should be written. */
 function exportPath(requested, outputDir, model, format) {
   if (requested) {
@@ -76,7 +85,7 @@ export function createTools(config = {}) {
             exact: args.exact,
           });
         } catch (err) {
-          return fail(`script failed: ${err.message}`);
+          return fail(`script failed: ${errMessage(err)}`);
         }
         const measure = JSON.parse(model.shape.measure(undefined));
         const validation = JSON.parse(model.shape.validate(undefined));
@@ -184,7 +193,7 @@ export function createTools(config = {}) {
             writeFileSync(dest, buildObj(mesh.positions, mesh.normals, mesh.indices), 'utf8');
           }
         } catch (err) {
-          return fail(`export failed: ${err.message}`);
+          return fail(`export failed: ${errMessage(err)}`);
         }
         return text({ model_id: model.id, format, path: dest, bytes: statSync(dest).size });
       },
@@ -287,7 +296,7 @@ export function createTools(config = {}) {
       try {
         return tool.handler(args || {});
       } catch (err) {
-        return fail(err.message);
+        return fail(errMessage(err));
       }
     },
   };

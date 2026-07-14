@@ -1,0 +1,655 @@
+[
+  {
+    "slug": "angle-bracket",
+    "title": "a mounting bracket with four holes",
+    "turns": [
+      {
+        "kind": "narration",
+        "text": "The kernel centers primitives on the origin and takes half-extents, so a 60×40×4 base is `box3(30, 20, 2)` and the back wall is `box3(30, 2, 20)` stood up along −Y. I’ll union them, then punch four Ø6 (r=3) holes through the base on a rectangular pattern — the pattern is just a JS loop."
+      },
+      {
+        "kind": "create_model",
+        "args": {
+          "script": "// 90° angle bracket: a 60×40×4 horizontal flange and a 60×4×40 vertical\n// flange along the back edge, with four Ø6 mounting holes in the base.\nconst base = Shape.box3(30, 20, 2);                        // 60 × 40 × 4\nconst wall = Shape.box3(30, 2, 20).translate(0, -18, 22);  // 60 × 4 × 40, back edge\nlet bracket = base.union(wall);\nconst hole = Shape.cylinder(3, 6);                         // r=3, punches through\nfor (const x of [-20, 20]) for (const y of [-12, 6]) {\n  bracket = bracket.subtract(hole.translate(x, y, 0));\n}\nreturn bracket;",
+          "name": "angle-bracket"
+        },
+        "payload": {
+          "model_id": "model-1",
+          "name": "angle-bracket",
+          "exact": false,
+          "mesh": {
+            "triangles": 22166,
+            "vertices": 11077
+          },
+          "boundingBox": {
+            "min": [
+              -30,
+              -20,
+              -2
+            ],
+            "max": [
+              30,
+              20,
+              42
+            ],
+            "size": [
+              60,
+              40,
+              44
+            ]
+          },
+          "volume": 18032.011256997677,
+          "valid": true,
+          "issues": []
+        }
+      },
+      {
+        "kind": "narration",
+        "text": "`create_model` returns immediately with `valid: true` and volume 18032 mm³ — the four holes and the boolean union all resolved into one closed solid. Let me eyeball it before exporting."
+      },
+      {
+        "kind": "screenshot",
+        "args": {
+          "model_id": "model-1",
+          "view": "iso",
+          "width": 720,
+          "height": 540
+        },
+        "file": "angle-bracket-iso.png",
+        "bytes": 17210
+      },
+      {
+        "kind": "narration",
+        "text": "That matches the spec. Mass properties, then the files:"
+      },
+      {
+        "kind": "measure",
+        "args": {
+          "model_id": "model-1",
+          "query": "mass"
+        },
+        "payload": {
+          "volume": 18032.011256997677,
+          "surfaceArea": 10703.113814485621,
+          "centroid": [
+            -0.0018492654194972567,
+            -9.333888727169896,
+            11.583349370088724
+          ],
+          "inertia": [
+            [
+              6124309.147046339,
+              -275.66871196687083,
+              1414.1311746387219
+            ],
+            [
+              -275.66871196687083,
+              8707097.60635368,
+              1812303.553753316
+            ],
+            [
+              1414.1311746387219,
+              1812303.553753316,
+              7971354.13934768
+            ]
+          ],
+          "exact": false
+        }
+      },
+      {
+        "kind": "narration",
+        "text": "Volume 18032 mm³ = 18.0 cm³; in 6061 aluminium (2.70 g/cm³) that’s about **49 g**. Exporting STEP and STL:"
+      },
+      {
+        "kind": "export",
+        "args": {
+          "model_id": "model-1",
+          "format": "step",
+          "path": "angle-bracket.step"
+        },
+        "payload": {
+          "model_id": "model-1",
+          "format": "step",
+          "path": "output/angle-bracket.step",
+          "bytes": 6517305
+        }
+      },
+      {
+        "kind": "export",
+        "args": {
+          "model_id": "model-1",
+          "format": "stl",
+          "path": "angle-bracket.stl"
+        },
+        "payload": {
+          "model_id": "model-1",
+          "format": "stl",
+          "path": "output/angle-bracket.stl",
+          "bytes": 1108384
+        }
+      },
+      {
+        "kind": "narration",
+        "text": "Done — a valid, watertight bracket with four through-holes, delivered as an analytic-fallback STEP file and a print-ready STL, straight from the prompt."
+      }
+    ]
+  },
+  {
+    "slug": "hinge-leaf",
+    "title": "a hinge leaf with knuckles and a pin bore",
+    "turns": [
+      {
+        "kind": "narration",
+        "text": "A knuckle is a cylinder whose default +Z axis I rotate onto +X, then slide along X. Three of them union onto the plate; a long thin cylinder on the same axis subtracts the pin bore. `rotate(0, 1, 0, 90)` swings +Z onto +X."
+      },
+      {
+        "kind": "create_model",
+        "args": {
+          "script": "// One leaf of a butt hinge: a flat plate with three barrel knuckles on the\n// pin axis (X) and a pin bore drilled through them. Two of these — one\n// mirrored — pin together into a working hinge.\nconst plate = Shape.box3(30, 15, 0.75).translate(0, -15.75, 0);  // 60 × 30 × 1.5 leaf\n// A knuckle is a cylinder whose +Z axis is rotated onto +X, then slid along X.\nconst knuckle = Shape.cylinder(4, 6).rotate(0, 1, 0, 90);        // r=4, 12 long on X\nlet leaf = plate;\nfor (const x of [-24, 0, 24]) leaf = leaf.union(knuckle.translate(x, 0, 0));\nconst pin = Shape.cylinder(1.6, 40).rotate(0, 1, 0, 90);         // Ø3.2 bore on X\nreturn leaf.subtract(pin);",
+          "name": "hinge-leaf"
+        },
+        "payload": {
+          "model_id": "model-2",
+          "name": "hinge-leaf",
+          "exact": false,
+          "mesh": {
+            "triangles": 21368,
+            "vertices": 10684
+          },
+          "boundingBox": {
+            "min": [
+              -30,
+              -30.75,
+              -5.3682811189189135
+            ],
+            "max": [
+              30,
+              6,
+              5.3682811189189135
+            ],
+            "size": [
+              60,
+              36.75,
+              10.736562237837827
+            ]
+          },
+          "volume": 4013.5680459331566,
+          "valid": true,
+          "issues": []
+        }
+      },
+      {
+        "kind": "narration",
+        "text": "Valid solid, 21,368 triangles — the pin bore runs cleanly through all three knuckles. Let me look at it and confirm the mesh is watertight before exporting."
+      },
+      {
+        "kind": "screenshot",
+        "args": {
+          "model_id": "model-2",
+          "view": "iso",
+          "width": 720,
+          "height": 540
+        },
+        "file": "hinge-leaf-iso.png",
+        "bytes": 25791
+      },
+      {
+        "kind": "validate",
+        "args": {
+          "model_id": "model-2"
+        },
+        "payload": {
+          "valid": true,
+          "closedManifold": true,
+          "triangles": 21368,
+          "vertices": 10684,
+          "volume": 4013.5680459331566,
+          "exact": false,
+          "issues": []
+        }
+      },
+      {
+        "kind": "narration",
+        "text": "`closedManifold: true`, no issues — a real solid, not a surface soup. Exporting STEP for the mechanical model:"
+      },
+      {
+        "kind": "export",
+        "args": {
+          "model_id": "model-2",
+          "format": "step",
+          "path": "hinge-leaf.step"
+        },
+        "payload": {
+          "model_id": "model-2",
+          "format": "step",
+          "path": "output/hinge-leaf.step",
+          "bytes": 11220052
+        }
+      },
+      {
+        "kind": "export",
+        "args": {
+          "model_id": "model-2",
+          "format": "stl",
+          "path": "hinge-leaf.stl"
+        },
+        "payload": {
+          "model_id": "model-2",
+          "format": "stl",
+          "path": "output/hinge-leaf.stl",
+          "bytes": 1068484
+        }
+      },
+      {
+        "kind": "narration",
+        "text": "Mirror this leaf about X and pin the two together and you have a working hinge."
+      }
+    ]
+  },
+  {
+    "slug": "enclosure",
+    "title": "a shelled enclosure with a press-fit lid",
+    "turns": [
+      {
+        "kind": "narration",
+        "text": "I’ll shell the body by subtracting an inner cavity from a rounded box, raising the cavity so it breaks through the top face — that leaves the box open for the lid. Then a separate lid with a recessed lip sized for a press fit."
+      },
+      {
+        "kind": "create_model",
+        "args": {
+          "script": "// Electronics enclosure: a rounded box hollowed to a 3 mm wall with an open\n// top. The shell is outer.subtract(inner) — the inner cavity is raised so it\n// breaks through the top face, leaving the box open for the lid.\nconst outer = Shape.roundedBox(40, 30, 15, 3);                 // 80 × 60 × 30\nconst cavity = Shape.box3(37, 27, 14).translate(0, 0, 2);      // 3 mm walls, open top\nreturn outer.subtract(cavity);",
+          "name": "enclosure-body"
+        },
+        "payload": {
+          "model_id": "model-3",
+          "name": "enclosure-body",
+          "exact": false,
+          "mesh": {
+            "triangles": 25868,
+            "vertices": 12936
+          },
+          "boundingBox": {
+            "min": [
+              -40,
+              -30,
+              -15
+            ],
+            "max": [
+              40,
+              30,
+              15
+            ],
+            "size": [
+              80,
+              60,
+              30
+            ]
+          },
+          "volume": 34621.162880956064,
+          "valid": true,
+          "issues": []
+        }
+      },
+      {
+        "kind": "narration",
+        "text": "Body is valid — volume 34621 mm³ after hollowing. Rendering it to check the wall broke through the top:"
+      },
+      {
+        "kind": "screenshot",
+        "args": {
+          "model_id": "model-3",
+          "view": "iso",
+          "width": 720,
+          "height": 540
+        },
+        "file": "enclosure-body-iso.png",
+        "bytes": 24741
+      },
+      {
+        "kind": "export",
+        "args": {
+          "model_id": "model-3",
+          "format": "step",
+          "path": "enclosure-body.step"
+        },
+        "payload": {
+          "model_id": "model-3",
+          "format": "step",
+          "path": "output/enclosure-body.step",
+          "bytes": 4985617
+        }
+      },
+      {
+        "kind": "export",
+        "args": {
+          "model_id": "model-3",
+          "format": "stl",
+          "path": "enclosure-body.stl"
+        },
+        "payload": {
+          "model_id": "model-3",
+          "format": "stl",
+          "path": "output/enclosure-body.stl",
+          "bytes": 1293484
+        }
+      },
+      {
+        "kind": "narration",
+        "text": "Open-topped shell, confirmed. Now the lid: a top plate with a lip that drops into the mouth with 0.5 mm clearance per wall."
+      },
+      {
+        "kind": "create_model",
+        "args": {
+          "script": "// Matching lid: a top plate with a recessed lip that press-fits into the\n// enclosure's open mouth (0.5 mm clearance on each wall).\nconst cap = Shape.roundedBox(40, 30, 1.5, 3).translate(0, 0, 16.5);  // top plate\nconst lip = Shape.box3(36.5, 26.5, 2).translate(0, 0, 13);           // insert lip\nreturn cap.union(lip);",
+          "name": "enclosure-lid"
+        },
+        "payload": {
+          "model_id": "model-4",
+          "name": "enclosure-lid",
+          "exact": false,
+          "mesh": {
+            "triangles": 15124,
+            "vertices": 7564
+          },
+          "boundingBox": {
+            "min": [
+              -40,
+              -30,
+              11
+            ],
+            "max": [
+              40,
+              30,
+              18
+            ],
+            "size": [
+              80,
+              60,
+              7
+            ]
+          },
+          "volume": 28863.973766896357,
+          "valid": true,
+          "issues": []
+        }
+      },
+      {
+        "kind": "screenshot",
+        "args": {
+          "model_id": "model-4",
+          "view": "iso",
+          "width": 720,
+          "height": 540
+        },
+        "file": "enclosure-lid-iso.png",
+        "bytes": 21835
+      },
+      {
+        "kind": "export",
+        "args": {
+          "model_id": "model-4",
+          "format": "step",
+          "path": "enclosure-lid.step"
+        },
+        "payload": {
+          "model_id": "model-4",
+          "format": "step",
+          "path": "output/enclosure-lid.step",
+          "bytes": 4416489
+        }
+      },
+      {
+        "kind": "export",
+        "args": {
+          "model_id": "model-4",
+          "format": "stl",
+          "path": "enclosure-lid.stl"
+        },
+        "payload": {
+          "model_id": "model-4",
+          "format": "stl",
+          "path": "output/enclosure-lid.stl",
+          "bytes": 756284
+        }
+      },
+      {
+        "kind": "narration",
+        "text": "Two parts, both watertight: an open-topped 3 mm-walled enclosure and a press-fit lid, each as STEP and STL. The lip is 0.5 mm under the cavity on every wall, so it seats without jamming."
+      }
+    ]
+  },
+  {
+    "slug": "gear-disk",
+    "title": "a toothed disk from a circular pattern",
+    "turns": [
+      {
+        "kind": "narration",
+        "text": "One tooth box, rotated into 16 positions by a loop, unioned onto a root cylinder, minus a central bore. `(360 * i) / TEETH` spaces the teeth evenly."
+      },
+      {
+        "kind": "create_model",
+        "args": {
+          "script": "// A toothed disk: a root disk with N teeth placed on a circular pattern by\n// rotating one tooth box around the Z axis, plus a central bore. The pattern\n// is just a JS loop — the script vocabulary is a real programming language.\nconst TEETH = 16, TH = 4, ROOT = 16, BORE = 4;\nlet gear = Shape.cylinder(ROOT, TH);\nconst tooth = Shape.box3(3, 2.2, TH).translate(ROOT + 1.5, 0, 0);\nfor (let i = 0; i < TEETH; i++) {\n  gear = gear.union(tooth.rotate(0, 0, 1, (360 * i) / TEETH));\n}\nreturn gear.subtract(Shape.cylinder(BORE, TH + 2));           // central bore",
+          "name": "gear-disk"
+        },
+        "payload": {
+          "model_id": "model-5",
+          "name": "gear-disk",
+          "exact": false,
+          "mesh": {
+            "triangles": 50928,
+            "vertices": 25478
+          },
+          "boundingBox": {
+            "min": [
+              -20.614211729823097,
+              -20.577241106166063,
+              -16
+            ],
+            "max": [
+              20.567131070203015,
+              20.61083951798434,
+              16
+            ],
+            "size": [
+              41.181342800026115,
+              41.1880806241504,
+              32
+            ]
+          },
+          "volume": 8999.588002223581,
+          "valid": true,
+          "issues": []
+        }
+      },
+      {
+        "kind": "narration",
+        "text": "All 16 teeth resolved — `valid: true`, volume 9000 mm³. Top view to check the tooth count and spacing, then iso:"
+      },
+      {
+        "kind": "screenshot",
+        "args": {
+          "model_id": "model-5",
+          "view": "top",
+          "width": 720,
+          "height": 540
+        },
+        "file": "gear-disk-top.png",
+        "bytes": 26349
+      },
+      {
+        "kind": "screenshot",
+        "args": {
+          "model_id": "model-5",
+          "view": "iso",
+          "width": 720,
+          "height": 540
+        },
+        "file": "gear-disk-iso.png",
+        "bytes": 37032
+      },
+      {
+        "kind": "narration",
+        "text": "Sixteen evenly-spaced teeth. STL exports the mesh directly:"
+      },
+      {
+        "kind": "export",
+        "args": {
+          "model_id": "model-5",
+          "format": "stl",
+          "path": "gear-disk.stl"
+        },
+        "payload": {
+          "model_id": "model-5",
+          "format": "stl",
+          "path": "output/gear-disk.stl",
+          "bytes": 2546484
+        }
+      },
+      {
+        "kind": "narration",
+        "text": "For completeness I’ll also try STEP. The thin teeth sit right at the edge of the model’s bounding box, and the faceted STEP path needs the surface strictly *inside* the meshing region — so this is a case where the export declines rather than emitting a broken file. Watch how it reports:"
+      },
+      {
+        "kind": "export",
+        "args": {
+          "model_id": "model-5",
+          "format": "step",
+          "path": "gear-disk.step"
+        },
+        "error": "Error: export failed: STEP export failed: degenerate geometry in sdf_to_brep: adaptive meshing did not produce a closed manifold; the surface must lie strictly inside the meshing bounds"
+      },
+      {
+        "kind": "narration",
+        "text": "That’s the honest failure mode: `isError: true` with a specific reason, not a silently-corrupt STEP. The STL is unaffected — meshing and STEP’s planar-region recovery are different code paths. For an analytic STEP of a gear you’d thicken the teeth slightly or model them as an extruded `Profile`; the STL here is already print-ready."
+      }
+    ]
+  },
+  {
+    "slug": "bottle",
+    "title": "a bottle from a revolved, shelled profile",
+    "turns": [
+      {
+        "kind": "narration",
+        "text": "A `Profile` is a closed polyline with optional arcs. I draw the outer silhouette — straight up the body, an `arcTo` for the rounded shoulder, up the neck — revolve it about Y, then subtract a slightly-smaller inner revolve that runs taller than the neck so it opens the mouth. That inner subtract is the shell."
+      },
+      {
+        "kind": "create_model",
+        "args": {
+          "script": "// A bottle: revolve a 2D silhouette 360° about the Y axis, then hollow it by\n// subtracting an inner revolve that breaks through the top (the shell). The\n// arcTo on the shoulder is a rounded fillet from body to neck.\nconst outer = new Profile(0, 0);\nouter.lineTo(18, 0);\nouter.lineTo(18, 44);\nouter.arcTo(6, 60, 0.55);     // rounded shoulder (fillet), body -> neck\nouter.lineTo(6, 74);\nouter.lineTo(0, 74);\nouter.close();\nlet bottle = Shape.revolve(outer, 360);\n\nconst cavity = new Profile(0, 3);\ncavity.lineTo(15, 3);\ncavity.lineTo(15, 44);\ncavity.arcTo(3, 60, 0.55);\ncavity.lineTo(3, 90);         // taller than the neck: opens the mouth\ncavity.lineTo(0, 90);\ncavity.close();\nreturn bottle.subtract(Shape.revolve(cavity, 360));",
+          "name": "bottle"
+        },
+        "payload": {
+          "model_id": "model-6",
+          "name": "bottle",
+          "exact": false,
+          "mesh": {
+            "triangles": 23388,
+            "vertices": 11688
+          },
+          "boundingBox": {
+            "min": [
+              -18.768181818181816,
+              0,
+              -18.768181818181816
+            ],
+            "max": [
+              18.768181818181816,
+              74,
+              18.768181818181816
+            ],
+            "size": [
+              37.53636363636363,
+              74,
+              37.53636363636363
+            ]
+          },
+          "volume": 21530.952716922486,
+          "valid": true,
+          "issues": []
+        }
+      },
+      {
+        "kind": "narration",
+        "text": "Rendering the result from the front and iso to check the silhouette and the open neck:"
+      },
+      {
+        "kind": "screenshot",
+        "args": {
+          "model_id": "model-6",
+          "view": "front",
+          "width": 720,
+          "height": 540
+        },
+        "file": "bottle-front.png",
+        "bytes": 36300
+      },
+      {
+        "kind": "screenshot",
+        "args": {
+          "model_id": "model-6",
+          "view": "iso",
+          "width": 720,
+          "height": 540
+        },
+        "file": "bottle-iso.png",
+        "bytes": 42556
+      },
+      {
+        "kind": "narration",
+        "text": "Now the watertightness check — a shell that didn’t break through would read as a closed cavity:"
+      },
+      {
+        "kind": "validate",
+        "args": {
+          "model_id": "model-6"
+        },
+        "payload": {
+          "valid": true,
+          "closedManifold": true,
+          "triangles": 23388,
+          "vertices": 11688,
+          "volume": 21530.952716922486,
+          "exact": false,
+          "issues": []
+        }
+      },
+      {
+        "kind": "narration",
+        "text": "`closedManifold: true`, volume 21531 mm³ — a genuine hollow solid with an open mouth. Exporting mesh formats:"
+      },
+      {
+        "kind": "export",
+        "args": {
+          "model_id": "model-6",
+          "format": "stl",
+          "path": "bottle.stl"
+        },
+        "payload": {
+          "model_id": "model-6",
+          "format": "stl",
+          "path": "output/bottle.stl",
+          "bytes": 1169484
+        }
+      },
+      {
+        "kind": "export",
+        "args": {
+          "model_id": "model-6",
+          "format": "obj",
+          "path": "bottle.obj"
+        },
+        "payload": {
+          "model_id": "model-6",
+          "format": "obj",
+          "path": "output/bottle.obj",
+          "bytes": 1985589
+        }
+      },
+      {
+        "kind": "narration",
+        "text": "A hollow bottle with a rounded shoulder and an open neck, watertight where it should be and open where it should be — all from a revolved profile and one boolean subtract."
+      }
+    ]
+  }
+]

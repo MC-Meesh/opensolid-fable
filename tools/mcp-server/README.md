@@ -150,8 +150,23 @@ claude mcp add opensolid -- node /absolute/path/to/tools/mcp-server/src/server.j
 
 ## Examples
 
-[`examples/bracket-transcript.md`](examples/bracket-transcript.md) is a full
-agent transcript: an agent designs an L-bracket with two mounting holes from a
-one-line spec, using only these tools — create, validate, measure, screenshot,
-export. It shows the intended loop: *script → validate → measure → adjust →
-export.*
+[`examples/agent-gallery/`](examples/agent-gallery/) is a gallery of **five**
+worked agent transcripts — a mounting bracket, a hinge leaf, a shelled enclosure
+with a press-fit lid, a toothed disk built from a circular pattern, and a
+revolved-and-shelled bottle. Each is real, unedited output from this server,
+captured by [`build-gallery.mjs`](examples/agent-gallery/build-gallery.mjs): the
+agent writes a script, gets mesh stats and a validity flag, renders screenshots,
+measures mass properties, and exports STEP/STL/OBJ. They show the intended loop
+— *script → validate → measure → adjust → export* — and one genuine export
+limitation and how the tool reports it.
+
+Regenerate the whole gallery (renders, exports, and transcripts):
+
+```bash
+node examples/agent-gallery/build-gallery.mjs
+```
+
+Exported files and renders land in [`examples/output/`](examples/output/). For
+connecting a client, the full tool reference, the script API, and the failure
+modes these examples exercise, see the
+[Agent Guide](../../docs/AGENT_GUIDE.md).

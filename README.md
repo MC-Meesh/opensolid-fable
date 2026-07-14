@@ -370,11 +370,37 @@ is not checked in. See `web/playground/README.md` for the full UI reference
 
 ---
 
+## AI-first CAD
+
+OpenSolid is designed to be driven by an agent, not just a mouse. An
+[MCP](https://modelcontextprotocol.io) server exposes the kernel as a handful of
+tools — `create_model`, `get_screenshot`, `measure`, `validate`, `export` — so
+any MCP-capable agent (Claude, etc.) becomes a **headless CAD operator**: it
+writes a script, gets back mesh stats and a validity report, renders
+screenshots, checks mass properties, and exports STEP/STL/OBJ, with no GUI in the
+loop. The kernel is the same wasm build the playground runs, so anything an agent
+builds opens unchanged in the browser.
+
+- **[Agent Guide](docs/AGENT_GUIDE.md)** — connect a client, the tool reference,
+  the script API, and every failure mode with how it's reported.
+- **[Agent gallery](tools/mcp-server/examples/agent-gallery/)** — five worked
+  transcripts (bracket, hinge, enclosure, gear, bottle), each real unedited
+  output from the server: prompt in, manufacturable part out.
+- **[MCP server](tools/mcp-server/)** — the server itself, setup, and tests.
+
+```bash
+cd tools/mcp-server && npm run build
+claude mcp add opensolid -- node "$PWD/src/server.js"
+```
+
+---
+
 ## Repository layout
 
 ```
 crates/            The five Rust crates (see Architecture)
 web/playground/    React + Vite browser playground
+tools/mcp-server/  MCP server + agent gallery (see AI-first CAD)
 research/          Landscape analysis (read-only reference)
 spec/              v1 spec — Parasolid mapping, tolerance philosophy, targets
                    (the v1 crate structure predates the hybrid pivot; ignore it)
