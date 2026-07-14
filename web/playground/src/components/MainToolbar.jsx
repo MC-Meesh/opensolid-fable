@@ -18,6 +18,18 @@ const ICON = {
 };
 
 const Icons = {
+  undo: (
+    <svg {...ICON}>
+      <path d="M4 8 H10 c2.2 0 3.5 1.3 3.5 3.2 S12.2 14.4 10 14.4 H6.5" />
+      <path d="M6.5 5 L3.5 8 L6.5 11" />
+    </svg>
+  ),
+  redo: (
+    <svg {...ICON}>
+      <path d="M12 8 H6 c-2.2 0-3.5 1.3-3.5 3.2 S3.8 14.4 6 14.4 H9.5" />
+      <path d="M9.5 5 L12.5 8 L9.5 11" />
+    </svg>
+  ),
   sketch: (
     <svg {...ICON}>
       <path d="M2 14 L3 10.5 L11.5 2 L14 4.5 L5.5 13 Z" />
@@ -114,6 +126,12 @@ function ToolButton({ icon, label, title, disabledReason, active, disabled, comp
 
 export default function MainToolbar({
   disabled,
+  canUndo = false,
+  canRedo = false,
+  undoDepth = 0,
+  redoDepth = 0,
+  onUndo,
+  onRedo,
   sketchOpen,
   sketchOnFace = false,
   onSketchToggle,
@@ -132,6 +150,28 @@ export default function MainToolbar({
   const notReady = 'Still loading the WASM kernel';
   return (
     <div className="main-toolbar" role="toolbar" aria-label="Main toolbar">
+      <div className="tool-group" aria-label="Edit">
+        <span className="tool-group-label">Edit</span>
+        <ToolButton
+          icon="undo"
+          label="Undo"
+          title={canUndo ? `Undo (Ctrl+Z) — ${undoDepth} step${undoDepth === 1 ? '' : 's'}` : 'Nothing to undo'}
+          disabledReason={disabled ? notReady : 'Nothing to undo'}
+          disabled={disabled || !canUndo}
+          compact
+          onClick={onUndo}
+        />
+        <ToolButton
+          icon="redo"
+          label="Redo"
+          title={canRedo ? `Redo (Ctrl+Shift+Z) — ${redoDepth} step${redoDepth === 1 ? '' : 's'}` : 'Nothing to redo'}
+          disabledReason={disabled ? notReady : 'Nothing to redo'}
+          disabled={disabled || !canRedo}
+          compact
+          onClick={onRedo}
+        />
+      </div>
+      <div className="tool-sep" />
       <div className="tool-group" aria-label="Sketch">
         <span className="tool-group-label">Sketch</span>
         <ToolButton

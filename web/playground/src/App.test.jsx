@@ -82,4 +82,22 @@ describe('App', () => {
     expect(html).not.toContain('Loading WASM');
     expect(html).not.toContain('WASM engine failed to load');
   });
+
+  it('renders the feature-level Undo/Redo controls, disabled at a fresh start', () => {
+    const loader = fakeLoader({
+      status: 'ready',
+      error: null,
+      api: { WasmShape: class {}, WasmProfile2D: class {} },
+    });
+    const html = renderToString(
+      <WasmProvider loader={loader}>
+        <App />
+      </WasmProvider>
+    );
+    expect(html).toContain('>Edit<'); // toolbar Edit group
+    // No edits committed yet (effects don't run under renderToString), so
+    // both are disabled.
+    expect(html).toMatch(/<button[^>]*disabled[^>]*aria-label="Undo"/);
+    expect(html).toMatch(/<button[^>]*disabled[^>]*aria-label="Redo"/);
+  });
 });

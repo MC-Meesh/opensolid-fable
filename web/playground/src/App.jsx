@@ -26,6 +26,13 @@ import { createFaceRegionIndex } from './lib/facePlane.js';
 import { isFacePlane } from './lib/sketch/profile.js';
 import { faceRefFromPlane, planarRegionsOf, resolveRefs } from './lib/persistentRef.js';
 import { computeRebuildState } from './lib/rebuildState.js';
+import {
+  createHistory,
+  commit as recordHistory,
+  undo as undoHistory,
+  redo as redoHistory,
+  depth as historyDepthOf,
+} from './lib/history.js';
 
 // Adaptive meshing target: maximum chordal deviation from the exact
 // surface, in model units. The octree refines near curvature and CSG
@@ -154,6 +161,14 @@ export default function App() {
   // Bidirectional sync: the script text is the source of truth; every model
   // edit funnels through commitScript below.
   const scriptRef = useRef(DEFAULT_SCRIPT);
+  // Feature-level (session-wide) undo/redo: a linear stack of script
+  // snapshots — the script fully serializes the construction tree, so each
+  // store commit that changes it pushes one entry (see src/lib/history.js).
+  // Sketch-mode's own history (src/lib/sketch/history.js) nests under this:
+  // it owns Ctrl+Z while a sketch is open, and applying the sketch lands as
+  // one entry here. Depth is mirrored into state to drive the toolbar.
+  const historyRef = useRef(createHistory(DEFAULT_SCRIPT));
+  const [historyDepth, setHistoryDepth] = useState({ undo: 0, redo: 0 });
   // Store generation: bumped once per model commit. Remesh requests and the
   // pruned-display recompute carry the generation they were issued for, and
   // results from superseded generations are dropped instead of rendered.
@@ -310,16 +325,41 @@ export default function App() {
   //
   // `selectPath`: undefined keeps the current selection (restored by path
   // after re-evaluation), null clears it, an array selects that path.
+  // `record`: push the previous script onto the undo stack (default). Undo
+  // and redo replay a snapshot with record=false so they don't re-record.
   const commitScript = useCallback(
-    (source, { fromEditor = false, selectPath } = {}) => {
+    (source, { fromEditor = false, selectPath, record = true } = {}) => {
       clearTimeout(editTimerRef.current);
       if (selectPath !== undefined) selectedPathRef.current = selectPath;
+      // Snapshot the pre-commit script for undo. recordHistory no-ops when the
+      // script is unchanged, so redundant commits never create a history step.
+      if (record && recordHistory(historyRef.current, source)) {
+        setHistoryDepth(historyDepthOf(historyRef.current));
+      }
       scriptRef.current = source;
       if (!fromEditor) editorRef.current?.setDoc(source);
       evaluateScript();
     },
     [evaluateScript]
   );
+
+  // Feature-level undo/redo: swap the live script for the adjacent history
+  // snapshot and replay it through the store (record=false — the snapshot is
+  // already in history). Selection is cleared: the tree it referenced may no
+  // longer exist after the model changes shape.
+  const undo = useCallback(() => {
+    const target = undoHistory(historyRef.current);
+    if (target === null) return;
+    setHistoryDepth(historyDepthOf(historyRef.current));
+    commitScript(target, { record: false, selectPath: null });
+  }, [commitScript]);
+
+  const redo = useCallback(() => {
+    const target = redoHistory(historyRef.current);
+    if (target === null) return;
+    setHistoryDepth(historyDepthOf(historyRef.current));
+    commitScript(target, { record: false, selectPath: null });
+  }, [commitScript]);
 
   // GUI-edit lane: serialize the mutated tree back into a canonical script.
   // The script is a regenerated view — only the header comment survives a
@@ -898,8 +938,25 @@ export default function App() {
       if (tag === 'INPUT' || tag === 'TEXTAREA') return;
       const cm = event.target.closest('.cm-editor');
       if (cm) return;
-      // Sketch mode owns the keyboard (tools, dimensions, undo, Esc).
+      // Sketch mode owns the keyboard (tools, dimensions, undo, Esc): its
+      // own history nests under the feature-level history handled here.
       if (sketchOpen) return;
+
+      // Feature-level undo/redo. Ctrl/Cmd+Z undoes; Ctrl/Cmd+Shift+Z and
+      // Ctrl/Cmd+Y redo (the editor keeps its own undo — this handler already
+      // bailed above when focus is in an input or the CodeMirror editor).
+      const mod = event.ctrlKey || event.metaKey;
+      if (mod && (event.key === 'z' || event.key === 'Z')) {
+        event.preventDefault();
+        if (event.shiftKey) redo();
+        else undo();
+        return;
+      }
+      if (mod && (event.key === 'y' || event.key === 'Y')) {
+        event.preventDefault();
+        redo();
+        return;
+      }
 
       if (event.key === 't' || event.key === 'T') {
         setGizmoMode('translate');
@@ -925,7 +982,7 @@ export default function App() {
     }
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [clearSelection, sweep, cancelSweep, sketchOpen, handleDeleteSelected]);
+  }, [clearSelection, sweep, cancelSweep, sketchOpen, handleDeleteSelected, undo, redo]);
 
   // Exact booleans rebuild shapes, not just meshes: re-run the script.
   const handleExactBooleansChange = useCallback(
@@ -1052,6 +1109,12 @@ export default function App() {
       <div className="right">
         <MainToolbar
           disabled={!wasmReady}
+          canUndo={historyDepth.undo > 0}
+          canRedo={historyDepth.redo > 0}
+          undoDepth={historyDepth.undo}
+          redoDepth={historyDepth.redo}
+          onUndo={undo}
+          onRedo={redo}
           sketchOpen={sketchOpen}
           sketchOnFace={Boolean(pickedFace?.planar)}
           onSketchToggle={handleSketchToggle}

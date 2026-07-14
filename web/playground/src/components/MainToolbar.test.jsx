@@ -56,12 +56,12 @@ describe('MainToolbar', () => {
   it('disables sweep buttons with a tooltip explaining why', () => {
     const html = render();
     expect(html).toMatch(/<span class="tool-wrap" title="Open a sketch and draw a closed profile first">/);
-    expect(html).toMatch(/disabled[^>]*>.*Extrude/);
+    expect(html).toMatch(/<button[^>]*disabled[^>]*aria-label="Extrude"/);
   });
 
   it('enables sweeps when a closed profile exists', () => {
     const html = render({ sketchOpen: true, canSweep: true });
-    expect(html).not.toMatch(/disabled[^>]*>.*Extrude/);
+    expect(html).not.toMatch(/<button[^>]*disabled[^>]*aria-label="Extrude"/);
     expect(html).toContain('Exit Sketch');
   });
 
@@ -74,5 +74,22 @@ describe('MainToolbar', () => {
   it('disables everything with a loading tooltip before WASM is ready', () => {
     const html = render({ disabled: true });
     expect(html).toContain('Still loading the WASM kernel');
+  });
+
+  it('renders an Edit group with Undo/Redo, disabled when history is empty', () => {
+    const html = render();
+    expect(html).toContain('>Edit<');
+    expect(html).toMatch(/<button[^>]*disabled[^>]*aria-label="Undo"/);
+    expect(html).toMatch(/<button[^>]*disabled[^>]*aria-label="Redo"/);
+    expect(html).toContain('Nothing to undo');
+    expect(html).toContain('Nothing to redo');
+  });
+
+  it('enables Undo/Redo and surfaces the step depth in the tooltip', () => {
+    const html = render({ canUndo: true, undoDepth: 3, canRedo: true, redoDepth: 1 });
+    expect(html).not.toMatch(/<button[^>]*disabled[^>]*aria-label="Undo"/);
+    expect(html).not.toMatch(/<button[^>]*disabled[^>]*aria-label="Redo"/);
+    expect(html).toContain('Undo (Ctrl+Z) — 3 steps');
+    expect(html).toContain('Redo (Ctrl+Shift+Z) — 1 step');
   });
 });
