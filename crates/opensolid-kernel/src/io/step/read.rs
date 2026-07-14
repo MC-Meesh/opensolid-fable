@@ -47,8 +47,13 @@
 //! **millimetres**, on import. The applied factor is exposed as
 //! [`StepImport::length_scale`]. Files with no interpretable length unit
 //! import verbatim (scale 1); an uninterpretable or conflicting
-//! declaration emits a [`Severity::Warning`] diagnostic. Angle units are
-//! not yet interpreted (see of-ed1): angles import verbatim as radians.
+//! declaration emits a [`Severity::Warning`] diagnostic. The declared
+//! plane-angle unit is honoured the same way: the reader resolves the
+//! `PLANE_ANGLE_UNIT` (`SI_UNIT` radian, or a `CONVERSION_BASED_UNIT` such
+//! as degree) and scales all angle measures (e.g. conical-surface
+//! semi-angles) into radians, the kernel convention. The applied factor is
+//! exposed as [`StepImport::angle_scale`]. Files with no interpretable angle
+//! unit import angles verbatim (scale 1).
 //!
 //! # Example
 //!
@@ -187,6 +192,12 @@ pub struct StepImport {
     /// been multiplied by this factor — coordinates in the stores (and
     /// fallback meshes) are always millimetres.
     pub length_scale: f64,
+    /// Radians per file plane-angle unit, resolved from the file's
+    /// `GLOBAL_UNIT_ASSIGNED_CONTEXT` (1.0 when no angle unit is declared or
+    /// it cannot be interpreted). All imported angle measures (e.g. conical
+    /// surface semi-angles) have already been multiplied by this factor —
+    /// angles in the stores are always radians.
+    pub angle_scale: f64,
 }
 
 impl StepImport {
@@ -591,6 +602,105 @@ fn resolve_length_scale(file: &StepFile, diagnostics: &mut Vec<Diagnostic>) -> f
     scale
 }
 
+/// Radians per one of plane-angle unit `#unit_id`: an `SI_UNIT` is a
+/// (possibly prefixed) radian, a `CONVERSION_BASED_UNIT` (e.g. degree)
+/// chains through its `(PLANE_ANGLE_)MEASURE_WITH_UNIT` into another angle
+/// unit, followed at most `depth` links deep (guards reference cycles).
+/// `None` when the declaration cannot be interpreted.
+fn angle_unit_in_rad(file: &StepFile, unit_id: u64, depth: u32) -> Option<f64> {
+    if depth == 0 {
+        return None;
+    }
+    let inst = file.get(unit_id)?;
+    if let Some(si) = inst.entity.part("SI_UNIT") {
+        let prefix = match si.attributes.first()? {
+            Value::Unset => 1.0,
+            Value::Enum(name) => si_prefix_factor(name)?,
+            _ => return None,
+        };
+        (si.attributes.get(1)?.as_enum()? == "RADIAN").then_some(prefix)
+    } else if let Some(cbu) = inst.entity.part("CONVERSION_BASED_UNIT") {
+        // CONVERSION_BASED_UNIT(name, conversion_factor): the factor is a
+        // measure-with-unit whose value counts another angle unit
+        // (e.g. DEGREE = 0.017453… rad).
+        let measure = file.get(cbu.attributes.get(1)?.as_ref_id()?)?;
+        let rec = measure
+            .entity
+            .part("PLANE_ANGLE_MEASURE_WITH_UNIT")
+            .or_else(|| measure.entity.part("MEASURE_WITH_UNIT"))?;
+        let value = as_number(rec.attributes.first()?)?;
+        if !(value.is_finite() && value > 0.0) {
+            return None;
+        }
+        let base = angle_unit_in_rad(file, rec.attributes.get(1)?.as_ref_id()?, depth - 1)?;
+        Some(value * base)
+    } else {
+        None
+    }
+}
+
+/// Resolve the file's declared plane-angle unit to a scale factor (radians
+/// per file angle unit — the kernel convention is radians). Files declaring
+/// no angle unit import verbatim (scale 1). An uninterpretable declaration
+/// warns and is skipped; declarations that disagree across contexts warn and
+/// the first interpretable one wins. Mirrors [`resolve_length_scale`].
+fn resolve_angle_scale(file: &StepFile, diagnostics: &mut Vec<Diagnostic>) -> f64 {
+    let mut resolved: Option<(u64, f64)> = None;
+    for inst in &file.data {
+        let Some(ctx) = inst.entity.part("GLOBAL_UNIT_ASSIGNED_CONTEXT") else {
+            continue;
+        };
+        let Some(units) = ctx.attributes.first().and_then(Value::as_list) else {
+            continue;
+        };
+        for unit in units {
+            let Some(unit_id) = unit.as_ref_id() else {
+                continue;
+            };
+            let is_angle = file
+                .get(unit_id)
+                .is_some_and(|u| u.entity.part("PLANE_ANGLE_UNIT").is_some());
+            if !is_angle {
+                continue;
+            }
+            match (angle_unit_in_rad(file, unit_id, 4), resolved) {
+                (Some(scale), None) => resolved = Some((unit_id, scale)),
+                (Some(scale), Some((first_id, first))) => {
+                    if (scale - first).abs() > first.abs() * 1e-9 {
+                        diagnostics.push(Diagnostic {
+                            entity: Some(unit_id),
+                            severity: Severity::Warning,
+                            message: format!(
+                                "conflicting plane-angle units: #{first_id} is {first} rad but \
+                                 #{unit_id} is {scale} rad; using #{first_id}"
+                            ),
+                        });
+                    }
+                }
+                (None, _) => diagnostics.push(Diagnostic {
+                    entity: Some(unit_id),
+                    severity: Severity::Warning,
+                    message: "cannot interpret declared PLANE_ANGLE_UNIT; angles import verbatim"
+                        .to_string(),
+                }),
+            }
+        }
+    }
+    let Some((unit_id, scale)) = resolved else {
+        return 1.0;
+    };
+    if scale != 1.0 {
+        diagnostics.push(Diagnostic {
+            entity: Some(unit_id),
+            severity: Severity::Info,
+            message: format!(
+                "declared plane-angle unit is {scale} rad; angles scaled into radians"
+            ),
+        });
+    }
+    scale
+}
+
 // ---------------------------------------------------------------------
 // Geometry resolvers
 // ---------------------------------------------------------------------
@@ -684,7 +794,13 @@ enum RawSurface {
     Nurbs(Box<NurbsSurface>),
 }
 
-fn resolve_surface(file: &StepFile, id: u64, referrer: u64, scale: f64) -> MapResult<RawSurface> {
+fn resolve_surface(
+    file: &StepFile,
+    id: u64,
+    referrer: u64,
+    scale: f64,
+    angle_scale: f64,
+) -> MapResult<RawSurface> {
     let inst = instance(file, id, referrer)?;
     let Some(rec) = inst.as_simple() else {
         return Err(unsupported(
@@ -713,8 +829,9 @@ fn resolve_surface(file: &StepFile, id: u64, referrer: u64, scale: f64) -> MapRe
         "CONICAL_SURFACE" => {
             let p = placement(1)?;
             let radius = real_attr(rec, 2, id)? * scale;
-            // semi_angle is a plane angle measure: no length scaling.
-            let semi_angle = real_attr(rec, 3, id)?;
+            // semi_angle is a plane-angle measure: scale into radians (the
+            // length scale never applies).
+            let semi_angle = real_attr(rec, 3, id)? * angle_scale;
             Ok(RawSurface::Analytic(
                 Surface3::cone(p.location, p.axis, semi_angle, radius)
                     .map_err(|e| geometry_error(id, &e))?,
@@ -1098,6 +1215,8 @@ struct SolidBuilder<'a> {
     geo: &'a mut GeometryStore,
     /// Length-unit factor (mm per file unit) applied to all geometry.
     scale: f64,
+    /// Plane-angle factor (rad per file angle unit) applied to angle measures.
+    angle_scale: f64,
     created: Created,
     /// `VERTEX_POINT` #id → mapped vertex (shared between edges).
     vertices: HashMap<u64, EntityId<Vertex>>,
@@ -1150,7 +1269,13 @@ impl SolidBuilder<'_> {
 
         // Surface first: an unmappable surface (NURBS) is the more
         // fundamental finding than any bound-level problem.
-        let surface = match resolve_surface(self.file, surface_ref, face_ref, self.scale)? {
+        let surface = match resolve_surface(
+            self.file,
+            surface_ref,
+            face_ref,
+            self.scale,
+            self.angle_scale,
+        )? {
             RawSurface::Analytic(surface) => surface,
             RawSurface::Nurbs(_) => {
                 return Err(unsupported(
@@ -1351,6 +1476,8 @@ struct FallbackMesher<'a> {
     options: &'a TessellationOptions,
     /// Length-unit factor (mm per file unit) applied to all geometry.
     scale: f64,
+    /// Plane-angle factor (rad per file angle unit) applied to angle measures.
+    angle_scale: f64,
     diagnostics: &'a mut Vec<Diagnostic>,
     /// `EDGE_CURVE` #id → its polyline from start vertex to end vertex.
     /// Shared between adjacent faces so junctions weld watertight.
@@ -1416,7 +1543,13 @@ impl FallbackMesher<'_> {
         let surface_ref = ref_attr(rec, 2, face_ref)?;
         let same_sense = bool_attr(rec, 3, face_ref)?;
 
-        match resolve_surface(self.file, surface_ref, face_ref, self.scale)? {
+        match resolve_surface(
+            self.file,
+            surface_ref,
+            face_ref,
+            self.scale,
+            self.angle_scale,
+        )? {
             RawSurface::Analytic(surface @ Surface3::Plane { .. }) => {
                 self.mesh_planar_face(mesh, face_ref, &bounds, &surface, same_sense)
             }
@@ -1795,6 +1928,7 @@ fn map_file(
 ) -> StepImport {
     let mut diagnostics = Vec::new();
     let length_scale = resolve_length_scale(file, &mut diagnostics);
+    let angle_scale = resolve_angle_scale(file, &mut diagnostics);
     let mut solids = Vec::new();
     for inst in &file.data {
         let Some(rec) = inst.entity.part("MANIFOLD_SOLID_BREP") else {
@@ -1807,6 +1941,7 @@ fn map_file(
             geo,
             options,
             length_scale,
+            angle_scale,
             inst,
             &mut diagnostics,
         );
@@ -1827,15 +1962,18 @@ fn map_file(
         solids,
         diagnostics,
         length_scale,
+        angle_scale,
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn map_solid(
     file: &StepFile,
     store: &mut TopologyStore,
     geo: &mut GeometryStore,
     options: &StepReadOptions,
     scale: f64,
+    angle_scale: f64,
     inst: &Instance,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> SolidOutcome {
@@ -1858,6 +1996,7 @@ fn map_solid(
         store,
         geo,
         scale,
+        angle_scale,
         created: Created::default(),
         vertices: HashMap::new(),
         edges: HashMap::new(),
@@ -1895,6 +2034,7 @@ fn map_solid(
         file,
         options: &options.tessellation,
         scale,
+        angle_scale,
         diagnostics,
         polylines: HashMap::new(),
     };
@@ -2599,6 +2739,152 @@ mod tests {
         );
     }
 
+    // ---- plane-angle units (of-ed1) ----
+
+    /// Wrap a DATA body in an envelope declaring millimetres for length and
+    /// the given plane-angle unit through a `GLOBAL_UNIT_ASSIGNED_CONTEXT`.
+    /// `angle_units` must define instance `#901` as the plane-angle unit
+    /// (support entities may use `#909`–`#919`).
+    fn wrap_with_angle_units(data: &str, angle_units: &str) -> String {
+        format!(
+            "ISO-10303-21;\nHEADER;\nFILE_SCHEMA(('CONFIG_CONTROL_DESIGN'));\nENDSEC;\n\
+             DATA;\n{data}\n\
+             #900 = ( LENGTH_UNIT() NAMED_UNIT(*) SI_UNIT(.MILLI.,.METRE.) );\n\
+             {angle_units}\n\
+             #902 = ( NAMED_UNIT(*) SI_UNIT($,.STERADIAN.) SOLID_ANGLE_UNIT() );\n\
+             #903 = ( GEOMETRIC_REPRESENTATION_CONTEXT(3) \
+             GLOBAL_UNIT_ASSIGNED_CONTEXT((#900,#901,#902)) \
+             REPRESENTATION_CONTEXT('Context #1','3D Context') );\n\
+             ENDSEC;\nEND-ISO-10303-21;\n"
+        )
+    }
+
+    /// A CATIA-style degree plane-angle unit: a `CONVERSION_BASED_UNIT`
+    /// counting 0.01745… of the SI radian (`#901`, base radian at `#911`,
+    /// which is reachable only through the measure — not the context list).
+    const DEGREE_UNIT: &str = "\
+        #901 = (CONVERSION_BASED_UNIT('DEGREE',#910) NAMED_UNIT(#909) PLANE_ANGLE_UNIT());\n\
+        #909 = DIMENSIONAL_EXPONENTS(0.,0.,0.,0.,0.,0.,0.);\n\
+        #910 = PLANE_ANGLE_MEASURE_WITH_UNIT(PLANE_ANGLE_MEASURE(0.017453292519943295),#911);\n\
+        #911 = ( NAMED_UNIT(*) PLANE_ANGLE_UNIT() SI_UNIT($,.RADIAN.) );";
+
+    /// Resolve the plane-angle scale of an envelope carrying `angle_units`
+    /// (no geometry needed — `resolve_angle_scale` reads only the context).
+    fn angle_scale_of(angle_units: &str) -> (f64, Vec<Diagnostic>) {
+        let src = wrap_with_angle_units("", angle_units);
+        let file = super::super::parse(&src).expect("fixture parses");
+        let mut diags = Vec::new();
+        let scale = resolve_angle_scale(&file, &mut diags);
+        (scale, diags)
+    }
+
+    #[test]
+    fn degree_plane_angle_unit_resolves_to_radians_per_degree() {
+        let (scale, diags) = angle_scale_of(DEGREE_UNIT);
+        assert!(
+            (scale - PI / 180.0).abs() < 1e-12,
+            "degree scale {scale} != pi/180"
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.severity == Severity::Info
+                    && d.message.contains("declared plane-angle unit")),
+            "expected an info diagnostic: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn radian_plane_angle_unit_imports_verbatim_and_silent() {
+        let (scale, diags) =
+            angle_scale_of("#901 = ( NAMED_UNIT(*) PLANE_ANGLE_UNIT() SI_UNIT($,.RADIAN.) );");
+        assert_eq!(scale, 1.0);
+        assert!(
+            diags.is_empty(),
+            "radian files must import without angle chatter: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn no_angle_unit_imports_verbatim() {
+        // A context with only a length unit leaves the angle scale at 1.0.
+        let (_, _, report) = import(&wrap(&sphere_step_at(1, 2.0)));
+        assert_eq!(report.angle_scale, 1.0);
+    }
+
+    #[test]
+    fn uninterpretable_plane_angle_unit_warns_and_imports_verbatim() {
+        let (scale, diags) =
+            angle_scale_of("#901 = ( NAMED_UNIT(*) PLANE_ANGLE_UNIT() SI_UNIT($,.GRADIAN.) );");
+        assert_eq!(scale, 1.0);
+        assert!(
+            diags.iter().any(|d| d.severity == Severity::Warning
+                && d.message
+                    .contains("cannot interpret declared PLANE_ANGLE_UNIT")),
+            "expected an uninterpretable-unit warning: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn conflicting_plane_angle_units_warn_and_first_wins() {
+        // A second context declaring radians appears before the
+        // degree-declaring #903 context, so radians (scale 1) wins.
+        let (scale, diags) = angle_scale_of(&format!(
+            "#921 = ( NAMED_UNIT(*) PLANE_ANGLE_UNIT() SI_UNIT($,.RADIAN.) );\n\
+             #922 = ( GEOMETRIC_REPRESENTATION_CONTEXT(3) \
+             GLOBAL_UNIT_ASSIGNED_CONTEXT((#921)) \
+             REPRESENTATION_CONTEXT('Context #2','3D Context') );\n\
+             {DEGREE_UNIT}"
+        ));
+        assert_eq!(scale, 1.0);
+        assert!(
+            diags.iter().any(|d| d.severity == Severity::Warning
+                && d.message.contains("conflicting plane-angle units")),
+            "expected a conflicting-units warning: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn degree_unit_scales_cone_semi_angle_into_radians() {
+        // A CATIA degree file: the 45° semi-angle must import as pi/4 rad,
+        // not the 45 rad a verbatim read would produce.
+        let file = super::super::parse(&wrap_with_angle_units(
+            "#1 = CARTESIAN_POINT('', (0., 0., 0.));\n\
+             #2 = DIRECTION('', (0., 0., 1.));\n\
+             #3 = DIRECTION('', (1., 0., 0.));\n\
+             #4 = AXIS2_PLACEMENT_3D('', #1, #2, #3);\n\
+             #7 = CONICAL_SURFACE('', #4, 2.0, 45.0);",
+            DEGREE_UNIT,
+        ))
+        .expect("fixture parses");
+        let mut diags = Vec::new();
+        let angle_scale = resolve_angle_scale(&file, &mut diags);
+        let scale = resolve_length_scale(&file, &mut diags);
+        let RawSurface::Analytic(Surface3::Cone {
+            half_angle, radius, ..
+        }) = resolve_surface(&file, 7, 0, scale, angle_scale).unwrap()
+        else {
+            panic!("expected a cone");
+        };
+        assert!(
+            (half_angle - PI / 4.0).abs() < 1e-12,
+            "45 deg semi-angle imported as {half_angle} rad, expected pi/4"
+        );
+        assert!((radius - 2.0).abs() < 1e-12, "radius must be unaffected");
+    }
+
+    #[test]
+    fn degree_unit_exposed_on_report_end_to_end() {
+        // read_step populates StepImport::angle_scale from the file context.
+        let src = wrap_with_angle_units(&sphere_step_at(1, 2.0), DEGREE_UNIT);
+        let (_, _, report) = import(&src);
+        assert!(
+            (report.angle_scale - PI / 180.0).abs() < 1e-12,
+            "report.angle_scale {} != pi/180",
+            report.angle_scale
+        );
+    }
+
     // ---- entity-coverage: geometry resolvers ----
 
     fn parse_fixture(data: &str) -> StepFile {
@@ -2619,7 +2905,7 @@ mod tests {
              #9 = PLANE('', #4);",
         );
         let center = Point3::new(1.0, 2.0, 3.0);
-        match resolve_surface(&file, 5, 0, 1.0).unwrap() {
+        match resolve_surface(&file, 5, 0, 1.0, 1.0).unwrap() {
             RawSurface::Analytic(Surface3::Sphere {
                 center: c, radius, ..
             }) => {
@@ -2628,7 +2914,7 @@ mod tests {
             }
             _ => panic!("expected a sphere"),
         }
-        match resolve_surface(&file, 6, 0, 1.0).unwrap() {
+        match resolve_surface(&file, 6, 0, 1.0, 1.0).unwrap() {
             RawSurface::Analytic(Surface3::Torus {
                 major_radius,
                 minor_radius,
@@ -2639,7 +2925,7 @@ mod tests {
             }
             _ => panic!("expected a torus"),
         }
-        match resolve_surface(&file, 7, 0, 1.0).unwrap() {
+        match resolve_surface(&file, 7, 0, 1.0, 1.0).unwrap() {
             RawSurface::Analytic(Surface3::Cone {
                 half_angle, radius, ..
             }) => {
@@ -2649,11 +2935,11 @@ mod tests {
             _ => panic!("expected a cone"),
         }
         assert!(matches!(
-            resolve_surface(&file, 8, 0, 1.0).unwrap(),
+            resolve_surface(&file, 8, 0, 1.0, 1.0).unwrap(),
             RawSurface::Analytic(Surface3::Cylinder { .. })
         ));
         assert!(matches!(
-            resolve_surface(&file, 9, 0, 1.0).unwrap(),
+            resolve_surface(&file, 9, 0, 1.0, 1.0).unwrap(),
             RawSurface::Analytic(Surface3::Plane { .. })
         ));
     }
@@ -2727,7 +3013,7 @@ mod tests {
              #5 = B_SPLINE_SURFACE_WITH_KNOTS('', 1, 1, ((#1, #2), (#3, #4)), .UNSPECIFIED., \
                   .F., .F., .F., (2, 2), (2, 2), (0., 1.), (0., 1.), .UNSPECIFIED.);",
         );
-        let RawSurface::Nurbs(surface) = resolve_surface(&file, 5, 0, 1.0).unwrap() else {
+        let RawSurface::Nurbs(surface) = resolve_surface(&file, 5, 0, 1.0, 1.0).unwrap() else {
             panic!("expected a NURBS surface");
         };
         assert_eq!(surface.degree_u(), 1);
