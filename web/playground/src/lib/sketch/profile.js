@@ -34,9 +34,16 @@ export function isFacePlane(plane) {
   return typeof plane === 'object' && plane !== null;
 }
 
-/** Short display name of a sketch plane ('XY' … or 'Face'). */
+/**
+ * Short display name of a sketch plane. Named planes read as themselves
+ * ('XY' …); a persistent reference plane (of-fsl.14, `kind: 'plane'`) reads by
+ * its name when one is threaded through; an ephemeral picked face reads
+ * 'Face'.
+ */
 export function planeLabel(plane) {
-  return isFacePlane(plane) ? 'Face' : plane;
+  if (!isFacePlane(plane)) return plane;
+  if (plane.kind === 'plane') return plane.name || 'Plane';
+  return 'Face';
 }
 
 /**

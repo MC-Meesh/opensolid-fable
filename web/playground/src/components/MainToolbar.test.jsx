@@ -92,4 +92,15 @@ describe('MainToolbar', () => {
     expect(html).toContain('Undo (Ctrl+Z) — 3 steps');
     expect(html).toContain('Redo (Ctrl+Shift+Z) — 1 step');
   });
+
+  it('offers a Reference button in the Features group (of-fsl.14)', () => {
+    const html = render();
+    expect(html).toContain('Reference');
+    expect(html).toMatch(/title="[^"]*datum planes, axes, points/);
+  });
+
+  it('marks the Reference button active while its panel is open', () => {
+    const html = render({ referenceOpen: true });
+    expect(html).toMatch(/<button[^>]*class="main-tool active"[^>]*aria-label="Reference"/);
+  });
 });

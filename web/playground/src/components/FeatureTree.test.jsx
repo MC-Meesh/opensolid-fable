@@ -6,7 +6,7 @@
 import { describe, expect, it } from 'vitest';
 import { renderToString } from 'react-dom/server';
 import FeatureTree from './FeatureTree.jsx';
-import { buildFeatures } from '../lib/featureTree.js';
+import { buildFeatures, buildReferenceFeatures } from '../lib/featureTree.js';
 
 const noop = () => {};
 
@@ -95,6 +95,33 @@ describe('FeatureTree', () => {
     });
     expect(html).toContain('feature-badge error');
     expect(html).toContain('Rebuild error');
+  });
+
+  it('renders reference-geometry rows with rename + delete but no eye/suppress (of-fsl.14)', () => {
+    const refGeom = [
+      { id: 1, name: 'Plane1', kind: 'plane', entity: { kind: 'plane' } },
+      { id: 2, name: 'Axis1', kind: 'axis', entity: { kind: 'axis' } },
+    ];
+    const html = render({
+      features: [...buildReferenceFeatures(refGeom), ...sampleFeatures()],
+    });
+    expect(html).toContain('Plane1');
+    expect(html).toContain('Axis1');
+    expect(html).toContain('Delete Plane1');
+    // Datums are not part of the mesh recompute: no hide/suppress affordances.
+    expect(html).not.toContain('Hide Plane1');
+    expect(html).not.toContain('Suppress Plane1');
+    // Model features below still get the full action set.
+    expect(html).toContain('Hide Extrude1');
+  });
+
+  it('marks the selected reference row via selectedRefId', () => {
+    const refGeom = [{ id: 7, name: 'Plane1', kind: 'plane', entity: { kind: 'plane' } }];
+    const html = render({
+      features: buildReferenceFeatures(refGeom),
+      selectedRefId: 7,
+    });
+    expect(html).toContain('selected');
   });
 
   it('collapses to a thin docked strip', () => {

@@ -15,6 +15,7 @@
 // unit-tested directly (same pattern as sceneTree.js).
 
 import { UNARY_OPS } from './sceneTree.js';
+import { REFERENCE_META } from './referenceGeometry.js';
 
 /** Display metadata per op: feature kind and type name used for numbering. */
 export const FEATURE_META = {
@@ -103,6 +104,28 @@ export function buildFeatures(root, names = {}) {
     }
   }
   return features;
+}
+
+/**
+ * Feature-tree rows for the reference-geometry collection (of-fsl.14).
+ *
+ * Reference geometry is not a Shape, so these rows carry no traced-tree node —
+ * they are flagged `reference: true` and keyed `ref:<id>`, and the tree renders
+ * them with rename/delete only (no eye/suppress, which are mesh-recompute
+ * concerns). App concatenates these ahead of the model features, SolidWorks'
+ * convention of listing datums at the top of the FeatureManager.
+ */
+export function buildReferenceFeatures(refGeom = []) {
+  return refGeom.map((item) => ({
+    key: `ref:${item.id}`,
+    refId: item.id,
+    reference: true,
+    kind: item.kind, // 'plane' | 'axis' | 'point' | 'csys' — drives the icon
+    type: REFERENCE_META[item.kind]?.type ?? item.kind,
+    name: item.name,
+    defaultName: item.name,
+    depth: 0,
+  }));
 }
 
 /** Node ids for the feature keys that resolve in the current feature list.

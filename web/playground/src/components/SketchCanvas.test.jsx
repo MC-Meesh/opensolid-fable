@@ -46,6 +46,38 @@ describe('SketchCanvas', () => {
     expect(html).toContain('sketch-hint');
   });
 
+  it('lists reference planes in the plane picker (of-fsl.14)', () => {
+    const refPlanes = [
+      { id: 1, name: 'Plane1', plane: { kind: 'plane', name: 'Plane1' } },
+    ];
+    const html = renderToString(
+      <SketchCanvas
+        open
+        plane="XY"
+        refPlanes={refPlanes}
+        onPlaneChange={() => {}}
+        onProfileChange={() => {}}
+      />
+    );
+    expect(html).toContain('Plane1');
+    expect(html).toContain('Sketch on reference Plane1');
+  });
+
+  it('labels a reference plane instead of showing the Face chip (of-fsl.14)', () => {
+    const refPlane = { kind: 'plane', name: 'Plane2' };
+    const html = renderToString(
+      <SketchCanvas
+        open
+        plane={refPlane}
+        refPlanes={[{ id: 2, name: 'Plane2', plane: refPlane }]}
+        onPlaneChange={() => {}}
+        onProfileChange={() => {}}
+      />
+    );
+    // A persistent reference plane is not an ephemeral face pick.
+    expect(html).not.toContain('>Face<');
+  });
+
   it('renders hidden when closed', () => {
     const html = renderToString(
       <SketchCanvas

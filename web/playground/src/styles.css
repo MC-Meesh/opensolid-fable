@@ -717,6 +717,84 @@ button.main-tool svg { flex: none; }
 .sweep-actions { display: flex; gap: 8px; }
 .sweep-actions button { padding: 5px 14px; font-size: 12.5px; }
 
+/* ---- reference-geometry creation panel (of-fsl.14) ---- */
+.ref-panel {
+  position: absolute;
+  top: 46px;
+  right: 10px;
+  z-index: 3;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  width: 250px;
+  padding: 10px 12px;
+  background: color-mix(in srgb, var(--panel) 94%, transparent);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 12.5px;
+  backdrop-filter: blur(6px);
+}
+.ref-panel-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 13px;
+  font-weight: 600;
+}
+.ref-panel-close {
+  background: none;
+  border: none;
+  color: var(--muted);
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 2px;
+}
+.ref-panel-close:hover { color: var(--text); }
+.ref-kind-tabs { display: flex; gap: 4px; }
+.ref-kind {
+  flex: 1;
+  padding: 4px 0;
+  background: var(--bg);
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.ref-kind.active {
+  color: var(--text);
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 18%, var(--bg));
+}
+.ref-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  color: var(--muted);
+}
+.ref-field-label { color: var(--muted); }
+.ref-field select,
+.ref-field input[type="number"],
+.ref-field input[type="text"] {
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 4px 6px;
+  font-size: 12px;
+  width: 100%;
+}
+.ref-vec { display: flex; gap: 4px; }
+.ref-vec input { flex: 1; min-width: 0; }
+.ref-error {
+  color: var(--error);
+  font-size: 11.5px;
+  white-space: pre-wrap;
+}
+.ref-actions { display: flex; gap: 8px; }
+.ref-actions button { padding: 5px 14px; font-size: 12.5px; }
+
 /* Transient notice (e.g. "sketch on curved faces not supported yet"). */
 .toast {
   position: absolute;

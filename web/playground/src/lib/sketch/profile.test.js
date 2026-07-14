@@ -285,4 +285,14 @@ describe('plane mapping', () => {
     expect(planeAxisLabels(FACE)).toEqual(['U', 'V']);
     expect(planeAxisLabels('YZ')).toEqual(['Z', 'Y']);
   });
+
+  it('labels a persistent reference plane by its name (of-fsl.14)', () => {
+    const refPlane = { ...FACE, kind: 'plane', name: 'Plane2' };
+    expect(planeLabel(refPlane)).toBe('Plane2');
+    // A reference plane with no threaded name reads generically.
+    const unnamed = { ...FACE, kind: 'plane' };
+    expect(planeLabel(unnamed)).toBe('Plane');
+    // It still reads U/V for its sketch axes, like any object plane.
+    expect(planeAxisLabels(refPlane)).toEqual(['U', 'V']);
+  });
 });

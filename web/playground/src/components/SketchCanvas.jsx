@@ -40,6 +40,7 @@ import {
   segmentEnd2D,
   segmentStart2D,
 } from '../lib/sketch/profile.js';
+import { isReferencePlane } from '../lib/referenceGeometry.js';
 import {
   canRedo,
   canUndo,
@@ -171,6 +172,10 @@ export default forwardRef(function SketchCanvas(
   {
     open,
     plane,
+    // Reference planes offered alongside XY/XZ/YZ: `[{ id, name, plane }]`,
+    // where `plane` is the datum entity (a face-plane superset) sketching maps
+    // through unchanged (of-fsl.14).
+    refPlanes = [],
     view: viewProp,
     onViewChange,
     onPlaneChange,
@@ -1604,7 +1609,7 @@ export default forwardRef(function SketchCanvas(
         </div>
         <div className="group">
           <span className="group-label">Plane</span>
-          {isFacePlane(plane) && (
+          {isFacePlane(plane) && !isReferencePlane(plane) && (
             <button
               className="tool-btn active"
               disabled
@@ -1626,6 +1631,21 @@ export default forwardRef(function SketchCanvas(
               onClick={() => onPlaneChange(p)}
             >
               {p}
+            </button>
+          ))}
+          {refPlanes.map((rp) => (
+            <button
+              key={`ref:${rp.id}`}
+              className={`tool-btn${plane === rp.plane ? ' active' : ''}`}
+              disabled={Boolean(editing)}
+              title={
+                editing
+                  ? 'The plane is fixed while editing an existing sketch'
+                  : `Sketch on reference ${rp.name}`
+              }
+              onClick={() => onPlaneChange(rp.plane)}
+            >
+              {rp.name}
             </button>
           ))}
         </div>

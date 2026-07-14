@@ -104,6 +104,13 @@ const Icons = {
       <circle cx="13" cy="8" r="1" fill="currentColor" />
     </svg>
   ),
+  // Datum plane over crossed reference axes (SolidWorks reference-geometry cue).
+  reference: (
+    <svg {...ICON}>
+      <path d="M2.5 5.5 L8 3 L13.5 5.5 L8 8 Z" />
+      <path d="M8 8 V13.5 M4.5 11.5 H11.5" strokeDasharray="2 1.4" />
+    </svg>
+  ),
 };
 
 function ToolButton({ icon, label, title, disabledReason, active, disabled, compact, onClick }) {
@@ -135,6 +142,8 @@ export default function MainToolbar({
   sketchOpen,
   sketchOnFace = false,
   onSketchToggle,
+  referenceOpen = false,
+  onReference,
   canSweep,
   sweepDisabledReason,
   onSweep,
@@ -206,6 +215,15 @@ export default function MainToolbar({
           disabledReason={disabled ? notReady : sweepDisabledReason}
           disabled={disabled || !canSweep}
           onClick={() => onSweep('revolve')}
+        />
+        <ToolButton
+          icon="reference"
+          label="Reference"
+          title="Create reference geometry: datum planes, axes, points, coordinate systems"
+          disabledReason={notReady}
+          active={referenceOpen}
+          disabled={disabled}
+          onClick={onReference}
         />
       </div>
       <div className="tool-sep" />

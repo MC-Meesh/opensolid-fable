@@ -15,6 +15,11 @@ import {
 } from '../lib/sketchView.js';
 import { isFacePlane } from '../lib/sketch/profile.js';
 import { HOVER_RGB, SELECTED_RGB, expandToNonIndexed, paintHighlights } from '../lib/faceHighlight.js';
+import {
+  axisEndpoints,
+  csysSegments,
+  planeQuadCorners,
+} from '../lib/refGeomGlyphs.js';
 
 // World convention: Y up, ground grid in the XZ plane, front view looks
 // along -Z. Standard view directions live in lib/views.js.
@@ -191,6 +196,8 @@ const Viewport3D = forwardRef(function Viewport3D(
     hoverFaceTris,
     selectedFaceTris,
     previewMesh,
+    refGeom,
+    selectedRefId,
     onPick,
     onHover,
     onTransform,
@@ -736,6 +743,106 @@ const Viewport3D = forwardRef(function Viewport3D(
       edgeMaterial.dispose();
     };
   }, [sketchPlane, mesh]);
+
+  // Reference-geometry glyphs (of-fsl.14): a datum-plane quad, axis line,
+  // point marker, or coordinate-system triad per collection entity. The
+  // endpoint math lives in lib/refGeomGlyphs.js; this only wraps it in
+  // three.js objects and disposes them on change. All resources created here
+  // are tracked and freed in the cleanup so nothing leaks across rebuilds.
+  useEffect(() => {
+    const ctx = sceneRef.current;
+    if (!ctx || !refGeom || refGeom.length === 0) return undefined;
+    const scene = ctx.meshObject.parent;
+
+    // Scale axis/csys spans to the model so glyphs read at any zoom.
+    const geo = ctx.meshObject.geometry;
+    if (!geo.boundingSphere) geo.computeBoundingSphere();
+    const radius = geo.boundingSphere?.radius;
+    const span = Number.isFinite(radius) && radius > 0 ? Math.max(radius * 1.4, 2) : 5;
+
+    const PLANE_COLOR = 0x5b8def;
+    const AXIS_COLOR = 0xffa94d;
+    const POINT_COLOR = 0xf2f2f2;
+    const SELECTED_COLOR = 0xffd54a;
+
+    const group = new THREE.Group();
+    const disposables = [];
+    const track = (obj) => {
+      disposables.push(obj);
+      return obj;
+    };
+
+    for (const item of refGeom) {
+      const highlighted = item.id === selectedRefId;
+      const entity = item.entity;
+
+      if (entity.kind === 'plane') {
+        const corners = planeQuadCorners(entity);
+        const positions = new Float32Array(corners.flat());
+        const fillGeo = track(new THREE.BufferGeometry());
+        fillGeo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+        fillGeo.setIndex([0, 1, 2, 0, 2, 3]);
+        const fillMat = track(
+          new THREE.MeshBasicMaterial({
+            color: highlighted ? SELECTED_COLOR : PLANE_COLOR,
+            transparent: true,
+            opacity: highlighted ? 0.22 : 0.12,
+            side: THREE.DoubleSide,
+            depthWrite: false,
+          })
+        );
+        group.add(new THREE.Mesh(fillGeo, fillMat));
+
+        const loopGeo = track(new THREE.BufferGeometry());
+        loopGeo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+        const edgeMat = track(
+          new THREE.LineBasicMaterial({
+            color: highlighted ? SELECTED_COLOR : PLANE_COLOR,
+            transparent: true,
+            opacity: 0.7,
+          })
+        );
+        group.add(new THREE.LineLoop(loopGeo, edgeMat));
+      } else if (entity.kind === 'axis') {
+        const [a, b] = axisEndpoints(entity, span);
+        const lineGeo = track(new THREE.BufferGeometry());
+        lineGeo.setAttribute(
+          'position',
+          new THREE.BufferAttribute(new Float32Array([...a, ...b]), 3)
+        );
+        const lineMat = track(
+          new THREE.LineBasicMaterial({ color: highlighted ? SELECTED_COLOR : AXIS_COLOR })
+        );
+        group.add(new THREE.LineSegments(lineGeo, lineMat));
+      } else if (entity.kind === 'point') {
+        const dotGeo = track(new THREE.SphereGeometry(span * 0.02, 12, 8));
+        const dotMat = track(
+          new THREE.MeshBasicMaterial({ color: highlighted ? SELECTED_COLOR : POINT_COLOR })
+        );
+        const dot = new THREE.Mesh(dotGeo, dotMat);
+        dot.position.set(...entity.position);
+        group.add(dot);
+      } else if (entity.kind === 'csys') {
+        for (const seg of csysSegments(entity, span * 0.5)) {
+          const segGeo = track(new THREE.BufferGeometry());
+          segGeo.setAttribute(
+            'position',
+            new THREE.BufferAttribute(new Float32Array([...seg.from, ...seg.to]), 3)
+          );
+          const segMat = track(
+            new THREE.LineBasicMaterial({ color: highlighted ? SELECTED_COLOR : seg.color })
+          );
+          group.add(new THREE.LineSegments(segGeo, segMat));
+        }
+      }
+    }
+
+    scene.add(group);
+    return () => {
+      scene.remove(group);
+      for (const obj of disposables) obj.dispose();
+    };
+  }, [refGeom, selectedRefId, mesh]);
 
   useEffect(() => {
     const ctx = sceneRef.current;

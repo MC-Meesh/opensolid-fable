@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { buildFeatures, pruneTree, resolveKeys } from './featureTree.js';
+import {
+  buildFeatures,
+  buildReferenceFeatures,
+  pruneTree,
+  resolveKeys,
+} from './featureTree.js';
 
 // Plain construction-tree nodes (the shape sceneTree's tracer produces),
 // with ids in creation order.
@@ -143,5 +148,32 @@ describe('pruneTree', () => {
     const pruned = pruneTree(sub, new Set([2]));
     expect(pruned).toBe(ext);
     expect(pruned.profile).toBe(profile);
+  });
+});
+
+describe('buildReferenceFeatures', () => {
+  const refGeom = [
+    { id: 1, name: 'Plane1', kind: 'plane', entity: { kind: 'plane' } },
+    { id: 3, name: 'MyAxis', kind: 'axis', entity: { kind: 'axis' } },
+    { id: 4, name: 'CSys1', kind: 'csys', entity: { kind: 'csys' } },
+  ];
+
+  it('produces reference-flagged rows keyed by id', () => {
+    const rows = buildReferenceFeatures(refGeom);
+    expect(rows.map((r) => r.key)).toEqual(['ref:1', 'ref:3', 'ref:4']);
+    expect(rows.every((r) => r.reference === true)).toBe(true);
+    expect(rows.map((r) => r.refId)).toEqual([1, 3, 4]);
+  });
+
+  it('carries the item name and a type label from REFERENCE_META', () => {
+    const rows = buildReferenceFeatures(refGeom);
+    expect(rows[0]).toMatchObject({ name: 'Plane1', kind: 'plane', type: 'Plane' });
+    expect(rows[1].name).toBe('MyAxis');
+    expect(rows[2].type).toBe('CSys');
+  });
+
+  it('returns an empty list for no reference geometry', () => {
+    expect(buildReferenceFeatures()).toEqual([]);
+    expect(buildReferenceFeatures([])).toEqual([]);
   });
 });

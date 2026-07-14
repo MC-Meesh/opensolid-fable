@@ -10,6 +10,7 @@ import FeatureTree from './components/FeatureTree.jsx';
 import PropertyPanel from './components/PropertyPanel.jsx';
 import SketchCanvas from './components/SketchCanvas.jsx';
 import SweepPanel from './components/SweepPanel.jsx';
+import ReferencePanel from './components/ReferencePanel.jsx';
 import { DEFAULT_SCRIPT } from './lib/defaultScript.js';
 import { freeNodes, nodeLabel, runTracedScript, scriptHeader, serializeTree } from './lib/sceneTree.js';
 import { buildBinaryStl } from './lib/stl.js';
@@ -18,7 +19,9 @@ import { applyTranslate, applyRotate, applyScale, pathTo, nodeAt, replaceById } 
 import { setNodeArg, setBooleanOp } from './lib/propertyEdit.js';
 import { deleteNode } from './lib/deleteNode.js';
 import { VIEW_SHORTCUTS } from './lib/views.js';
-import { buildFeatures, pruneTree, resolveKeys } from './lib/featureTree.js';
+import { buildFeatures, buildReferenceFeatures, pruneTree, resolveKeys } from './lib/featureTree.js';
+import { createReference, deleteReference, renameReference } from './lib/refGeomStore.js';
+import { isReferencePlane } from './lib/referenceGeometry.js';
 import { PALETTE } from './lib/shapeGraph.js';
 import { addPrimitiveNode, assertStoreConsistency } from './lib/storeSync.js';
 import { buildSweepShape, opsBounds, profileToOps, sweepTreeNode } from './lib/sweep.js';
@@ -136,6 +139,16 @@ export default function App() {
   const [suppressedKeys, setSuppressedKeys] = useState(() => new Set());
   const [editingSketch, setEditingSketch] = useState(null); // { nodeId, name }
 
+  // Reference geometry (of-fsl.14): user-created datum planes / axes / points /
+  // coordinate systems. NOT Shapes, so they live beside the traced tree as a
+  // parallel keyed collection (like featureNames), routed through refGeomStore.
+  // `selectedRefId` drives the viewport highlight; `refPanel`/`refError` own the
+  // creation panel's open state and its last build failure.
+  const [refGeom, setRefGeom] = useState([]);
+  const [refPanelOpen, setRefPanelOpen] = useState(false);
+  const [refError, setRefError] = useState(null);
+  const [selectedRefId, setSelectedRefId] = useState(null);
+
   // Persistent face references (of-fsl.8): Map<featureKey, FaceRef> for
   // sweeps placed on a picked face. Held in a ref (survives renders without
   // re-triggering) and re-resolved against the rebuilt mesh after every edit;
@@ -188,6 +201,7 @@ export default function App() {
     setSelectedNode(null);
     setSelectedMesh(null);
     setSelectedPivot(null);
+    setSelectedRefId(null);
     selectedPathRef.current = null;
   }, []);
 
@@ -413,6 +427,7 @@ export default function App() {
         return;
       }
       setSelectedNode(node);
+      setSelectedRefId(null);
       selectedPathRef.current = pathTo(root, node.id);
       if (node.shape) {
         try {
@@ -565,6 +580,62 @@ export default function App() {
 
   const features = useMemo(() => buildFeatures(tree, featureNames), [tree, featureNames]);
 
+  // Reference geometry, merged into the tree ahead of the model features
+  // (SolidWorks lists datums at the top of the FeatureManager). Kept separate
+  // from `features` so the persistent-reference rebuild pass below — which is
+  // about sweeps on faces — never sees the datum rows.
+  const refFeatures = useMemo(() => buildReferenceFeatures(refGeom), [refGeom]);
+  const treeFeatures = useMemo(() => [...refFeatures, ...features], [refFeatures, features]);
+  // Reference planes offered to the sketch plane picker: the entity carries its
+  // display name (for planeLabel) and a stable identity (memoized) so the
+  // picker can mark the active one.
+  const refPlanes = useMemo(
+    () =>
+      refGeom
+        .filter((item) => item.kind === 'plane')
+        .map((item) => ({ id: item.id, name: item.name, plane: { ...item.entity, name: item.name } })),
+    [refGeom]
+  );
+
+  // Build-and-append a reference entity from the panel's spec; a degenerate
+  // configuration throws from the constructor and surfaces as the panel error,
+  // leaving the collection unchanged. The new entity becomes the selection.
+  const handleCreateReference = useCallback(
+    ({ kind, method, params, name }) => {
+      try {
+        const next = createReference(refGeom, kind, method, params, name);
+        setRefGeom(next);
+        setSelectedRefId(next[next.length - 1].id);
+        setRefError(null);
+      } catch (err) {
+        setRefError(String(err?.message || err));
+      }
+    },
+    [refGeom]
+  );
+
+  const handleReferenceDelete = useCallback((id) => {
+    setRefGeom((list) => deleteReference(list, id));
+    setSelectedRefId((current) => (current === id ? null : current));
+  }, []);
+
+  const handleReferenceRename = useCallback((id, name) => {
+    setRefGeom((list) => renameReference(list, id, name));
+  }, []);
+
+  const handleReferenceSelect = useCallback(
+    (id) => {
+      clearSelection();
+      setSelectedRefId(id);
+    },
+    [clearSelection]
+  );
+
+  const toggleReferencePanel = useCallback(() => {
+    setRefError(null);
+    setRefPanelOpen((open) => !open);
+  }, []);
+
   // Persistent-reference rebuild pass (of-fsl.8). After each rebuild produces a
   // fresh mesh and feature list: (1) attach a pending face ref to its newly
   // created sweep feature, (2) drop refs whose owning feature no longer exists,
@@ -668,14 +739,23 @@ export default function App() {
     remesh({ generation });
   }, [tree, hiddenKeys, suppressedKeys, wasmReady, remesh]);
 
-  const handleFeatureRename = useCallback((key, name) => {
-    setFeatureNames((prev) => {
-      const next = { ...prev };
-      if (name) next[key] = name;
-      else delete next[key]; // empty rename reverts to the default name
-      return next;
-    });
-  }, []);
+  const handleFeatureRename = useCallback(
+    (key, name) => {
+      // Reference-geometry rows are keyed `ref:<id>` and rename through the
+      // collection store, not the featureNames map.
+      if (typeof key === 'string' && key.startsWith('ref:')) {
+        handleReferenceRename(Number(key.slice(4)), name);
+        return;
+      }
+      setFeatureNames((prev) => {
+        const next = { ...prev };
+        if (name) next[key] = name;
+        else delete next[key]; // empty rename reverts to the default name
+        return next;
+      });
+    },
+    [handleReferenceRename]
+  );
 
   const handleToggleHide = useCallback((key) => {
     setHiddenKeys((prev) => {
@@ -706,6 +786,10 @@ export default function App() {
 
   const handleFeatureDelete = useCallback(
     (feature) => {
+      if (feature.reference) {
+        handleReferenceDelete(feature.refId);
+        return;
+      }
       const root = tracedRef.current?.root;
       if (!root) return;
       const pruned = pruneTree(root, new Set([feature.id]));
@@ -717,7 +801,7 @@ export default function App() {
       clearSelection();
       commitRoot(pruned);
     },
-    [clearSelection, commitRoot]
+    [clearSelection, commitRoot, handleReferenceDelete]
   );
 
   const enterSketchEdit = useCallback(
@@ -740,13 +824,17 @@ export default function App() {
 
   const handleFeatureSelect = useCallback(
     (feature) => {
+      if (feature.reference) {
+        handleReferenceSelect(feature.refId);
+        return;
+      }
       if (feature.kind === 'sketch') {
         enterSketchEdit(feature);
         return;
       }
       selectNode(feature.node, { allowRoot: true });
     },
-    [enterSketchEdit, selectNode]
+    [enterSketchEdit, selectNode, handleReferenceSelect]
   );
 
   // Apply an edited sketch back onto its sweep feature: only the profile
@@ -901,8 +989,9 @@ export default function App() {
           );
           return;
         }
-        // No face picked: never reopen on a stale face plane.
-        setSketchPlane((p) => (isFacePlane(p) ? 'XY' : p));
+        // No face picked: never reopen on a stale face plane, but a persistent
+        // reference plane is a valid, durable sketch plane — keep it.
+        setSketchPlane((p) => (isFacePlane(p) && !isReferencePlane(p) ? 'XY' : p));
       }
     }
     setSweep(null);
@@ -1084,8 +1173,9 @@ export default function App() {
           </div>
           <FeatureTree
             embedded
-            features={features}
+            features={treeFeatures}
             selectedId={selectedNode?.id}
+            selectedRefId={selectedRefId}
             hiddenKeys={hiddenKeys}
             suppressedKeys={suppressedKeys}
             rebuildState={rebuildState}
@@ -1118,6 +1208,8 @@ export default function App() {
           sketchOpen={sketchOpen}
           sketchOnFace={Boolean(pickedFace?.planar)}
           onSketchToggle={handleSketchToggle}
+          referenceOpen={refPanelOpen}
+          onReference={toggleReferencePanel}
           canSweep={sketchOpen && profileClosed && !sweep}
           sweepDisabledReason={
             sketchOpen
@@ -1139,6 +1231,8 @@ export default function App() {
             ref={viewportRef}
             mesh={mesh}
             wireframe={wireframe}
+            refGeom={refGeom}
+            selectedRefId={selectedRefId}
             sketchPlane={sketchOpen ? sketchPlane : null}
             sketchView={sketchView}
             onSketchViewChange={setSketchView}
@@ -1165,6 +1259,13 @@ export default function App() {
           onChange={handleSweepChange}
           onApply={applySweep}
           onCancel={cancelSweep}
+        />
+        <ReferencePanel
+          open={refPanelOpen}
+          refGeom={refGeom}
+          error={refError}
+          onCreate={handleCreateReference}
+          onClose={toggleReferencePanel}
         />
         {selectedNode && (
           <div className="gizmo-bar">
@@ -1215,6 +1316,7 @@ export default function App() {
             ref={sketchCanvasRef}
             open={sketchOpen}
             plane={sketchPlane}
+            refPlanes={refPlanes}
             view={sketchView}
             onViewChange={setSketchView}
             onPlaneChange={setSketchPlane}
