@@ -5,7 +5,9 @@ import {
   addConstraint,
   addLine,
   addPoint,
+  addPolygon,
   addRectangle,
+  addSlot,
   constraintRefs,
   createSketch,
   deleteConstraint,
@@ -13,9 +15,11 @@ import {
   deletePoint,
   entityPointIds,
   entityRadius,
+  mirrorEntities,
   translatePoints,
   validateConstraint,
 } from './model.js';
+import { extractProfile } from './profile.js';
 
 describe('sketch model', () => {
   it('creates points, lines, circles, and arcs with unique ids', () => {
@@ -57,6 +61,81 @@ describe('sketch model', () => {
     expect(s.entities[right].p2).toBe(s.entities[top].p1);
     expect(s.entities[top].p2).toBe(s.entities[left].p1);
     expect(s.entities[left].p2).toBe(s.entities[bottom].p1);
+  });
+
+  it('addPolygon builds a closed n-gon of chained lines', () => {
+    const s = createSketch();
+    const lines = addPolygon(s, 0, 0, 2, 6);
+    expect(lines).toHaveLength(6);
+    expect(Object.keys(s.points)).toHaveLength(6);
+    // Each line's end is the next line's start (shared corners → closed loop).
+    for (let i = 0; i < 6; i++) {
+      expect(s.entities[lines[i]].p2).toBe(s.entities[lines[(i + 1) % 6]].p1);
+    }
+    // First vertex sits at (radius, 0) with the default rotation.
+    const v0 = s.points[s.entities[lines[0]].p1];
+    expect(v0.x).toBeCloseTo(2, 12);
+    expect(v0.y).toBeCloseTo(0, 12);
+    // A regular polygon extracts as a closed profile.
+    expect(extractProfile(s, 'XY').closed).toBe(true);
+  });
+
+  it('addPolygon clamps sides to a minimum of 3 and rounds', () => {
+    const s = createSketch();
+    expect(addPolygon(s, 0, 0, 1, 2)).toHaveLength(3);
+    const s2 = createSketch();
+    expect(addPolygon(s2, 0, 0, 1, 5.4)).toHaveLength(5);
+  });
+
+  it('addSlot builds a closed obround of two lines and two arcs', () => {
+    const s = createSketch();
+    const ids = addSlot(s, 0, 0, 4, 0, 1);
+    expect(ids).toHaveLength(4);
+    const types = ids.map((id) => s.entities[id].type);
+    expect(types).toEqual(['line', 'arc', 'line', 'arc']);
+    // Rails sit at y = ±radius above/below the horizontal centerline.
+    const left = s.entities[ids[0]];
+    expect(s.points[left.p1]).toMatchObject({ x: 0, y: 1 });
+    expect(s.points[left.p2]).toMatchObject({ x: 4, y: 1 });
+    // The loop closes into one profile.
+    expect(extractProfile(s, 'XY').closed).toBe(true);
+  });
+
+  it('mirrorEntities reflects a copy across an axis, flipping arc winding', () => {
+    const s = createSketch();
+    const a = addPoint(s, 1, 1);
+    const b = addPoint(s, 3, 2);
+    const line = addLine(s, a, b);
+    const c = addPoint(s, 2, 2);
+    const arc = addArc(s, c, a, b, true);
+    // Mirror across the X axis (y = 0): (x, y) -> (x, -y).
+    const copies = mirrorEntities(s, [line, arc], 0, 0, 1, 0);
+    expect(copies).toHaveLength(2);
+    const mline = s.entities[copies[0]];
+    expect(s.points[mline.p1]).toMatchObject({ x: 1, y: -1 });
+    expect(s.points[mline.p2]).toMatchObject({ x: 3, y: -2 });
+    // Shared endpoints are reflected once and reused by both copies.
+    const marc = s.entities[copies[1]];
+    expect(marc.p1).toBe(mline.p1);
+    expect(marc.p2).toBe(mline.p2);
+    expect(marc.ccw).toBe(false); // winding flips under reflection
+  });
+
+  it('mirrorEntities preserves the construction flag of its sources', () => {
+    const s = createSketch();
+    const a = addPoint(s, 0, 1);
+    const b = addPoint(s, 2, 1);
+    const line = addLine(s, a, b, { construction: true });
+    const [copy] = mirrorEntities(s, [line], 0, 0, 1, 0);
+    expect(s.entities[copy].construction).toBe(true);
+  });
+
+  it('construction entities are excluded from profile extraction', () => {
+    const s = createSketch();
+    addPolygon(s, 0, 0, 2, 4); // a real closed square
+    addLine(s, addPoint(s, -5, 0), addPoint(s, 5, 0), { construction: true });
+    // The stray construction line would otherwise break the single loop.
+    expect(extractProfile(s, 'XY').closed).toBe(true);
   });
 
   it('entityRadius reads circles directly and arcs from geometry', () => {

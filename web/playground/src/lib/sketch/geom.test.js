@@ -6,6 +6,7 @@ import {
   distToCircle,
   distToSegment,
   normalizeAngle,
+  reflectPoint,
   sampleArc,
   signedArea,
 } from './geom.js';
@@ -60,6 +61,19 @@ describe('geom', () => {
     expect(pts[4][1]).toBeCloseTo(1, 12);
     const cw = sampleArc(0, 0, 1, 0, PI / 2, false, 4);
     expect(cw[4][1]).toBeCloseTo(-1, 12);
+  });
+
+  it('reflectPoint mirrors across an axis and through a degenerate point', () => {
+    // Across the X axis (y = 0): (x, y) -> (x, -y).
+    expect(reflectPoint(3, 2, 0, 0, 1, 0)).toEqual([3, -2]);
+    // Across the Y axis (x = 0): (x, y) -> (-x, y).
+    expect(reflectPoint(3, 2, 0, 0, 0, 1)).toEqual([-3, 2]);
+    // Across the 45° line y = x: (x, y) -> (y, x).
+    const [rx, ry] = reflectPoint(3, 1, 0, 0, 1, 1);
+    expect(rx).toBeCloseTo(1, 12);
+    expect(ry).toBeCloseTo(3, 12);
+    // Degenerate axis reflects through the point.
+    expect(reflectPoint(5, 4, 1, 1, 1, 1)).toEqual([-3, -2]);
   });
 
   it('signedArea is positive for counterclockwise polygons', () => {

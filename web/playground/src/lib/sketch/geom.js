@@ -78,6 +78,22 @@ export function sampleArc(cx, cy, r, startAngle, sweep, ccw, n) {
   return pts;
 }
 
+/**
+ * Reflect point (px, py) across the infinite line through (ax, ay)-(bx, by).
+ * A degenerate axis (a == b) reflects through the point instead.
+ */
+export function reflectPoint(px, py, ax, ay, bx, by) {
+  const dx = bx - ax;
+  const dy = by - ay;
+  const lenSq = dx * dx + dy * dy;
+  if (lenSq === 0) return [2 * ax - px, 2 * ay - py];
+  // Projection parameter of P onto the axis, then mirror across the foot.
+  const t = ((px - ax) * dx + (py - ay) * dy) / lenSq;
+  const fx = ax + t * dx;
+  const fy = ay + t * dy;
+  return [2 * fx - px, 2 * fy - py];
+}
+
 /** Signed area of a closed polygon (positive = counterclockwise). */
 export function signedArea(points) {
   let area = 0;

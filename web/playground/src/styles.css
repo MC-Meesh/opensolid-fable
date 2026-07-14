@@ -782,7 +782,10 @@ button.main-tool svg { flex: none; }
 .sketch-svg.tool-line,
 .sketch-svg.tool-rect,
 .sketch-svg.tool-circle,
-.sketch-svg.tool-arc { cursor: crosshair; }
+.sketch-svg.tool-arc,
+.sketch-svg.tool-polygon,
+.sketch-svg.tool-slot,
+.sketch-svg.tool-centerline { cursor: crosshair; }
 .sketch-svg .grid-minor { stroke: #222831; stroke-width: 1; }
 .sketch-svg .grid-major { stroke: #2d3542; stroke-width: 1; }
 .sketch-svg .axis-u { stroke: #7a4a4a; stroke-width: 1.2; }
@@ -799,6 +802,12 @@ button.main-tool svg { flex: none; }
   cursor: pointer;
 }
 .sketch-svg .entity.selected { stroke: var(--accent); stroke-width: 2.4; }
+.sketch-svg .entity.construction {
+  stroke: #8a93a3;
+  stroke-width: 1.2;
+  stroke-dasharray: 6 4;
+}
+.sketch-svg .entity.construction.selected { stroke: var(--accent); }
 .sketch-svg .point {
   fill: #aab6c6;
   stroke: #14171c;

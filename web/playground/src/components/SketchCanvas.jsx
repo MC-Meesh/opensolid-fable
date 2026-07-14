@@ -13,13 +13,16 @@ import {
   addConstraint,
   addLine,
   addPoint,
+  addPolygon,
   addRectangle,
+  addSlot,
   createSketch,
   deleteConstraint,
   deleteEntity,
   deletePoint,
   entityPointIds,
   entityRadius,
+  mirrorEntities,
   translatePoints,
   validateConstraint,
 } from '../lib/sketch/model.js';
@@ -100,8 +103,29 @@ const TOOLS = [
     key: 'A',
     hint: 'Click center, start, then end (drag direction sets the sweep)',
   },
+  {
+    id: 'polygon',
+    label: 'Polygon',
+    key: 'G',
+    hint: 'Drag from center to a vertex · type a number to set the side count',
+  },
+  {
+    id: 'slot',
+    label: 'Slot',
+    key: 'S',
+    hint: 'Click both centerline ends, then drag to set the width',
+  },
+  {
+    id: 'centerline',
+    label: 'Centerline',
+    key: 'N',
+    hint: 'Construction line (excluded from the profile) · click two points · Esc ends',
+  },
   { id: 'pan', label: 'Pan', key: 'P', hint: 'Drag to pan (middle-drag works with any tool)' },
 ];
+
+const DEFAULT_POLYGON_SIDES = 6;
+const MIN_POLYGON_SIDES = 3;
 
 const PLANES = ['XY', 'XZ', 'YZ'];
 
@@ -210,6 +234,9 @@ export default forwardRef(function SketchCanvas(
   dimEntryRef.current = dimEntry;
   const [dimEdit, setDimEdit] = useState(null); // { id, text, wx, wy } editing a dimension
   const [message, setMessage] = useState(null);
+  const [polygonSides, setPolygonSides] = useState(DEFAULT_POLYGON_SIDES);
+  const polygonSidesRef = useRef(DEFAULT_POLYGON_SIDES);
+  polygonSidesRef.current = polygonSides;
   const dragRef = useRef(null);
 
   const sketch = sketchRef.current;
@@ -405,12 +432,13 @@ export default forwardRef(function SketchCanvas(
       if (!snap.id && Math.hypot(snap.x - startPos.x, snap.y - startPos.y) < 1e-9) {
         return;
       }
+      const construction = Boolean(d.construction);
       const before = takeBefore();
       const p1 = materialize(s, d.start);
       const closing = Boolean(snap.id) && snap.id === d.chainStartId;
       const p2 = materialize(s, snap);
       if (p1 === p2) return;
-      const lineId = addLine(s, p1, p2);
+      const lineId = addLine(s, p1, p2, { construction });
       if (snap.axis === 'h') {
         addConstraint(s, { type: 'horizontal', line: lineId });
       } else if (snap.axis === 'v') {
@@ -427,6 +455,7 @@ export default forwardRef(function SketchCanvas(
       } else {
         setDraft({
           kind: 'line',
+          construction,
           start: { id: p2, x: s.points[p2].x, y: s.points[p2].y },
           chainStartId: d.chainStartId ?? p1,
         });
@@ -504,6 +533,55 @@ export default forwardRef(function SketchCanvas(
     [anchorPos, materialize, takeBefore, runSolve, commitRecord]
   );
 
+  /**
+   * Commit a regular polygon at the draft center, sized to the cursor (which
+   * fixes both the circumradius and the first-vertex direction).
+   */
+  const commitPolygon = useCallback(
+    (cursorX, cursorY) => {
+      const d = draftRef.current;
+      const s = sketchRef.current;
+      const c = anchorPos(d.center);
+      const radius = Math.hypot(cursorX - c.x, cursorY - c.y);
+      if (!(radius > 1e-9)) return false;
+      const rotation = Math.atan2(cursorY - c.y, cursorX - c.x);
+      const before = takeBefore();
+      addPolygon(s, c.x, c.y, radius, polygonSidesRef.current, rotation);
+      runSolve();
+      commitRecord(before);
+      setDraft(null);
+      setDimEntry(null);
+      return true;
+    },
+    [anchorPos, takeBefore, runSolve, commitRecord]
+  );
+
+  /**
+   * Commit a straight slot whose centerline runs draft.p1 → draft.p2, with
+   * half-width set by the cursor's perpendicular distance from that line.
+   */
+  const commitSlot = useCallback(
+    (cursorX, cursorY) => {
+      const d = draftRef.current;
+      const s = sketchRef.current;
+      const { p1, p2 } = d;
+      const dx = p2.x - p1.x;
+      const dy = p2.y - p1.y;
+      const len = Math.hypot(dx, dy);
+      if (!(len > 1e-9)) return false;
+      // Perpendicular distance from the cursor to the infinite centerline.
+      const width = Math.abs((cursorX - p1.x) * -dy + (cursorY - p1.y) * dx) / len;
+      if (!(width > 1e-9)) return false;
+      const before = takeBefore();
+      addSlot(s, p1.x, p1.y, p2.x, p2.y, width);
+      runSolve();
+      commitRecord(before);
+      setDraft(null);
+      return true;
+    },
+    [takeBefore, runSolve, commitRecord]
+  );
+
   // ---- exact dimension entry (type a number while drafting) ---------------
 
   const commitDimEntry = useCallback(() => {
@@ -578,11 +656,33 @@ export default forwardRef(function SketchCanvas(
             ? 'circle'
             : d.kind === 'rect'
               ? 'rect'
-              : null;
+              : d.kind === 'polygon'
+                ? 'polygon'
+                : null;
       if (!kind) return false;
       const entry = dimEntryRef.current;
       const key = event.key;
       const isDigit = /^[0-9.]$/.test(key);
+
+      // Polygon: typed digits set the side count (radius comes from the drag).
+      if (kind === 'polygon') {
+        if (/^[0-9]$/.test(key)) {
+          const cur = entry?.kind === 'polygon' ? entry.text : '';
+          const text = (cur + key).slice(0, 2);
+          setDimEntry({ kind: 'polygon', text });
+          const n = parseInt(text, 10);
+          if (n >= MIN_POLYGON_SIDES) setPolygonSides(n);
+          return true;
+        }
+        if (key === 'Backspace' && entry?.kind === 'polygon') {
+          const text = entry.text.slice(0, -1);
+          setDimEntry({ kind: 'polygon', text });
+          const n = parseInt(text, 10);
+          setPolygonSides(n >= MIN_POLYGON_SIDES ? n : DEFAULT_POLYGON_SIDES);
+          return true;
+        }
+        return false;
+      }
 
       if (isDigit) {
         if (kind === 'rect') {
@@ -750,6 +850,56 @@ export default forwardRef(function SketchCanvas(
           commitArc(Math.atan2(world.y - c.y, world.x - c.x));
           return;
         }
+        case 'centerline': {
+          if (!draft) {
+            const snap = resolveSnap(world);
+            setDraft({
+              kind: 'line',
+              construction: true,
+              start: snap,
+              chainStartId: snap.id ?? null,
+            });
+            return;
+          }
+          const startPos = anchorPos(draft.start);
+          const snap = resolveSnap(world, { axisFrom: startPos });
+          commitLineSegment(snap);
+          return;
+        }
+        case 'polygon': {
+          if (!draft) {
+            const snap = resolveSnap(world);
+            event.target.setPointerCapture?.(event.pointerId);
+            setDraft({
+              kind: 'polygon',
+              center: snap,
+              pressed: true,
+              psx: event.clientX,
+              psy: event.clientY,
+            });
+            return;
+          }
+          const snap = resolveSnap(world, {
+            exclude: draft.center.id ? new Set([draft.center.id]) : undefined,
+          });
+          commitPolygon(snap.x, snap.y);
+          return;
+        }
+        case 'slot': {
+          if (!draft) {
+            const snap = resolveSnap(world);
+            setDraft({ kind: 'slot', p1: { x: snap.x, y: snap.y }, stage: 1 });
+            return;
+          }
+          if (draft.stage === 1) {
+            const snap = resolveSnap(world, { axisFrom: draft.p1 });
+            if (Math.hypot(snap.x - draft.p1.x, snap.y - draft.p1.y) < 1e-9) return;
+            setDraft({ ...draft, p2: { x: snap.x, y: snap.y }, stage: 2 });
+            return;
+          }
+          commitSlot(world.x, world.y);
+          return;
+        }
         default:
       }
     },
@@ -763,6 +913,8 @@ export default forwardRef(function SketchCanvas(
       commitRect,
       commitCircle,
       commitArc,
+      commitPolygon,
+      commitSlot,
       takeBefore,
     ]
   );
@@ -898,13 +1050,26 @@ export default forwardRef(function SketchCanvas(
               exclude: d.center.id ? new Set([d.center.id]) : undefined,
             });
             committed = commitCircle(Math.hypot(snap.x - c.x, snap.y - c.y));
+          } else if (d.kind === 'polygon') {
+            const snap = resolveSnap(world, {
+              exclude: d.center.id ? new Set([d.center.id]) : undefined,
+            });
+            committed = commitPolygon(snap.x, snap.y);
           }
         }
         // A plain click (or a degenerate drag): stay in click-move-click mode.
         if (!committed) setDraft({ ...d, pressed: false, dragging: false });
       }
     },
-    [eventWorld, resolveSnap, anchorPos, commitRect, commitCircle, commitRecord]
+    [
+      eventWorld,
+      resolveSnap,
+      anchorPos,
+      commitRect,
+      commitCircle,
+      commitPolygon,
+      commitRecord,
+    ]
   );
 
   // ---- selection-derived state / constraint actions ---------------------
@@ -939,6 +1104,38 @@ export default forwardRef(function SketchCanvas(
     },
     [takeBefore, runSolve, commitRecord]
   );
+
+  /**
+   * Mirror the selected entities across the single selected line (its axis),
+   * adding reflected copies. The axis line itself is not duplicated.
+   */
+  const mirrorSelection = useCallback(() => {
+    if (selLines.length !== 1) {
+      setMessage('Select exactly one line as the mirror axis');
+      return;
+    }
+    const axis = selLines[0];
+    const targets = selEntities.filter((e) => e.id !== axis.id);
+    if (targets.length === 0) {
+      setMessage('Select geometry to mirror alongside the axis line');
+      return;
+    }
+    const s = sketchRef.current;
+    const a = s.points[axis.p1];
+    const b = s.points[axis.p2];
+    const before = takeBefore();
+    const created = mirrorEntities(
+      s,
+      targets.map((e) => e.id),
+      a.x,
+      a.y,
+      b.x,
+      b.y
+    );
+    runSolve();
+    commitRecord(before);
+    setSelection(created.map((id) => ({ kind: 'entity', id })));
+  }, [selLines, selEntities, takeBefore, runSolve, commitRecord]);
 
   const applyDimension = useCallback(() => {
     const value = parseDimension(dimValue);
@@ -1188,7 +1385,9 @@ export default forwardRef(function SketchCanvas(
   }
 
   function renderEntity(entity) {
-    const cls = `entity${isSelected('entity', entity.id) ? ' selected' : ''}`;
+    const cls = `entity${entity.construction ? ' construction' : ''}${
+      isSelected('entity', entity.id) ? ' selected' : ''
+    }`;
     if (entity.type === 'line') {
       const a = sketch.points[entity.p1];
       const b = sketch.points[entity.p2];
@@ -1434,6 +1633,66 @@ export default forwardRef(function SketchCanvas(
         </g>
       );
     }
+    if (draft.kind === 'polygon') {
+      const c = anchorPos(draft.center);
+      const at = snap.id && snap.id === draft.center.id ? cursor : snap;
+      const radius = Math.hypot(at.x - c.x, at.y - c.y);
+      if (!(radius > 1e-9)) return null;
+      const rot = Math.atan2(at.y - c.y, at.x - c.x);
+      const n = Math.max(MIN_POLYGON_SIDES, Math.round(polygonSides));
+      const pts = [];
+      for (let i = 0; i < n; i++) {
+        const a = rot + (i * 2 * Math.PI) / n;
+        pts.push(
+          worldToScreen(c.x + radius * Math.cos(a), c.y + radius * Math.sin(a))
+        );
+      }
+      return (
+        <polygon
+          className="draft"
+          points={pts.map(([x, y]) => `${x},${y}`).join(' ')}
+          fill="none"
+        />
+      );
+    }
+    if (draft.kind === 'slot') {
+      const { p1 } = draft;
+      const [x1, y1] = worldToScreen(p1.x, p1.y);
+      if (draft.stage === 1) {
+        const [x2, y2] = worldToScreen(snap.x, snap.y);
+        return <line className="draft faint" x1={x1} y1={y1} x2={x2} y2={y2} />;
+      }
+      const { p2 } = draft;
+      const dx = p2.x - p1.x;
+      const dy = p2.y - p1.y;
+      const len = Math.hypot(dx, dy) || 1;
+      const width =
+        Math.abs((cursor.x - p1.x) * -dy + (cursor.y - p1.y) * dx) / len;
+      const [cx2, cy2] = worldToScreen(p2.x, p2.y);
+      // Sample the obround outline (rails + semicircular caps) as one polyline.
+      const base = Math.atan2(dy, dx); // centerline direction
+      const outline = [];
+      const capSamples = 16;
+      // Start cap: sweep the far side around p1 from +normal to −normal.
+      for (let i = 0; i <= capSamples; i++) {
+        const a = base + Math.PI / 2 + (i / capSamples) * Math.PI;
+        outline.push([p1.x + width * Math.cos(a), p1.y + width * Math.sin(a)]);
+      }
+      // End cap: sweep around p2 from −normal back to +normal.
+      for (let i = 0; i <= capSamples; i++) {
+        const a = base - Math.PI / 2 + (i / capSamples) * Math.PI;
+        outline.push([p2.x + width * Math.cos(a), p2.y + width * Math.sin(a)]);
+      }
+      const pts = outline
+        .map(([wx, wy]) => worldToScreen(wx, wy).join(','))
+        .join(' ');
+      return (
+        <g>
+          <line className="draft faint" x1={x1} y1={y1} x2={cx2} y2={cy2} />
+          <polygon className="draft" points={pts} fill="none" />
+        </g>
+      );
+    }
     return null;
   }
 
@@ -1450,9 +1709,27 @@ export default forwardRef(function SketchCanvas(
         }`;
       } else if (dimEntry.kind === 'circle') {
         text = `R ${dimEntry.text}▏`;
+      } else if (dimEntry.kind === 'polygon') {
+        text = `${dimEntry.text || polygonSides}▏ sides`;
       } else {
         text = `L ${dimEntry.text}▏`;
       }
+    } else if (draft.kind === 'polygon') {
+      const c = anchorPos(draft.center);
+      const at = snap.id && snap.id === draft.center.id ? cursor : snap;
+      const r = Math.hypot(at.x - c.x, at.y - c.y);
+      text = `${polygonSides}-gon · R ${formatNumber(r)}`;
+    } else if (draft.kind === 'slot' && draft.stage === 2) {
+      const { p1, p2 } = draft;
+      const dx = p2.x - p1.x;
+      const dy = p2.y - p1.y;
+      const len = Math.hypot(dx, dy) || 1;
+      const width =
+        Math.abs((cursor.x - p1.x) * -dy + (cursor.y - p1.y) * dx) / len;
+      text = `L ${formatNumber(len)} · W ${formatNumber(2 * width)}`;
+    } else if (draft.kind === 'slot') {
+      const { p1 } = draft;
+      text = `L ${formatNumber(Math.hypot(snap.x - p1.x, snap.y - p1.y))}`;
     } else if (draft.kind === 'line' && draft.start) {
       const p = anchorPos(draft.start);
       const len = Math.hypot(snap.x - p.x, snap.y - p.y);
@@ -1831,6 +2108,17 @@ export default forwardRef(function SketchCanvas(
             onClick={applyDimension}
           >
             Set
+          </button>
+        </div>
+        <div className="group">
+          <span className="group-label">Modify</span>
+          <button
+            className="tool-btn"
+            disabled={selLines.length !== 1 || selEntities.length < 2}
+            title="Mirror the selected geometry across the selected line"
+            onClick={mirrorSelection}
+          >
+            Mirror
           </button>
         </div>
         <div className="group">

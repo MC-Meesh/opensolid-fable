@@ -21,7 +21,14 @@
  * Entities reference points by id; chained lines share endpoint ids, which is
  * implicit coincidence. The explicit `coincident` constraint glues two
  * distinct points together via the solver.
+ *
+ * Any entity may carry `construction: true` — reference geometry (centerlines,
+ * mirror axes, layout guides) that is drawn but excluded from profile
+ * extraction. `addLine`/`addCircle`/`addArc` take a trailing options object to
+ * set it; the flag is omitted entirely for normal geometry.
  */
+
+import { reflectPoint } from './geom.js';
 
 export function createSketch() {
   return { seq: 0, points: {}, entities: {}, constraints: {} };
@@ -38,21 +45,32 @@ export function addPoint(sketch, x, y) {
   return id;
 }
 
-export function addLine(sketch, p1, p2) {
+/** Attach `construction: true` to an entity spec when requested. */
+function withConstruction(entity, { construction = false } = {}) {
+  return construction ? { ...entity, construction: true } : entity;
+}
+
+export function addLine(sketch, p1, p2, opts = {}) {
   const id = nextId(sketch, 'e');
-  sketch.entities[id] = { id, type: 'line', p1, p2 };
+  sketch.entities[id] = withConstruction({ id, type: 'line', p1, p2 }, opts);
   return id;
 }
 
-export function addCircle(sketch, center, radius) {
+export function addCircle(sketch, center, radius, opts = {}) {
   const id = nextId(sketch, 'e');
-  sketch.entities[id] = { id, type: 'circle', center, radius };
+  sketch.entities[id] = withConstruction(
+    { id, type: 'circle', center, radius },
+    opts
+  );
   return id;
 }
 
-export function addArc(sketch, center, p1, p2, ccw = true) {
+export function addArc(sketch, center, p1, p2, ccw = true, opts = {}) {
   const id = nextId(sketch, 'e');
-  sketch.entities[id] = { id, type: 'arc', center, p1, p2, ccw };
+  sketch.entities[id] = withConstruction(
+    { id, type: 'arc', center, p1, p2, ccw },
+    opts
+  );
   return id;
 }
 
@@ -80,6 +98,90 @@ export function addRectangle(sketch, x1, y1, x2, y2) {
   addConstraint(sketch, { type: 'vertical', line: right });
   addConstraint(sketch, { type: 'vertical', line: left });
   return [bottom, right, top, left];
+}
+
+/**
+ * Regular n-gon inscribed in a circle of `radius` about (cx, cy), first
+ * vertex at `rotation` radians (default 0 = +X). Built as `sides` chained
+ * lines sharing corner ids; returns the line ids in order.
+ */
+export function addPolygon(sketch, cx, cy, radius, sides, rotation = 0, opts = {}) {
+  const n = Math.max(3, Math.round(sides));
+  const corners = [];
+  for (let i = 0; i < n; i++) {
+    const a = rotation + (i * 2 * Math.PI) / n;
+    corners.push(addPoint(sketch, cx + radius * Math.cos(a), cy + radius * Math.sin(a)));
+  }
+  const lines = [];
+  for (let i = 0; i < n; i++) {
+    lines.push(addLine(sketch, corners[i], corners[(i + 1) % n], opts));
+  }
+  return lines;
+}
+
+/**
+ * Straight slot: a stadium (obround) of half-width `radius` around the
+ * centerline segment (x1, y1)-(x2, y2) — two parallel lines capped by two
+ * semicircular arcs, forming one closed loop. Returns the entity ids
+ * [line, arc, line, arc] in loop order.
+ */
+export function addSlot(sketch, x1, y1, x2, y2, radius, opts = {}) {
+  const dx = x2 - x1;
+  const dy = y2 - y1;
+  const len = Math.hypot(dx, dy);
+  // Unit normal to the centerline; offset the two side rails by ±radius.
+  const nx = len > 0 ? -dy / len : 0;
+  const ny = len > 0 ? dx / len : 1;
+  const ox = nx * radius;
+  const oy = ny * radius;
+  // Rail endpoints: left side runs start→end, right side runs end→start so
+  // the four segments chain head-to-tail around the loop (CCW for len,r > 0).
+  const a = addPoint(sketch, x1 + ox, y1 + oy); // start, left
+  const b = addPoint(sketch, x2 + ox, y2 + oy); // end,   left
+  const c = addPoint(sketch, x2 - ox, y2 - oy); // end,   right
+  const d = addPoint(sketch, x1 - ox, y1 - oy); // start, right
+  const c1 = addPoint(sketch, x2, y2); // end cap center
+  const c0 = addPoint(sketch, x1, y1); // start cap center
+  const left = addLine(sketch, a, b, opts);
+  const endCap = addArc(sketch, c1, b, c, true, opts);
+  const right = addLine(sketch, c, d, opts);
+  const startCap = addArc(sketch, c0, d, a, true, opts);
+  return [left, endCap, right, startCap];
+}
+
+/**
+ * Mirror `ids` (entity ids) across the infinite line through points
+ * (ax, ay)-(bx, by), adding reflected copies to the sketch. Points shared
+ * between mirrored entities are reflected once and reused, so the copy keeps
+ * the original's connectivity. Returns the new entity ids.
+ */
+export function mirrorEntities(sketch, ids, ax, ay, bx, by, opts = {}) {
+  const pointMap = new Map(); // original point id -> reflected point id
+  const reflect = (pid) => {
+    if (pointMap.has(pid)) return pointMap.get(pid);
+    const p = sketch.points[pid];
+    const [rx, ry] = reflectPoint(p.x, p.y, ax, ay, bx, by);
+    const np = addPoint(sketch, rx, ry);
+    pointMap.set(pid, np);
+    return np;
+  };
+  const created = [];
+  for (const id of ids) {
+    const e = sketch.entities[id];
+    if (!e) continue;
+    const construction = e.construction ? { construction: true } : opts;
+    if (e.type === 'line') {
+      created.push(addLine(sketch, reflect(e.p1), reflect(e.p2), construction));
+    } else if (e.type === 'circle') {
+      created.push(addCircle(sketch, reflect(e.center), e.radius, construction));
+    } else if (e.type === 'arc') {
+      // Reflection reverses orientation, so the arc's winding flips.
+      created.push(
+        addArc(sketch, reflect(e.center), reflect(e.p1), reflect(e.p2), !e.ccw, construction)
+      );
+    }
+  }
+  return created;
 }
 
 /** Point ids referenced by an entity (center first for circle/arc). */

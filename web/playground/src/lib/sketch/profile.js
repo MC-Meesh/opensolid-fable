@@ -213,7 +213,8 @@ function circleProfile(sketch, circle, plane) {
  * Extract the sketch's single closed profile, or explain why there is none.
  */
 export function extractProfile(sketch, plane = 'XY') {
-  const entities = Object.values(sketch.entities);
+  // Construction geometry (centerlines, mirror axes) is reference-only.
+  const entities = Object.values(sketch.entities).filter((e) => !e.construction);
   const circles = entities.filter((e) => e.type === 'circle');
   const chain = entities.filter((e) => e.type === 'line' || e.type === 'arc');
 
