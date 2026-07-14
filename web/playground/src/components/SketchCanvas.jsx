@@ -12,6 +12,7 @@ import {
   addCircle,
   addConstraint,
   addLine,
+  addLoop,
   addPoint,
   addPolygon,
   addRectangle,
@@ -26,9 +27,15 @@ import {
   translatePoints,
   validateConstraint,
 } from '../lib/sketch/model.js';
+import {
+  extendEntityAt,
+  offsetEntities,
+  trimEntityAt,
+} from '../lib/sketch/edit.js';
 import { solve } from '../lib/sketch/solver.js';
 import {
   axisAlign,
+  distToEntity,
   hitTest,
   nearestPoint,
   snapToGrid,
@@ -122,6 +129,18 @@ const TOOLS = [
     key: 'N',
     hint: 'Construction line (excluded from the profile) · click two points · Esc ends',
   },
+  {
+    id: 'trim',
+    label: 'Trim',
+    key: 'T',
+    hint: 'Click a segment to trim it back to its nearest intersections',
+  },
+  {
+    id: 'extend',
+    label: 'Extend',
+    key: 'X',
+    hint: 'Click near an open end to extend it to the nearest intersection',
+  },
   { id: 'pan', label: 'Pan', key: 'P', hint: 'Drag to pan (middle-drag works with any tool)' },
 ];
 
@@ -151,6 +170,16 @@ function arcScreenGeometry(sketch, entity) {
   const end = normalizeAngle(Math.atan2(p2.y - c.y, p2.x - c.x));
   const sweep = arcSweep(start, end, entity.ccw);
   return { c, p1, p2, r, start, end, sweep };
+}
+
+/** Id of the nearest entity outline within `tol` of (x, y), or null. */
+function nearestEntityAt(sketch, x, y, tol) {
+  let best = null;
+  for (const e of Object.values(sketch.entities)) {
+    const d = distToEntity(sketch, e, x, y);
+    if (d <= tol && (!best || d < best.d)) best = { id: e.id, d };
+  }
+  return best ? best.id : null;
 }
 
 /** A representative world point for an entity: line midpoint, or curve center. */
@@ -209,6 +238,9 @@ export default forwardRef(function SketchCanvas(
     editing = null,
     onApplyEdit,
     documentUnit = DEFAULT_LENGTH_UNIT,
+    // Boundary loops (sketch u,v) of the face this sketch opened on, if any,
+    // for "convert entities". Each loop is an array of [u, v] points.
+    faceLoops = null,
   },
   ref
 ) {
@@ -239,6 +271,8 @@ export default forwardRef(function SketchCanvas(
   const [polygonSides, setPolygonSides] = useState(DEFAULT_POLYGON_SIDES);
   const polygonSidesRef = useRef(DEFAULT_POLYGON_SIDES);
   polygonSidesRef.current = polygonSides;
+  const [offsetDist, setOffsetDist] = useState('');
+  const [offsetFlip, setOffsetFlip] = useState(false);
   const dragRef = useRef(null);
 
   const sketch = sketchRef.current;
@@ -902,6 +936,25 @@ export default forwardRef(function SketchCanvas(
           commitSlot(world.x, world.y);
           return;
         }
+        case 'trim':
+        case 'extend': {
+          const tol = HIT_PX / view.scale;
+          const hitId = nearestEntityAt(s, world.x, world.y, tol);
+          if (!hitId) return;
+          const before = takeBefore();
+          const changed =
+            tool === 'trim'
+              ? trimEntityAt(s, hitId, world.x, world.y)
+              : extendEntityAt(s, hitId, world.x, world.y);
+          if (changed) {
+            setSelection([]);
+            runSolve();
+            commitRecord(before);
+          } else if (tool === 'extend') {
+            setMessage('Nothing to extend to — no intersection beyond that end');
+          }
+          return;
+        }
         default:
       }
     },
@@ -918,6 +971,8 @@ export default forwardRef(function SketchCanvas(
       commitPolygon,
       commitSlot,
       takeBefore,
+      runSolve,
+      commitRecord,
     ]
   );
 
@@ -1138,6 +1193,56 @@ export default forwardRef(function SketchCanvas(
     commitRecord(before);
     setSelection(created.map((id) => ({ kind: 'entity', id })));
   }, [selLines, selEntities, takeBefore, runSolve, commitRecord]);
+
+  /**
+   * Offset the selected entities by the entered distance (flip reverses the
+   * side). Connected chains join at their offset corners; the copies replace
+   * the selection so they can be dimensioned or swept.
+   */
+  const offsetSelection = useCallback(() => {
+    const dist = parseDimension(offsetDist);
+    if (!dist) {
+      setMessage('Enter a positive offset distance');
+      return;
+    }
+    if (selEntities.length === 0) {
+      setMessage('Select geometry to offset first');
+      return;
+    }
+    const s = sketchRef.current;
+    const before = takeBefore();
+    const created = offsetEntities(
+      s,
+      selEntities.map((e) => e.id),
+      offsetFlip ? -dist : dist
+    );
+    if (created.length === 0) {
+      setMessage('Offset collapsed — try a smaller distance or flip the side');
+      return;
+    }
+    runSolve();
+    commitRecord(before);
+    setSelection(created.map((id) => ({ kind: 'entity', id })));
+  }, [offsetDist, offsetFlip, selEntities, takeBefore, runSolve, commitRecord]);
+
+  /** Convert the sketch's face boundary loops into editable sketch lines. */
+  const convertEntities = useCallback(() => {
+    if (!faceLoops || faceLoops.length === 0) {
+      setMessage('Open the sketch on a flat face to convert its edges');
+      return;
+    }
+    const s = sketchRef.current;
+    const before = takeBefore();
+    const created = [];
+    for (const loop of faceLoops) created.push(...addLoop(s, loop));
+    if (created.length === 0) {
+      setMessage('Face boundary produced no geometry');
+      return;
+    }
+    runSolve();
+    commitRecord(before);
+    setSelection(created.map((id) => ({ kind: 'entity', id })));
+  }, [faceLoops, takeBefore, runSolve, commitRecord]);
 
   const applyDimension = useCallback(() => {
     const value = parseDimension(dimValue);
@@ -2121,6 +2226,41 @@ export default forwardRef(function SketchCanvas(
             onClick={mirrorSelection}
           >
             Mirror
+          </button>
+          <input
+            className="dim-input"
+            type="number"
+            min="0"
+            step="any"
+            placeholder="offset"
+            value={offsetDist}
+            onChange={(e) => setOffsetDist(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') offsetSelection();
+            }}
+          />
+          <button
+            className={`tool-btn${offsetFlip ? ' active' : ''}`}
+            title="Flip the offset side"
+            onClick={() => setOffsetFlip((f) => !f)}
+          >
+            ⇄
+          </button>
+          <button
+            className="tool-btn"
+            disabled={selEntities.length === 0}
+            title="Offset the selected geometry by the entered distance"
+            onClick={offsetSelection}
+          >
+            Offset
+          </button>
+          <button
+            className="tool-btn"
+            disabled={!faceLoops || faceLoops.length === 0}
+            title="Convert the sketched face's boundary edges into sketch geometry"
+            onClick={convertEntities}
+          >
+            Convert
           </button>
         </div>
         <div className="group">

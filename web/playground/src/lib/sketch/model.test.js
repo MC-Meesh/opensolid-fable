@@ -4,6 +4,7 @@ import {
   addCircle,
   addConstraint,
   addLine,
+  addLoop,
   addPoint,
   addPolygon,
   addRectangle,
@@ -34,6 +35,34 @@ describe('sketch model', () => {
     expect(s.entities[line]).toMatchObject({ type: 'line', p1: a, p2: b });
     expect(s.entities[circle]).toMatchObject({ type: 'circle', radius: 2 });
     expect(s.entities[arc]).toMatchObject({ type: 'arc', ccw: true });
+  });
+
+  it('addLoop chains points into a closed loop of shared-corner lines', () => {
+    const s = createSketch();
+    const ids = addLoop(s, [
+      [0, 0],
+      [2, 0],
+      [2, 1],
+      [0, 1],
+    ]);
+    expect(ids).toHaveLength(4);
+    // Consecutive lines share a corner point id (closed chain).
+    for (let i = 0; i < 4; i++) {
+      expect(s.entities[ids[i]].p2).toBe(s.entities[ids[(i + 1) % 4]].p1);
+    }
+    // A closed loop of 4 lines extracts as a closed profile.
+    expect(extractProfile(s, 'XY').closed).toBe(true);
+  });
+
+  it('addLoop drops a trailing point coincident with the first', () => {
+    const s = createSketch();
+    const ids = addLoop(s, [
+      [0, 0],
+      [1, 0],
+      [1, 1],
+      [0, 0],
+    ]);
+    expect(ids).toHaveLength(3);
   });
 
   it('entityPointIds covers every entity type', () => {

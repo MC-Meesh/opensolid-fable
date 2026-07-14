@@ -34,6 +34,7 @@ import {
 } from './lib/sweep.js';
 import { createFaceRegionIndex, makeTangentPlane } from './lib/facePlane.js';
 import { isFacePlane } from './lib/sketch/profile.js';
+import { faceBoundaryLoopsUV } from './lib/sketch/edit.js';
 import { faceRefFromPlane, planarRegionsOf, resolveRefs } from './lib/persistentRef.js';
 import { computeRebuildState } from './lib/rebuildState.js';
 import {
@@ -148,6 +149,9 @@ export default function App() {
   const [gizmoMode, setGizmoMode] = useState('translate');
   const [sketchOpen, setSketchOpen] = useState(false);
   const [sketchPlane, setSketchPlane] = useState('XY');
+  // Boundary loops (in sketch u,v) of the picked planar face, for "convert
+  // entities"; null unless the sketch was opened on a face (of-fsl.21).
+  const [faceSketchLoops, setFaceSketchLoops] = useState(null);
   // Shared sketch-mode view (plane coords + px per world unit): initialized
   // from the camera by Viewport3D, panned/zoomed by SketchCanvas, applied
   // back to the camera — one world-to-screen transform for both layers.
@@ -1025,6 +1029,20 @@ export default function App() {
     if (!sketchOpen) {
       if (pickedFace?.plane) {
         setSketchPlane(pickedFace.plane);
+        // A planar face carries a boundary we can convert into the sketch;
+        // project its mesh-region edges into the face's (u, v) once, up front.
+        const displayed = meshRef.current;
+        if (pickedFace.planar && displayed?.indices?.length) {
+          const loops = faceBoundaryLoopsUV(
+            displayed.positions,
+            displayed.indices,
+            pickedFace.tris,
+            pickedFace.plane
+          );
+          setFaceSketchLoops(loops.length > 0 ? loops : null);
+        } else {
+          setFaceSketchLoops(null);
+        }
         setPickedFace(null);
       } else {
         if (pickedFace) {
@@ -1033,6 +1051,7 @@ export default function App() {
         }
         // No face picked: never reopen on a stale face plane.
         setSketchPlane((p) => (isFacePlane(p) ? 'XY' : p));
+        setFaceSketchLoops(null);
       }
     }
     setSweep(null);
@@ -1422,6 +1441,7 @@ export default function App() {
             editing={editingSketch ? { name: editingSketch.name } : null}
             onApplyEdit={handleApplySketchEdit}
             documentUnit={documentUnit}
+            faceLoops={faceSketchLoops}
           />
         </ErrorBoundary>
         <ErrorBoundary name="Drawing canvas">

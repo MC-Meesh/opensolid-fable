@@ -2,9 +2,12 @@ import { describe, expect, it } from 'vitest';
 import {
   angleOnArc,
   arcSweep,
+  circleCircleIntersections,
   distToArc,
   distToCircle,
   distToSegment,
+  lineCircleIntersections,
+  lineLineIntersection,
   normalizeAngle,
   reflectPoint,
   sampleArc,
@@ -74,6 +77,49 @@ describe('geom', () => {
     expect(ry).toBeCloseTo(3, 12);
     // Degenerate axis reflects through the point.
     expect(reflectPoint(5, 4, 1, 1, 1, 1)).toEqual([-3, -2]);
+  });
+
+  it('lineLineIntersection crosses and reports parameters', () => {
+    // x-axis segment (0,0)-(2,0) vs vertical (1,-1)-(1,1): cross at (1,0).
+    const hit = lineLineIntersection([0, 0], [2, 0], [1, -1], [1, 1]);
+    expect(hit.x).toBeCloseTo(1, 12);
+    expect(hit.y).toBeCloseTo(0, 12);
+    expect(hit.t).toBeCloseTo(0.5, 12); // halfway along A
+    expect(hit.u).toBeCloseTo(0.5, 12); // halfway along B
+  });
+
+  it('lineLineIntersection returns null for parallel lines', () => {
+    expect(lineLineIntersection([0, 0], [1, 0], [0, 1], [1, 1])).toBeNull();
+    expect(lineLineIntersection([0, 0], [0, 0], [0, 1], [1, 1])).toBeNull();
+  });
+
+  it('lineCircleIntersections finds two, one (tangent), or none', () => {
+    // Horizontal line y=0 through unit circle: (-1,0) and (1,0), t-ordered.
+    const two = lineCircleIntersections([-2, 0], [2, 0], [0, 0], 1);
+    expect(two).toHaveLength(2);
+    expect(two[0].x).toBeCloseTo(-1, 12);
+    expect(two[1].x).toBeCloseTo(1, 12);
+    // Tangent line y=1.
+    const one = lineCircleIntersections([-2, 1], [2, 1], [0, 0], 1);
+    expect(one).toHaveLength(1);
+    expect(one[0].y).toBeCloseTo(1, 9);
+    // Miss.
+    expect(lineCircleIntersections([-2, 2], [2, 2], [0, 0], 1)).toHaveLength(0);
+  });
+
+  it('circleCircleIntersections handles crossing, tangent, and disjoint', () => {
+    // Unit circles at (0,0) and (1,0) cross at x=0.5, y=±√3/2.
+    const pts = circleCircleIntersections([0, 0], 1, [1, 0], 1);
+    expect(pts).toHaveLength(2);
+    expect(pts[0].x).toBeCloseTo(0.5, 12);
+    expect(Math.abs(pts[0].y)).toBeCloseTo(Math.sqrt(3) / 2, 12);
+    // Externally tangent: (0,0) r1 and (2,0) r1 touch at (1,0).
+    const tan = circleCircleIntersections([0, 0], 1, [2, 0], 1);
+    expect(tan).toHaveLength(1);
+    expect(tan[0].x).toBeCloseTo(1, 9);
+    // Disjoint and concentric.
+    expect(circleCircleIntersections([0, 0], 1, [5, 0], 1)).toHaveLength(0);
+    expect(circleCircleIntersections([0, 0], 1, [0, 0], 2)).toHaveLength(0);
   });
 
   it('signedArea is positive for counterclockwise polygons', () => {

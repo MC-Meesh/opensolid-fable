@@ -41,7 +41,7 @@ tangent, length, radius. **Undo/redo:** sketch mode only.
 | Line / rectangle / circle / arc | Full primitive set + inference | **complete** | — | — |
 | Slot / polygon / ellipse / spline | Dedicated tools | **missing** | medium | of-fsl.13 |
 | Construction / centerline geometry | Reference geometry inside sketch | **missing** | medium | of-fsl.13 |
-| Trim / extend / offset / sketch-mirror / convert-entities | Core edit tools | **missing** | high | of-fsl.13 |
+| Trim / extend / offset / sketch-mirror / convert-entities | Core edit tools | **complete** | — | — |
 | Constraints: horizontal, vertical, coincident, tangent | Auto + manual relations | **complete** | — | — |
 | Constraints: parallel, perpendicular, equal, concentric, midpoint, symmetric, collinear, fix | Everyday relations | **missing** | high | of-fsl.11 |
 | Dimension: length (line), radius (circle/arc) | Smart dimension | **partial** | — | — |

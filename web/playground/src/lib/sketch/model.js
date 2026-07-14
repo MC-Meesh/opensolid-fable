@@ -248,6 +248,32 @@ function removeConstraintsReferencing(sketch, ids) {
   }
 }
 
+/**
+ * Add a closed loop of connected lines through `points` (`[x, y]` pairs),
+ * sharing corner point ids so the chain reads as one profile loop. A trailing
+ * point coincident with the first is dropped. Returns the new line ids.
+ */
+export function addLoop(sketch, points, opts = {}) {
+  const pts = points.slice();
+  if (pts.length >= 2) {
+    const [fx, fy] = pts[0];
+    const [lx, ly] = pts[pts.length - 1];
+    if (Math.hypot(lx - fx, ly - fy) < 1e-9) pts.pop();
+  }
+  if (pts.length < 2) return [];
+  const ids = pts.map(([x, y]) => addPoint(sketch, x, y));
+  const lines = [];
+  for (let i = 0; i < ids.length; i++) {
+    lines.push(addLine(sketch, ids[i], ids[(i + 1) % ids.length], opts));
+  }
+  return lines;
+}
+
+/** Remove points no entity references (and constraints that used them). */
+export function pruneOrphanPoints(sketch) {
+  removeOrphanPoints(sketch);
+}
+
 function removeOrphanPoints(sketch) {
   const used = new Set();
   for (const e of Object.values(sketch.entities)) {

@@ -28,7 +28,11 @@ describe('SketchCanvas', () => {
       'Polygon',
       'Slot',
       'Centerline',
+      'Trim',
+      'Extend',
       'Mirror',
+      'Offset',
+      'Convert',
       'Extrude',
       'Revolve',
     ]) {
@@ -39,6 +43,25 @@ describe('SketchCanvas', () => {
     }
     // Empty sketch reports an open profile.
     expect(html).toContain('empty sketch');
+  });
+
+  it('enables Convert only when opened on a face with boundary loops', () => {
+    const withoutFace = renderToString(
+      <SketchCanvas open plane="XY" onPlaneChange={() => {}} onProfileChange={() => {}} />
+    );
+    // No face loops → the Convert button is disabled.
+    expect(withoutFace).toMatch(/Convert<\/button>/);
+    expect(withoutFace).toContain('disabled');
+    const withFace = renderToString(
+      <SketchCanvas
+        open
+        plane="XY"
+        onPlaneChange={() => {}}
+        onProfileChange={() => {}}
+        faceLoops={[[[0, 0], [1, 0], [1, 1], [0, 1]]]}
+      />
+    );
+    expect(withFace).toContain('Convert');
   });
 
   it('renders sketch-mode controls: Finish, undo/redo, and the tool chip', () => {
