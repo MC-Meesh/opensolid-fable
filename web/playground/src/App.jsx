@@ -9,6 +9,7 @@ import StatusBar from './components/StatusBar.jsx';
 import FeatureTree from './components/FeatureTree.jsx';
 import PropertyPanel from './components/PropertyPanel.jsx';
 import SketchCanvas from './components/SketchCanvas.jsx';
+import DrawingCanvas from './components/DrawingCanvas.jsx';
 import SweepPanel from './components/SweepPanel.jsx';
 import SectionPanel from './components/SectionPanel.jsx';
 import { DEFAULT_SCRIPT } from './lib/defaultScript.js';
@@ -144,6 +145,11 @@ export default function App() {
   // from the camera by Viewport3D, panned/zoomed by SketchCanvas, applied
   // back to the camera — one world-to-screen transform for both layers.
   const [sketchView, setSketchView] = useState(null);
+  // Drawing mode (of-fsl.26.2): a 2D orthographic-drawing overlay parallel to
+  // sketch mode. `drawingView` is its own pan/zoom `{ cx, cy, scale }` in sheet
+  // coordinates, distinct from the sketch view.
+  const [drawingOpen, setDrawingOpen] = useState(false);
+  const [drawingView, setDrawingView] = useState(null);
   const [sweep, setSweep] = useState(null);
   const [sweepError, setSweepError] = useState(null);
   const [previewMesh, setPreviewMesh] = useState(null);
@@ -1023,6 +1029,23 @@ export default function App() {
     setSketchOpen(false);
   }, []);
 
+  // Drawing mode toggle (of-fsl.26.2). Mutually exclusive with sketch mode;
+  // re-fit happens inside DrawingCanvas on open, so clear the view on close.
+  const handleDrawingToggle = useCallback(() => {
+    setDrawingOpen((v) => {
+      if (v) {
+        setDrawingView(null);
+        return false;
+      }
+      return true;
+    });
+  }, []);
+
+  const handleDrawingExit = useCallback(() => {
+    setDrawingView(null);
+    setDrawingOpen(false);
+  }, []);
+
   // Transient toast (non-blocking notice, e.g. "curved face").
   useEffect(() => {
     if (!toast) return undefined;
@@ -1046,7 +1069,8 @@ export default function App() {
       if (cm) return;
       // Sketch mode owns the keyboard (tools, dimensions, undo, Esc): its
       // own history nests under the feature-level history handled here.
-      if (sketchOpen) return;
+      // Drawing mode likewise owns its keys (Esc to exit).
+      if (sketchOpen || drawingOpen) return;
 
       // Feature-level undo/redo. Ctrl/Cmd+Z undoes; Ctrl/Cmd+Shift+Z and
       // Ctrl/Cmd+Y redo (the editor keeps its own undo — this handler already
@@ -1088,7 +1112,7 @@ export default function App() {
     }
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [clearSelection, sweep, cancelSweep, sketchOpen, handleDeleteSelected, undo, redo]);
+  }, [clearSelection, sweep, cancelSweep, sketchOpen, drawingOpen, handleDeleteSelected, undo, redo]);
 
   // Exact booleans rebuild shapes, not just meshes: re-run the script.
   const handleExactBooleansChange = useCallback(
@@ -1253,6 +1277,8 @@ export default function App() {
           sketchOpen={sketchOpen}
           sketchOnFace={Boolean(pickedFace?.planar)}
           onSketchToggle={handleSketchToggle}
+          drawingOpen={drawingOpen}
+          onDrawingToggle={handleDrawingToggle}
           canSweep={sketchOpen && profileClosed && !sweep}
           sweepDisabledReason={
             sketchOpen
@@ -1377,6 +1403,15 @@ export default function App() {
             editing={editingSketch ? { name: editingSketch.name } : null}
             onApplyEdit={handleApplySketchEdit}
             documentUnit={documentUnit}
+          />
+        </ErrorBoundary>
+        <ErrorBoundary name="Drawing canvas">
+          <DrawingCanvas
+            open={drawingOpen}
+            mesh={mesh}
+            view={drawingView}
+            onViewChange={setDrawingView}
+            onExit={handleDrawingExit}
           />
         </ErrorBoundary>
         {toast && <div className="toast">{toast}</div>}
