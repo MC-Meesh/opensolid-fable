@@ -44,6 +44,10 @@ const coord = (arg, label) => field(arg, label);
 const axis = (arg, label) => field(arg, label, { unit: '' });
 // Strictly-positive scale factor.
 const factor = (arg, label) => field(arg, label, { unit: '×', min: MIN_SIZE });
+// Integer instance count for patterns (at least one copy).
+const count = (arg, label) => field(arg, label, { unit: '', min: 1, max: 500, step: 1 });
+// Angle stored in degrees already (no display conversion), for pattern spans.
+const degrees = (arg, label) => field(arg, label, { unit: '°', min: -3600, max: 3600, step: 1 });
 // Angle stored in radians, displayed in degrees.
 const angle = (arg, label) =>
   field(arg, label, {
@@ -174,6 +178,34 @@ export const OP_SPECS = {
     kind: 'modifier',
     title: 'Shell',
     groups: [{ label: 'Wall', fields: [size(0, 't')] }],
+  },
+  linearPattern: {
+    kind: 'pattern',
+    title: 'Linear pattern',
+    groups: [
+      { label: 'Spacing', fields: xyz(coord) },
+      { label: 'Count', fields: [count(3, 'n')] },
+    ],
+  },
+  circularPattern: {
+    kind: 'pattern',
+    title: 'Circular pattern',
+    // args: [ax, ay, az, cx, cy, cz, count, angleDegrees]
+    groups: [
+      { label: 'Axis', fields: xyz(axis) },
+      { label: 'Center', fields: xyz(coord, 3) },
+      { label: 'Count', fields: [count(6, 'n')] },
+      { label: 'Angle', fields: [degrees(7, 'span')] },
+    ],
+  },
+  mirror: {
+    kind: 'pattern',
+    title: 'Mirror',
+    // args: [nx, ny, nz, px, py, pz]
+    groups: [
+      { label: 'Normal', fields: xyz(axis) },
+      { label: 'Point', fields: xyz(coord, 3) },
+    ],
   },
   union: { kind: 'boolean', title: 'Boolean', groups: [] },
   intersect: { kind: 'boolean', title: 'Boolean', groups: [] },

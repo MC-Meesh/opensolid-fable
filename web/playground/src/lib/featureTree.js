@@ -38,6 +38,9 @@ export const FEATURE_META = {
   scale: { kind: 'transform', type: 'Scale' },
   uniformScale: { kind: 'transform', type: 'Scale' },
   shell: { kind: 'modifier', type: 'Shell' },
+  linearPattern: { kind: 'pattern', type: 'LinearPattern' },
+  circularPattern: { kind: 'pattern', type: 'CircularPattern' },
+  mirror: { kind: 'pattern', type: 'Mirror' },
 };
 
 function metaFor(op) {

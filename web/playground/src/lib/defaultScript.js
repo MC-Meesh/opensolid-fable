@@ -32,6 +32,14 @@ export const DEFAULT_SCRIPT = `// Build a shape with the OpenSolid API and retur
 //                                       axis (px,py,pz), by deg degrees
 //   .shell(thickness)                   hollow to a uniform wall, centered
 //                                       on the surface
+// Patterns & mirror (each returns a new shape):
+//   .linearPattern(dx, dy, dz, count)   count copies stepped by (dx,dy,dz)
+//   .circularPattern(ax,ay,az, cx,cy,cz, count, angleDeg?)
+//                                       count copies around the axis
+//                                       (ax,ay,az) through (cx,cy,cz),
+//                                       spanning angleDeg (default 360)
+//   .mirror(nx, ny, nz, px, py, pz)     union with the reflection across the
+//                                       plane at (px,py,pz) with normal (nx,ny,nz)
 // Booleans (each returns a new shape):
 //   .union(other)  .intersect(other)  .subtract(other)
 //   .smoothUnion(other, radius?)        blended union; radius defaults to

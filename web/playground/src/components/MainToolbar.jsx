@@ -85,6 +85,28 @@ const Icons = {
       <path d="M5 6.4 L8 4.9 L11 6.4 V9.6 L8 11.1 L5 9.6 Z" />
     </svg>
   ),
+  linearPattern: (
+    <svg {...ICON}>
+      <rect x="2" y="6" width="3.5" height="3.5" />
+      <rect x="6.25" y="6" width="3.5" height="3.5" opacity="0.7" />
+      <rect x="10.5" y="6" width="3.5" height="3.5" opacity="0.45" />
+    </svg>
+  ),
+  circularPattern: (
+    <svg {...ICON}>
+      <circle cx="8" cy="8" r="5.2" strokeDasharray="1.6 1.4" />
+      <rect x="6.5" y="1.4" width="3" height="3" />
+      <rect x="11.6" y="6.5" width="3" height="3" opacity="0.6" />
+      <rect x="1.4" y="6.5" width="3" height="3" opacity="0.6" />
+    </svg>
+  ),
+  mirror: (
+    <svg {...ICON}>
+      <path d="M8 1.5 V14.5" strokeDasharray="2 1.6" />
+      <path d="M6 4 L2.5 8 L6 12 Z" />
+      <path d="M10 4 L13.5 8 L10 12 Z" opacity="0.55" />
+    </svg>
+  ),
   fit: (
     <svg {...ICON}>
       <path d="M2 5.5 V2 h3.5 M10.5 2 H14 v3.5 M14 10.5 V14 h-3.5 M5.5 14 H2 v-3.5" />
@@ -195,6 +217,9 @@ export default function MainToolbar({
   onAddFeature,
   canShell,
   onShell,
+  canPattern,
+  patternDisabledReason,
+  onPattern,
   onView,
   onFit,
   wireframe,
@@ -293,6 +318,30 @@ export default function MainToolbar({
           disabledReason={disabled ? notReady : 'Run a script that produces a solid first'}
           disabled={disabled || !canShell}
           onClick={onShell}
+        />
+        <ToolButton
+          icon="linearPattern"
+          label="Linear Pattern"
+          title="Repeat the selected body along a direction"
+          disabledReason={disabled ? notReady : patternDisabledReason}
+          disabled={disabled || !canPattern}
+          onClick={() => onPattern('linearPattern')}
+        />
+        <ToolButton
+          icon="circularPattern"
+          label="Circular Pattern"
+          title="Repeat the selected body around an axis"
+          disabledReason={disabled ? notReady : patternDisabledReason}
+          disabled={disabled || !canPattern}
+          onClick={() => onPattern('circularPattern')}
+        />
+        <ToolButton
+          icon="mirror"
+          label="Mirror"
+          title="Mirror the selected body across a plane"
+          disabledReason={disabled ? notReady : patternDisabledReason}
+          disabled={disabled || !canPattern}
+          onClick={() => onPattern('mirror')}
         />
         <ToolButton
           icon="reference"

@@ -1,4 +1,4 @@
-function maxId(node, seen = new Set()) {
+export function maxId(node, seen = new Set()) {
   if (seen.has(node.id)) return 0;
   seen.add(node.id);
   return node.children.reduce((m, c) => Math.max(m, maxId(c, seen)), node.id);

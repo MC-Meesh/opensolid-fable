@@ -1,7 +1,9 @@
 use crate::blend::SmoothUnion;
 use crate::csg::{Intersection, Subtraction, Union};
 use crate::fillet::{BlendMode, BooleanKind, EdgeBlend, EdgeRegion};
+use crate::pattern::{CircularPattern, LinearPattern, Mirror};
 use crate::primitives::Sdf;
+use opensolid_core::error::CoreResult;
 use opensolid_core::interval::Interval;
 use opensolid_core::types::{BoundingBox3, Point3, Vector3};
 use std::sync::Arc;
@@ -69,6 +71,42 @@ impl Shape {
             radius,
             region,
         )
+    }
+
+    /// `count` copies of this shape, copy `k` translated by `k * step`.
+    ///
+    /// # Errors
+    /// Propagates [`LinearPattern::new`] validation (`count >= 1`, finite
+    /// `step`).
+    pub fn linear_pattern(self, step: Vector3, count: usize) -> CoreResult<Shape> {
+        Ok(Shape::new(LinearPattern::new(self, step, count)?))
+    }
+
+    /// `count` copies of this shape rotated about the axis line through
+    /// `center` with direction `axis`, copy `k` turned by `k * angle` radians.
+    ///
+    /// # Errors
+    /// Propagates [`CircularPattern::new`] validation (`count >= 1`, non-zero
+    /// finite `axis`, finite `angle`).
+    pub fn circular_pattern(
+        self,
+        center: Point3,
+        axis: Vector3,
+        angle: f64,
+        count: usize,
+    ) -> CoreResult<Shape> {
+        Ok(Shape::new(CircularPattern::new(
+            self, center, axis, angle, count,
+        )?))
+    }
+
+    /// This shape unioned with its reflection across the plane through `point`
+    /// with `normal`.
+    ///
+    /// # Errors
+    /// Propagates [`Mirror::new`] validation (non-zero finite `normal`).
+    pub fn mirror(self, point: Point3, normal: Vector3) -> CoreResult<Shape> {
+        Ok(Shape::new(Mirror::new(self, point, normal)?))
     }
 
     /// True if both handles refer to the same underlying SDF instance.

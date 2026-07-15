@@ -436,6 +436,18 @@ pub struct MeshData {
     pub feature_edges: Vec<f32>,
 }
 
+/// Round a JS-supplied pattern `count` to a positive instance count. JS has
+/// only `f64`, so fractional or non-finite values are rejected rather than
+/// silently truncated.
+fn pattern_count(count: f64) -> Result<usize, String> {
+    if !count.is_finite() || count < 0.5 {
+        return Err(format!(
+            "pattern count must be a positive integer, got {count}"
+        ));
+    }
+    Ok(count.round() as usize)
+}
+
 /// Runtime-composable SDF shape. Methods never mutate: each returns a new
 /// shape, so intermediate shapes can be reused freely from JS.
 ///
@@ -846,6 +858,67 @@ impl WasmShape {
     pub fn shell(&self, thickness: f64) -> Result<WasmShape, String> {
         self.inner
             .shell(thickness)
+            .map(WasmShape::sdf_only)
+            .map_err(|e| e.to_string())
+    }
+
+    /// `count` copies of this shape, copy `k` translated by `k·(dx, dy, dz)`.
+    /// `count` is rounded to the nearest integer and must be at least 1.
+    #[wasm_bindgen(js_name = linearPattern)]
+    pub fn linear_pattern(
+        &self,
+        dx: f64,
+        dy: f64,
+        dz: f64,
+        count: f64,
+    ) -> Result<WasmShape, String> {
+        let n = pattern_count(count)?;
+        self.inner
+            .linear_pattern(Vector3::new(dx, dy, dz), n)
+            .map(WasmShape::sdf_only)
+            .map_err(|e| e.to_string())
+    }
+
+    /// `count` copies of this shape spaced evenly around the axis through
+    /// `(cx, cy, cz)` with direction `(ax, ay, az)`. The copies span
+    /// `angleDegrees` total (default `360`), so consecutive copies differ by
+    /// `angleDegrees / count`. `count` is rounded to the nearest integer and
+    /// must be at least 1.
+    #[allow(clippy::too_many_arguments)]
+    #[wasm_bindgen(js_name = circularPattern)]
+    pub fn circular_pattern(
+        &self,
+        ax: f64,
+        ay: f64,
+        az: f64,
+        cx: f64,
+        cy: f64,
+        cz: f64,
+        count: f64,
+        angle_degrees: Option<f64>,
+    ) -> Result<WasmShape, String> {
+        let n = pattern_count(count)?;
+        let total = angle_degrees.unwrap_or(360.0);
+        let step = total.to_radians() / n as f64;
+        self.inner
+            .circular_pattern(Point3::new(cx, cy, cz), Vector3::new(ax, ay, az), step, n)
+            .map(WasmShape::sdf_only)
+            .map_err(|e| e.to_string())
+    }
+
+    /// This shape unioned with its reflection across the plane through
+    /// `(px, py, pz)` with normal `(nx, ny, nz)`.
+    pub fn mirror(
+        &self,
+        nx: f64,
+        ny: f64,
+        nz: f64,
+        px: f64,
+        py: f64,
+        pz: f64,
+    ) -> Result<WasmShape, String> {
+        self.inner
+            .mirror(Point3::new(px, py, pz), Vector3::new(nx, ny, nz))
             .map(WasmShape::sdf_only)
             .map_err(|e| e.to_string())
     }

@@ -385,6 +385,86 @@ impl BoundedShape {
         })
     }
 
+    /// `count` copies of this shape, copy `k` translated by `k * step`. The
+    /// tracked box is the union of the translated per-copy boxes.
+    ///
+    /// # Errors
+    /// Propagates [`opensolid_frep::LinearPattern::new`] validation
+    /// (`count >= 1`, finite `step`).
+    pub fn linear_pattern(&self, step: Vector3, count: usize) -> CoreResult<Self> {
+        let shape = self.shape.clone().linear_pattern(step, count)?;
+        let mut bounds = BoundingBox3::EMPTY;
+        for k in 0..count {
+            let shift = step * k as f64;
+            bounds = bounds.union(&BoundingBox3::new(
+                self.bounds.min + shift,
+                self.bounds.max + shift,
+            ));
+        }
+        Ok(Self { shape, bounds })
+    }
+
+    /// `count` copies rotated about the axis line through `center` with
+    /// direction `axis`, copy `k` turned by `k * angle` radians. The tracked
+    /// box is the union of the AABBs of the rotated per-copy boxes
+    /// (conservative).
+    ///
+    /// # Errors
+    /// Propagates [`opensolid_frep::CircularPattern::new`] validation
+    /// (`count >= 1`, non-zero finite `axis`, finite `angle`).
+    pub fn circular_pattern(
+        &self,
+        center: Point3,
+        axis: Vector3,
+        angle: f64,
+        count: usize,
+    ) -> CoreResult<Self> {
+        let shape = self
+            .shape
+            .clone()
+            .circular_pattern(center, axis, angle, count)?;
+        let unit = axis / axis.norm();
+        let b = &self.bounds;
+        let mut bounds = BoundingBox3::EMPTY;
+        for k in 0..count {
+            let rot = Transform3::rotation(unit * (k as f64 * angle));
+            let corners = (0..8).map(|i| {
+                let corner = Point3::new(
+                    if i & 1 == 0 { b.min.x } else { b.max.x },
+                    if i & 2 == 0 { b.min.y } else { b.max.y },
+                    if i & 4 == 0 { b.min.z } else { b.max.z },
+                );
+                center + rot.transform_vector(&(corner - center))
+            });
+            bounds = bounds.union(&BoundingBox3::from_points(corners));
+        }
+        Ok(Self { shape, bounds })
+    }
+
+    /// This shape unioned with its reflection across the plane through `point`
+    /// with `normal`. The tracked box is the union of this box and the AABB of
+    /// its reflected corners.
+    ///
+    /// # Errors
+    /// Propagates [`opensolid_frep::Mirror::new`] validation (non-zero finite
+    /// `normal`).
+    pub fn mirror(&self, point: Point3, normal: Vector3) -> CoreResult<Self> {
+        let shape = self.shape.clone().mirror(point, normal)?;
+        let unit = normal / normal.norm();
+        let b = &self.bounds;
+        let reflected = (0..8).map(|i| {
+            let corner = Point3::new(
+                if i & 1 == 0 { b.min.x } else { b.max.x },
+                if i & 2 == 0 { b.min.y } else { b.max.y },
+                if i & 4 == 0 { b.min.z } else { b.max.z },
+            );
+            let signed = (corner - point).dot(&unit);
+            corner - unit * (2.0 * signed)
+        });
+        let bounds = self.bounds.union(&BoundingBox3::from_points(reflected));
+        Ok(Self { shape, bounds })
+    }
+
     pub fn union(&self, other: &Self) -> Self {
         Self {
             shape: self.shape.clone().union(other.shape.clone()),
@@ -1373,5 +1453,98 @@ mod tests {
         let mesh = filleted.mesh_adaptive(0.01, None);
         assert!(!mesh.is_empty());
         assert!(mesh.is_closed_manifold(), "filleted union not manifold");
+    }
+
+    // ---- Patterns and mirror ----
+
+    /// A linear pattern of `count` well-separated unit cubes encloses `count`
+    /// times the single-cube volume — the headline non-overlap acceptance.
+    #[test]
+    fn linear_pattern_volume_is_count_times_unit() {
+        // Unit cube (volume 1) stepped by 2 along x: three disjoint cubes.
+        let unit = BoundedShape::box3(0.5, 0.5, 0.5);
+        let pat = unit
+            .linear_pattern(Vector3::new(2.0, 0.0, 0.0), 3)
+            .expect("valid pattern");
+        assert_eq!(pat.bounds.min, Point3::new(-0.5, -0.5, -0.5));
+        assert_eq!(pat.bounds.max, Point3::new(4.5, 0.5, 0.5));
+        let mesh = pat.mesh_adaptive(0.01, None);
+        assert!(mesh.is_closed_manifold(), "pattern mesh not manifold");
+        let v = mesh_volume(&mesh);
+        assert!((v - 3.0).abs() < 0.05, "expected ~3.0, got {v}");
+    }
+
+    /// A circular pattern of `count` well-separated cubes about the y axis
+    /// encloses `count` times the single-cube volume.
+    #[test]
+    fn circular_pattern_volume_is_count_times_unit() {
+        // Unit cube pushed out to x = 2.5, six copies 60° apart about y: the
+        // copies sit on a radius-2.5 ring, far enough apart not to overlap.
+        let unit = BoundedShape::box3(0.5, 0.5, 0.5).translate(Vector3::new(2.5, 0.0, 0.0));
+        let pat = unit
+            .circular_pattern(
+                Point3::origin(),
+                Vector3::new(0.0, 1.0, 0.0),
+                std::f64::consts::PI / 3.0,
+                6,
+            )
+            .expect("valid pattern");
+        let mesh = pat.mesh_adaptive(0.01, None);
+        assert!(mesh.is_closed_manifold(), "pattern mesh not manifold");
+        let v = mesh_volume(&mesh);
+        assert!((v - 6.0).abs() < 0.15, "expected ~6.0, got {v}");
+    }
+
+    /// Mirroring a body that lies entirely on one side of the plane doubles
+    /// the volume and produces a mesh symmetric across the plane.
+    #[test]
+    fn mirror_doubles_volume_and_is_symmetric() {
+        // Unit cube at x = 2 mirrored across the x = 0 plane: two disjoint
+        // cubes, one at x = ±2.
+        let body = BoundedShape::box3(0.5, 0.5, 0.5).translate(Vector3::new(2.0, 0.0, 0.0));
+        let single = mesh_volume(&body.mesh_adaptive(0.01, None));
+        let mirrored = body
+            .mirror(Point3::origin(), Vector3::new(1.0, 0.0, 0.0))
+            .expect("valid mirror");
+        assert_eq!(mirrored.bounds.min, Point3::new(-2.5, -0.5, -0.5));
+        assert_eq!(mirrored.bounds.max, Point3::new(2.5, 0.5, 0.5));
+        let mesh = mirrored.mesh_adaptive(0.01, None);
+        assert!(mesh.is_closed_manifold(), "mirror mesh not manifold");
+        let v = mesh_volume(&mesh);
+        assert!((v - 2.0 * single).abs() < 0.05, "expected 2x, got {v}");
+        // Symmetry: reflecting any surface vertex lands on the surface too.
+        for p in &mesh.positions {
+            let reflected = Point3::new(-p.x, p.y, p.z);
+            assert!(
+                mirrored.shape.eval(&reflected).abs() < 0.05,
+                "reflection of {p:?} off surface"
+            );
+        }
+    }
+
+    #[test]
+    fn patterns_and_mirror_reject_bad_args() {
+        let s = BoundedShape::sphere(1.0);
+        assert!(s.linear_pattern(Vector3::new(1.0, 0.0, 0.0), 0).is_err());
+        assert!(
+            s.circular_pattern(Point3::origin(), Vector3::zeros(), 1.0, 4)
+                .is_err()
+        );
+        assert!(s.mirror(Point3::origin(), Vector3::zeros()).is_err());
+    }
+
+    #[test]
+    fn single_copy_pattern_matches_original_bounds() {
+        // count == 1 leaves the shape and its box unchanged.
+        let s = BoundedShape::sphere(1.0).translate(Vector3::new(0.5, 0.0, 0.0));
+        let lin = s
+            .linear_pattern(Vector3::new(3.0, 0.0, 0.0), 1)
+            .expect("ok");
+        assert_eq!(lin.bounds.min, s.bounds.min);
+        assert_eq!(lin.bounds.max, s.bounds.max);
+        let circ = s
+            .circular_pattern(Point3::origin(), Vector3::new(0.0, 1.0, 0.0), 1.0, 1)
+            .expect("ok");
+        assert_meshes_cleanly(&circ);
     }
 }

@@ -14,6 +14,7 @@ import SweepPanel from './components/SweepPanel.jsx';
 import SectionPanel from './components/SectionPanel.jsx';
 import MeasurePanel from './components/MeasurePanel.jsx';
 import ReferencePanel from './components/ReferencePanel.jsx';
+import FeaturePanel from './components/FeaturePanel.jsx';
 import { DEFAULT_SCRIPT } from './lib/defaultScript.js';
 import { freeNodes, nodeLabel, runTracedScript, scriptHeader, serializeTree } from './lib/sceneTree.js';
 import { buildBinaryStl } from './lib/stl.js';
@@ -34,6 +35,7 @@ import {
   profileToOps,
   sweepTreeNode,
 } from './lib/sweep.js';
+import { featureArgs, featureTreeNode } from './lib/pattern.js';
 import { createFaceRegionIndex, makeTangentPlane } from './lib/facePlane.js';
 import { buildEdgeModel, snapEntity } from './lib/measureTopology.js';
 import { boundingBoxDims, measurePair, measureSingle, triListArea } from './lib/measure.js';
@@ -168,6 +170,10 @@ export default function App() {
   const [drawingView, setDrawingView] = useState(null);
   const [sweep, setSweep] = useState(null);
   const [sweepError, setSweepError] = useState(null);
+  // Pending pattern/mirror feature (of-fsl.6): a plain object the FeaturePanel
+  // edits live, applied as a unary node wrapping the selected body.
+  const [feature, setFeature] = useState(null);
+  const [featureError, setFeatureError] = useState(null);
   const [previewMesh, setPreviewMesh] = useState(null);
   // Hovered planar face: `{ meshKey, tris }` — triangle indices into the
   // displayed mesh, shown as an in-place darkening (of-4eh.18). meshKey
@@ -1162,6 +1168,8 @@ export default function App() {
       // the buried part when the sweep unions with the body (of-fsl.5).
       const fromSurface = kind === 'extrude' && isFacePlane(profile.plane) && profile.plane.curved;
       clearSelection();
+      setFeature(null);
+      setFeatureError(null);
       setSweepError(null);
       setSketchOpen(false);
       setSweep(
@@ -1245,6 +1253,92 @@ export default function App() {
     }
   }, [sweep, wasm]);
 
+  // ---- pattern / mirror workflow ------------------------------------------
+
+  // Seed a pending feature from the selected body, deriving sensible defaults
+  // from its bounds and any picked flat face (used as the axis / mirror plane).
+  const handleFeatureStart = useCallback(
+    (kind) => {
+      const target = selectedNode;
+      if (!target?.shape) return;
+      const b = target.shape.bounds();
+      const size = [b[3] - b[0], b[4] - b[1], b[5] - b[2]];
+      const picked = pickedFace?.planar ? pickedFace.plane : null;
+      const dir = picked ? picked.normal : null;
+      setSweep(null);
+      setSweepError(null);
+      setFeatureError(null);
+      const base = { kind, targetId: target.id, targetNode: target, picked: Boolean(picked) };
+      if (kind === 'linearPattern') {
+        const span = Math.max(size[0], size[1], size[2], 0.5) * 1.6;
+        const d = dir ?? [1, 0, 0];
+        setFeature({ ...base, dx: d[0] * span, dy: d[1] * span, dz: d[2] * span, count: 3 });
+      } else if (kind === 'circularPattern') {
+        const axis = dir ?? [0, 1, 0];
+        setFeature({
+          ...base,
+          ax: axis[0],
+          ay: axis[1],
+          az: axis[2],
+          cx: 0,
+          cy: 0,
+          cz: 0,
+          count: 6,
+          angleDeg: 360,
+        });
+      } else {
+        const n = dir ?? [1, 0, 0];
+        const o = picked ? picked.origin : [0, 0, 0];
+        setFeature({ ...base, nx: n[0], ny: n[1], nz: n[2], px: o[0], py: o[1], pz: o[2] });
+      }
+    },
+    [selectedNode, pickedFace]
+  );
+
+  const handleFeatureChange = useCallback((patch) => {
+    setFeature((current) => (current ? { ...current, ...patch } : current));
+  }, []);
+
+  const cancelFeature = useCallback(() => {
+    setFeature(null);
+    setFeatureError(null);
+  }, []);
+
+  // Commit the pending feature: wrap the target body and commit through the
+  // store. Selection is dropped (its node id is superseded by re-evaluation).
+  const applyFeature = useCallback(() => {
+    if (!feature) return;
+    setFeature(null);
+    setFeatureError(null);
+    clearSelection();
+    commitTree(featureTreeNode(tracedRef.current?.root ?? null, feature));
+  }, [feature, commitTree, clearSelection]);
+
+  // Live preview: apply the pending feature to the target body's shape and
+  // remesh whenever its parameters change.
+  useEffect(() => {
+    if (!feature || !wasm) {
+      if (!sweep) setPreviewMesh(null);
+      return;
+    }
+    const source = feature.targetNode?.shape;
+    if (!source) {
+      setPreviewMesh(null);
+      return;
+    }
+    let shape = null;
+    try {
+      shape = source[feature.kind](...featureArgs(feature));
+      setPreviewMesh(meshShape(shape));
+      setFeatureError(null);
+    } catch (err) {
+      setPreviewMesh(null);
+      setFeatureError(String(err));
+    } finally {
+      shape?.free?.();
+    }
+  }, [feature, wasm, sweep]);
+
   // SolidWorks entry gesture: with a face picked, Sketch opens ON that face
   // (of-4eh.16). A planar face sketches on its plane; a curved face sketches
   // on the tangent plane at the pick point (of-fsl.5). Only faces that carry
@@ -1282,6 +1376,8 @@ export default function App() {
     }
     setSweep(null);
     setSweepError(null);
+    setFeature(null);
+    setFeatureError(null);
     setEditingSketch(null);
     // Sketch and Measure are mutually exclusive modes.
     setMeasureMode(false);
@@ -1602,6 +1698,13 @@ export default function App() {
           onAddFeature={handleAddFeature}
           canShell={Boolean(tree) && !sketchOpen}
           onShell={handleShell}
+          canPattern={Boolean(selectedNode) && !sketchOpen && !sweep && !feature}
+          patternDisabledReason={
+            sketchOpen
+              ? 'Finish or exit the sketch first'
+              : 'Select a body in the viewport or tree first'
+          }
+          onPattern={handleFeatureStart}
           onView={(name) => viewportRef.current?.snapView(name)}
           onFit={() => viewportRef.current?.zoomToFit()}
           wireframe={wireframe}
@@ -1678,6 +1781,13 @@ export default function App() {
           refGeom={refGeom}
           onAdd={handleRefAdd}
           onClose={handleRefPanelToggle}
+        />
+        <FeaturePanel
+          feature={feature}
+          error={featureError}
+          onChange={handleFeatureChange}
+          onApply={applyFeature}
+          onCancel={cancelFeature}
         />
         {selectedNode && (
           <div className="gizmo-bar">

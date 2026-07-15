@@ -51,6 +51,7 @@ pub mod fillet;
 pub mod mesh;
 pub mod mesh_adaptive;
 pub mod ops;
+pub mod pattern;
 pub mod primitives;
 pub mod profile;
 pub mod refine;
@@ -64,6 +65,7 @@ pub use fillet::{BlendMode, BooleanKind, EdgeBlend, EdgeRegion};
 pub use mesh::{MeshOptions, Triangle, TriangleMesh, mesh_sdf, mesh_sdf_indexed};
 pub use mesh_adaptive::{AdaptiveMeshOptions, mesh_sdf_adaptive, mesh_sdf_adaptive_indexed};
 pub use ops::{Offset, Rounded, SdfOpsExt, Shell};
+pub use pattern::{CircularPattern, LinearPattern, Mirror};
 pub use profile::{
     Extrude, MAX_DRAFT, OpenPath2D, OpenPath2DBuilder, Profile2D, Profile2DBuilder, Revolve, Rib,
     RibSide,
