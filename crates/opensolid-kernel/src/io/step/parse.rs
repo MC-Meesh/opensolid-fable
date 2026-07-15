@@ -834,7 +834,7 @@ END-ISO-10303-21;
     /// 2.48s under 16-binary load vs ~0.45s in isolation), so this only runs
     /// on demand: `cargo test -p opensolid-kernel -- --ignored`.
     #[test]
-    #[ignore = "of-0mc (by design): wall-clock perf test, flaky under parallel suite load — run with --ignored"]
+    #[ignore = "by design: wall-clock perf test, flaky under parallel suite load — run with --ignored"]
     fn torture_big_file_under_two_seconds() {
         use std::time::Instant;
 

@@ -289,10 +289,13 @@ bounds, and the Euler–Poincaré relation `V − E + F − R = 2(S − H)`
 (`crates/opensolid-brep/src/euler.rs:103`). Bugs found in the field become new
 checker rules, so the same class of error cannot silently return `Ok` twice.
 
-**Every function is tested.** 913 tests pass across the Rust workspace
+**Every function is tested.** 1184 tests pass across the Rust workspace
 (`cargo test --workspace`), plus the playground's vitest suite. CI runs `fmt`,
 `clippy -D warnings`, `build`, and `test` on every push
-(`.github/workflows/ci.yml`).
+(`.github/workflows/ci.yml`). Eight tests are `#[ignore]`d: three are on-demand
+perf measurements, and five are known-broken cases held as executable bug
+reports — each names the open bead blocking it (of-s89, of-9ia, of-kb8), per
+the stress-suite-first policy of never softening a test to make it pass.
 
 ---
 
@@ -303,21 +306,24 @@ checker rules, so the same class of error cannot silently return `Ok` twice.
 | Planes | ✅ today | ✅ |
 | Cylinders | ✅ today | ✅ |
 | Spheres / tori | ✅ today (of-7ld) | ✅ |
-| Cones | 🚧 (plane-cone ✅; cone-cone → of-dtj.4) | ✅ |
+| Cones | ✅ today (of-dtj); non-coaxial cone–cone → of-9ia | ✅ |
 | Coincident / tangent contacts | rejected → fallback | ✅ |
 | Organic blends, offsets, shells | — | ✅ |
 | STEP (AP203) read/write | ✅ today (of-3qy) | mesh fallback on read |
 
-The exact analytic pipeline covers **plane, cylinder, sphere, and torus**
-faces today: the sphere/torus stress campaign (bead of-7ld) promoted both
-classes through the stress-suite-first policy, and marched SSI curves carry
-the oblique plane–torus and torus–torus configurations. **Cones** are nearly
-there: every **plane–cone** boolean is exact — the parabola/hyperbola/
-generator sections that arise when a planar face cuts a cone off-axis march
-through the bounded SSI entry point (of-dtj.1), and sphere–cone / torus–cone
-pairs march against their compact partner (of-dtj.2). The one remaining gap is
-**cone–cone** SSI (coaxial analytic + general marched), tracked by of-dtj.4;
-until it lands, coaxial cone/frustum overlaps fall to the F-Rep path. **STEP (AP203)
+The exact analytic pipeline covers **plane, cylinder, sphere, torus, and
+cone** faces today: the sphere/torus stress campaign (bead of-7ld) promoted
+both classes through the stress-suite-first policy, and marched SSI curves
+carry the oblique plane–torus and torus–torus configurations. **Cones** have
+since been promoted the same way (of-dtj): every **plane–cone** boolean is
+exact — the parabola/hyperbola/generator sections that arise when a planar
+face cuts a cone off-axis march through the bounded SSI entry point
+(of-dtj.1) — sphere–cone / torus–cone pairs march against their compact
+partner (of-dtj.2), and **coaxial cone–cone** overlaps take the exact path
+through the analytic cone–cone SSI. The one remaining cone gap is
+**non-coaxial cone–cone**: the SSI itself marches correctly, but hosting the
+marched imprint on the two curved cone faces leaves an open chain (of-9ia), so
+those configurations fall to the F-Rep path. **STEP (AP203)
 interchange** shipped (bead of-3qy): analytic parts round-trip through
 `write_step`/`read_step` as exact B-Reps — byte-identical on re-export for
 primitive-derived geometry — with a welded-mesh fallback for files the kernel
@@ -339,7 +345,7 @@ source of truth for task state.
 
 ```sh
 cargo build            # build the workspace
-cargo test             # run all 913 tests
+cargo test             # run all 1184 tests
 cargo clippy -- -D warnings
 ```
 

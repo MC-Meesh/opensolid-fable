@@ -22,9 +22,9 @@
 //! fixed point**: the re-imported solid serializes to the same file, so it
 //! is the same geometry down to every `f64`, and its enclosed volume IS
 //! the measured one. Measuring the re-imported body directly — through a
-//! second exact boolean — currently produces a non-manifold tessellation
-//! (of-6cf); that path is covered by an `#[ignore]`d test referencing the
-//! bead.
+//! second exact boolean — is covered live by
+//! [`reimported_step_solid_works_as_boolean_operand`], the of-6cf
+//! regression.
 //!
 //! The 1e-6 volume gates hold because every face of the measured results
 //! is planar except a small spherical cap: planar faces triangulate

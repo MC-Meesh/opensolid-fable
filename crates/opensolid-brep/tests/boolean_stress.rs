@@ -11,53 +11,6 @@
 //! softened to pass. Run the known-broken cases with `cargo test --test
 //! boolean_stress -- --ignored`.
 //!
-//! Bugs filed from this suite (first run, 2026-07-04):
-//! - of-ipt.4: block×cylinder booleans silently wrong — hole volume off by
-//!   ~12×, bottom-face hole never cut, cylinder band ~30% tessellated.
-//! - of-ipt.5: ≥15° tilted cylinder tool: subtract silently returns A
-//!   unchanged (imprints dropped; SSI verified correct).
-//! - of-ipt.6: 0.5°–5° tilted cylinder: output fails check() and
-//!   tessellates non-manifold.
-//! - of-ipt.7: 25° diagonal tilt: Degenerate "interior imprint ring lies
-//!   in no region of its host face".
-//! - of-ipt.8: quarter-notch through a vertical edge: volume wrong
-//!   (removed 0.197 vs 0.251) despite valid topology.
-//! - of-ipt.9: tessellate() emits sliver triangles; MeshSdf::new rejects
-//!   every boolean output tried (even pure block∪block).
-//! - of-ny6: block∩block under a generic-axis rotation tessellates
-//!   non-manifold (one edge shared by four triangles) despite clean
-//!   check() and correct hexahedron topology.
-//!
-//! Re-verified after the of-k3u seam-refinement fix (of-ipt.12,
-//! 2026-07-05): 15° tilt is still a silent no-op; 30°/45° now accept the
-//! imprint but fail check() (OpenEdgeInClosedShell) like of-ipt.6; the
-//! 25° skew case no longer errors — it builds correct topology (genus 1,
-//! clean check) but tessellates non-manifold. of-ipt.6/8/9 and of-ny6
-//! are unchanged.
-//!
-//! of-ipt.4 FIXED (2026-07-05): full-wrap curved-chart bands now refine
-//! wide uv chords on-surface during tessellation; the block×cylinder
-//! through-hole cases (all scales), the near-tangent wall case, and the
-//! block−cylinder round trip are un-ignored and pass.
-//!
-//! of-ipt.7 FIXED (2026-07-05): the 25° skew case tessellates closed-
-//! manifold after the of-ipt.4 curved-chart refinement and the of-299
-//! hole-bridge validation landed; volume matches the transversal
-//! prediction. Un-ignored.
-//!
-//! of-ipt.8 FIXED (2026-07-08): the quarter-notch (cylinder centered on a
-//! vertical block edge) now removes 0.2511 vs the analytic 0.2513 (rel_err
-//! 3e-5, was 0.1971 / 7e-3). Same of-ipt.4 curved-chart full-wrap
-//! refinement (57af8a6): before it the notch's swept band tessellated the
-//! wrong geometry and undercounted the removed volume. Un-ignored.
-//!
-//! of-ipt.9 FIXED (2026-07-08): the block∪block corner-overlap round trip
-//! (tessellate → MeshSdf → volume) passes — the accumulated planar and
-//! curved-chart triangulation robustness (of-ipt.4 refinement, of-6dw
-//! planar ear-clipping) no longer emits the sliver triangles MeshSdf::new
-//! rejected. `round_trip_union_of_blocks` un-ignored; `round_trip_block_
-//! minus_cylinder` was already passing.
-//!
 //! Invariants asserted throughout:
 //! - `BooleanOutput::check()` reports no failures,
 //! - `BooleanOutput::tessellate()` yields a closed manifold mesh,
@@ -66,133 +19,24 @@
 //!   `vol(A) + vol(B) == vol(A∪B) + vol(A∩B)` holds,
 //! - results are invariant under rigid rotation of both operands.
 //!
-//! Sections (6)-(8) are the sphere/torus campaign (of-7ld.3), written
-//! BEFORE those surfaces were enabled in the exact pipeline (the of-7ld
-//! promotion policy). Every test there started `#[ignore]`d while
-//! `Chart::new` rejected `Surface3::Sphere`/`Torus`; of-7ld.4 lifted
-//! that gate after the of-7ld.5/6/7 fixes, and the tests that pass are
-//! now live. The still-`#[ignore]`d remainder name their open blockers
-//! (of-2ql). Run those with
-//! `cargo test --test boolean_stress -- --ignored`.
+//! Sections (6)-(8) are the sphere/torus campaign (of-7ld.3) and section
+//! (9) the cone/frustum campaign (of-fsl.23). Both were written
+//! tests-first while `Chart` still rejected the surfaces, then promoted
+//! once the gate lifted (of-7ld.4, of-dtj). Plane, cylinder, sphere,
+//! torus and cone booleans now take the exact B-Rep path end-to-end, and
+//! the hybrid kernel diverts any exact-path shortfall to the F-Rep
+//! fallback. The campaigns' history — the bugs they filed and the fixes
+//! that retired them — is in the git log, not here.
 //!
-//! Bugs filed from the campaign's first run (2026-07-12, `Chart::new`
-//! gate lifted locally):
-//! - of-7ld.5: every plane-sphere boolean — even the plain cap bite —
-//!   fails classification ("could not find an interior sample point for
-//!   a face region"): the closed sphere face's uv cover polygon has only
-//!   the seam meridian for boundary and collapses at the pole rows.
-//! - of-7ld.6: a sphere face's broad-phase box is built from its
-//!   boundary samples — the seam meridian alone — so it is flat along
-//!   the seam-plane normal and misses shallow-overlap clashes entirely
-//!   (near-tangent sphere pairs skip SSI and go straight to
-//!   classification; silent-wrong-result risk once of-7ld.5 is fixed).
-//! - of-7ld.7: every torus boolean whose SSI succeeds (axis-perpendicular
-//!   and axis-containing plane cuts) dies in imprinting: the full-wrap
-//!   imprint circles on the doubly-periodic chart are rejected as "an
-//!   imprint chain ends in a face interior without closing".
-//!
-//! With the gate lifted, the four structured-rejection tests (tangency
-//! and sub-tolerance guards) already pass; all other campaign tests fail
-//! on of-7ld.5/6/7 or on SSI pairs pending the of-7ld.2 merge.
-//!
-//! Update (of-7ld.5 fix): pole closure rows are now embedded explicitly
-//! (`CoverEmbedder`), sphere seams split wrapping imprint rings, sphere
-//! ray hits and curved-region mesh refinement are wired, and 12 of the
-//! sphere-campaign tests pass with the gate lifted (each annotated
-//! "passes with the chart gate lifted"). The rest fail on the sibling
-//! bugs their `#[ignore]` messages name: of-43n (imprints crossing the
-//! seam level without/beyond a single wrap — includes the random pair /
-//! face-cap / near-tangent tests, which reach imprinting now that
-//! of-7ld.6 fixed the broad-phase boxes), of-rb4 (imprints through pole
-//! vertices), and the marched cylinder-sphere SSI not yet wired into
-//! `boolean()`.
-//!
-//! Update (of-7ld.7 fix): closed imprints on any periodic chart are
-//! now split at every wrapped seam axis (torus `u` AND `v`, sphere `u` —
-//! was cylinder-only), split closed edges keep their topological vertex
-//! as an atom boundary, chord matching shifts whole periods on both axes,
-//! ray classification handles sphere/torus, and the curved-chart interior
-//! lattice covers sphere/torus (half-cell staggered so pitch-aligned
-//! boundary samples cannot fold it). With the gate lifted, all
-//! sunk-slab scales, the axis-plane half torus, the coaxial/coplanar
-//! torus-torus lenses, and the slab∪torus MeshSdf round trip pass
-//! end-to-end. Still open: wiring marched SSI (oblique plane-torus,
-//! non-coaxial torus-torus) into boolean(), of-43n, and of-rb4.
-//!
-//! Update (of-7ld.4 promotion): `Chart::new` admits spheres and tori —
-//! sphere/torus booleans in supported configurations now take the exact
-//! B-Rep path end-to-end (the hybrid kernel still diverts any exact-path
-//! shortfall to the F-Rep fallback). 42 of the 55 tests here run live;
-//! the 13 still `#[ignore]`d fail on of-43n (5), of-rb4 (2), of-yet
-//! (marched SSI wiring, 5), and of-2ql (napkin-ring volume accuracy, 1).
-//!
-//! Update (of-43n fix): closed imprint rings are now split at EVERY
-//! seam-level crossing — winding-0 rings straddling the seam become two
-//! boundary-to-boundary chords (chain merging stops at the seam
-//! junctions; chord-to-cycle matching disambiguates the tied cover-copy
-//! vertices by requiring both split pieces CCW). The two purely
-//! seam-topological tests (side cap across the seam, rotated cap-bite
-//! invariance) run live; the other three formerly-of-43n tests now get
-//! past imprinting but still miss volume/manifold checks on of-2ql's
-//! refinement-lattice slivers — their `#[ignore]` messages now name
-//! of-2ql.
-//!
-//! Update (of-2ql fix): interior lattice points that land exactly on a
-//! triangulation edge (pitch-aligned boundary sampling makes seed-chord
-//! diagonals pass through staggered lattice points) are inserted with a
-//! proper edge split instead of a corner split that minted negative uv
-//! slivers and left secant triangles through the cylinder wall. The
-//! napkin-ring test is live; three residual-sliver tests still name
-//! of-2ql.
-//!
-//! Update (of-rb4 fix): imprints threaded through sphere pole vertices
-//! are split at the poles (their endpoints snapped to the exact pole
-//! points), chains terminate at pole junctions and anchor to the pole
-//! vertex by 3D coincidence, a chain closing on a single boundary vertex
-//! splits off a pinched outer cycle instead of a hole that touches it,
-//! and cycles starting at a pole embed their pole row from the true
-//! arrival meridian. `hemisphere_imprint_through_poles` and
-//! `sphere_octant_on_block_corner` are live; 8 remain `#[ignore]`d
-//! (of-2ql residual slivers ×3, of-yet ×5).
-//!
-//! Update (of-yet): `find_imprints` now falls back to the of-7ld.2
-//! marched tracer (`ssi::intersect_marched`) when analytic SSI reports a
-//! supported pair's general configuration as NotImplemented; the marched
-//! polylines are hosted as `Curve3::Polyline` imprints. The five of-yet
-//! tests (oblique plane-torus, non-coaxial torus-torus, cylinder-sphere)
-//! run live; 3 remain `#[ignore]`d (of-2ql residual slivers).
-//!
-//! Update (of-s89): the of-2ql residual slivers are gone and all three of
-//! those tests (`sphere_pair_lens_identities`, `random_sphere_pairs_identity`,
-//! `random_sphere_face_caps_identity`) run live. Two fixes compose: of-6ry's
-//! constrained-Delaunay curved-face seed removed the near-full-sphere 3D
-//! fold, and of-s89 added a Ruppert-style edge-split pass to
-//! `refine_curved_region` that refines sphere faces to half a boundary
-//! sagitta. Neither the seed nor a Lawson flip is a size criterion — a long
-//! Delaunay-legal chord across a cap survives both and cuts a secant through
-//! the surface, leaving cap/lens volumes ~1% low; only inserting interior
-//! vertices shortens it. The only `#[ignore]`s left in this file are the two
-//! of-dtj.4 cone-cone cases below.
-//!
-//! Section (9) is the cone/frustum campaign (of-fsl.23), written BEFORE
-//! cones were admitted to the exact path (tests-first-ignored, sphere/torus
-//! precedent, commit 567930a). The `Chart::build` gate has since lifted
-//! (of-dtj), and the plane-cone SSI now marches its parabola/hyperbola/
-//! generator sections through the bounded entry point (of-dtj.1), so every
-//! plane-cone case is live: the conical countersink bites at 1×/0.001×/1000×
-//! scale and the tilted-cone-block identity (of-fsl.27), plus the through-
-//! hole `frustum_through_slab`, `cone_block_inclusion_exclusion`, and the
-//! rigid-motion `rotated_frustum_bite_invariance` (of-fsl.28). Two cases
-//! remain `#[ignore]`d on the one unresolved gap:
-//!   • of-dtj.4 (cone-cone SSI — analytic coaxial + marched general):
-//!     `opposed_cones_intersection`, `coaxial_frustums_union_identity`.
-//!     of-dtj.2 delivered only the compact-partner cone pairs (sphere-cone,
-//!     torus-cone) and explicitly defers the unbounded cone-cone pair to
-//!     of-dtj.4; until it lands these return NotImplemented at analytic.rs:121.
+//! One case is `#[ignore]`d, naming its open blocker: of-9ia, where the
+//! marched non-coaxial cone-cone imprint is hosted as an open chain
+//! ending in a face interior — a reconstruction gap, not an SSI gap
+//! (`skew_frustums_inclusion_exclusion`). The coaxial cone-cone pair goes
+//! through the analytic SSI and runs live
+//! (`opposed_cones_intersection`, `coaxial_frustums_union_identity`).
 //! The no-panic guard `no_panics_on_cone_configurations` stays live across
 //! the promotion — it accepts both a valid exact solid and the structured
-//! `NotImplemented` F-Rep fallback. Run the still-ignored cone cases with
-//! `cargo test --test boolean_stress -- --ignored`.
+//! `NotImplemented` F-Rep fallback.
 
 use nalgebra::{Rotation3, Unit};
 use opensolid_brep::boolean::{intersect, subtract, unite};
@@ -2399,10 +2243,10 @@ fn no_panics_on_awkward_configurations() {
 // =====================================================================
 // (9) Cone / frustum operands (of-fsl.23 campaign)
 //
-// Written before `Chart::build` admits `Surface3::Cone`; every case here
-// is `#[ignore]`d citing the promotion blocker of-dtj (tests-first-
-// ignored, precedent 567930a). Un-ignore a case only once it is green
-// after the gate lifts. Volumes use `frustum_volume` closed forms
+// Written tests-first while `Chart::build` still rejected
+// `Surface3::Cone`; the gate has since lifted (of-dtj) and every case
+// here is live except `skew_frustums_inclusion_exclusion` (of-9ia).
+// Volumes use `frustum_volume` closed forms
 // (`π h (r1² + r1·r2 + r2²)/3`); tilted/overlap cases fall back to the
 // scale-free inclusion–exclusion identity `vol(A)+vol(B)=vol(∪)+vol(∩)`.
 // =====================================================================
@@ -2514,8 +2358,9 @@ fn crossing_frustums_intersection() {
 #[ignore = "of-9ia: the non-coaxial cone-cone SSI marches correctly (of-dtj.4, \
             unit test marched_bounded_cone_cone_offset_axes), but hosting the \
             marched imprint on the two curved cone faces yields an open chain \
-            that ends in the face interior (boolean::imprint Degenerate at \
-            boolean.rs:3376) — a reconstruction gap, not an SSI gap"]
+            that ends in the face interior (boolean::imprint Degenerate, \
+            'an imprint chain ends in a face interior') — a reconstruction \
+            gap, not an SSI gap"]
 fn skew_frustums_inclusion_exclusion() {
     let context = "non-coaxial frustums ∪/∩ identity";
     let mut scene = Scene::new();
@@ -2596,17 +2441,22 @@ fn cone_block_inclusion_exclusion() {
 /// Two interpenetrating coaxial frustums: the inclusion–exclusion
 /// identity must hold across their cone-cone wall intersection in the
 /// overlap band. Closed-form operand volumes, identity for the overlap.
+/// Rides on the coaxial branch of the analytic cone-cone SSI (cf. the
+/// `cone_cone_opposed_single_circle` unit test); the general non-coaxial
+/// pair is marched instead, and is covered by
+/// [`skew_frustums_inclusion_exclusion`].
 #[test]
-#[ignore = "of-dtj.4: no analytic/marched SSI for cone-cone pairs yet \
-            (NotImplemented 'analytic SSI for cone pairs other than \
-            plane-cone') — of-dtj.2 delivered sphere-cone/torus-cone only \
-            and explicitly defers the unbounded cone-cone pair to of-dtj.4 \
-            — analytic.rs:121"]
 fn coaxial_frustums_union_identity() {
     let context = "coaxial frustums union/intersection identity";
     let mut scene = Scene::new();
+    // The frustums must not share a half-angle: `lower` narrows along
+    // r(z) = 2 − z/3, so an `upper` of (1.5, 0.5, 3.0) based at z = 1.5
+    // would trace r(z) = 2 − z/3 as well — the same cone surface, a
+    // coincident-face pair rather than the transversal wall crossing this
+    // test is about. `upper` widens instead (r(z) = 1 + (z − 1.5)/3),
+    // cutting the lower wall at z = 2.25 inside the overlap band.
     let lower = scene.cone(Point3::new(0.0, 0.0, 0.0), 2.0, 1.0, 3.0);
-    let upper = scene.cone(Point3::new(0.0, 0.0, 1.5), 1.5, 0.5, 3.0);
+    let upper = scene.cone(Point3::new(0.0, 0.0, 1.5), 1.0, 2.0, 3.0);
     let union = scene
         .unite(lower, upper)
         .unwrap_or_else(|e| panic!("{context}: unite failed: {e:?}"));
@@ -2616,7 +2466,7 @@ fn coaxial_frustums_union_identity() {
     let vol_union = volume(&union, &format!("{context}: union"));
     let vol_inter = volume(&inter, &format!("{context}: intersection"));
     let vol_lower = frustum_volume(2.0, 1.0, 3.0);
-    let vol_upper = frustum_volume(1.5, 0.5, 3.0);
+    let vol_upper = frustum_volume(1.0, 2.0, 3.0);
     assert_close(
         vol_union + vol_inter,
         vol_lower + vol_upper,
