@@ -1394,3 +1394,111 @@ button.main-tool svg { flex: none; }
   color: var(--muted);
   font-size: 13px;
 }
+
+/* Mass properties readout (of-fsl.19). Anchored bottom-right, above the stats
+   bar, rather than joining the top-right rail: the property panel lives there
+   and inspecting a selected feature's mass is a natural pairing, so the two
+   must be able to coexist. Capped in height with its own scroll — the inertia
+   tensor makes this the tallest overlay, and the document itself must never
+   scroll (see layout.test.jsx). */
+.mass-panel {
+  position: absolute;
+  bottom: 44px;
+  right: 10px;
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 250px;
+  max-width: 340px;
+  max-height: calc(100% - 100px);
+  overflow-y: auto;
+  padding: 10px 12px;
+  background: color-mix(in srgb, var(--panel) 94%, transparent);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 12.5px;
+  backdrop-filter: blur(6px);
+}
+.mass-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 13px;
+  font-weight: 600;
+}
+.mass-close {
+  padding: 0 6px;
+  font-size: 16px;
+  line-height: 1;
+  background: none;
+  border: none;
+  color: var(--muted);
+  cursor: pointer;
+}
+.mass-close:hover { color: var(--text); }
+.mass-field {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+}
+.mass-field select { flex: 1; }
+.mass-density {
+  flex: 1;
+  min-width: 0;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 4px 6px;
+  font-size: 12px;
+}
+.mass-unit { color: var(--muted); font-size: 11px; }
+.mass-error {
+  margin: 0;
+  color: var(--warn, #e0a458);
+  font-size: 12px;
+  line-height: 1.4;
+}
+/* Two columns: labels muted and left, values tabular so digits line up down
+   the column and a changing mass doesn't jitter its neighbours. */
+.mass-values {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 4px 12px;
+  margin: 0;
+  padding-top: 2px;
+  border-top: 1px solid var(--border);
+}
+.mass-values dt { color: var(--muted); }
+.mass-values dd {
+  margin: 0;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.mass-inertia { display: flex; flex-direction: column; gap: 4px; }
+.mass-inertia-title {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.3;
+  padding-top: 6px;
+  border-top: 1px solid var(--border);
+}
+.mass-tensor {
+  width: 100%;
+  border-collapse: collapse;
+  font-variant-numeric: tabular-nums;
+  font-size: 11.5px;
+}
+.mass-tensor td {
+  padding: 2px 4px;
+  text-align: right;
+}
+.mass-footnote {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.3;
+  padding-top: 6px;
+  border-top: 1px solid var(--border);
+}

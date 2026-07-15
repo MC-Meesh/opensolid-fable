@@ -69,6 +69,7 @@ describe('layout contract: everything fits one window height', () => {
       '.feature-tree-body', // tree list (sidebar Tree tab)
       '.error', // script error readout (sidebar bottom)
       '.prop-panel', // floating property panel overlay
+      '.mass-panel', // floating mass properties overlay (max-height bounded)
       '.wasm-error pre', // wasm failure screen detail
       '.error-boundary pre', // crash detail
     ]);

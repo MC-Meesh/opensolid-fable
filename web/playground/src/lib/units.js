@@ -18,14 +18,16 @@
 /**
  * The length units a document can be authored in. `key` is the stable
  * identifier persisted and passed to the WASM `exportStep`; `label` is the
- * suffix shown next to dimensions; `name` is the long form for menus. Order
- * is the order shown in the unit picker.
+ * suffix shown next to dimensions; `name` is the long form for menus;
+ * `metres` is how many metres one unit spans, which converts the kernel's
+ * unitless numbers into SI for mass properties. Order is the order shown in
+ * the unit picker.
  */
 export const LENGTH_UNITS = [
-  { key: 'mm', label: 'mm', name: 'Millimetres' },
-  { key: 'cm', label: 'cm', name: 'Centimetres' },
-  { key: 'm', label: 'm', name: 'Metres' },
-  { key: 'in', label: 'in', name: 'Inches' },
+  { key: 'mm', label: 'mm', name: 'Millimetres', metres: 0.001 },
+  { key: 'cm', label: 'cm', name: 'Centimetres', metres: 0.01 },
+  { key: 'm', label: 'm', name: 'Metres', metres: 1 },
+  { key: 'in', label: 'in', name: 'Inches', metres: 0.0254 },
 ];
 
 /** Default document unit: millimetres, the conventional CAD exchange unit. */
@@ -47,6 +49,17 @@ export function normalizeUnit(key) {
 /** Short display suffix for a unit key, e.g. `'mm'`. */
 export function unitLabel(key) {
   return (BY_KEY.get(key) ?? BY_KEY.get(DEFAULT_LENGTH_UNIT)).label;
+}
+
+/**
+ * How many metres one document unit spans, e.g. `metresPerUnit('mm') ===
+ * 0.001`. Mass properties are the one place the playground must leave the
+ * kernel's unitless world: a density is physical (kg/m³), so a raw volume in
+ * document-unit³ has to be scaled by this factor cubed to reach m³. Unknown
+ * keys fall back to the default unit, matching [`normalizeUnit`].
+ */
+export function metresPerUnit(key) {
+  return (BY_KEY.get(key) ?? BY_KEY.get(DEFAULT_LENGTH_UNIT)).metres;
 }
 
 /**

@@ -16,6 +16,7 @@ import SectionPanel from './components/SectionPanel.jsx';
 import MeasurePanel from './components/MeasurePanel.jsx';
 import ReferencePanel from './components/ReferencePanel.jsx';
 import FeaturePanel from './components/FeaturePanel.jsx';
+import MassPropertiesPanel from './components/MassPropertiesPanel.jsx';
 import { DEFAULT_SCRIPT } from './lib/defaultScript.js';
 import { freeNodes, nodeLabel, runTracedScript, scriptHeader, serializeTree } from './lib/sceneTree.js';
 import { buildBinaryStl } from './lib/stl.js';
@@ -24,6 +25,17 @@ import { applyTranslate, applyRotate, applyScale, applyShell, pathTo, nodeAt, re
 import { setNodeArg, setBooleanOp } from './lib/propertyEdit.js';
 import { deleteNode } from './lib/deleteNode.js';
 import { DEFAULT_LENGTH_UNIT, normalizeUnit, UNIT_STORAGE_KEY } from './lib/units.js';
+import {
+  CUSTOM_MATERIAL,
+  DEFAULT_MATERIAL,
+  DENSITY_STORAGE_KEY,
+  MATERIAL_STORAGE_KEY,
+  densityForSelection,
+  materialDensity,
+  normalizeDensity,
+  normalizeMaterial,
+} from './lib/materials.js';
+import { massProperties, parseMeasure } from './lib/massProps.js';
 import { VIEW_SHORTCUTS } from './lib/views.js';
 import { buildFeatures, buildReferenceFeatures, pruneTree, resolveKeys } from './lib/featureTree.js';
 import { PALETTE } from './lib/shapeGraph.js';
@@ -150,6 +162,33 @@ export default function App() {
   // flip }, or null when off. The offset is shared by the panel slider and the
   // viewport drag handle.
   const [section, setSection] = useState(null);
+  // Mass properties (of-fsl.19). `massOpen` is the readout's open/closed flag;
+  // `massMeasure` is the raw `measure()` payload for the displayed shape (named
+  // apart from the Measure tool's state below — unrelated features), cached
+  // rather than recomputed per keystroke because density scales mass and
+  // inertia linearly — a material edit is a pure multiply (see lib/massProps.js)
+  // and only a model change needs a fresh measurement. `density` is the raw
+  // text in the field (kg/m³), so a half-typed value stays editable; it's
+  // normalized at compute time.
+  const [massOpen, setMassOpen] = useState(false);
+  const [massMeasure, setMassMeasure] = useState(null);
+  const [material, setMaterial] = useState(() => {
+    try {
+      return normalizeMaterial(globalThis.localStorage?.getItem(MATERIAL_STORAGE_KEY));
+    } catch {
+      return DEFAULT_MATERIAL;
+    }
+  });
+  const [density, setDensity] = useState(() => {
+    try {
+      const stored = normalizeDensity(globalThis.localStorage?.getItem(DENSITY_STORAGE_KEY));
+      if (stored != null) return String(stored);
+      const key = normalizeMaterial(globalThis.localStorage?.getItem(MATERIAL_STORAGE_KEY));
+      return String(materialDensity(key));
+    } catch {
+      return String(materialDensity(DEFAULT_MATERIAL));
+    }
+  });
   const [mesh, setMesh] = useState(null);
   const [stats, setStats] = useState(null);
   const [tree, setTree] = useState(null);
@@ -1721,6 +1760,86 @@ export default function App() {
     [section, mesh]
   );
 
+  // ---- mass properties (of-fsl.19) ----------------------------------------
+  // Measure the *displayed* shape, so a readout of a model with features
+  // hidden or suppressed describes what's on screen — same shape selection as
+  // the STEP export above.
+  const measureDisplayed = useCallback(() => {
+    const display = displayRef.current;
+    const shape = display.mode === 'pruned' ? display.shape : shapeRef.current;
+    if (display.mode === 'empty' || !shape) {
+      setError('Nothing to measure yet: run a script that produces a shape.');
+      return null;
+    }
+    if (typeof shape.measure !== 'function') {
+      setError('Mass properties need a rebuilt WASM package: run `npm run wasm`.');
+      return null;
+    }
+    try {
+      return parseMeasure(shape.measure(MESH_ACCURACY));
+    } catch (err) {
+      setError(String(err));
+      return null;
+    }
+  }, []);
+
+  const handleMassPropsToggle = useCallback(() => setMassOpen((open) => !open), []);
+  const handleMassPropsClose = useCallback(() => setMassOpen(false), []);
+
+  // One place measures, so an open readout re-measures on every model change
+  // instead of going quietly stale. Measuring is the expensive half; density
+  // is applied downstream in the memo below.
+  useEffect(() => {
+    if (!massOpen) {
+      setMassMeasure(null);
+      return;
+    }
+    setMassMeasure(measureDisplayed());
+  }, [massOpen, mesh, measureDisplayed]);
+
+  const massReport = useMemo(
+    () =>
+      massOpen
+        ? massProperties({ measure: massMeasure, density: normalizeDensity(density), unit: documentUnit })
+        : null,
+    [massOpen, massMeasure, density, documentUnit]
+  );
+
+  const changeMaterial = useCallback(
+    (next) => {
+      const key = normalizeMaterial(next);
+      const value = densityForSelection(key, density);
+      setMaterial(key);
+      setDensity(String(value));
+      try {
+        globalThis.localStorage?.setItem(MATERIAL_STORAGE_KEY, key);
+        globalThis.localStorage?.setItem(DENSITY_STORAGE_KEY, String(value));
+      } catch {
+        // Private-mode / storage-disabled: the choice just won't persist.
+      }
+    },
+    [density]
+  );
+
+  const changeDensity = useCallback(
+    (text) => {
+      setDensity(text);
+      const value = normalizeDensity(text);
+      if (value == null) return; // Half-typed or invalid: keep it editable, persist nothing.
+      // A density that isn't the selected material's makes the label a lie, so
+      // detach to Custom rather than keep claiming the part is steel.
+      const key = value === materialDensity(material) ? material : CUSTOM_MATERIAL;
+      setMaterial(key);
+      try {
+        globalThis.localStorage?.setItem(MATERIAL_STORAGE_KEY, key);
+        globalThis.localStorage?.setItem(DENSITY_STORAGE_KEY, String(value));
+      } catch {
+        // Private-mode / storage-disabled: the choice just won't persist.
+      }
+    },
+    [material]
+  );
+
   // Splitter drag: clamp so the editor stays usable and the viewport never
   // starves. Listeners go on the window — the pointer outruns a 5px handle.
   const startSplitterDrag = useCallback((event) => {
@@ -1877,6 +1996,8 @@ export default function App() {
           onSectionToggle={handleSectionToggle}
           referenceOpen={refPanelOpen}
           onReferenceToggle={handleRefPanelToggle}
+          massOpen={massOpen}
+          onMassPropsToggle={handleMassPropsToggle}
           onDownloadStl={downloadStl}
           onDownloadStep={downloadStep}
           documentUnit={documentUnit}
@@ -1953,6 +2074,15 @@ export default function App() {
           refGeom={refGeom}
           onAdd={handleRefAdd}
           onClose={handleRefPanelToggle}
+        />
+        <MassPropertiesPanel
+          report={massReport}
+          material={material}
+          density={density}
+          unit={documentUnit}
+          onMaterialChange={changeMaterial}
+          onDensityChange={changeDensity}
+          onClose={handleMassPropsClose}
         />
         <FeaturePanel
           feature={feature}

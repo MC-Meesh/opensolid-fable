@@ -163,6 +163,16 @@ const Icons = {
       <path d="M8 9 V14 M8 14 L6 12.5 M8 14 L10 12.5" />
     </svg>
   ),
+  mass: (
+    // A balance scale: the beam with a pan hanging at each end.
+    <svg {...ICON}>
+      <path d="M8 3 V13.4" />
+      <path d="M5.5 13.4 H10.5" />
+      <path d="M2.6 4.8 H13.4" />
+      <path d="M1.2 7.6 H4 L2.6 4.8 Z" />
+      <path d="M12 7.6 H14.8 L13.4 4.8 Z" />
+    </svg>
+  ),
   stl: (
     <svg {...ICON}>
       <path d="M8 2 v7.5 M5.2 6.8 L8 9.5 L10.8 6.8" />
@@ -238,6 +248,8 @@ export default function MainToolbar({
   onSectionToggle,
   referenceOpen = false,
   onReferenceToggle,
+  massOpen = false,
+  onMassPropsToggle = () => {},
   onDownloadStl,
   onDownloadStep,
   documentUnit = 'mm',
@@ -451,6 +463,16 @@ export default function MainToolbar({
           disabled={disabled}
           compact
           onClick={onSectionToggle}
+        />
+        <ToolButton
+          icon="mass"
+          label="Mass"
+          title="Mass properties: volume, surface area, mass, center of mass, and inertia"
+          disabledReason={notReady}
+          active={massOpen}
+          disabled={disabled}
+          compact
+          onClick={onMassPropsToggle}
         />
       </div>
       <div className="tool-sep" />

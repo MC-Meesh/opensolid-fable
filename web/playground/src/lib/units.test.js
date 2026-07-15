@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   DEFAULT_LENGTH_UNIT,
   LENGTH_UNITS,
+  metresPerUnit,
   normalizeUnit,
   unitLabel,
   withUnit,
@@ -29,6 +30,18 @@ describe('document units', () => {
     expect(unitLabel('cm')).toBe('cm');
     expect(unitLabel('in')).toBe('in');
     expect(unitLabel('bogus')).toBe('mm');
+  });
+
+  it('converts each unit to metres for mass properties', () => {
+    expect(metresPerUnit('mm')).toBe(0.001);
+    expect(metresPerUnit('cm')).toBe(0.01);
+    expect(metresPerUnit('m')).toBe(1);
+    expect(metresPerUnit('in')).toBe(0.0254);
+  });
+
+  it('falls back to the default unit scale for unknown keys', () => {
+    expect(metresPerUnit('furlong')).toBe(0.001);
+    expect(metresPerUnit(undefined)).toBe(0.001);
   });
 
   it('appends the unit suffix, leaving blanks blank', () => {

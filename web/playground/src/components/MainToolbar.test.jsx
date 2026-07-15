@@ -41,7 +41,7 @@ describe('MainToolbar', () => {
     expect(html).toContain('View');
     expect(html).toContain('Drawing');
     expect(html).toContain('Export');
-    for (const label of ['Extrude', 'Revolve', 'Sweep', 'Loft', 'Shell', 'Reference', 'Fillet', 'Fit', 'Front', 'Top', 'Right', 'Iso', 'Wireframe', 'Section', 'STL', 'STEP']) {
+    for (const label of ['Extrude', 'Revolve', 'Sweep', 'Loft', 'Shell', 'Reference', 'Fillet', 'Fit', 'Front', 'Top', 'Right', 'Iso', 'Wireframe', 'Section', 'Mass', 'STL', 'STEP']) {
       expect(html).toContain(label);
     }
   });
@@ -59,6 +59,15 @@ describe('MainToolbar', () => {
     const active = render({ filletActive: true, canFillet: false });
     expect(active).toContain('Exit Fillet');
     expect(active).not.toMatch(/disabled[^>]*aria-label="Exit Fillet"/);
+  });
+
+  it('reflects the mass properties readout in the Mass button', () => {
+    expect(render()).toMatch(/<button[^>]*aria-pressed="false"[^>]*aria-label="Mass"/);
+    expect(render({ massOpen: true })).toMatch(/<button[^>]*aria-pressed="true"[^>]*aria-label="Mass"/);
+  });
+
+  it('disables Mass until the kernel is loaded', () => {
+    expect(render({ disabled: true })).toMatch(/<button[^>]*disabled[^>]*aria-label="Mass"/);
   });
 
   it('makes sketch and drawing mutually exclusive', () => {
