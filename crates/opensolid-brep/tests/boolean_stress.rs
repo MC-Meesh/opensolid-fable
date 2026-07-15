@@ -162,6 +162,18 @@
 //! tests (oblique plane-torus, non-coaxial torus-torus, cylinder-sphere)
 //! run live; 3 remain `#[ignore]`d (of-2ql residual slivers).
 //!
+//! Update (of-s89): the of-2ql residual slivers are gone and all three of
+//! those tests (`sphere_pair_lens_identities`, `random_sphere_pairs_identity`,
+//! `random_sphere_face_caps_identity`) run live. Two fixes compose: of-6ry's
+//! constrained-Delaunay curved-face seed removed the near-full-sphere 3D
+//! fold, and of-s89 added a Ruppert-style edge-split pass to
+//! `refine_curved_region` that refines sphere faces to half a boundary
+//! sagitta. Neither the seed nor a Lawson flip is a size criterion — a long
+//! Delaunay-legal chord across a cap survives both and cuts a secant through
+//! the surface, leaving cap/lens volumes ~1% low; only inserting interior
+//! vertices shortens it. The only `#[ignore]`s left in this file are the two
+//! of-dtj.4 cone-cone cases below.
+//!
 //! Section (9) is the cone/frustum campaign (of-fsl.23), written BEFORE
 //! cones were admitted to the exact path (tests-first-ignored, sphere/torus
 //! precedent, commit 567930a). The `Chart::build` gate has since lifted
@@ -1584,7 +1596,6 @@ fn rotated_block_cap_bite_volume_invariance() {
 /// intersection has the exact cap closed form, and the three-way volume
 /// identities must hold.
 #[test]
-#[ignore = "of-6ry fixed the case 1 union fold (CDT curved-face seed); remaining blocker is of-s89 bounded-cap volume — case 6 intersection cap 5.3e-3 low, allowed 5e-3. Un-ignore once of-s89 lands."]
 fn random_sphere_face_caps_identity() {
     let mut rng = Rng::new(0x0F1_CA9);
     for case in 0..8 {
@@ -1771,7 +1782,6 @@ fn offset_cylinder_drills_sphere_identity() {
 /// form (two caps against the radical plane), checked together with the
 /// inclusion–exclusion identity for equal and unequal radii.
 #[test]
-#[ignore = "of-2ql: refinement lattice slivers — thin-lens (r=0.8, d=1.4) volume 1.0e-2 low (of-43n seam splits fixed)"]
 fn sphere_pair_lens_identities() {
     for (r1, r2, d) in [(1.0, 1.0, 1.2), (1.0, 0.6, 0.9), (0.8, 0.8, 1.4)] {
         let context = format!("sphere pair r1={r1} r2={r2} d={d}");
@@ -1817,7 +1827,6 @@ fn sphere_pair_lens_identities() {
 /// direction, separation strictly between the internal and external
 /// tangency distances with margin. Lens closed form + identities.
 #[test]
-#[ignore = "of-2ql: refinement lattice slivers — case 1 lens volume 5.6e-3 low, allowed 5e-3 (of-43n seam splits fixed)"]
 fn random_sphere_pairs_identity() {
     let mut rng = Rng::new(0x2_5EED_BA11);
     for case in 0..8 {

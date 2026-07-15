@@ -5003,9 +5003,216 @@ fn refine_curved_region(
     // curved face.
     mesh.make_delaunay(all_uv, &constraints);
 
+    // Ruppert-style size refinement of SPHERE faces. Neither the seed nor the
+    // Delaunay sweep is a SIZE criterion: both only optimize the connectivity
+    // of a fixed point set, and a long chord between two far-apart boundary
+    // vertices can be perfectly Delaunay. On a cap boundary the seed spans the
+    // chart with such chords, and a flip cannot shorten one — only a new
+    // interior vertex can. That surviving chord's flat 3D facet cuts a deep
+    // secant through the surface, so spherical-cap and lens volumes come out
+    // low (of-s89).
+    //
+    // Split every interior, non-constraint edge whose 3D chord sags more than
+    // half a boundary-sampling sagitta off the surface, placing the new vertex
+    // exactly ON the surface at the edge midpoint and legalizing locally
+    // (`insert_on_edge` runs a Lawson pass, robust since of-yud). Splitting an
+    // edge onto the surface quarters that edge's sag directly, and the local
+    // legalization reconnects the midpoint to nearby lattice points, so the
+    // worst chord shrinks every round. Constraint (boundary ring) edges are
+    // never split, so cross-face welding is untouched; interior midpoints stay
+    // clear of the boundary so they never weld to anything.
+    //
+    // Restricted to spheres deliberately. This all happens in parameter space,
+    // and only the sphere chart has an ISOTROPIC uv metric — both axes are
+    // angles scaled by the one radius. A cylinder's or torus's `v` is a model
+    // length, so at large model scale the uv aspect ratio blows up and the
+    // uv-space Delaunay legalization spins, over-refining a full-wrap band into
+    // a self-overlapping sheet with the wrong enclosed volume (measured: a
+    // 1000× through-hole wall exploded to 500k triangles, hole volume 15%
+    // low). Cylinders and tori already meet the chordal target from the lattice
+    // + of-yud sweep alone, so they need none of this. The two guards below —
+    // revert on any adjacency corruption, revert on a runaway split budget —
+    // keep even a pathological sphere face no worse than its valid pre-refine
+    // state.
+    let target_sag = {
+        // Half a boundary-polyline sagitta on the sphere's radius: boundaries
+        // are sampled at `pitch`, so this holds interior chords to a hair
+        // finer than the boundary itself (one full sagitta leaves cap/lens
+        // volumes ~1% low; half clears the tolerance with margin).
+        let r = su.max(sv);
+        0.5 * r * (1.0 - (0.5 * pitch).cos())
+    };
+    if matches!(chart, Chart::Sphere { .. }) && target_sag > 0.0 {
+        let eps_area = 1e-12 * (u1 - u0) * (v1 - v0);
+        // Clearance a split vertex must keep from the boundary, in the same
+        // arc-length metric the lattice uses. A T-junction only arises if the
+        // vertex WELDS to a boundary vertex (weld band ≈ 1e-9·extent), so this
+        // is set far tighter than the lattice's quarter-cell — enough to clear
+        // the weld band by orders of magnitude while still letting refinement
+        // reach the rim-adjacent triangles (of-s89: thin caps need it).
+        let split_margin2 = {
+            let m = 1e-4 * (step_u * su).min(step_v * sv);
+            m * m
+        };
+        // Snapshot the valid pre-refinement mesh so a pathological seam/pole
+        // configuration that the guards above miss can never leave a face
+        // WORSE than it started: if refinement corrupts adjacency (an edge
+        // ending up in >2 triangles) OR runs away past its split budget, we
+        // restore this exactly and drop the added interior vertices. The face
+        // is then merely as coarse as before — never broken.
+        let snapshot_tris = mesh.tris.clone();
+        let snapshot_verts = all_uv.len();
+        // A well-behaved cap converges in a few splits per seed triangle;
+        // ~12× the seed count is far above that but still bounds a face that
+        // fails to converge (which reverts rather than exploding).
+        let budget_cap = 12 * mesh.tris.len() + 4000;
+        let mut budget = budget_cap;
+        loop {
+            let mut split_any = false;
+            let ntri = mesh.tris.len();
+            for t in 0..ntri {
+                let mut k = 0;
+                while k < 3 {
+                    let n = mesh.adj[t][k];
+                    if n == NO_TRI {
+                        k += 1;
+                        continue;
+                    }
+                    let (a, b) = (mesh.tris[t][k], mesh.tris[t][(k + 1) % 3]);
+                    if constraints.contains(&(a.min(b), a.max(b))) {
+                        k += 1;
+                        continue;
+                    }
+                    // Sag of this edge's flat chord off the true surface.
+                    let mid_uv = (
+                        0.5 * (all_uv[a].0 + all_uv[b].0),
+                        0.5 * (all_uv[a].1 + all_uv[b].1),
+                    );
+                    let mid_chord = Point3::from((all_p[a].coords + all_p[b].coords) * 0.5);
+                    let surf = chart_point(chart, mid_uv);
+                    if (surf - mid_chord).norm() <= target_sag {
+                        k += 1;
+                        continue;
+                    }
+                    // Keep the new vertex `split_margin2`-clear of the boundary
+                    // (arc-length metric, same as the lattice's clearance but
+                    // far tighter). A chord between two nearby boundary vertices
+                    // can have its midpoint land ON the boundary polyline;
+                    // welding that midpoint into a boundary edge would split it
+                    // on one face only and T-junction the assembled mesh
+                    // (of-s89: non-manifold). Such edges are short — skipping
+                    // them costs no accuracy.
+                    let ps = (mid_uv.0 * su, mid_uv.1 * sv);
+                    let mut clear = true;
+                    'rings: for &(start, len) in ring_ranges {
+                        for jj in 0..len {
+                            let ba = (all_uv[start + jj].0 * su, all_uv[start + jj].1 * sv);
+                            let bb = (
+                                all_uv[start + (jj + 1) % len].0 * su,
+                                all_uv[start + (jj + 1) % len].1 * sv,
+                            );
+                            if point_seg_dist2(ps, ba, bb) < split_margin2 {
+                                clear = false;
+                                break 'rings;
+                            }
+                        }
+                    }
+                    if !clear {
+                        k += 1;
+                        continue;
+                    }
+                    // `insert_on_edge` needs both incident triangles proper
+                    // (splitting a degenerate one mints the very slivers this
+                    // avoids). Skip the edge otherwise; a later round or the
+                    // final sweep handles it.
+                    let [ha, hb, hc] = mesh.tris[t];
+                    let [na, nb, nc] = mesh.tris[n];
+                    if orient2d(all_uv[ha], all_uv[hb], all_uv[hc]) <= eps_area
+                        || orient2d(all_uv[na], all_uv[nb], all_uv[nc]) <= eps_area
+                    {
+                        k += 1;
+                        continue;
+                    }
+                    // Refuse a folded quad: a zero-uv-area seam/pole sliver can
+                    // leave the two triangles across this edge sharing a second
+                    // vertex (the apexes `c` and `q` coincide, or the quad's
+                    // four corners are not distinct). `insert_on_edge`'s relink
+                    // assumes a proper quad and corrupts adjacency on a fold
+                    // (of-s89: the mesh then reads back non-manifold). The CDT
+                    // seed cannot produce such a fold, but the ear-clip
+                    // fallback above still can, so the guard stays. Leave such
+                    // edges to the final Delaunay sweep.
+                    let c = mesh.tris[t][(k + 2) % 3];
+                    let fold = match mesh.edge_index(n, a, b) {
+                        None => true,
+                        Some(j) => {
+                            let q = mesh.tris[n][(j + 2) % 3];
+                            q == c || q == a || q == b || c == a || c == b
+                        }
+                    };
+                    if fold {
+                        k += 1;
+                        continue;
+                    }
+                    let np = all_uv.len();
+                    all_uv.push(mid_uv);
+                    all_p.push(surf);
+                    mesh.insert_on_edge(t, k, np, all_uv, &constraints);
+                    split_any = true;
+                    budget -= 1;
+                    if budget == 0 {
+                        break;
+                    }
+                    // Triangle `t` is now a different, smaller triangle; its
+                    // edges are re-examined from k = 0 on the next iteration.
+                    k = 0;
+                }
+                if budget == 0 {
+                    break;
+                }
+            }
+            if !split_any || budget == 0 {
+                break;
+            }
+        }
+        // A final global sweep restores the Delaunay property the splits may
+        // have perturbed away from the parts of the mesh their local
+        // legalization did not reach.
+        mesh.make_delaunay(all_uv, &constraints);
+
+        // Corruption check: a 2-manifold triangulation never shares an edge
+        // among more than two triangles. If refinement violated that (a fold
+        // the guards did not catch), discard it and fall back to the snapshot.
+        let mut mult: std::collections::HashMap<(usize, usize), u32> =
+            std::collections::HashMap::new();
+        let mut corrupt = false;
+        'scan: for tri in &mesh.tris {
+            for k in 0..3 {
+                let (a, b) = (tri[k], tri[(k + 1) % 3]);
+                if a == b {
+                    continue;
+                }
+                let m = mult.entry((a.min(b), a.max(b))).or_insert(0);
+                *m += 1;
+                if *m > 2 {
+                    corrupt = true;
+                    break 'scan;
+                }
+            }
+        }
+        // Revert on corruption OR on a runaway (budget-exhausted) refinement:
+        // both signal a face this parameter-space scheme cannot refine safely,
+        // so keep the valid pre-refinement mesh instead.
+        if corrupt || budget == 0 {
+            mesh.tris = snapshot_tris;
+            all_uv.truncate(snapshot_verts);
+            all_p.truncate(snapshot_verts);
+        }
+    }
+
     // Read back. Insertion and flips only ever retriangulate the same point
     // set inside the seed's boundary, so the mesh still tiles exactly the
-    // region the ear clip covered — nothing to cull. Zero-area uv slivers are
+    // region the seed covered — nothing to cull. Zero-area uv slivers are
     // kept (as before: collinear boundary chains rely on them to pair their
     // chord edges; the emitter drops only zero-3D-length ones).
     tris.clear();
