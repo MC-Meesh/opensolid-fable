@@ -2548,12 +2548,13 @@ fn rotated_frustum_bite_invariance() {
     );
 }
 
-/// Cone inputs must never PANIC the boolean pipeline. Today every cone
-/// boolean returns a structured `NotImplemented` (the F-Rep fallback,
-/// `Chart::build` gate closed); once cones are promoted these return
-/// valid solids. Both outcomes are accepted — only a panic or an invalid
-/// `Ok` is a bug — so this guard stays live across the promotion. (This
-/// is the one un-ignored cone test.)
+/// Cone inputs must never PANIC the boolean pipeline. These cases return
+/// valid solids now that cones are promoted (of-dtj); before the promotion
+/// they returned a structured `NotImplemented` (the F-Rep fallback, with
+/// the `Chart::build` gate closed). Both outcomes are still accepted —
+/// only a panic or an invalid `Ok` is a bug — so this guard holds the line
+/// either way, including for any configuration that still diverts to the
+/// fallback (e.g. non-coaxial cone–cone, of-9ia).
 #[test]
 fn no_panics_on_cone_configurations() {
     let mut scene = Scene::new();
@@ -2575,7 +2576,7 @@ fn no_panics_on_cone_configurations() {
                 assert_valid(&out, name);
             }
             Err(e) => {
-                // Structured fallback (NotImplemented today) is acceptable.
+                // A structured fallback (NotImplemented) is acceptable.
                 let _ = format!("{name}: rejected with {e:?}");
             }
         }

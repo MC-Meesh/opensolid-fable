@@ -7,9 +7,11 @@
 //!    come back as exact B-Reps with identical Euler counts. Where the
 //!    standalone tessellator produces a closed manifold on both sides the
 //!    volumes must agree within 1e-9 relative; everywhere the emitted text
-//!    must be a **fixed point** of `write ∘ read` (writing the re-imported
+//!    must reach a **fixed point** of `write ∘ read` (writing the re-imported
 //!    body reproduces the file byte for byte), which pins every coordinate
 //!    to the exact `f64` and the whole topology graph to the same traversal.
+//!    Stores that share geometry across faces reach it from the second write
+//!    rather than the first (of-kb8, below); every other case is immediate.
 //! 2. **Synthetic adversarial files** — missing entities, cyclic references,
 //!    degenerate geometry, unit mismatches, huge coordinates, overflowing
 //!    reals, truncation, garbage. The reader must return structured errors
@@ -29,8 +31,10 @@
 //! `cargo test --test step_corpus -- --ignored`.
 //!
 //! Bugs filed from this suite (first run, 2026-07-12):
-//! - of-1dd: parser stack overflow on ~500-deep nested aggregates — a 1KB
-//!   crafted file aborts the process.
+//! - of-1dd (fixed): parser stack overflow on ~500-deep nested aggregates —
+//!   a 1KB crafted file aborted the process. `parse_value` now routes both
+//!   recursion sites through a depth counter capped at 64, returning a
+//!   structured 'aggregate nesting too deep' error instead.
 //! - of-83h (fixed): reader ignored declared length units; metre and
 //!   millimetre files imported identical geometry. The reader now scales
 //!   coordinates into millimetres from the GLOBAL_UNIT_ASSIGNED_CONTEXT.

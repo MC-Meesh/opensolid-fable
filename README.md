@@ -289,13 +289,16 @@ bounds, and the Euler–Poincaré relation `V − E + F − R = 2(S − H)`
 (`crates/opensolid-brep/src/euler.rs:103`). Bugs found in the field become new
 checker rules, so the same class of error cannot silently return `Ok` twice.
 
-**Every function is tested.** 1184 tests pass across the Rust workspace
+**Every function is tested.** 1187 tests pass across the Rust workspace
 (`cargo test --workspace`), plus the playground's vitest suite. CI runs `fmt`,
 `clippy -D warnings`, `build`, and `test` on every push
-(`.github/workflows/ci.yml`). Eight tests are `#[ignore]`d: three are on-demand
-perf measurements, and five are known-broken cases held as executable bug
-reports — each names the open bead blocking it (of-s89, of-9ia, of-kb8), per
-the stress-suite-first policy of never softening a test to make it pass.
+(`.github/workflows/ci.yml`). Five tests are `#[ignore]`d: three are on-demand
+perf measurements (wall-clock probes, too load-sensitive to gate CI), and two
+are known-broken cases held as executable bug reports — each names the open
+bead blocking it (of-9ia non-coaxial cone–cone hosting, of-kb8 STEP shared
+geometry), per the stress-suite-first policy of never softening a test to make
+it pass. When a bead closes, its tests are un-ignored rather than deleted: the
+sphere-cap refinement fix (of-s89) returned three such tests to the suite.
 
 ---
 
@@ -309,7 +312,7 @@ the stress-suite-first policy of never softening a test to make it pass.
 | Cones | ✅ today (of-dtj); non-coaxial cone–cone → of-9ia | ✅ |
 | Coincident / tangent contacts | rejected → fallback | ✅ |
 | Organic blends, offsets, shells | — | ✅ |
-| STEP (AP203) read/write | ✅ today (of-3qy) | mesh fallback on read |
+| STEP (AP203) read/write | ✅ today (of-3qy); shared geometry re-imports duplicated → of-kb8 | mesh fallback on read |
 
 The exact analytic pipeline covers **plane, cylinder, sphere, torus, and
 cone** faces today: the sphere/torus stress campaign (bead of-7ld) promoted
@@ -326,11 +329,15 @@ marched imprint on the two curved cone faces leaves an open chain (of-9ia), so
 those configurations fall to the F-Rep path. **STEP (AP203)
 interchange** shipped (bead of-3qy): analytic parts round-trip through
 `write_step`/`read_step` as exact B-Reps — byte-identical on re-export for
-primitive-derived geometry — with a welded-mesh fallback for files the kernel
-cannot yet represent exactly, unit scaling from the file's declared length
-unit, and cross-feature integration tests chaining STEP with exact booleans,
-hybrid booleans, and sweeps
-(`crates/opensolid-kernel/tests/integration_e2e.rs`). Meanwhile the F-Rep
+primitive-derived geometry, with one open gap: when faces share a surface (or
+edges a curve), the reader materializes one instance per referencing face
+instead of memoizing by STEP instance id, so those bodies reach their
+byte-identical fixed point from the second write rather than the first
+(of-kb8; topology, counts, and volume are unaffected). The importer also
+carries a welded-mesh fallback for files the kernel cannot yet represent
+exactly, unit scaling from the file's declared length unit, and cross-feature
+integration tests chaining STEP with exact booleans, hybrid booleans, and
+sweeps (`crates/opensolid-kernel/tests/integration_e2e.rs`). Meanwhile the F-Rep
 fallback covers **everything** — any pair of valid inputs produces a
 watertight result, because `min`/`max` on distance fields cannot fail.
 
@@ -345,8 +352,9 @@ source of truth for task state.
 
 ```sh
 cargo build            # build the workspace
-cargo test             # run all 1184 tests
+cargo test             # 1187 tests; 5 ignored (see below)
 cargo clippy -- -D warnings
+cargo test -- --ignored  # the 5: 3 on-demand perf probes, 2 open bugs
 ```
 
 ### Run the demo
