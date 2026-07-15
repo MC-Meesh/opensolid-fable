@@ -77,6 +77,17 @@ describe('buildFeatures', () => {
     expect(features[1].key).toBe('shell:1');
   });
 
+  it('lists a taper as Draft, matching sceneTree op labels', () => {
+    // The op is 'taper' but the GUI calls the feature Draft everywhere else;
+    // without a FEATURE_META entry the row read 'taper1' with kind 'unknown'.
+    const box = node(1, 'box3', [1, 1, 1]);
+    const taper = node(2, 'taper', [5], [box]);
+    const features = buildFeatures(taper);
+    expect(features.map((f) => f.name)).toEqual(['Box1', 'Draft1']);
+    expect(features[1].kind).toBe('transform');
+    expect(features[1].key).toBe('draft:1');
+  });
+
   it('applies user renames by key and keeps the default name', () => {
     const { union } = sampleTree();
     const features = buildFeatures(union, { 'box:1': 'Base plate' });

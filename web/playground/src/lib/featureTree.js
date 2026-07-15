@@ -37,6 +37,7 @@ export const FEATURE_META = {
   rotate: { kind: 'transform', type: 'Rotate' },
   scale: { kind: 'transform', type: 'Scale' },
   uniformScale: { kind: 'transform', type: 'Scale' },
+  taper: { kind: 'transform', type: 'Draft' },
   shell: { kind: 'modifier', type: 'Shell' },
   linearPattern: { kind: 'pattern', type: 'LinearPattern' },
   circularPattern: { kind: 'pattern', type: 'CircularPattern' },
