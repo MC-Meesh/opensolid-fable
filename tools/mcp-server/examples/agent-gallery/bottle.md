@@ -59,7 +59,7 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 >       37.53636363636363
 >     ]
 >   },
->   "volume": 21530.952716922486,
+>   "volume": 21531.303576462276,
 >   "valid": true,
 >   "issues": []
 > }
@@ -88,7 +88,7 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 >   "closedManifold": true,
 >   "triangles": 23388,
 >   "vertices": 11688,
->   "volume": 21530.952716922486,
+>   "volume": 21531.303576462276,
 >   "exact": false,
 >   "issues": []
 > }
@@ -112,7 +112,7 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 >   "model_id": "model-6",
 >   "format": "obj",
 >   "path": "output/bottle.obj",
->   "bytes": 1985589
+>   "bytes": 1985008
 > }
 > ```
 
