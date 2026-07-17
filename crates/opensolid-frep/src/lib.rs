@@ -46,6 +46,7 @@
 
 pub mod blend;
 pub mod csg;
+pub mod diff;
 pub mod eval;
 pub mod fillet;
 pub mod mesh;
