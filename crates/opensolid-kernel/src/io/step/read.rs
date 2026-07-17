@@ -1584,7 +1584,11 @@ impl FallbackMesher<'_> {
         for &bound_ref in bounds {
             rings_3d.push(self.bound_polygon(bound_ref, face_ref)?);
         }
-        if rings_3d.iter().all(|r| r.len() < 3) {
+        // The outer bound must be a real polygon. Hole bounds that sample to
+        // fewer than 3 points cut nothing out and are tolerated (the
+        // triangulator ignores them); an outer bound that does is a face with
+        // no area, which is a malformed file, not a hole-free face.
+        if !rings_3d.iter().any(|r| r.len() >= 3) {
             return Err(invalid(
                 face_ref,
                 "face boundary samples to fewer than 3 points",
@@ -1599,7 +1603,14 @@ impl FallbackMesher<'_> {
         // face along +n — outward.
         let n = if same_sense { *normal } else { -normal };
         let (e_u, e_v) = plane_basis(&n);
-        let origin = rings_3d[0][0];
+        // Any point on the plane serves as the projection origin; the first
+        // ring may be empty, so take it from the first that is not.
+        let origin = rings_3d
+            .iter()
+            .flatten()
+            .next()
+            .copied()
+            .expect("some ring has at least 3 points");
         let project = |p: &Point3| {
             let d = p - origin;
             (d.dot(&e_u), d.dot(&e_v))
