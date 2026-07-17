@@ -100,7 +100,12 @@ structure (it's different now).
 a post-merge sync can also repoint your local branch ref to a foreign tip).
 Before going idle after `gt done`:
 
-1. Verify your MR bead exists: `bd list --type=merge-request --status=open` must show your branch.
-2. If it doesn't, push your branch to origin explicitly and re-run `gt done` (or `gt mq submit`).
+1. Verify your work is TRACKED (an MR bead that already CLOSED means it merged — success,
+   not a drop; `--status=open` alone false-alarms whenever the refinery is fast):
+   `bd list --type=merge-request --all` filtered to your issue — an MR bead must exist,
+   open OR closed. If closed, optionally confirm reachability once the train lands:
+   `git fetch && git log origin/main --grep=<issue-id> --oneline` (allow queue latency).
+2. Only if NO MR bead was ever created: push your branch to origin explicitly and re-run
+   `gt done` (or `gt mq submit`), then re-check step 1.
 3. Trust the GitHub-side ref over your local branch ref — if your local branch suddenly
    points at someone else's commit, your content is still safe on `origin/<your-branch>`.
