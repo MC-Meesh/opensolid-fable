@@ -1354,6 +1354,72 @@ type SolidTag = usize; // 0 = A, 1 = B
 /// the next inversion's hint.
 type HostUv = ((f64, f64), (f64, f64));
 
+/// The two host faces of one imprint and their world bounding boxes,
+/// bundled so [`clip_imprint`](Pipeline::clip_imprint) stays under clippy's
+/// argument limit. `fa`/`box_a` and `fb`/`box_b` always travel together —
+/// each face index is paired with the box it was culled by.
+struct ImprintHosts<'a> {
+    fa: usize,
+    fb: usize,
+    box_a: &'a BoundingBox3,
+    box_b: &'a BoundingBox3,
+}
+
+/// Host parameters for every station of an imprint sample, in station
+/// order: **carried where the marcher converged them, projected only where
+/// it did not** (of-4is).
+///
+/// This is the whole of what carrying the marched preimages changes. A
+/// carried station is exact and costs nothing; a projected one is seeded by
+/// the station before it, carried or not, which is what keeps a mixed run
+/// (a seam-cut fragment whose pinned endpoint failed to solve) continuous.
+/// A carried station is the better seed of the two — it is the converged
+/// value rather than another iterate.
+///
+/// # Panics
+/// If `carried` is shorter than `stations`. The two come from opposite ends
+/// of the pipeline — the preimages from `marched_polylines`, the station
+/// count from the sampling above — so their agreement is an invariant no
+/// local reading can confirm. A silent misalignment would host stations at
+/// their *neighbours'* parameters, which is exactly the class of wrong-uv
+/// corruption of-4is exists to remove; failing loudly is the only safe
+/// reading of a mismatch.
+///
+/// # Errors
+/// Propagates the projector's failure. Only projected stations can fail;
+/// carried ones cannot, which is the robustness half of of-4is.
+fn resolve_station_uv(
+    stations: usize,
+    carried: Option<&[Option<HostUv>]>,
+    mut project: impl FnMut(usize, Option<HostUv>) -> CoreResult<HostUv>,
+) -> CoreResult<Vec<HostUv>> {
+    assert!(
+        carried.is_none_or(|c| c.len() >= stations),
+        "carried preimages ({}) do not cover every station ({stations})",
+        carried.map_or(0, <[Option<HostUv>]>::len),
+    );
+    let mut uvs = Vec::with_capacity(stations);
+    let mut hint = None;
+    for i in 0..stations {
+        let uv = match carried.and_then(|c| c[i]) {
+            Some(uv) => uv,
+            None => project(i, hint)?,
+        };
+        uvs.push(uv);
+        hint = Some(uv);
+    }
+    Ok(uvs)
+}
+
+/// Regroup a marcher state (`[u_a, v_a, u_b, v_b]`) as a [`HostUv`]. The
+/// two orderings agree because the marcher is handed `(sa, sb)` in host
+/// order, so its A-side params are the A-host's chart params — the analytic
+/// charts share [`plane_basis`] with [`SurfaceEval::point`], and a NURBS
+/// chart's params are the patch's own knots.
+fn state_uv(state: [f64; 4]) -> HostUv {
+    ((state[0], state[1]), (state[2], state[3]))
+}
+
 /// A curve in the global split network: an original edge of one solid or
 /// an imprint shared by one face of each solid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1927,13 +1993,19 @@ impl<'a> Pipeline<'a> {
                                           intersection curves (transversal MVP)",
                             });
                         }
+                        // Analytic SSI hands back a closed-form curve, not a
+                        // traced one: there are no converged preimages
+                        // behind it to carry, so every station projects.
                         self.clip_imprint(
                             &ic.curve,
-                            fa,
-                            fb,
-                            box_a,
-                            box_b,
+                            ImprintHosts {
+                                fa,
+                                fb,
+                                box_a,
+                                box_b,
+                            },
                             ImprintKind::Transversal,
+                            None,
                         )?;
                     }
                 }
@@ -1945,14 +2017,17 @@ impl<'a> Pipeline<'a> {
                 // does not cover keep the analytic error.
                 Err(CoreError::NotImplemented { .. }) if marched_ssi_supported(sa, sb) => {
                     for mc in intersect_marched(sa, sb, &self.tol)? {
-                        for curve in self.marched_polylines(mc, sa, sb) {
+                        for (curve, uv) in Self::marched_polylines(mc, sa, sb, self.snap) {
                             self.clip_imprint(
                                 &curve,
-                                fa,
-                                fb,
-                                box_a,
-                                box_b,
+                                ImprintHosts {
+                                    fa,
+                                    fb,
+                                    box_a,
+                                    box_b,
+                                },
                                 ImprintKind::Transversal,
+                                Some(&uv),
                             )?;
                         }
                     }
@@ -1968,14 +2043,17 @@ impl<'a> Pipeline<'a> {
                     let joint = box_a.intersection(box_b);
                     let bounds = (joint.center(), 0.5 * joint.extents().norm());
                     for mc in intersect_marched_bounded(sa, sb, bounds, &self.tol)? {
-                        for curve in self.marched_polylines(mc, sa, sb) {
+                        for (curve, uv) in Self::marched_polylines(mc, sa, sb, self.snap) {
                             self.clip_imprint(
                                 &curve,
-                                fa,
-                                fb,
-                                box_a,
-                                box_b,
+                                ImprintHosts {
+                                    fa,
+                                    fb,
+                                    box_a,
+                                    box_b,
+                                },
                                 ImprintKind::Transversal,
+                                Some(&uv),
                             )?;
                         }
                     }
@@ -2003,19 +2081,43 @@ impl<'a> Pipeline<'a> {
     ///   between consecutive parameter samples (interior samples stay
     ///   inside the domain box), and each jump is cut at the exact seam
     ///   point ([`pin_intersection_point`]).
-    fn marched_polylines(&self, mut mc: MarchedCurve, sa: &Surface3, sb: &Surface3) -> Vec<Curve3> {
+    ///
+    /// Each fragment is returned with its vertices' `(uv_a, uv_b)` host
+    /// preimages, which the marcher converged and this wrapper preserves
+    /// across both the endpoint polish and the seam cuts (of-4is). A vertex
+    /// is `None` only where a solve failed and the point was interpolated,
+    /// leaving nothing exact to carry; [`Pipeline::clip_imprint`] projects
+    /// those and only those.
+    fn marched_polylines(
+        mut mc: MarchedCurve,
+        sa: &Surface3,
+        sb: &Surface3,
+        snap: f64,
+    ) -> Vec<(Curve3, Vec<Option<HostUv>>)> {
+        // Parallel to `mc.points` throughout: the marcher's own converged
+        // preimages, updated in place wherever a vertex is re-solved below.
+        let mut uv: Vec<Option<HostUv>> = mc
+            .params_a
+            .iter()
+            .zip(&mc.params_b)
+            .map(|(&a, &b)| Some((a, b)))
+            .collect();
         if !mc.closed {
             for k in [0, mc.points.len() - 1] {
-                if let Some(p) =
-                    tighten_boundary_point(sa, sb, mc.params_a[k], mc.params_b[k], self.snap * 0.5)
+                if let Some((p, state)) =
+                    tighten_boundary_point(sa, sb, mc.params_a[k], mc.params_b[k], snap * 0.5)
                 {
                     mc.points[k] = p;
+                    uv[k] = Some(state_uv(state));
                 }
             }
-            return vec![Curve3::Polyline {
-                points: mc.points,
-                closed: false,
-            }];
+            return vec![(
+                Curve3::Polyline {
+                    points: mc.points,
+                    closed: false,
+                },
+                uv,
+            )];
         }
 
         // Seam cuts on a closed curve: scalar ring position (vertex index
@@ -2030,7 +2132,7 @@ impl<'a> Pipeline<'a> {
         };
         let periods = [sa.period_u(), sa.period_v(), sb.period_u(), sb.period_v()];
         let bounds = [sa.domain_u(), sa.domain_v(), sb.domain_u(), sb.domain_v()];
-        let mut cuts: Vec<(f64, Point3)> = Vec::new();
+        let mut cuts: Vec<(f64, Point3, Option<HostUv>)> = Vec::new();
         for i in 0..mc.points.len() - 1 {
             for k in 0..4 {
                 let Some(period) = periods[k] else { continue };
@@ -2048,16 +2150,25 @@ impl<'a> Pipeline<'a> {
                 };
                 let s = ((pin_value - w0) / (w1_unwrapped - w0)).clamp(0.0, 1.0);
                 let seed = [track(0, i), track(1, i), track(2, i), track(3, i)];
-                let point = pin_intersection_point(sa, sb, seed, k, pin_value, self.snap * 0.5)
-                    .unwrap_or_else(|| mc.points[i] + (mc.points[i + 1] - mc.points[i]) * s);
-                cuts.push((i as f64 + s, point));
+                // The interpolated fallback is a point with no converged
+                // preimage behind it, so it carries none: hosting it means
+                // projecting, which is what `None` asks for.
+                let (point, cut_uv) =
+                    match pin_intersection_point(sa, sb, seed, k, pin_value, snap * 0.5) {
+                        Some((p, state)) => (p, Some(state_uv(state))),
+                        None => (mc.points[i] + (mc.points[i + 1] - mc.points[i]) * s, None),
+                    };
+                cuts.push((i as f64 + s, point, cut_uv));
             }
         }
         if cuts.is_empty() {
-            return vec![Curve3::Polyline {
-                points: mc.points,
-                closed: true,
-            }];
+            return vec![(
+                Curve3::Polyline {
+                    points: mc.points,
+                    closed: true,
+                },
+                uv,
+            )];
         }
         cuts.sort_by(|a, b| a.0.total_cmp(&b.0));
 
@@ -2065,23 +2176,31 @@ impl<'a> Pipeline<'a> {
         let n = mc.points.len() - 1; // distinct vertices
         let mut fragments = Vec::new();
         for j in 0..cuts.len() {
-            let (q0, p0) = cuts[j];
-            let (mut q1, p1) = cuts[(j + 1) % cuts.len()];
+            let (q0, p0, uv0) = cuts[j];
+            let (mut q1, p1, uv1) = cuts[(j + 1) % cuts.len()];
             if j + 1 == cuts.len() {
                 q1 += n as f64;
             }
             let mut points = vec![p0];
+            // Walks in lockstep with `points`: the fragment's uv is the
+            // ring's, bracketed by the two cuts' own converged preimages.
+            let mut frag_uv = vec![uv0];
             let mut v = q0.floor() as usize + 1;
             while (v as f64) < q1 - 1e-12 {
                 points.push(mc.points[v % n]);
+                frag_uv.push(uv[v % n]);
                 v += 1;
             }
             points.push(p1);
-            if polyline_length(&points) > self.snap {
-                fragments.push(Curve3::Polyline {
-                    points,
-                    closed: false,
-                });
+            frag_uv.push(uv1);
+            if polyline_length(&points) > snap {
+                fragments.push((
+                    Curve3::Polyline {
+                        points,
+                        closed: false,
+                    },
+                    frag_uv,
+                ));
             }
         }
         fragments
@@ -2136,13 +2255,18 @@ impl<'a> Pipeline<'a> {
                 .map(|de| self.solids[other_s].edges[de.edge].curve.clone())
                 .collect();
             for curve in curves {
+                // An existing trim edge, carried from the partner's
+                // topology rather than traced: no preimages travel with it.
                 self.clip_imprint(
                     &curve,
-                    fa,
-                    fb,
-                    box_a,
-                    box_b,
+                    ImprintHosts {
+                        fa,
+                        fb,
+                        box_a,
+                        box_b,
+                    },
                     ImprintKind::CoincidentEdge { host },
+                    None,
                 )?;
             }
         }
@@ -2269,6 +2393,16 @@ impl<'a> Pipeline<'a> {
     /// Clip one SSI curve to both face regions; store surviving pieces as
     /// imprints.
     ///
+    /// `station_uv`, when present, supplies each station's host parameters
+    /// directly, parallel to a [`Curve3::Polyline`]'s vertices — the
+    /// marcher already converged them, so the station is *known* rather
+    /// than re-derived (of-4is). This is not only cheaper than inverting;
+    /// it is exact where the inversion is merely seeded, which is what
+    /// takes the wrong-sheet hazard on a self-approaching NURBS patch from
+    /// mitigated to impossible at the stations. `None` entries (and every
+    /// non-marched curve) fall back to the seeded [`Chart::param`]
+    /// projection, so the two paths differ in accuracy, never in meaning.
+    ///
     /// # Errors
     /// Propagates [`Chart::param`]'s failure to invert a sample onto either
     /// host face (NURBS hosts only), which aborts the boolean to the F-Rep
@@ -2277,12 +2411,16 @@ impl<'a> Pipeline<'a> {
     fn clip_imprint(
         &mut self,
         curve: &Curve3,
-        fa: usize,
-        fb: usize,
-        box_a: &BoundingBox3,
-        box_b: &BoundingBox3,
+        hosts: ImprintHosts<'_>,
         kind: ImprintKind,
+        station_uv: Option<&[Option<HostUv>]>,
     ) -> CoreResult<()> {
+        let ImprintHosts {
+            fa,
+            fb,
+            box_a,
+            box_b,
+        } = hosts;
         // Sampling stations: the full period for closed conics, a bbox
         // slab clip for lines, the vertices for (marched) polylines. For
         // closed curves the stations cover one period without repeating
@@ -2324,21 +2462,27 @@ impl<'a> Pipeline<'a> {
         // optimization: on a NURBS host an unseeded projection of a patch
         // that approaches itself can converge onto the wrong sheet, and a
         // wrong uv here clips the imprint against the wrong region.
-        let inside = |t: f64, hint: Option<HostUv>| -> CoreResult<(bool, HostUv)> {
+        let project = |t: f64, hint: Option<HostUv>| -> CoreResult<HostUv> {
             let p = curve.point(t);
             let (hint_a, hint_b) = match hint {
                 Some((a, b)) => (Some(a), Some(b)),
                 None => (None, None),
             };
-            let pa = self.face_polys[0][fa].chart.param(&p, hint_a)?;
-            let pb = self.face_polys[1][fb].chart.param(&p, hint_b)?;
             // Both inversions run regardless: each seeds the next station's
             // hint, and a coincident partner's curve still has to stay
             // walkable on the side that does not clip it.
-            let is_inside = [(0, fa, pa), (1, fb, pb)].into_iter().all(|(s, f, uv)| {
+            let pa = self.face_polys[0][fa].chart.param(&p, hint_a)?;
+            let pb = self.face_polys[1][fb].chart.param(&p, hint_b)?;
+            Ok((pa, pb))
+        };
+        let contains = |(pa, pb): HostUv| -> bool {
+            [(0, fa, pa), (1, fb, pb)].into_iter().all(|(s, f, uv)| {
                 !kind.binds(s) || self.face_polys[s][f].contains_for_clip(uv, self.snap)
-            });
-            Ok((is_inside, (pa, pb)))
+            })
+        };
+        let inside = |t: f64, hint: Option<HostUv>| -> CoreResult<(bool, HostUv)> {
+            let uv = project(t, hint)?;
+            Ok((contains(uv), uv))
         };
         // A run lying *entirely* along a host's own trim boundary cuts that
         // face into nothing: it re-traces an edge the arrangement already
@@ -2364,16 +2508,8 @@ impl<'a> Pipeline<'a> {
                     })
             })
         };
-        // Walked in station order so each inversion seeds the next.
-        let mut flags: Vec<bool> = Vec::with_capacity(ts.len());
-        let mut station_uv: Vec<HostUv> = Vec::with_capacity(ts.len());
-        let mut hint = None;
-        for &t in &ts {
-            let (is_inside, uv) = inside(t, hint)?;
-            flags.push(is_inside);
-            station_uv.push(uv);
-            hint = Some(uv);
-        }
+        let uvs = resolve_station_uv(ts.len(), station_uv, |i, hint| project(ts[i], hint))?;
+        let flags: Vec<bool> = uvs.iter().map(|&uv| contains(uv)).collect();
 
         if closed_curve && flags.iter().all(|&f| f) {
             // Entire ring inside every region that binds it.
@@ -2445,7 +2581,7 @@ impl<'a> Pipeline<'a> {
                 }
                 // Seed from the run's first station: it is inside, so its
                 // parameters are on the sheet the crossing belongs to.
-                let t = refine_clip_crossing(&inside, t_out, t_in, Some(station_uv[first_idx]))?;
+                let t = refine_clip_crossing(&inside, t_out, t_in, Some(uvs[first_idx]))?;
                 let p = curve.point(t);
                 pts.push(self.polish_clip_endpoint(p, fa, fb));
             }
@@ -2459,7 +2595,7 @@ impl<'a> Pipeline<'a> {
                 if closed_curve && t_out < t_in {
                     t_out += period;
                 }
-                let t = refine_clip_crossing(&inside, t_out, t_in, Some(station_uv[last_idx]))?;
+                let t = refine_clip_crossing(&inside, t_out, t_in, Some(uvs[last_idx]))?;
                 let p = curve.point(t);
                 pts.push(self.polish_clip_endpoint(p, fa, fb));
             }
@@ -9618,6 +9754,296 @@ mod tests {
             scaled_knots(3, n, v_origin, v_span),
         )
         .expect("valid bicubic patch")
+    }
+
+    // -----------------------------------------------------------------
+    // Carried marched preimages (of-4is)
+    // -----------------------------------------------------------------
+
+    /// Bilinear NURBS patch over x, y ∈ [-2, 2] on the plane
+    /// z = height + slope_x·x, with an explicit knot domain. The domain is
+    /// a parameter on purpose: giving the two patches of a pair *different*
+    /// knot ranges makes their parameters tell each other apart, so a test
+    /// that mixed up which surface a carried `(u, v)` belongs to fails
+    /// loudly instead of passing on a coincidence.
+    fn tilted_patch(height: f64, slope_x: f64, origin: f64, span: f64) -> NurbsSurface {
+        let z = |x: f64| height + slope_x * x;
+        let control_points = vec![
+            vec![
+                Point3::new(-2.0, -2.0, z(-2.0)),
+                Point3::new(-2.0, 2.0, z(-2.0)),
+            ],
+            vec![
+                Point3::new(2.0, -2.0, z(2.0)),
+                Point3::new(2.0, 2.0, z(2.0)),
+            ],
+        ];
+        let knots = scaled_knots(1, 2, origin, span);
+        NurbsSurface::bspline(control_points, knots.clone(), knots).expect("valid bilinear patch")
+    }
+
+    /// Two NURBS patches crossing along x = 0, on deliberately unequal knot
+    /// domains.
+    fn crossing_nurbs_pair() -> (Surface3, Surface3) {
+        (
+            Surface3::nurbs(tilted_patch(0.0, 0.0, 0.0, 1.0)),
+            Surface3::nurbs(tilted_patch(0.0, 1.0, 10.0, 0.5)),
+        )
+    }
+
+    /// The heart of of-4is: every vertex a marched fragment hands to
+    /// `clip_imprint` arrives with the preimages the marcher converged, on
+    /// **both** hosts — including the endpoints, which
+    /// `tighten_boundary_point` re-solves and which therefore cannot just
+    /// inherit the tracer's original params.
+    ///
+    /// The residual bound is the marcher's own gap, not a projection
+    /// tolerance: these params are not an approximation of an inversion,
+    /// they are what the inversion would be trying to recover.
+    #[test]
+    fn marched_polylines_carry_converged_preimages_for_every_vertex() {
+        let (a, b) = crossing_nurbs_pair();
+        let bounds = (Point3::origin(), 6.0);
+        let curves = intersect_marched_bounded(&a, &b, bounds, &tol()).expect("NURBS pair marches");
+        assert!(!curves.is_empty(), "expected an intersection curve");
+        let mut vertices = 0;
+        for mc in curves {
+            for (curve, uv) in Pipeline::marched_polylines(mc, &a, &b, SNAP) {
+                let Curve3::Polyline { points, .. } = &curve else {
+                    panic!("marched curves are hosted as polylines");
+                };
+                assert_eq!(uv.len(), points.len(), "preimages must be parallel");
+                for (p, carried) in points.iter().zip(&uv) {
+                    let Some(((ua, va), (ub, vb))) = *carried else {
+                        panic!("a marched vertex reached the boolean with no preimage");
+                    };
+                    assert!(
+                        (a.point(ua, va) - p).norm() <= 1e-7,
+                        "carried uv_a does not reproduce the vertex"
+                    );
+                    assert!(
+                        (b.point(ub, vb) - p).norm() <= 1e-7,
+                        "carried uv_b does not reproduce the vertex"
+                    );
+                    vertices += 1;
+                }
+            }
+        }
+        assert!(vertices > 2, "expected a dense fragment, got {vertices}");
+    }
+
+    /// The carried preimages must be in the *charts'* parameters, since
+    /// that is what `clip_imprint` feeds to `contains_for_clip`. This is
+    /// the `state_uv` ordering claim: A-side params index the A host.
+    ///
+    /// The two patches carry disjoint knot domains ([0,1] vs [10,10.5]), so
+    /// a swap of the two sides — the one bug this plumbing invites — cannot
+    /// pass: each chart would report the other's range.
+    #[test]
+    fn carried_preimages_are_in_the_hosts_own_chart_parameters() {
+        let (a, b) = crossing_nurbs_pair();
+        let (chart_a, chart_b) = (
+            build_chart(&a).expect("regular patch"),
+            build_chart(&b).expect("regular patch"),
+        );
+        let bounds = (Point3::origin(), 6.0);
+        let curves = intersect_marched_bounded(&a, &b, bounds, &tol()).expect("NURBS pair marches");
+        for mc in curves {
+            for (curve, uv) in Pipeline::marched_polylines(mc, &a, &b, SNAP) {
+                let Curve3::Polyline { points, .. } = &curve else {
+                    panic!("marched curves are hosted as polylines");
+                };
+                for (p, carried) in points.iter().zip(&uv) {
+                    let Some((uv_a, uv_b)) = *carried else {
+                        panic!("expected carried preimages");
+                    };
+                    // What the projection this change removes would return.
+                    let proj_a = chart_a.param(p, None).expect("A inverts");
+                    let proj_b = chart_b.param(p, None).expect("B inverts");
+                    for (carried, proj, side) in [(uv_a, proj_a, "A"), (uv_b, proj_b, "B")] {
+                        assert!(
+                            (carried.0 - proj.0).abs() < 1e-6 && (carried.1 - proj.1).abs() < 1e-6,
+                            "side {side}: carried {carried:?} disagrees with the chart's {proj:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A carried station must not be projected — that is the point of
+    /// of-4is, and the one thing a projection-shaped fallback could
+    /// silently undo while every geometric assertion still passed. The spy
+    /// projector fails the test if it is consulted at all.
+    #[test]
+    fn resolve_station_uv_never_projects_a_carried_station() {
+        let carried = vec![
+            Some(((1.0, 2.0), (3.0, 4.0))),
+            Some(((5.0, 6.0), (7.0, 8.0))),
+        ];
+        let uvs = resolve_station_uv(2, Some(&carried), |i, _| {
+            panic!("station {i} was projected despite carrying converged params")
+        })
+        .expect("carried stations cannot fail");
+        assert_eq!(
+            uvs,
+            vec![((1.0, 2.0), (3.0, 4.0)), ((5.0, 6.0), (7.0, 8.0))]
+        );
+    }
+
+    /// Every station projects when nothing is carried: analytic SSI and
+    /// coincident trim edges must keep the pre-of-4is path exactly.
+    #[test]
+    fn resolve_station_uv_projects_every_station_without_carried_params() {
+        let mut projected = Vec::new();
+        let uvs = resolve_station_uv(3, None, |i, hint| {
+            projected.push((i, hint));
+            Ok(((i as f64, 0.0), (0.0, 0.0)))
+        })
+        .expect("projector succeeds");
+        assert_eq!(uvs.len(), 3);
+        // Each station seeds the next, and the first has no seed.
+        assert_eq!(
+            projected,
+            vec![
+                (0, None),
+                (1, Some(((0.0, 0.0), (0.0, 0.0)))),
+                (2, Some(((1.0, 0.0), (0.0, 0.0)))),
+            ]
+        );
+    }
+
+    /// The mixed run — a seam-cut fragment whose pinned endpoint did not
+    /// solve. The gap projects, and must be seeded by the *carried*
+    /// neighbour rather than starting cold: dropping that seed is what
+    /// would put the projection back on the wrong sheet.
+    #[test]
+    fn resolve_station_uv_seeds_a_projected_gap_from_the_carried_neighbour() {
+        let carried = vec![
+            Some(((9.0, 9.0), (1.0, 1.0))),
+            None,
+            Some(((3.0, 3.0), (4.0, 4.0))),
+        ];
+        let mut seeds = Vec::new();
+        let uvs = resolve_station_uv(3, Some(&carried), |i, hint| {
+            seeds.push((i, hint));
+            Ok(((0.0, 0.0), (0.0, 0.0)))
+        })
+        .expect("projector succeeds");
+        assert_eq!(
+            seeds,
+            vec![(1, Some(((9.0, 9.0), (1.0, 1.0))))],
+            "only the uncarried station projects, seeded by its predecessor"
+        );
+        // The carried stations survive verbatim around the projected gap.
+        assert_eq!(uvs[0], ((9.0, 9.0), (1.0, 1.0)));
+        assert_eq!(uvs[2], ((3.0, 3.0), (4.0, 4.0)));
+    }
+
+    /// Preimages that do not cover the stations are a plumbing error
+    /// between two distant ends of the pipeline, and hosting a station at
+    /// its neighbour's uv is precisely the corruption of-4is removes — so
+    /// it must not be absorbed quietly.
+    #[test]
+    #[should_panic(expected = "do not cover every station")]
+    fn resolve_station_uv_rejects_preimages_that_miss_a_station() {
+        let carried = vec![Some(((1.0, 2.0), (3.0, 4.0)))];
+        let _ = resolve_station_uv(2, Some(&carried), |_, _| Ok(((0.0, 0.0), (0.0, 0.0))));
+    }
+
+    /// A patch that folds back on itself, its two ends `gap` apart in z at
+    /// the same (x, y) while the middle bulges away. The two ends are whole
+    /// `v`-domain apart in parameter space but nearly coincident in space:
+    /// the self-approach the wrong-sheet hazard needs.
+    fn folded_patch(gap: f64) -> NurbsSurface {
+        let control_points: Vec<Vec<Point3>> = (0..4)
+            .map(|i| {
+                let x = i as f64 - 1.5;
+                vec![
+                    Point3::new(x, 0.0, gap),
+                    Point3::new(x, 1.2, gap + 1.5),
+                    Point3::new(x, 1.2, -1.5),
+                    Point3::new(x, 0.0, 0.0),
+                ]
+            })
+            .collect();
+        let knots = KnotVector::clamped_uniform(3, 4).expect("valid knots");
+        NurbsSurface::bspline(control_points, knots.clone(), knots).expect("valid patch")
+    }
+
+    /// THE GATE (of-4is): on a NURBS↔NURBS imprint whose patch approaches
+    /// itself, every marched station hosts on the sheet it was traced from,
+    /// with no projection involved.
+    ///
+    /// **The self-approach has to be sub-tolerance to be a hazard at all**,
+    /// which is worth stating because it is not what section 4 assumed. A
+    /// station lies *exactly* on its sheet, so while the other sheet is
+    /// further away than `tol.linear`, the closest-point projection is
+    /// simply right, and `nurbs_param`'s acceptance check rejects a
+    /// wrong-sheet convergence as too far from `p`. Only once the sheets
+    /// close to within tolerance can the wrong sheet both attract the
+    /// iteration and pass acceptance — measured on this fixture, the
+    /// disagreement appears at a `gap` of 1e-10 and not at 1e-8.
+    ///
+    /// The oracle is the sheet the marcher traced, never a projection: the
+    /// projection is the thing on trial and cannot also be the judge.
+    #[test]
+    fn a_self_approaching_patch_hosts_marched_vertices_on_the_correct_sheet() {
+        let gap = 1e-10;
+        let folded = Surface3::nurbs(folded_patch(gap));
+        // Precondition, asserted rather than assumed: the two ends really
+        // do approach below the tolerance the projection judges by, which
+        // is what leaves an unseeded inversion free to pick either.
+        let (v_lo, v_hi) = folded.domain_v();
+        let approach = (folded.point(0.5, v_lo) - folded.point(0.5, v_hi)).norm();
+        assert!(
+            approach <= tol().linear,
+            "fixture must self-approach within tolerance, got {approach:e}"
+        );
+
+        let cutter = Surface3::nurbs(tilted_patch(0.0, 0.35, 10.0, 0.5));
+        let bounds = (Point3::origin(), 6.0);
+        let curves = intersect_marched_bounded(&folded, &cutter, bounds, &tol())
+            .expect("the folded pair marches");
+        assert!(!curves.is_empty(), "expected intersection curves");
+
+        let chart = build_chart(&folded).expect("regular patch");
+        let mut checked = 0;
+        // Vertices where re-projecting is *not* equivalent to carrying:
+        // the inversion either lands a fold away in v (wrong sheet) or
+        // fails outright, which would abort the boolean to F-Rep.
+        let mut projection_would_not_recover = 0;
+        for mc in curves {
+            for (curve, uv) in Pipeline::marched_polylines(mc, &folded, &cutter, SNAP) {
+                let Curve3::Polyline { points, .. } = &curve else {
+                    panic!("marched curves are hosted as polylines");
+                };
+                for (p, carried) in points.iter().zip(&uv) {
+                    let Some(((ua, va), _)) = *carried else {
+                        panic!("a station on the folded patch carries no preimage");
+                    };
+                    // THE ASSERTION: the carried params name the traced
+                    // sheet, for every station, whatever an inversion of
+                    // the same point would have preferred.
+                    assert!(
+                        (folded.point(ua, va) - p).norm() <= 1e-7,
+                        "carried uv is not on the traced sheet"
+                    );
+                    checked += 1;
+                    match chart.param(p, None) {
+                        Ok((_, pv)) if (pv - va).abs() > 0.5 => projection_would_not_recover += 1,
+                        Err(_) => projection_would_not_recover += 1,
+                        Ok(_) => {}
+                    }
+                }
+            }
+        }
+        assert!(checked > 100, "expected dense fragments, got {checked}");
+        assert!(
+            projection_would_not_recover > 0,
+            "fixture proves nothing: every unseeded projection recovered the \
+             traced station, so carrying the params changed no outcome here"
+        );
     }
 
     #[test]

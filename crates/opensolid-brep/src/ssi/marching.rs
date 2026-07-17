@@ -973,13 +973,18 @@ fn march_bounded_pair(
 /// the **pinned** surface — exactly on that surface's seam curve — or
 /// `None` when no parameter sits on a natural bound (a stalled fragment)
 /// or the tight solve does not converge.
+///
+/// The converged `[u_a, v_a, u_b, v_b]` accompanies the point on the same
+/// terms the marcher's own vertices carry: exact on the pinned surface, a
+/// gap away on the free one. Callers that host the polished endpoint need
+/// them to avoid re-deriving what the solve already knows (of-4is).
 pub(crate) fn tighten_boundary_point(
     a: &Surface3,
     b: &Surface3,
     params_a: (f64, f64),
     params_b: (f64, f64),
     gap_tol: f64,
-) -> Option<Point3> {
+) -> Option<(Point3, [f64; 4])> {
     let state = [params_a.0, params_a.1, params_b.0, params_b.1];
     let natural = [a.domain_u(), a.domain_v(), b.domain_u(), b.domain_v()];
     let pin = (0..4).find(|&k| {
@@ -999,7 +1004,10 @@ const PIN_POLISH_ITERATIONS: usize = 3;
 /// index `pin` (into `[u_a, v_a, u_b, v_b]`) held fixed at `pin_value`,
 /// from `seed` (which must be within a marching step of the root).
 /// Returns the point evaluated on the pinned surface — exactly on its
-/// `pin_value` iso-curve — or `None` if the tight solve does not converge.
+/// `pin_value` iso-curve — together with the `[u_a, v_a, u_b, v_b]` it
+/// converged to, or `None` if the tight solve does not converge. The
+/// params are those of the *returned* point: the polish loop keeps the
+/// best-gap iterate, so state and point advance together.
 ///
 /// The root is polished past `gap_tol` to the numerical fixed point:
 /// acceptance at `gap_tol` alone leaves the iterate anywhere in a
@@ -1016,7 +1024,7 @@ pub(crate) fn pin_intersection_point(
     pin: usize,
     pin_value: f64,
     gap_tol: f64,
-) -> Option<Point3> {
+) -> Option<(Point3, [f64; 4])> {
     let mut state = seed;
     state[pin] = pin_value;
     // Domains only clamp the Newton updates; the seed is already within a
@@ -1037,6 +1045,7 @@ pub(crate) fn pin_intersection_point(
     let on_pinned = |f: &Frames| if pin < 2 { f.pa } else { f.pb };
     let mut best_gap = frames.gap().norm();
     let mut best_point = on_pinned(&frames);
+    let mut best_state = accepted.0;
     let mut s = accepted;
     for _ in 0..PIN_POLISH_ITERATIONS {
         if marcher.pinned_newton_step(&mut s, &frames, pin).is_none() {
@@ -1049,8 +1058,9 @@ pub(crate) fn pin_intersection_point(
         }
         best_gap = gap;
         best_point = on_pinned(&frames);
+        best_state = s.0;
     }
-    Some(best_point)
+    Some((best_point, best_state))
 }
 
 /// Reject the Villarceau configuration: a plane through the torus center
@@ -1890,7 +1900,8 @@ mod tests {
             (ub, vb - 2e-5),
             1e-4, // above the seed's gap: accepted at iteration 0
         )
-        .expect("pinned solve must converge");
+        .expect("pinned solve must converge")
+        .0;
         assert!(
             (p - q).norm() < 1e-10,
             "polished endpoint {p:?} is {:e} from the exact junction {q:?}",
@@ -1908,7 +1919,8 @@ mod tests {
         let (sphere, cylinder, _, (_, va), (ub, vb)) = seam_junction_fixture();
         let lo =
             tighten_boundary_point(&sphere, &cylinder, (0.0, va + 3e-5), (ub, vb - 2e-5), 1e-4)
-                .expect("low-side solve must converge");
+                .expect("low-side solve must converge")
+                .0;
         let hi = tighten_boundary_point(
             &sphere,
             &cylinder,
@@ -1916,12 +1928,43 @@ mod tests {
             (ub, vb + 3e-5),
             1e-4,
         )
-        .expect("high-side solve must converge");
+        .expect("high-side solve must converge")
+        .0;
         assert!(
             (lo - hi).norm() < 1e-12,
             "seam-side endpoints disagree by {:e}",
             (lo - hi).norm()
         );
+    }
+
+    /// The params must describe the point actually returned, not the seed
+    /// (of-4is): callers host the polished point and its preimages
+    /// together, so a state left behind at the seed would host the endpoint
+    /// at coordinates it does not occupy. The polish loop advances point
+    /// and state as a pair — this is what pins that.
+    #[test]
+    fn tighten_returns_the_params_of_the_polished_point() {
+        let (sphere, cylinder, q, (ua, va), (ub, vb)) = seam_junction_fixture();
+        let (p, state) = tighten_boundary_point(
+            &sphere,
+            &cylinder,
+            (ua, va + 3e-5),
+            (ub, vb - 2e-5),
+            1e-4, // above the seed's gap, so acceptance alone keeps the seed
+        )
+        .expect("pinned solve must converge");
+        // The seed's params are ~3e-5 off; the returned ones must track the
+        // polished point instead, which the seed's would fail by ~1e-5.
+        assert!(
+            (sphere.point(state[0], state[1]) - p).norm() < 1e-14,
+            "params_a must reproduce the polished point on the pinned sphere"
+        );
+        assert!(
+            (cylinder.point(state[2], state[3]) - p).norm() < 1e-9,
+            "params_b must reproduce it on the free cylinder within the gap"
+        );
+        assert_eq!(state[0], ua, "the pinned seam parameter stays bit-exact");
+        assert!((p - q).norm() < 1e-10);
     }
 
     /// No parameter on a natural domain bound (a stalled fragment): the
@@ -1945,11 +1988,38 @@ mod tests {
             ub,
             1e-4,
         )
-        .expect("pinned solve must converge");
+        .expect("pinned solve must converge")
+        .0;
         assert!((p - q).norm() < 1e-10);
         // Exactly on the cylinder's u = ub ruling line.
         let ruling = cylinder.point(ub, p.z);
         assert!((p - ruling).norm() < 1e-14);
+    }
+
+    /// The pinned solve's params are the point's on both sides, with the
+    /// pin held bit-exact — the contract `marched_polylines` hands a
+    /// seam-cut vertex to the boolean on (of-4is).
+    #[test]
+    fn pin_intersection_point_returns_the_params_of_the_returned_point() {
+        let (sphere, cylinder, _, (ua, va), (ub, vb)) = seam_junction_fixture();
+        let (p, state) = pin_intersection_point(
+            &sphere,
+            &cylinder,
+            [ua, va + 1e-5, ub, vb - 1e-5],
+            2,
+            ub,
+            1e-4,
+        )
+        .expect("pinned solve must converge");
+        assert_eq!(state[2], ub, "the pinned parameter stays bit-exact");
+        assert!(
+            (cylinder.point(state[2], state[3]) - p).norm() < 1e-14,
+            "params_b must reproduce the point on the pinned cylinder"
+        );
+        assert!(
+            (sphere.point(state[0], state[1]) - p).norm() < 1e-9,
+            "params_a must reproduce it on the free sphere within the gap"
+        );
     }
 
     // -----------------------------------------------------------------
