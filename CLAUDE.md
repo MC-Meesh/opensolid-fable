@@ -102,8 +102,9 @@ Before going idle after `gt done`:
 
 1. Verify your work is TRACKED (an MR bead that already CLOSED means it merged — success,
    not a drop; `--status=open` alone false-alarms whenever the refinery is fast):
-   `bd list --type=merge-request --all` filtered to your issue — an MR bead must exist,
-   open OR closed. If closed, optionally confirm reachability once the train lands:
+   `bd list --all | grep -i 'merge: <your-issue-id>'` — an MR bead must exist, open OR
+   closed (NOTE: MR beads are type=task labeled gt:merge-request, titled 'Merge: <issue>';
+   `--type=merge-request` matches nothing). If closed, optionally confirm reachability once the train lands:
    `git fetch && git log origin/main --grep=<issue-id> --oneline` (allow queue latency).
 2. Only if NO MR bead was ever created: push your branch to origin explicitly and re-run
    `gt done` (or `gt mq submit`), then re-check step 1.
