@@ -2352,8 +2352,15 @@ impl<'a> Pipeline<'a> {
                                     .into(),
                             }
                         })?;
-                    let inside_other = self.contains_point(other, &sample)?;
-                    let (keep, reverse) = keep_table(op, s, inside_other);
+                    // Ray parity answers In/Out only. Coincident faces (the
+                    // source of On) do not imprint yet, so no region reaching
+                    // here can be on the other boundary (of-bxl.4).
+                    let verdict = if self.contains_point(other, &sample)? {
+                        Verdict::In
+                    } else {
+                        Verdict::Out
+                    };
+                    let (keep, reverse) = keep_table(op, s, verdict);
                     if keep {
                         kept.push(KeptRegion {
                             solid: s,
@@ -2443,15 +2450,79 @@ impl<'a> Pipeline<'a> {
     }
 }
 
-/// (keep?, reverse orientation?) for a region of `solid` that is
-/// `inside_other` the other body.
-fn keep_table(op: BooleanOp, solid: SolidTag, inside_other: bool) -> (bool, bool) {
-    match (op, solid, inside_other) {
-        (BooleanOp::Unite, _, inside) => (!inside, false),
-        (BooleanOp::Subtract, 0, inside) => (!inside, false),
-        (BooleanOp::Subtract, 1, inside) => (inside, true),
-        (BooleanOp::Intersect, _, inside) => (inside, false),
-        _ => unreachable!(),
+/// Which side of the other solid a face region lies on.
+///
+/// `On` is only produced for regions of a face that is coincident with a
+/// face of the other solid — a case the imprint stage cannot yet build, so
+/// nothing constructs it before of-bxl.4. Ray parity must never *discover*
+/// `On`: an on-boundary sample is exactly what [`Pipeline::contains_point`]
+/// evades, so coincidence is propagated structurally instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    /// Strictly inside the other solid.
+    In,
+    /// Strictly outside the other solid.
+    Out,
+    /// On the other solid's boundary, with the two normals agreeing
+    /// (`Same`) or opposing (`Opposite`).
+    #[allow(
+        dead_code,
+        reason = "constructed once coincident faces imprint (of-bxl.4)"
+    )]
+    On(Sense),
+}
+
+/// Relative orientation of two coincident faces: the sign of `n_a · n_b`
+/// at the sample point.
+#[allow(
+    dead_code,
+    reason = "constructed once coincident faces imprint (of-bxl.4)"
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Sense {
+    /// Normals agree: the solids lie on the same side of the shared face.
+    Same,
+    /// Normals oppose: the solids abut across the shared face.
+    Opposite,
+}
+
+/// (keep?, reverse orientation?) for a region of `solid` classified as
+/// `verdict` against the other body.
+///
+/// The standard Requicha/Voelcker rule: unite keeps OUT ∪ ON-same-sense,
+/// intersect keeps IN ∪ ON-same-sense, subtract keeps A's OUT ∪ B's IN
+/// (reversed) ∪ ON-opposite-sense.
+///
+/// A same-sense ON region is a face both solids carry, so both would emit
+/// it. It is kept from A only — a canonical tie-break, without which the
+/// shared face appears twice and the shell is non-manifold. Opposite-sense
+/// ON regions are the interior wall of two abutting solids: unite and
+/// intersect drop them from both sides (which is what fuses the bodies),
+/// and subtract keeps A's copy as the exposed face of the cut.
+fn keep_table(op: BooleanOp, solid: SolidTag, verdict: Verdict) -> (bool, bool) {
+    use BooleanOp::{Intersect, Subtract, Unite};
+    use Sense::{Opposite, Same};
+    use Verdict::{In, On, Out};
+    match (op, solid, verdict) {
+        // Unite: keep what is outside the other body.
+        (Unite, _, Out) => (true, false),
+        (Unite, 0, On(Same)) => (true, false),
+        (Unite, _, In | On(Same) | On(Opposite)) => (false, false),
+
+        // Intersect: keep what is inside the other body. Merely touching
+        // solids meet in a zero-thickness square; that is an EMPTY body,
+        // not a sheet, so opposite-sense ON drops from both solids.
+        (Intersect, _, In) => (true, false),
+        (Intersect, 0, On(Same)) => (true, false),
+        (Intersect, _, Out | On(Same) | On(Opposite)) => (false, false),
+
+        // Subtract (A − B): A's outside, B's inside flipped inward.
+        (Subtract, 0, Out | On(Opposite)) => (true, false),
+        (Subtract, 0, In | On(Same)) => (false, false),
+        (Subtract, 1, In) => (true, true),
+        (Subtract, 1, Out | On(Same) | On(Opposite)) => (false, false),
+
+        (_, tag, _) => unreachable!("boolean solid tag must be 0 or 1, got {tag}"),
     }
 }
 
@@ -5513,6 +5584,140 @@ mod tests {
 
     fn tol() -> ToleranceContext {
         ToleranceContext::default()
+    }
+
+    /// All 24 (op, solid, verdict) cells, transcribed from the table in
+    /// docs/design/COINCIDENT.md §3. Written out cell by cell on purpose:
+    /// deriving the expectation would just restate `keep_table`'s own
+    /// logic and pass no matter what that logic said.
+    #[test]
+    fn keep_table_covers_every_op_solid_verdict_cell() {
+        use BooleanOp::{Intersect, Subtract, Unite};
+        use Sense::{Opposite, Same};
+        use Verdict::{In, On, Out};
+
+        const KEEP: (bool, bool) = (true, false);
+        const KEEP_REVERSED: (bool, bool) = (true, true);
+        const DROP: (bool, bool) = (false, false);
+
+        let cells: [(BooleanOp, SolidTag, Verdict, (bool, bool)); 24] = [
+            // Unite: the union's skin is what neither body swallowed. A
+            // same-sense shared face survives once, from A.
+            (Unite, 0, In, DROP),
+            (Unite, 0, Out, KEEP),
+            (Unite, 0, On(Same), KEEP),
+            (Unite, 0, On(Opposite), DROP),
+            (Unite, 1, In, DROP),
+            (Unite, 1, Out, KEEP),
+            (Unite, 1, On(Same), DROP),     // duplicate of A's copy
+            (Unite, 1, On(Opposite), DROP), // the wall between abutting solids
+            // Intersect: the shared material's skin. Two solids that merely
+            // touch intersect in a zero-thickness square — an empty body,
+            // not a sheet, so both On(Opposite) cells drop.
+            (Intersect, 0, In, KEEP),
+            (Intersect, 0, Out, DROP),
+            (Intersect, 0, On(Same), KEEP),
+            (Intersect, 0, On(Opposite), DROP),
+            (Intersect, 1, In, KEEP),
+            (Intersect, 1, Out, DROP),
+            (Intersect, 1, On(Same), DROP), // duplicate of A's copy
+            (Intersect, 1, On(Opposite), DROP),
+            // Subtract (A − B): A's exposed skin, plus B's intruding skin
+            // flipped to face into the cavity.
+            (Subtract, 0, In, DROP),
+            (Subtract, 0, Out, KEEP),
+            (Subtract, 0, On(Same), DROP), // B occupies that material
+            (Subtract, 0, On(Opposite), KEEP), // B abuts; A's face is exposed
+            (Subtract, 1, In, KEEP_REVERSED),
+            (Subtract, 1, Out, DROP),
+            (Subtract, 1, On(Same), DROP),
+            (Subtract, 1, On(Opposite), DROP),
+        ];
+
+        for (op, solid, verdict, expected) in cells {
+            assert_eq!(
+                keep_table(op, solid, verdict),
+                expected,
+                "{op:?} solid {solid} {verdict:?}"
+            );
+        }
+    }
+
+    /// A same-sense coincident face is carried by both solids. Exactly one
+    /// of them must emit it, or the shell grows a doubled face and fails
+    /// manifoldness. The tie-break is "solid A wins", for every op.
+    #[test]
+    fn keep_table_breaks_same_sense_ties_toward_solid_a() {
+        for op in [BooleanOp::Unite, BooleanOp::Subtract, BooleanOp::Intersect] {
+            let (keep_a, _) = keep_table(op, 0, Verdict::On(Sense::Same));
+            let (keep_b, _) = keep_table(op, 1, Verdict::On(Sense::Same));
+            assert!(!keep_b, "{op:?}: B must never emit a same-sense ON region");
+            assert!(
+                !(keep_a && keep_b),
+                "{op:?}: a same-sense ON region emitted twice is non-manifold"
+            );
+        }
+    }
+
+    /// Reversal is what turns B's boundary into the wall of a cavity in A.
+    /// It applies to exactly one cell; a stray reverse elsewhere would flip
+    /// a face's normal and invert the body.
+    #[test]
+    fn keep_table_reverses_only_subtracted_b_interior() {
+        for op in [BooleanOp::Unite, BooleanOp::Subtract, BooleanOp::Intersect] {
+            for solid in [0, 1] {
+                for verdict in [
+                    Verdict::In,
+                    Verdict::Out,
+                    Verdict::On(Sense::Same),
+                    Verdict::On(Sense::Opposite),
+                ] {
+                    let (_, reverse) = keep_table(op, solid, verdict);
+                    let expected =
+                        op == BooleanOp::Subtract && solid == 1 && verdict == Verdict::In;
+                    assert_eq!(reverse, expected, "{op:?} solid {solid} {verdict:?}");
+                }
+            }
+        }
+    }
+
+    /// The In/Out cells must match the bool table this replaced, or the
+    /// existing transversal booleans change behaviour. Ray parity produces
+    /// only these four cells per op until of-bxl.4 lands.
+    #[test]
+    fn keep_table_in_out_cells_match_the_prior_bool_table() {
+        for op in [BooleanOp::Unite, BooleanOp::Subtract, BooleanOp::Intersect] {
+            for solid in [0, 1] {
+                for inside_other in [true, false] {
+                    let legacy = match (op, solid, inside_other) {
+                        (BooleanOp::Unite, _, inside) => (!inside, false),
+                        (BooleanOp::Subtract, 0, inside) => (!inside, false),
+                        (BooleanOp::Subtract, 1, inside) => (inside, true),
+                        (BooleanOp::Intersect, _, inside) => (inside, false),
+                        _ => unreachable!(),
+                    };
+                    let verdict = if inside_other {
+                        Verdict::In
+                    } else {
+                        Verdict::Out
+                    };
+                    let (keep, reverse) = keep_table(op, solid, verdict);
+                    let (legacy_keep, legacy_reverse) = legacy;
+                    assert_eq!(
+                        keep, legacy_keep,
+                        "{op:?} solid {solid} inside_other={inside_other}"
+                    );
+                    // `reverse` is only read for kept regions; the old table
+                    // left it set on some dropped ones (Subtract/B/outside).
+                    if keep {
+                        assert_eq!(
+                            reverse, legacy_reverse,
+                            "{op:?} solid {solid} inside_other={inside_other}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
