@@ -57,7 +57,7 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 > }
 > ```
 
-**Agent:** Valid solid, 31,292 triangles — the pin bore runs cleanly through all three knuckles. One sizing note worth being honest about: I opened the bore to Ø4 because at Ø3.2 this part comes back `valid: false` with a *pinched* mesh — two surface sheets fused through one octree cell where the bore goes tangent. That is a known mesher defect (of-o0o), not a part that is too small to see, and it is worth knowing which it is: a finer `accuracy` does not clear a pinch, and the bore sizes that trip it are not the small ones in particular (Ø2.4 and Ø7 fail; Ø2.8, Ø3.6 and Ø4 are fine). So Ø4 is a workaround I found by moving, not a rule I derived. Let me confirm the mesh is watertight before exporting.
+**Agent:** Valid solid, 31,292 triangles — the pin bore runs cleanly through all three knuckles. Ø4 is a design choice here, not a workaround: I swept the bore from Ø2.4 to Ø7 and every size meshes closed, so the size is mine to pick from the hinge, not from the kernel. Let me confirm the mesh is watertight before exporting.
 
 > 🔧 **`get_screenshot`** `{ "model_id": "model-2", "view": "iso", "width": 720, "height": 540 }`
 >

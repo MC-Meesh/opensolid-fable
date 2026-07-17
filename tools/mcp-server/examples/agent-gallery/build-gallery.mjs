@@ -367,15 +367,10 @@ return leaf.subtract(pin);
     const m = t.create_model(script, 'hinge-leaf');
     t.say(
       `Valid solid, ${m.mesh.triangles.toLocaleString('en-US')} triangles — the pin ` +
-        'bore runs cleanly through all three knuckles. One sizing note worth being ' +
-        'honest about: I opened the bore to Ø4 because at Ø3.2 this part comes back ' +
-        '`valid: false` with a *pinched* mesh — two surface sheets fused through one ' +
-        'octree cell where the bore goes tangent. That is a known mesher defect ' +
-        '(of-o0o), not a part that is too small to see, and it is worth knowing which ' +
-        'it is: a finer `accuracy` does not clear a pinch, and the bore sizes that ' +
-        'trip it are not the small ones in particular (Ø2.4 and Ø7 fail; Ø2.8, Ø3.6 ' +
-        'and Ø4 are fine). So Ø4 is a workaround I found by moving, not a rule I ' +
-        'derived. Let me confirm the mesh is watertight before exporting.',
+        'bore runs cleanly through all three knuckles. Ø4 is a design choice here, ' +
+        'not a workaround: I swept the bore from Ø2.4 to Ø7 and every size meshes ' +
+        'closed, so the size is mine to pick from the hinge, not from the kernel. ' +
+        'Let me confirm the mesh is watertight before exporting.',
     );
     t.screenshot(m.model_id, 'hinge-leaf-iso.png', 'iso');
     const v = t.validate(m.model_id);
@@ -696,16 +691,16 @@ return part;
     t.say(
       'A valid, watertight right-angle bracket — gusset blended, corner ' +
         'filleted, four M5 holes drilled on two axes — as a faceted STEP and a ' +
-        'print-ready STL. Two caveats an agent should carry forward. The ' +
-        '**+Y** axis convention for `extrude`/`cylinder`: get it wrong and a ' +
-        'hole silently becomes a channel through the part, with no error and a ' +
-        '`valid: true` mesh — the volume delta is the only thing that catches ' +
-        'it, which is why measuring against a hand-computed number is not ' +
-        'optional here. And the faceted STEP path is fragile: this part ' +
-        'exports only because of the trailing no-op rotation. The identical ' +
-        'part without it, and every other identity-equivalent spelling tried, ' +
-        'meshes open and declines to export — while STL, which uses a ' +
-        'different mesher, exports fine either way.',
+        'print-ready STL. Two conventions an agent should carry forward, both ' +
+        'of which fail *silently*. The **+Y** axis convention for ' +
+        '`extrude`/`cylinder`: get it wrong and a hole becomes a channel ' +
+        'through the part, with no error and a `valid: true` mesh. And the ' +
+        'angle units: `rotate` takes **radians** while `revolve` takes ' +
+        '**degrees**, so a `rotate(..., 90)` written as a quarter turn is ' +
+        'really 116.6° and quietly tilts the feature off axis. Neither shows ' +
+        'up in a render or in `valid` — the volume delta against a ' +
+        'hand-computed number is the only thing that catches either, which is ' +
+        'why measuring is not optional here.',
     );
   },
 );

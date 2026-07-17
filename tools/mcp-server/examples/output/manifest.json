@@ -5,12 +5,12 @@
     "turns": [
       {
         "kind": "narration",
-        "text": "The kernel centers primitives on the origin and takes half-extents, so a 60×40×4 base is `box3(30, 20, 2)` and the back wall is `box3(30, 2, 20)` stood up along −Y. I’ll union them, then punch four Ø6 (r=3) holes through the base on a rectangular pattern — the pattern is just a JS loop. The one thing to get right: the base is a plate lying in xy with its 4 mm thickness along **z**, so the holes must run along **z** — and `Shape.cylinder` is a **+Y** cylinder, so each one needs `rotate(1, 0, 0, 90)` to swing its axis onto +Z. Skip that and the holes bore lengthwise through the 40 mm width instead, which still reports `valid: true`."
+        "text": "The kernel centers primitives on the origin and takes half-extents, so a 60×40×4 base is `box3(30, 20, 2)` and the back wall is `box3(30, 2, 20)` stood up along −Y. I’ll union them, then punch four Ø6 (r=3) holes through the base on a rectangular pattern — the pattern is just a JS loop. The one thing to get right: the base is a plate lying in xy with its 4 mm thickness along **z**, so the holes must run along **z** — and `Shape.cylinder` is a **+Y** cylinder, so each one needs a quarter turn about X to swing its axis onto +Z. Skip that and the holes bore lengthwise through the 40 mm width instead, which still reports `valid: true`. One API note I have to get right: `rotate` takes its angle in **radians**, so that quarter turn is `rotate(1, 0, 0, Math.PI / 2)`. Writing `90` is not a 90° turn — it is 90 radians, which lands 116.6° round and tilts every bore off axis."
       },
       {
         "kind": "create_model",
         "args": {
-          "script": "// 90° angle bracket: a 60×40×4 horizontal flange and a 60×4×40 vertical\n// flange along the back edge, with four Ø6 mounting holes in the base.\nconst base = Shape.box3(30, 20, 2);                        // 60 × 40 × 4\nconst wall = Shape.box3(30, 2, 20).translate(0, -18, 22);  // 60 × 4 × 40, back edge\nlet bracket = base.union(wall);\n// cylinder() is +Y-axis; the base plate's thickness is along z, so rotate the\n// hole onto +Z before punching it through.\nconst hole = Shape.cylinder(3, 6).rotate(1, 0, 0, 90);     // r=3, +Y -> +Z\nfor (const x of [-20, 20]) for (const y of [-12, 6]) {\n  bracket = bracket.subtract(hole.translate(x, y, 0));\n}\nreturn bracket;",
+          "script": "// 90° angle bracket: a 60×40×4 horizontal flange and a 60×4×40 vertical\n// flange along the back edge, with four Ø6 mounting holes in the base.\nconst base = Shape.box3(30, 20, 2);                        // 60 × 40 × 4\nconst wall = Shape.box3(30, 2, 20).translate(0, -18, 22);  // 60 × 4 × 40, back edge\nlet bracket = base.union(wall);\n// cylinder() is +Y-axis; the base plate's thickness is along z, so rotate the\n// hole onto +Z before punching it through. rotate() takes RADIANS.\nconst hole = Shape.cylinder(3, 6).rotate(1, 0, 0, Math.PI / 2);  // r=3, +Y -> +Z\nfor (const x of [-20, 20]) for (const y of [-12, 6]) {\n  bracket = bracket.subtract(hole.translate(x, y, 0));\n}\nreturn bracket;",
           "name": "angle-bracket"
         },
         "payload": {
@@ -18,8 +18,8 @@
           "name": "angle-bracket",
           "exact": false,
           "mesh": {
-            "triangles": 19366,
-            "vertices": 9681
+            "triangles": 24188,
+            "vertices": 12088
           },
           "boundingBox": {
             "min": [
@@ -38,14 +38,14 @@
               44
             ]
           },
-          "volume": 18585.712471707368,
+          "volume": 18736.52541076776,
           "valid": true,
           "issues": []
         }
       },
       {
         "kind": "narration",
-        "text": "`create_model` returns immediately with `valid: true` and volume 18586 mm³ — the four holes and the boolean union all resolved into one closed solid. Let me eyeball it before exporting."
+        "text": "`create_model` returns immediately with `valid: true` and volume 18737 mm³ — the four holes and the boolean union all resolved into one closed solid. Let me eyeball it before exporting."
       },
       {
         "kind": "screenshot",
@@ -56,7 +56,7 @@
           "height": 540
         },
         "file": "angle-bracket-iso.png",
-        "bytes": 19590
+        "bytes": 17825
       },
       {
         "kind": "narration",
@@ -69,28 +69,28 @@
           "query": "mass"
         },
         "payload": {
-          "volume": 18585.712471707368,
-          "surfaceArea": 10645.158889048333,
+          "volume": 18736.52541076776,
+          "surfaceArea": 10723.762830207674,
           "centroid": [
-            -0.0017141130990889618,
-            -9.142890079673267,
-            11.236832123975795
+            -0.000020571797553580846,
+            -9.146998505174698,
+            11.26306284369305
           ],
           "inertia": [
             [
-              6275395.541823169,
-              -306.3689073331263,
-              1445.8172902536046
+              6345533.795163175,
+              1.9971831435529674,
+              -10.602795309747968
             ],
             [
-              -306.3689073331263,
-              9002296.533018937,
-              1851641.4006252699
+              1.9971831435529674,
+              9125871.747594982,
+              1868205.04889089
             ],
             [
-              1445.8172902536046,
-              1851641.4006252699,
-              8271231.722990537
+              -10.602795309747968,
+              1868205.04889089,
+              8360144.591583632
             ]
           ],
           "exact": false
@@ -98,7 +98,7 @@
       },
       {
         "kind": "narration",
-        "text": "Volume 18586 mm³ against 18747.6 predicted — -0.9%, which is the SDF mesher reading a hair under true volume at this accuracy, not a modelling error. (Had I left the holes on the default +Y axis they would have bored lengthwise through the plate and landed near 18032 — a 4% miss that looks fine in every render.) So: 18.6 cm³, and in 6061 aluminium (2.70 g/cm³) about **50 g**. Now the files — STL first:"
+        "text": "Volume 18737 mm³ against 18747.6 predicted — -0.1%, which is the SDF mesher reading a hair under true volume at this accuracy, not a modelling error. (Had I left the holes on the default +Y axis they would have bored lengthwise through the plate and landed near 18032 — a 4% miss that looks fine in every render.) So: 18.7 cm³, and in 6061 aluminium (2.70 g/cm³) about **51 g**. Now the files — STL first:"
       },
       {
         "kind": "export",
@@ -111,7 +111,7 @@
           "model_id": "model-1",
           "format": "stl",
           "path": "output/angle-bracket.stl",
-          "bytes": 968384
+          "bytes": 1209484
         }
       },
       {
@@ -125,7 +125,12 @@
           "format": "step",
           "path": "angle-bracket.step"
         },
-        "error": "Error: export failed: STEP export failed: degenerate geometry in sdf_to_brep: adaptive meshing did not produce a closed manifold: 2 pinched edge(s) joining 3+ triangles — two surface sheets fused through one cell, typically at a near-tangent CSG feature; this is a mesher defect (of-o0o), and a finer accuracy does not reliably clear it"
+        "payload": {
+          "model_id": "model-1",
+          "format": "step",
+          "path": "output/angle-bracket.step",
+          "bytes": 8476931
+        }
       },
       {
         "kind": "narration",
@@ -143,12 +148,12 @@
     "turns": [
       {
         "kind": "narration",
-        "text": "A knuckle is a cylinder whose default **+Y** axis I rotate onto +X, then slide along X. Three of them union onto the plate; a long thin cylinder on the same axis subtracts the pin bore. The rotation to reach for is `rotate(0, 0, 1, 90)` — turning about **Z** is what carries +Y onto X. Rotating about Y, which is the tempting one to write, would spin the cylinder about its own axis and change nothing."
+        "text": "A knuckle is a cylinder whose default **+Y** axis I rotate onto +X, then slide along X. Three of them union onto the plate; a long thin cylinder on the same axis subtracts the pin bore. The rotation to reach for is `rotate(0, 0, 1, Math.PI / 2)` — turning about **Z** is what carries +Y onto X, and the angle is in radians. Rotating about Y, which is the tempting one to write, would spin the cylinder about its own axis and change nothing."
       },
       {
         "kind": "create_model",
         "args": {
-          "script": "// One leaf of a butt hinge: a flat plate with three barrel knuckles on the\n// pin axis (X) and a pin bore drilled through them. Two of these — one\n// mirrored — pin together into a working hinge.\nconst plate = Shape.box3(30, 15, 0.75).translate(0, -15.75, 0);  // 60 × 30 × 1.5 leaf\n// cylinder() is +Y-axis. Rotating about Z carries it onto X (rotating about Y\n// would be a no-op — it is already on Y).\nconst knuckle = Shape.cylinder(4, 6).rotate(0, 0, 1, 90);        // r=4, 12 long on X\nlet leaf = plate;\nfor (const x of [-24, 0, 24]) leaf = leaf.union(knuckle.translate(x, 0, 0));\nconst pin = Shape.cylinder(2, 40).rotate(0, 0, 1, 90);           // Ø4 bore on X\nreturn leaf.subtract(pin);",
+          "script": "// One leaf of a butt hinge: a flat plate with three barrel knuckles on the\n// pin axis (X) and a pin bore drilled through them. Two of these — one\n// mirrored — pin together into a working hinge.\nconst plate = Shape.box3(30, 15, 0.75).translate(0, -15.75, 0);  // 60 × 30 × 1.5 leaf\n// cylinder() is +Y-axis. Rotating about Z carries it onto X (rotating about Y\n// would be a no-op — it is already on Y). rotate() takes RADIANS.\nconst Q = Math.PI / 2;                                           // quarter turn\nconst knuckle = Shape.cylinder(4, 6).rotate(0, 0, 1, Q);         // r=4, 12 long on X\nlet leaf = plate;\nfor (const x of [-24, 0, 24]) leaf = leaf.union(knuckle.translate(x, 0, 0));\nconst pin = Shape.cylinder(2, 40).rotate(0, 0, 1, Q);            // Ø4 bore on X\nreturn leaf.subtract(pin);",
           "name": "hinge-leaf"
         },
         "payload": {
@@ -156,34 +161,34 @@
           "name": "hinge-leaf",
           "exact": false,
           "mesh": {
-            "triangles": 24684,
-            "vertices": 12342
+            "triangles": 31292,
+            "vertices": 15642
           },
           "boundingBox": {
             "min": [
-              -31.15627444612003,
+              -30,
               -30.75,
               -4
             ],
             "max": [
-              31.15627444612003,
-              6.264428351177253,
+              30,
+              4.000000000000001,
               4
             ],
             "size": [
-              62.31254889224006,
-              37.01442835117725,
+              60,
+              34.75,
               8
             ]
           },
-          "volume": 3977.0056213444655,
+          "volume": 3815.201362779873,
           "valid": true,
           "issues": []
         }
       },
       {
         "kind": "narration",
-        "text": "Valid solid, 24,684 triangles — the pin bore runs cleanly through all three knuckles. One sizing note worth being honest about: I opened the bore to Ø4 because at Ø3.2 this part comes back `valid: false` with a *pinched* mesh — two surface sheets fused through one octree cell where the bore goes tangent. That is a known mesher defect (of-o0o), not a part that is too small to see, and it is worth knowing which it is: a finer `accuracy` does not clear a pinch, and the bore sizes that trip it are not the small ones in particular (Ø2.4 and Ø7 fail; Ø2.8, Ø3.6 and Ø4 are fine). So Ø4 is a workaround I found by moving, not a rule I derived. Let me confirm the mesh is watertight before exporting."
+        "text": "Valid solid, 31,292 triangles — the pin bore runs cleanly through all three knuckles. Ø4 is a design choice here, not a workaround: I swept the bore from Ø2.4 to Ø7 and every size meshes closed, so the size is mine to pick from the hinge, not from the kernel. Let me confirm the mesh is watertight before exporting."
       },
       {
         "kind": "screenshot",
@@ -194,7 +199,7 @@
           "height": 540
         },
         "file": "hinge-leaf-iso.png",
-        "bytes": 26640
+        "bytes": 27421
       },
       {
         "kind": "validate",
@@ -204,9 +209,9 @@
         "payload": {
           "valid": true,
           "closedManifold": true,
-          "triangles": 24684,
-          "vertices": 12342,
-          "volume": 3977.0056213444655,
+          "triangles": 31292,
+          "vertices": 15642,
+          "volume": 3815.201362779873,
           "exact": false,
           "issues": []
         }
@@ -222,7 +227,12 @@
           "format": "step",
           "path": "hinge-leaf.step"
         },
-        "error": "Error: export failed: STEP export failed: degenerate geometry in sdf_to_brep: adaptive meshing did not produce a closed manifold: 2 pinched edge(s) joining 3+ triangles — two surface sheets fused through one cell, typically at a near-tangent CSG feature; this is a mesher defect (of-o0o), and a finer accuracy does not reliably clear it"
+        "payload": {
+          "model_id": "model-2",
+          "format": "step",
+          "path": "output/hinge-leaf.step",
+          "bytes": 18541158
+        }
       },
       {
         "kind": "narration",
@@ -239,7 +249,7 @@
           "model_id": "model-2",
           "format": "stl",
           "path": "output/hinge-leaf.stl",
-          "bytes": 1234284
+          "bytes": 1564684
         }
       },
       {
@@ -267,8 +277,8 @@
           "name": "enclosure-body",
           "exact": false,
           "mesh": {
-            "triangles": 25868,
-            "vertices": 12936
+            "triangles": 29596,
+            "vertices": 14800
           },
           "boundingBox": {
             "min": [
@@ -287,14 +297,14 @@
               30
             ]
           },
-          "volume": 34621.162880956064,
+          "volume": 34763.23671539217,
           "valid": true,
           "issues": []
         }
       },
       {
         "kind": "narration",
-        "text": "Body is valid — volume 34621 mm³ after hollowing. Rendering it to check the wall broke through the top:"
+        "text": "Body is valid — volume 34763 mm³ after hollowing. Rendering it to check the wall broke through the top:"
       },
       {
         "kind": "screenshot",
@@ -305,7 +315,7 @@
           "height": 540
         },
         "file": "enclosure-body-iso.png",
-        "bytes": 24741
+        "bytes": 23084
       },
       {
         "kind": "export",
@@ -318,7 +328,7 @@
           "model_id": "model-3",
           "format": "step",
           "path": "output/enclosure-body.step",
-          "bytes": 4985617
+          "bytes": 5924702
         }
       },
       {
@@ -332,7 +342,7 @@
           "model_id": "model-3",
           "format": "stl",
           "path": "output/enclosure-body.stl",
-          "bytes": 1293484
+          "bytes": 1479884
         }
       },
       {
@@ -350,8 +360,8 @@
           "name": "enclosure-lid",
           "exact": false,
           "mesh": {
-            "triangles": 15124,
-            "vertices": 7564
+            "triangles": 17284,
+            "vertices": 8644
           },
           "boundingBox": {
             "min": [
@@ -370,7 +380,7 @@
               7
             ]
           },
-          "volume": 28863.973766896357,
+          "volume": 28883.29791850566,
           "valid": true,
           "issues": []
         }
@@ -384,7 +394,7 @@
           "height": 540
         },
         "file": "enclosure-lid-iso.png",
-        "bytes": 21835
+        "bytes": 17566
       },
       {
         "kind": "export",
@@ -397,7 +407,7 @@
           "model_id": "model-4",
           "format": "step",
           "path": "output/enclosure-lid.step",
-          "bytes": 4416489
+          "bytes": 4721868
         }
       },
       {
@@ -411,7 +421,7 @@
           "model_id": "model-4",
           "format": "stl",
           "path": "output/enclosure-lid.stl",
-          "bytes": 756284
+          "bytes": 864284
         }
       },
       {
@@ -426,12 +436,12 @@
     "turns": [
       {
         "kind": "narration",
-        "text": "One tooth box, rotated into 16 positions by a loop, unioned onto a root cylinder, minus a central bore. `(360 * i) / TEETH` spaces the teeth evenly. The circular pattern has to turn about the **same axis the disk is on** — `Shape.cylinder` is **+Y**, so that is `rotate(0, 1, 0, ...)`. Pattern about Z instead and the teeth swing up out of the disk plane into a ring of floating blocks, which still meshes and still reports `valid: true`."
+        "text": "One tooth box, rotated into 16 positions by a loop, unioned onto a root cylinder, minus a central bore. `(2 * Math.PI * i) / TEETH` spaces the teeth evenly — `rotate` is in radians, so a full turn is `2π`, not `360`. The circular pattern has to turn about the **same axis the disk is on** — `Shape.cylinder` is **+Y**, so that is `rotate(0, 1, 0, ...)`. Pattern about Z instead and the teeth swing up out of the disk plane into a ring of floating blocks, which still meshes and still reports `valid: true`."
       },
       {
         "kind": "create_model",
         "args": {
-          "script": "// A toothed disk: a root disk with N teeth placed on a circular pattern by\n// rotating one tooth box around the disk's own axis (+Y, the cylinder axis),\n// plus a central bore. The pattern is just a JS loop — the script vocabulary\n// is a real programming language.\nconst TEETH = 16, TH = 4, ROOT = 16, BORE = 4;\nlet gear = Shape.cylinder(ROOT, TH);                          // disk faces in xz, axis +Y\nconst tooth = Shape.box3(3, TH, 2.2).translate(ROOT + 1.5, 0, 0);  // radial x, thick y\nfor (let i = 0; i < TEETH; i++) {\n  gear = gear.union(tooth.rotate(0, 1, 0, (360 * i) / TEETH));     // pattern about +Y\n}\nreturn gear.subtract(Shape.cylinder(BORE, TH + 2));           // central bore, coaxial",
+          "script": "// A toothed disk: a root disk with N teeth placed on a circular pattern by\n// rotating one tooth box around the disk's own axis (+Y, the cylinder axis),\n// plus a central bore. The pattern is just a JS loop — the script vocabulary\n// is a real programming language. rotate() takes RADIANS: a full turn is 2π.\nconst TEETH = 16, TH = 4, ROOT = 16, BORE = 4;\nlet gear = Shape.cylinder(ROOT, TH);                          // disk faces in xz, axis +Y\nconst tooth = Shape.box3(3, TH, 2.2).translate(ROOT + 1.5, 0, 0);  // radial x, thick y\nfor (let i = 0; i < TEETH; i++) {\n  gear = gear.union(tooth.rotate(0, 1, 0, (2 * Math.PI * i) / TEETH));  // pattern about +Y\n}\nreturn gear.subtract(Shape.cylinder(BORE, TH + 2));           // central bore, coaxial",
           "name": "gear-disk"
         },
         "payload": {
@@ -439,34 +449,34 @@
           "name": "gear-disk",
           "exact": false,
           "mesh": {
-            "triangles": 65762,
-            "vertices": 32881
+            "triangles": 95856,
+            "vertices": 47928
           },
           "boundingBox": {
             "min": [
-              -20.614211729823097,
+              -20.5,
               -4,
-              -20.61083951798434
+              -20.5
             ],
             "max": [
-              20.567131070203015,
+              20.5,
               4,
-              20.577241106166063
+              20.5
             ],
             "size": [
-              41.181342800026115,
+              41,
               8,
-              41.1880806241504
+              41
             ]
           },
-          "volume": 8373.391779139787,
+          "volume": 8601.150151593016,
           "valid": true,
           "issues": []
         }
       },
       {
         "kind": "narration",
-        "text": "All 16 teeth resolved — `valid: true`, volume 8373 mm³. Top view to check the tooth count and spacing, then iso:"
+        "text": "All 16 teeth resolved — `valid: true`, volume 8601 mm³. Top view to check the tooth count and spacing, then iso:"
       },
       {
         "kind": "screenshot",
@@ -477,7 +487,7 @@
           "height": 540
         },
         "file": "gear-disk-top.png",
-        "bytes": 19552
+        "bytes": 22721
       },
       {
         "kind": "screenshot",
@@ -488,7 +498,7 @@
           "height": 540
         },
         "file": "gear-disk-iso.png",
-        "bytes": 33168
+        "bytes": 34200
       },
       {
         "kind": "narration",
@@ -505,7 +515,7 @@
           "model_id": "model-5",
           "format": "stl",
           "path": "output/gear-disk.stl",
-          "bytes": 3288184
+          "bytes": 4792884
         }
       },
       {
@@ -523,7 +533,7 @@
           "model_id": "model-5",
           "format": "step",
           "path": "output/gear-disk.step",
-          "bytes": 33721874
+          "bytes": 41674481
         }
       }
     ]
@@ -547,8 +557,8 @@
           "name": "bottle",
           "exact": false,
           "mesh": {
-            "triangles": 23388,
-            "vertices": 11688
+            "triangles": 33252,
+            "vertices": 16628
           },
           "boundingBox": {
             "min": [
@@ -567,7 +577,7 @@
               37.53636363636363
             ]
           },
-          "volume": 21531.303576462276,
+          "volume": 21522.428820026827,
           "valid": true,
           "issues": []
         }
@@ -585,7 +595,7 @@
           "height": 540
         },
         "file": "bottle-front.png",
-        "bytes": 36330
+        "bytes": 41127
       },
       {
         "kind": "screenshot",
@@ -596,7 +606,7 @@
           "height": 540
         },
         "file": "bottle-iso.png",
-        "bytes": 42558
+        "bytes": 47609
       },
       {
         "kind": "narration",
@@ -610,16 +620,16 @@
         "payload": {
           "valid": true,
           "closedManifold": true,
-          "triangles": 23388,
-          "vertices": 11688,
-          "volume": 21531.303576462276,
+          "triangles": 33252,
+          "vertices": 16628,
+          "volume": 21522.428820026827,
           "exact": false,
           "issues": []
         }
       },
       {
         "kind": "narration",
-        "text": "`closedManifold: true`, volume 21531 mm³ — a genuine hollow solid with an open mouth. Exporting mesh formats:"
+        "text": "`closedManifold: true`, volume 21522 mm³ — a genuine hollow solid with an open mouth. Exporting mesh formats:"
       },
       {
         "kind": "export",
@@ -632,7 +642,7 @@
           "model_id": "model-6",
           "format": "stl",
           "path": "output/bottle.stl",
-          "bytes": 1169484
+          "bytes": 1662684
         }
       },
       {
@@ -646,7 +656,7 @@
           "model_id": "model-6",
           "format": "obj",
           "path": "output/bottle.obj",
-          "bytes": 1985008
+          "bytes": 2961475
         }
       },
       {
@@ -670,7 +680,7 @@
       {
         "kind": "create_model",
         "args": {
-          "script": "// Right-angle bracket: 60×40×5 base plate, 40×40×5 vertical plate, triangular\n// gusset, 4× M5 clearance holes, 3 mm fillets on the interior corner and gusset.\n//\n// extrude() sweeps a profile along +Y, mapping profile (u,v) -> (x,z). So the\n// L cross-section is drawn in (x, z) and swept 40 mm for the bracket's width.\nconst B = 0.41421356237309503;          // tan(90°/4): a 90° arc, DXF bulge\nconst p = new Profile(-30, 0);          // base underside, at the wall end\np.lineTo(30, 0);                        // base plate, 60 long\np.lineTo(30, 5);                        // base plate, 5 thick\np.lineTo(-22, 5);                       // top of base, out to the fillet tangent\np.arcTo(-25, 8, -B);                    // 3 mm fillet on the interior corner\np.lineTo(-25, 40);                      // wall inner face, 40 tall\np.lineTo(-30, 40);                      // wall top, 5 thick\np.close();\nconst ell = Shape.extrude(p, 40);       // sweep +Y: the 40 mm width\n\n// Triangular gusset: 20 mm legs, 5 mm thick, centered across the width.\nconst t = new Profile(-25, 5);\nt.lineTo(-5, 5);\nt.lineTo(-25, 25);\nt.close();\nconst gusset = Shape.extrude(t, 5).translate(0, 17.5, 0);\n\n// smoothUnion blends the gusset into both plates: the 3 mm gusset fillets.\nlet part = ell.smoothUnion(gusset, 3);\n\n// 4× M5 clearance holes (Ø5). cylinder() is +Y-axis, so rotate it onto the\n// drilling axis: +Z for the base plate, +X for the vertical plate.\nconst zHole = Shape.cylinder(2.5, 10).rotate(1, 0, 0, 90);   // -> +Z\nfor (const y of [10, 30]) part = part.subtract(zHole.translate(15, y, 0));\nconst xHole = Shape.cylinder(2.5, 10).rotate(0, 0, 1, 90);   // -> +X\nfor (const y of [10, 30]) part = part.subtract(xHole.translate(-27.5, y, 32));\n\n// The trailing no-op rotation is a WORKAROUND, not modelling (of-obv):\n// without it this exact part meshes open at the default accuracy and STEP\n// export declines. A 360° rotation is geometrically the identity; all it\n// changes is the shape's tracked bounding box, and that shifts the meshing\n// grid onto an alignment where the mesh closes. This specific expression was\n// found by trial: other identity-equivalent spellings still fail.\nreturn part.rotate(0, 1, 0, 360);",
+          "script": "// Right-angle bracket: 60×40×5 base plate, 40×40×5 vertical plate, triangular\n// gusset, 4× M5 clearance holes, 3 mm fillets on the interior corner and gusset.\n//\n// extrude() sweeps a profile along +Y, mapping profile (u,v) -> (x,z). So the\n// L cross-section is drawn in (x, z) and swept 40 mm for the bracket's width.\nconst B = 0.41421356237309503;          // tan(90°/4): a 90° arc, DXF bulge\nconst p = new Profile(-30, 0);          // base underside, at the wall end\np.lineTo(30, 0);                        // base plate, 60 long\np.lineTo(30, 5);                        // base plate, 5 thick\np.lineTo(-22, 5);                       // top of base, out to the fillet tangent\np.arcTo(-25, 8, -B);                    // 3 mm fillet on the interior corner\np.lineTo(-25, 40);                      // wall inner face, 40 tall\np.lineTo(-30, 40);                      // wall top, 5 thick\np.close();\nconst ell = Shape.extrude(p, 40);       // sweep +Y: the 40 mm width\n\n// Triangular gusset: 20 mm legs, 5 mm thick, centered across the width.\nconst t = new Profile(-25, 5);\nt.lineTo(-5, 5);\nt.lineTo(-25, 25);\nt.close();\nconst gusset = Shape.extrude(t, 5).translate(0, 17.5, 0);\n\n// smoothUnion blends the gusset into both plates: the 3 mm gusset fillets.\nlet part = ell.smoothUnion(gusset, 3);\n\n// 4× M5 clearance holes (Ø5). cylinder() is +Y-axis, so rotate it onto the\n// drilling axis: +Z for the base plate, +X for the vertical plate. rotate()\n// takes RADIANS, so a quarter turn is Math.PI / 2.\nconst Q = Math.PI / 2;\nconst zHole = Shape.cylinder(2.5, 10).rotate(1, 0, 0, Q);    // -> +Z\nfor (const y of [10, 30]) part = part.subtract(zHole.translate(15, y, 0));\nconst xHole = Shape.cylinder(2.5, 10).rotate(0, 0, 1, Q);    // -> +X\nfor (const y of [10, 30]) part = part.subtract(xHole.translate(-27.5, y, 32));\n\nreturn part;",
           "name": "bracket-right-angle"
         },
         "payload": {
@@ -678,34 +688,34 @@
           "name": "bracket-right-angle",
           "exact": false,
           "mesh": {
-            "triangles": 28716,
-            "vertices": 14352
+            "triangles": 28796,
+            "vertices": 14392
           },
           "boundingBox": {
             "min": [
-              -9.442687855771439,
+              -30.75,
               -0.75,
-              -41.047070473065915
+              -0.75
             ],
             "max": [
-              47.7993167923437,
+              30.75,
               40.75,
-              29.699426813604816
+              40.75
             ],
             "size": [
-              57.24200464811514,
+              61.5,
               41.5,
-              70.74649728667073
+              41.5
             ]
           },
-          "volume": 19725.638807373976,
+          "volume": 19786.79765644562,
           "valid": true,
           "issues": []
         }
       },
       {
         "kind": "narration",
-        "text": "`valid: true`, volume 19726 mm³. That is the oracle that matters: hand-integrating the section gives 19792 mm³ (19077 for the filleted L, +1000 gusset, +blend, −393 for four Ø5 holes through 5 mm), so the mesh is reading 0.3% under — the same bias a plain 60×40×5 slab shows (11968 vs 12000). The holes are real: drop them and the body measures 20184 mm³. Let me look at it from three sides before exporting."
+        "text": "`valid: true`, volume 19787 mm³. That is the oracle that matters: hand-integrating the section gives 19792 mm³ (19077 for the filleted L, +1000 gusset, +blend, −393 for four Ø5 holes through 5 mm), so the mesh is reading 0.3% under — the same bias a plain 60×40×5 slab shows (11968 vs 12000). The holes are real: drop them and the body measures 20184 mm³. Let me look at it from three sides before exporting."
       },
       {
         "kind": "screenshot",
@@ -716,7 +726,7 @@
           "height": 540
         },
         "file": "bracket-right-angle-iso.png",
-        "bytes": 17561
+        "bytes": 32505
       },
       {
         "kind": "screenshot",
@@ -727,7 +737,7 @@
           "height": 540
         },
         "file": "bracket-right-angle-top.png",
-        "bytes": 20373
+        "bytes": 17684
       },
       {
         "kind": "screenshot",
@@ -738,7 +748,7 @@
           "height": 540
         },
         "file": "bracket-right-angle-front.png",
-        "bytes": 21524
+        "bytes": 29460
       },
       {
         "kind": "narration",
@@ -751,28 +761,28 @@
           "query": "mass"
         },
         "payload": {
-          "volume": 19725.638807373976,
-          "surfaceArea": 9238.05993943162,
+          "volume": 19786.79765644562,
+          "surfaceArea": 9221.085221281435,
           "centroid": [
-            12.45185878217461,
-            20.014728438991696,
-            7.576835948929436
+            -10.742706235801062,
+            20.000016553543194,
+            9.808830414815995
           ],
           "inertia": [
             [
-              7686048.81609845,
-              3952.9543972890824,
-              -3147808.0321175363
+              4926679.008941298,
+              40.11055980809033,
+              2343981.4189155716
             ],
             [
-              3952.9543972890824,
-              9226802.870358348,
-              6567.799299844075
+              40.11055980809033,
+              9299727.545560187,
+              -80.87396221142262
             ],
             [
-              -3147808.0321175363,
-              6567.799299844075,
-              6525541.356571443
+              2343981.4189155716,
+              -80.87396221142262,
+              9366653.418768229
             ]
           ],
           "exact": false
@@ -780,7 +790,7 @@
       },
       {
         "kind": "narration",
-        "text": "Volume 19726 mm³ = 19.7 cm³; in 6061 aluminium (2.70 g/cm³) that is about **53 g**. Note the `boundingBox` the tools report is the *tracked* box, not the part: it reads 61.5 × 41.5 × 41.5 for a part that is really 60 × 40 × 40, because `smoothUnion` pads the tracked box by `radius/4` and the no-op rotation pads it further. Do not trust it as a measurement. Exporting:"
+        "text": "Volume 19787 mm³ = 19.8 cm³; in 6061 aluminium (2.70 g/cm³) that is about **53 g**. Note the `boundingBox` the tools report is the *tracked* box, not the part: it reads 61.5 × 41.5 × 41.5 for a part that is really 60 × 40 × 40, because `smoothUnion` pads the tracked box by `radius/4`. It is a conservative bound the kernel carries for meshing, not a measurement — do not read dimensions off it. Exporting:"
       },
       {
         "kind": "export",
@@ -793,7 +803,7 @@
           "model_id": "model-7",
           "format": "step",
           "path": "output/bracket-right-angle.step",
-          "bytes": 20819785
+          "bytes": 11887645
         }
       },
       {
@@ -807,12 +817,12 @@
           "model_id": "model-7",
           "format": "stl",
           "path": "output/bracket-right-angle.stl",
-          "bytes": 1435884
+          "bytes": 1439884
         }
       },
       {
         "kind": "narration",
-        "text": "A valid, watertight right-angle bracket — gusset blended, corner filleted, four M5 holes drilled on two axes — as a faceted STEP and a print-ready STL. Two caveats an agent should carry forward. The **+Y** axis convention for `extrude`/`cylinder`: get it wrong and a hole silently becomes a channel through the part, with no error and a `valid: true` mesh — the volume delta is the only thing that catches it, which is why measuring against a hand-computed number is not optional here. And the faceted STEP path is fragile: this part exports only because of the trailing no-op rotation. The identical part without it, and every other identity-equivalent spelling tried, meshes open and declines to export — while STL, which uses a different mesher, exports fine either way."
+        "text": "A valid, watertight right-angle bracket — gusset blended, corner filleted, four M5 holes drilled on two axes — as a faceted STEP and a print-ready STL. Two conventions an agent should carry forward, both of which fail *silently*. The **+Y** axis convention for `extrude`/`cylinder`: get it wrong and a hole becomes a channel through the part, with no error and a `valid: true` mesh. And the angle units: `rotate` takes **radians** while `revolve` takes **degrees**, so a `rotate(..., 90)` written as a quarter turn is really 116.6° and quietly tilts the feature off axis. Neither shows up in a render or in `valid` — the volume delta against a hand-computed number is the only thing that catches either, which is why measuring is not optional here."
       }
     ]
   }

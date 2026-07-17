@@ -41,19 +41,15 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 > let part = ell.smoothUnion(gusset, 3);
 > 
 > // 4× M5 clearance holes (Ø5). cylinder() is +Y-axis, so rotate it onto the
-> // drilling axis: +Z for the base plate, +X for the vertical plate.
-> const zHole = Shape.cylinder(2.5, 10).rotate(1, 0, 0, 90);   // -> +Z
+> // drilling axis: +Z for the base plate, +X for the vertical plate. rotate()
+> // takes RADIANS, so a quarter turn is Math.PI / 2.
+> const Q = Math.PI / 2;
+> const zHole = Shape.cylinder(2.5, 10).rotate(1, 0, 0, Q);    // -> +Z
 > for (const y of [10, 30]) part = part.subtract(zHole.translate(15, y, 0));
-> const xHole = Shape.cylinder(2.5, 10).rotate(0, 0, 1, 90);   // -> +X
+> const xHole = Shape.cylinder(2.5, 10).rotate(0, 0, 1, Q);    // -> +X
 > for (const y of [10, 30]) part = part.subtract(xHole.translate(-27.5, y, 32));
 > 
-> // The trailing no-op rotation is a WORKAROUND, not modelling (of-obv):
-> // without it this exact part meshes open at the default accuracy and STEP
-> // export declines. A 360° rotation is geometrically the identity; all it
-> // changes is the shape's tracked bounding box, and that shifts the meshing
-> // grid onto an alignment where the mesh closes. This specific expression was
-> // found by trial: other identity-equivalent spellings still fail.
-> return part.rotate(0, 1, 0, 360);
+> return part;
 > ```
 > ```json
 > {
@@ -61,86 +57,86 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 >   "name": "bracket-right-angle",
 >   "exact": false,
 >   "mesh": {
->     "triangles": 28716,
->     "vertices": 14352
+>     "triangles": 28796,
+>     "vertices": 14392
 >   },
 >   "boundingBox": {
 >     "min": [
->       -9.442687855771439,
+>       -30.75,
 >       -0.75,
->       -41.047070473065915
+>       -0.75
 >     ],
 >     "max": [
->       47.7993167923437,
+>       30.75,
 >       40.75,
->       29.699426813604816
+>       40.75
 >     ],
 >     "size": [
->       57.24200464811514,
+>       61.5,
 >       41.5,
->       70.74649728667073
+>       41.5
 >     ]
 >   },
->   "volume": 19725.638807373976,
+>   "volume": 19786.79765644562,
 >   "valid": true,
 >   "issues": []
 > }
 > ```
 
-**Agent:** `valid: true`, volume 19726 mm³. That is the oracle that matters: hand-integrating the section gives 19792 mm³ (19077 for the filleted L, +1000 gusset, +blend, −393 for four Ø5 holes through 5 mm), so the mesh is reading 0.3% under — the same bias a plain 60×40×5 slab shows (11968 vs 12000). The holes are real: drop them and the body measures 20184 mm³. Let me look at it from three sides before exporting.
+**Agent:** `valid: true`, volume 19787 mm³. That is the oracle that matters: hand-integrating the section gives 19792 mm³ (19077 for the filleted L, +1000 gusset, +blend, −393 for four Ø5 holes through 5 mm), so the mesh is reading 0.3% under — the same bias a plain 60×40×5 slab shows (11968 vs 12000). The holes are real: drop them and the body measures 20184 mm³. Let me look at it from three sides before exporting.
 
 > 🔧 **`get_screenshot`** `{ "model_id": "model-7", "view": "iso", "width": 720, "height": 540 }`
 >
 > ![bracket-right-angle — iso view](../output/bracket-right-angle-iso.png)
 >
-> *(real 720×540 render, 17 KB PNG)*
+> *(real 720×540 render, 32 KB PNG)*
 
 > 🔧 **`get_screenshot`** `{ "model_id": "model-7", "view": "top", "width": 720, "height": 540 }`
 >
 > ![bracket-right-angle — top view](../output/bracket-right-angle-top.png)
 >
-> *(real 720×540 render, 20 KB PNG)*
+> *(real 720×540 render, 17 KB PNG)*
 
 > 🔧 **`get_screenshot`** `{ "model_id": "model-7", "view": "front", "width": 720, "height": 540 }`
 >
 > ![bracket-right-angle — front view](../output/bracket-right-angle-front.png)
 >
-> *(real 720×540 render, 21 KB PNG)*
+> *(real 720×540 render, 29 KB PNG)*
 
 **Agent:** The `top` render is the elevation that matters: the L-section with the 3 mm fillet blended into the interior corner and the gusset filling the angle. `front` is the plan view of the base plate with its two M5 holes, and the iso ties it together. Mass properties:
 
 > 🔧 **`measure`** `{ "model_id": "model-7", "query": "mass" }`
 > ```json
 > {
->   "volume": 19725.638807373976,
->   "surfaceArea": 9238.05993943162,
+>   "volume": 19786.79765644562,
+>   "surfaceArea": 9221.085221281435,
 >   "centroid": [
->     12.45185878217461,
->     20.014728438991696,
->     7.576835948929436
+>     -10.742706235801062,
+>     20.000016553543194,
+>     9.808830414815995
 >   ],
 >   "inertia": [
 >     [
->       7686048.81609845,
->       3952.9543972890824,
->       -3147808.0321175363
+>       4926679.008941298,
+>       40.11055980809033,
+>       2343981.4189155716
 >     ],
 >     [
->       3952.9543972890824,
->       9226802.870358348,
->       6567.799299844075
+>       40.11055980809033,
+>       9299727.545560187,
+>       -80.87396221142262
 >     ],
 >     [
->       -3147808.0321175363,
->       6567.799299844075,
->       6525541.356571443
+>       2343981.4189155716,
+>       -80.87396221142262,
+>       9366653.418768229
 >     ]
 >   ],
 >   "exact": false
 > }
 > ```
 
-**Agent:** Volume 19726 mm³ = 19.7 cm³; in 6061 aluminium (2.70 g/cm³) that is about **53 g**. Note the `boundingBox` the tools report is the *tracked* box, not the part: it reads 61.5 × 41.5 × 41.5 for a part that is really 60 × 40 × 40, because `smoothUnion` pads the tracked box by `radius/4` and the no-op rotation pads it further. Do not trust it as a measurement. Exporting:
+**Agent:** Volume 19787 mm³ = 19.8 cm³; in 6061 aluminium (2.70 g/cm³) that is about **53 g**. Note the `boundingBox` the tools report is the *tracked* box, not the part: it reads 61.5 × 41.5 × 41.5 for a part that is really 60 × 40 × 40, because `smoothUnion` pads the tracked box by `radius/4`. It is a conservative bound the kernel carries for meshing, not a measurement — do not read dimensions off it. Exporting:
 
 > 🔧 **`export`** `{ "model_id": "model-7", "format": "step", "path": "bracket-right-angle.step" }`
 > ```json
@@ -148,7 +144,7 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 >   "model_id": "model-7",
 >   "format": "step",
 >   "path": "output/bracket-right-angle.step",
->   "bytes": 20819785
+>   "bytes": 11887645
 > }
 > ```
 
@@ -158,8 +154,8 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 >   "model_id": "model-7",
 >   "format": "stl",
 >   "path": "output/bracket-right-angle.stl",
->   "bytes": 1435884
+>   "bytes": 1439884
 > }
 > ```
 
-**Agent:** A valid, watertight right-angle bracket — gusset blended, corner filleted, four M5 holes drilled on two axes — as a faceted STEP and a print-ready STL. Two caveats an agent should carry forward. The **+Y** axis convention for `extrude`/`cylinder`: get it wrong and a hole silently becomes a channel through the part, with no error and a `valid: true` mesh — the volume delta is the only thing that catches it, which is why measuring against a hand-computed number is not optional here. And the faceted STEP path is fragile: this part exports only because of the trailing no-op rotation. The identical part without it, and every other identity-equivalent spelling tried, meshes open and declines to export — while STL, which uses a different mesher, exports fine either way.
+**Agent:** A valid, watertight right-angle bracket — gusset blended, corner filleted, four M5 holes drilled on two axes — as a faceted STEP and a print-ready STL. Two conventions an agent should carry forward, both of which fail *silently*. The **+Y** axis convention for `extrude`/`cylinder`: get it wrong and a hole becomes a channel through the part, with no error and a `valid: true` mesh. And the angle units: `rotate` takes **radians** while `revolve` takes **degrees**, so a `rotate(..., 90)` written as a quarter turn is really 116.6° and quietly tilts the feature off axis. Neither shows up in a render or in `valid` — the volume delta against a hand-computed number is the only thing that catches either, which is why measuring is not optional here.

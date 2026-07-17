@@ -8,19 +8,19 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 
 ---
 
-**Agent:** One tooth box, rotated into 16 positions by a loop, unioned onto a root cylinder, minus a central bore. `(360 * i) / TEETH` spaces the teeth evenly. The circular pattern has to turn about the **same axis the disk is on** — `Shape.cylinder` is **+Y**, so that is `rotate(0, 1, 0, ...)`. Pattern about Z instead and the teeth swing up out of the disk plane into a ring of floating blocks, which still meshes and still reports `valid: true`.
+**Agent:** One tooth box, rotated into 16 positions by a loop, unioned onto a root cylinder, minus a central bore. `(2 * Math.PI * i) / TEETH` spaces the teeth evenly — `rotate` is in radians, so a full turn is `2π`, not `360`. The circular pattern has to turn about the **same axis the disk is on** — `Shape.cylinder` is **+Y**, so that is `rotate(0, 1, 0, ...)`. Pattern about Z instead and the teeth swing up out of the disk plane into a ring of floating blocks, which still meshes and still reports `valid: true`.
 
 > 🔧 **`create_model`**
 > ```js
 > // A toothed disk: a root disk with N teeth placed on a circular pattern by
 > // rotating one tooth box around the disk's own axis (+Y, the cylinder axis),
 > // plus a central bore. The pattern is just a JS loop — the script vocabulary
-> // is a real programming language.
+> // is a real programming language. rotate() takes RADIANS: a full turn is 2π.
 > const TEETH = 16, TH = 4, ROOT = 16, BORE = 4;
 > let gear = Shape.cylinder(ROOT, TH);                          // disk faces in xz, axis +Y
 > const tooth = Shape.box3(3, TH, 2.2).translate(ROOT + 1.5, 0, 0);  // radial x, thick y
 > for (let i = 0; i < TEETH; i++) {
->   gear = gear.union(tooth.rotate(0, 1, 0, (360 * i) / TEETH));     // pattern about +Y
+>   gear = gear.union(tooth.rotate(0, 1, 0, (2 * Math.PI * i) / TEETH));  // pattern about +Y
 > }
 > return gear.subtract(Shape.cylinder(BORE, TH + 2));           // central bore, coaxial
 > ```
@@ -30,45 +30,45 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 >   "name": "gear-disk",
 >   "exact": false,
 >   "mesh": {
->     "triangles": 65762,
->     "vertices": 32881
+>     "triangles": 95856,
+>     "vertices": 47928
 >   },
 >   "boundingBox": {
 >     "min": [
->       -20.614211729823097,
+>       -20.5,
 >       -4,
->       -20.61083951798434
+>       -20.5
 >     ],
 >     "max": [
->       20.567131070203015,
+>       20.5,
 >       4,
->       20.577241106166063
+>       20.5
 >     ],
 >     "size": [
->       41.181342800026115,
+>       41,
 >       8,
->       41.1880806241504
+>       41
 >     ]
 >   },
->   "volume": 8373.391779139787,
+>   "volume": 8601.150151593016,
 >   "valid": true,
 >   "issues": []
 > }
 > ```
 
-**Agent:** All 16 teeth resolved — `valid: true`, volume 8373 mm³. Top view to check the tooth count and spacing, then iso:
+**Agent:** All 16 teeth resolved — `valid: true`, volume 8601 mm³. Top view to check the tooth count and spacing, then iso:
 
 > 🔧 **`get_screenshot`** `{ "model_id": "model-5", "view": "top", "width": 720, "height": 540 }`
 >
 > ![gear-disk — top view](../output/gear-disk-top.png)
 >
-> *(real 720×540 render, 19 KB PNG)*
+> *(real 720×540 render, 22 KB PNG)*
 
 > 🔧 **`get_screenshot`** `{ "model_id": "model-5", "view": "iso", "width": 720, "height": 540 }`
 >
 > ![gear-disk — iso view](../output/gear-disk-iso.png)
 >
-> *(real 720×540 render, 32 KB PNG)*
+> *(real 720×540 render, 33 KB PNG)*
 
 **Agent:** Sixteen evenly-spaced teeth, and the disk reads 8 mm thick in y — which is the check that matters here. Had I patterned about Z, the top view would still show a tidy ring of sixteen blocks and `valid` would still be `true`, but the bounding box would come back 41 × 41 × 32 instead of 41 × 8 × 41: teeth orbiting the disk rather than sitting on its rim. STL exports the mesh directly:
 
@@ -78,7 +78,7 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 >   "model_id": "model-5",
 >   "format": "stl",
 >   "path": "output/gear-disk.stl",
->   "bytes": 3288184
+>   "bytes": 4792884
 > }
 > ```
 
@@ -90,6 +90,6 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 >   "model_id": "model-5",
 >   "format": "step",
 >   "path": "output/gear-disk.step",
->   "bytes": 33721874
+>   "bytes": 41674481
 > }
 > ```

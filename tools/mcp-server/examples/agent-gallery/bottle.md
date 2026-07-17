@@ -39,8 +39,8 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 >   "name": "bottle",
 >   "exact": false,
 >   "mesh": {
->     "triangles": 23388,
->     "vertices": 11688
+>     "triangles": 33252,
+>     "vertices": 16628
 >   },
 >   "boundingBox": {
 >     "min": [
@@ -59,7 +59,7 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 >       37.53636363636363
 >     ]
 >   },
->   "volume": 21531.303576462276,
+>   "volume": 21522.428820026827,
 >   "valid": true,
 >   "issues": []
 > }
@@ -71,13 +71,13 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 >
 > ![bottle — front view](../output/bottle-front.png)
 >
-> *(real 720×540 render, 35 KB PNG)*
+> *(real 720×540 render, 40 KB PNG)*
 
 > 🔧 **`get_screenshot`** `{ "model_id": "model-6", "view": "iso", "width": 720, "height": 540 }`
 >
 > ![bottle — iso view](../output/bottle-iso.png)
 >
-> *(real 720×540 render, 42 KB PNG)*
+> *(real 720×540 render, 46 KB PNG)*
 
 **Agent:** Now the watertightness check — a shell that didn’t break through would read as a closed cavity:
 
@@ -86,15 +86,15 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 > {
 >   "valid": true,
 >   "closedManifold": true,
->   "triangles": 23388,
->   "vertices": 11688,
->   "volume": 21531.303576462276,
+>   "triangles": 33252,
+>   "vertices": 16628,
+>   "volume": 21522.428820026827,
 >   "exact": false,
 >   "issues": []
 > }
 > ```
 
-**Agent:** `closedManifold: true`, volume 21531 mm³ — a genuine hollow solid with an open mouth. Exporting mesh formats:
+**Agent:** `closedManifold: true`, volume 21522 mm³ — a genuine hollow solid with an open mouth. Exporting mesh formats:
 
 > 🔧 **`export`** `{ "model_id": "model-6", "format": "stl", "path": "bottle.stl" }`
 > ```json
@@ -102,7 +102,7 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 >   "model_id": "model-6",
 >   "format": "stl",
 >   "path": "output/bottle.stl",
->   "bytes": 1169484
+>   "bytes": 1662684
 > }
 > ```
 
@@ -112,7 +112,7 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 >   "model_id": "model-6",
 >   "format": "obj",
 >   "path": "output/bottle.obj",
->   "bytes": 1985008
+>   "bytes": 2961475
 > }
 > ```
 

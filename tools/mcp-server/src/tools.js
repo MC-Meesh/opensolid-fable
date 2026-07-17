@@ -82,7 +82,16 @@ export function createTools(config = {}) {
           'Build a CAD model from a playground JS script and register it under a ' +
           'model_id. The script has `Shape` and `Profile` in scope and must `return` ' +
           'a Shape (identical semantics to the browser playground). Returns the ' +
-          'model_id plus mesh statistics and a validation summary.',
+          'model_id plus mesh statistics and a validation summary.\n' +
+          'Two conventions that fail silently — a wrong one still returns ' +
+          '`valid: true`, so check the volume against a hand-computed number:\n' +
+          '- ANGLE UNITS ARE NOT UNIFORM: `rotate(ax, ay, az, angle)` takes ' +
+          '**radians**, but `revolve(profile, angle)` takes **degrees**. A quarter ' +
+          'turn is `rotate(1, 0, 0, Math.PI / 2)`; writing `90` there means 90 ' +
+          'radians (116.6°) and tilts the feature off axis.\n' +
+          '- `cylinder`, `extrude` and `revolve` are built on the **+Y** axis. ' +
+          'Rotate a cylinder onto +Z (`rotate(1, 0, 0, Math.PI / 2)`) or +X ' +
+          '(`rotate(0, 0, 1, Math.PI / 2)`) before using it to drill along those axes.',
         inputSchema: {
           type: 'object',
           properties: {
