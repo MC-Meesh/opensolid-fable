@@ -351,16 +351,37 @@ mod tests {
         let (store2, geo2, bodies) = reimport(&export.text);
         assert_eq!(bodies.len(), 1, "one MANIFOLD_SOLID_BREP expected");
 
-        // Measuring the re-imported body directly is not possible today:
-        // `tessellate_body` refuses a planar face carrying hole loops
-        // ("needs constrained triangulation"), which every drilled plate on
-        // this part has. `step_corpus.rs`'s own `closed_volume` hits the same
-        // wall and returns None. So identity is established the same way the
-        // exact test does — `write ∘ read` as a fixed point — but compared
-        // numerically rather than bytewise, because the reader re-normalizes
-        // DIRECTION vectors and shifts scattered facet normals by ~1 ULP.
-        // Identical geometry to 1e-9 relative encloses an identical volume;
-        // the analytic pin above is what rules out agreeing on a wrong solid.
+        // Measure the re-imported body itself — the thing the round trip is
+        // really claiming, and only checkable now that `tessellate_body`
+        // bridges the hole loops every drilled plate on this part carries
+        // (of-fc8). It is held to the analytic volume, the same bar the
+        // exported mesh meets above: a re-import that dropped a hole, paved
+        // one over, or lost the gusset misses this band.
+        //
+        // It is not compared against `volume` at float tolerance, and must
+        // not be: `export_step` runs its own `sdf_to_brep` recovery at its
+        // own depth rather than serializing the `mesh_adaptive` triangles, so
+        // the two are independent facetings of one SDF and sit ~2% apart by
+        // construction. Identity of the *file* is what the fixed point below
+        // establishes.
+        use opensolid_kernel::brep::{TessellationOptions, tessellate_body};
+        let reimported_volume = mass_properties(
+            &tessellate_body(&store2, &geo2, bodies[0], &TessellationOptions::default())
+                .expect("re-imported faceted body must tessellate (of-fc8)"),
+        )
+        .expect("re-imported bracket mesh is a closed manifold")
+        .volume;
+        let rel = (reimported_volume - analytic).abs() / analytic;
+        assert!(
+            rel <= 3e-2,
+            "re-imported bracket volume {reimported_volume} deviates {rel:e} \
+             from the analytic {analytic}; the STEP round trip lost material"
+        );
+
+        // Identity of the file itself: `write ∘ read` as a fixed point, as
+        // the exact test does, but compared numerically rather than bytewise
+        // — on the faceted path the reader re-normalizes DIRECTION vectors
+        // and shifts scattered facet normals by ~1 ULP.
         let text2 = write_step(&store2, &geo2, &[bodies[0]], &StepWriteOptions::default())
             .expect("re-imported body must serialize");
         assert_step_numerically_identical(&export.text, &text2);
@@ -378,9 +399,7 @@ mod tests {
                 continue;
             }
             let split = |s: &str| -> Vec<String> {
-                s.split(|c: char| c == ',' || c == '(' || c == ')' || c == ' ')
-                    .map(str::to_owned)
-                    .collect()
+                s.split([',', '(', ')', ' ']).map(str::to_owned).collect()
             };
             let (tx, ty) = (split(x), split(y));
             assert_eq!(

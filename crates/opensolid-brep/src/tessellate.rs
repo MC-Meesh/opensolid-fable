@@ -3,9 +3,10 @@
 //!
 //! Strategy, per face by surface kind:
 //!
-//! - **Planar faces**: the outer loop is sampled into a polygon (lines as
-//!   single segments, circles/ellipses at the angular step) and
-//!   ear-clip triangulated (correct for concave outlines).
+//! - **Planar faces**: every loop is sampled into a polygon (lines as
+//!   single segments, circles/ellipses at the angular step); inner loops
+//!   (holes) are bridged into the outer loop and the result is ear-clip
+//!   triangulated (correct for concave outlines).
 //! - **Quadric faces** (cylinder, cone, sphere, torus): sampled on a
 //!   parameter grid. Periodic directions wrap by index, so seams close
 //!   exactly; parameterization singularities (sphere poles, cone apex)
@@ -27,10 +28,6 @@
 //!
 //! # MVP limitations (later hardening passes)
 //!
-//! - Planar faces are **ear-clip** triangulated (correct for concave outer
-//!   loops), but faces with inner loops (holes) are still rejected with
-//!   [`CoreError::NotImplemented`]. Full constrained Delaunay triangulation
-//!   (hole bridging, as in [`crate::boolean`]) is a later pass.
 //! - Cylinder/cone faces cover either their **full `u` period** (primitive and
 //!   sweep walls) or a **partial arc that is a clean iso-parameter rectangle**
 //!   (`[u_lo, u_hi] × [v_lo, v_hi]`, e.g. a quarter-cylinder notch from a
@@ -115,8 +112,9 @@ fn angular_segments(sweep: f64, options: &TessellationOptions) -> usize {
 ///
 /// # Errors
 /// [`CoreError::InvalidArgument`] if `body` is stale, or any reached face
-/// or edge lacks attached geometry; [`CoreError::NotImplemented`] for
-/// planar faces with holes (see the module docs).
+/// or edge lacks attached geometry; [`CoreError::NotImplemented`] for the
+/// trimmed quadric faces the module docs list; [`CoreError::Degenerate`] if a
+/// planar face's inner loops do not bound a valid region.
 pub fn tessellate_body(
     store: &TopologyStore,
     geo: &GeometryStore,
@@ -237,8 +235,9 @@ fn tessellate_face_into(
     }
 }
 
-/// Ear-clip triangulate a planar face's outer loop polygon. Correct for
-/// concave outlines, unlike the old first-vertex fan (of-6dw).
+/// Ear-clip triangulate a planar face, bridging any inner loops (holes) into
+/// the outer loop first. Correct for concave outlines, unlike the old
+/// first-vertex fan (of-6dw).
 #[allow(clippy::too_many_arguments)]
 fn fan_planar_face(
     store: &TopologyStore,
@@ -250,21 +249,24 @@ fn fan_planar_face(
     options: &TessellationOptions,
     mesh: &mut TriangleMesh,
 ) -> CoreResult<()> {
-    if !face.inner_loops.is_empty() {
-        return Err(CoreError::NotImplemented {
-            feature: "tessellating planar faces with holes (needs constrained triangulation)",
-        });
-    }
     let loop_id = face
         .outer_loop
         .ok_or_else(|| invalid_face(face_id, "has no outer loop"))?;
-    let polygon = sample_loop(store, geo, face_id, loop_id, options)?;
-    if polygon.len() < 3 {
+    let outer = sample_loop(store, geo, face_id, loop_id, options)?;
+    if outer.len() < 3 {
         return Err(invalid_face(
             face_id,
             "outer loop samples to fewer than 3 points",
         ));
     }
+    // Hole loops (every drilled plate has them, of-fc8) are sampled the same
+    // way and bridged into the outer loop below. A hole sampling to fewer
+    // than 3 points cuts nothing out; `ear_clip_rings` drops it.
+    let mut rings_3d = vec![outer];
+    for &inner_id in &face.inner_loops {
+        rings_3d.push(sample_loop(store, geo, face_id, inner_id, options)?);
+    }
+    let polygon: Vec<Point3> = rings_3d.iter().flatten().copied().collect();
 
     let surface_normal = surface
         .normal(0.0, 0.0)
@@ -290,14 +292,21 @@ fn fan_planar_face(
     // the loop runs counterclockwise about the outward normal.
     let (e_u, e_v) = plane_basis(&normal);
     let origin = polygon[0];
-    let uv: Vec<(f64, f64)> = polygon
+    let project = |p: &Point3| {
+        let d = p - origin;
+        (d.dot(&e_u), d.dot(&e_v))
+    };
+    let rings: Vec<Vec<(f64, f64)>> = rings_3d
         .iter()
-        .map(|p| {
-            let d = p - origin;
-            (d.dot(&e_u), d.dot(&e_v))
-        })
+        .map(|ring| ring.iter().map(project).collect())
         .collect();
-    for [a, b, c] in crate::triangulate::ear_clip(&uv) {
+    // `ear_clip_rings` indexes the rings' concatenation, matching the order
+    // `polygon` (and hence the emitted vertices) was built in.
+    let tris = crate::triangulate::ear_clip_rings(&rings).ok_or_else(|| CoreError::Degenerate {
+        context: "tessellate::planar_face",
+        reason: format!("face {face_id:?} has an inner loop that cannot be bridged to its outer loop; the loops do not bound a valid region"),
+    })?;
+    for [a, b, c] in tris {
         mesh.indices.push([base + a, base + b, base + c]);
     }
     Ok(())
@@ -724,6 +733,50 @@ mod tests {
             signed_volume(&reference),
             0.02,
             "notch volume vs BooleanOutput::tessellate",
+        );
+    }
+
+    /// The of-fc8 case: a drilled plate. Its top and bottom faces are planes
+    /// carrying a circular inner loop, which `tessellate_body` used to reject
+    /// outright (`NotImplemented`) — so no real mechanical part could be
+    /// measured. Bridging the hole into the outer loop tessellates it to a
+    /// watertight genus-1 mesh with the drilled volume.
+    #[test]
+    fn drilled_plate_is_watertight_with_the_hole_open() {
+        use opensolid_core::tolerance::ToleranceContext;
+        let mut store = TopologyStore::new();
+        let mut geo = GeometryStore::new();
+        let (w, t, r) = (4.0, 2.0, 1.0);
+        let plate = primitives::block(&mut store, &mut geo, w, w, t).unwrap();
+        // Concentric with the plate and longer than it: pierces clean through,
+        // so top and bottom each gain a circular inner loop.
+        let tool = primitives::cylinder(&mut store, &mut geo, r, 2.0 * t).unwrap();
+        let out = crate::boolean::subtract(&store, &geo, plate, tool, &ToleranceContext::default())
+            .expect("subtract");
+        let mesh = tessellate_body(
+            &out.store,
+            &out.geo,
+            out.body,
+            &TessellationOptions::default(),
+        )
+        .expect("planar faces with holes must tessellate (of-fc8)");
+
+        assert!(
+            mesh.is_closed_manifold(),
+            "drilled plate must be watertight, got {} tris",
+            mesh.triangle_count()
+        );
+        // Genus 1: V - E + F = 2 - 2g = 0. This is what proves the hole is
+        // actually open — a mesh that paved over it would have the right
+        // topology only by closing the tube, and its volume would be wrong.
+        assert_eq!(euler_characteristic(&mesh), 0, "through hole is genus 1");
+        let expected = w * w * t - PI * r * r * t;
+        assert_within(signed_volume(&mesh), expected, 0.02, "drilled plate volume");
+        assert_within(
+            signed_volume(&mesh),
+            signed_volume(&out.tessellate().expect("BooleanOutput::tessellate")),
+            0.02,
+            "volume vs BooleanOutput::tessellate",
         );
     }
 

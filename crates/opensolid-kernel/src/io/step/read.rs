@@ -103,7 +103,7 @@
 use std::collections::HashMap;
 
 use opensolid_brep::curve::plane_basis;
-use opensolid_brep::triangulate::ear_clip;
+use opensolid_brep::triangulate::{ear_clip_rings, signed_area2};
 use opensolid_brep::{
     Body, BodyType, Curve3, CurveEval, Edge, Face, FaceSense, Fin, FinSense, GeometryStore,
     KnotVector, Loop, LoopType, NurbsCurve, NurbsError, NurbsSurface, SYSTEM_RESOLUTION, Shell,
@@ -1570,7 +1570,8 @@ impl FallbackMesher<'_> {
         }
     }
 
-    /// Ear-clip a planar face's boundary polygon.
+    /// Ear-clip a planar face's boundary polygon, bridging in any hole
+    /// bounds (of-fc8: every drilled plate has them).
     fn mesh_planar_face(
         &mut self,
         mesh: &mut TriangleMesh,
@@ -1579,14 +1580,11 @@ impl FallbackMesher<'_> {
         surface: &Surface3,
         same_sense: bool,
     ) -> MapResult<()> {
-        if bounds.len() != 1 {
-            return Err(unsupported(
-                face_ref,
-                "planar faces with holes in the fallback tessellator",
-            ));
+        let mut rings_3d = Vec::with_capacity(bounds.len());
+        for &bound_ref in bounds {
+            rings_3d.push(self.bound_polygon(bound_ref, face_ref)?);
         }
-        let polygon = self.bound_polygon(bounds[0], face_ref)?;
-        if polygon.len() < 3 {
+        if rings_3d.iter().all(|r| r.len() < 3) {
             return Err(invalid(
                 face_ref,
                 "face boundary samples to fewer than 3 points",
@@ -1601,20 +1599,41 @@ impl FallbackMesher<'_> {
         // face along +n — outward.
         let n = if same_sense { *normal } else { -normal };
         let (e_u, e_v) = plane_basis(&n);
-        let origin = polygon[0];
-        let uv: Vec<(f64, f64)> = polygon
+        let origin = rings_3d[0][0];
+        let project = |p: &Point3| {
+            let d = p - origin;
+            (d.dot(&e_u), d.dot(&e_v))
+        };
+        let mut rings: Vec<Vec<(f64, f64)>> = rings_3d
             .iter()
-            .map(|p| {
-                let d = p - origin;
-                (d.dot(&e_u), d.dot(&e_v))
-            })
+            .map(|ring| ring.iter().map(project).collect())
             .collect();
+        // `ear_clip_rings` wants the outer loop first. FACE_OUTER_BOUND is
+        // supposed to say which that is, but exporters mislabel it and the
+        // attribute is optional in FACE_BOUND-only files; the widest ring is
+        // the outer one either way. Swap by area rather than trusting the tag.
+        let outer = (0..rings.len())
+            .max_by(|&a, &b| {
+                signed_area2(&rings[a])
+                    .abs()
+                    .total_cmp(&signed_area2(&rings[b]).abs())
+            })
+            .expect("bounds is non-empty");
+        rings.swap(0, outer);
+        rings_3d.swap(0, outer);
+
         let base = mesh.positions.len();
-        for point in &polygon {
+        for point in rings_3d.iter().flatten() {
             mesh.positions.push(*point);
             mesh.normals.push(n);
         }
-        for [a, b, c] in ear_clip(&uv) {
+        let tris = ear_clip_rings(&rings).ok_or_else(|| {
+            invalid(
+                face_ref,
+                "face has a hole bound that cannot be bridged to its outer bound",
+            )
+        })?;
+        for [a, b, c] in tris {
             mesh.indices.push([base + a, base + b, base + c]);
         }
         Ok(())

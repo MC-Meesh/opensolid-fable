@@ -1,4 +1,4 @@
-//! Ear-clipping triangulation of a single simple planar polygon.
+//! Ear-clipping triangulation of a planar polygon, with or without holes.
 //!
 //! Planar caps (extrusion end faces, planar B-Rep faces) used to be
 //! fan-triangulated — from a centroid or the loop's first vertex — which
@@ -12,6 +12,13 @@
 //! [`ear_clip`] is O(n²) ear clipping — the same core loop the boolean
 //! tessellator runs (`boolean::triangulate_mesh_face`) but specialized to
 //! one loop with no holes. It triangulates concave polygons correctly.
+//!
+//! [`ear_clip_rings`] extends it to faces with holes (every drilled plate
+//! has them, of-fc8): each hole is spliced into the outer loop along a
+//! bridge — a doubled-back segment to a visible outer vertex — turning the
+//! multiply-connected region into one simple polygon that ear clipping then
+//! handles unchanged. This mirrors `boolean::triangulate_mesh_face`, which
+//! bridges the same way.
 //!
 //! [`is_closed_manifold`]: opensolid_core::mesh::TriangleMesh::is_closed_manifold
 
@@ -35,24 +42,194 @@
 /// Public because the kernel's STEP import fallback tessellator clips
 /// planar face outlines with the same routine.
 pub fn ear_clip(uv: &[(f64, f64)]) -> Vec<[usize; 3]> {
-    let n = uv.len();
-    if n < 3 {
+    if uv.len() < 3 {
         return Vec::new();
     }
+    ear_clip_indexed(uv, (0..uv.len()).collect())
+}
 
-    // Ear clipping needs a counterclockwise loop so a positive corner
-    // cross product marks a convex (candidate-ear) corner. Detect the
-    // input winding from the signed area and walk the indices in reverse
-    // when it runs clockwise; the emitted triples then always come out
-    // counterclockwise, independent of how the caller wound the loop.
+/// Triangulate a planar face with holes: `rings[0]` is the outer loop and
+/// `rings[1..]` are hole loops, each given in order with either winding (the
+/// windings are normalized here, so callers need not orient holes opposite
+/// the outer loop). Returns triangles as index triples into the rings'
+/// concatenation — `rings[0]`'s vertices first, then each hole's in the order
+/// given — so a caller that concatenates its 3D points the same way can index
+/// them directly. Triangles come out counterclockwise in the `uv` plane, as
+/// [`ear_clip`]'s do.
+///
+/// Returns `None` if some hole cannot be bridged to the outer loop, which
+/// means the rings are not a valid face region (a hole outside the outer
+/// loop, overlapping holes, self-intersecting boundary). With no holes this
+/// is exactly [`ear_clip`] and never fails.
+pub fn ear_clip_rings(rings: &[Vec<(f64, f64)>]) -> Option<Vec<[usize; 3]>> {
+    let Some(outer) = rings.first() else {
+        return Some(Vec::new());
+    };
+    if outer.len() < 3 {
+        return Some(Vec::new());
+    }
+    if rings.len() == 1 {
+        return Some(ear_clip(outer));
+    }
+
+    // The returned triples index the rings' concatenation, so the vertex data
+    // is laid out exactly as given and never permuted; windings are fixed by
+    // ordering *indices* instead.
+    let uv: Vec<(f64, f64)> = rings.concat();
+    let mut base = 0;
+    let mut ring_idx: Vec<Vec<usize>> = Vec::with_capacity(rings.len());
+    for ring in rings {
+        ring_idx.push((base..base + ring.len()).collect());
+        base += ring.len();
+    }
+
+    // Bridging needs consistent windings: the outer loop counterclockwise and
+    // each hole clockwise, so that splicing a hole in runs it against the
+    // outer loop's traversal and leaves one simple, counterclockwise polygon.
+    // A hole handed to us counterclockwise would splice into a figure-eight.
+    if signed_area2(outer) < 0.0 {
+        ring_idx[0].reverse();
+    }
+    let mut holes: Vec<Vec<usize>> = Vec::new();
+    for (h, ring) in ring_idx[1..].iter_mut().zip(&rings[1..]) {
+        // A hole of fewer than 3 vertices cuts nothing out; skip it rather
+        // than bridge to it. Its vertices keep their slots in `uv` regardless.
+        if ring.len() < 3 {
+            continue;
+        }
+        if signed_area2(ring) > 0.0 {
+            h.reverse();
+        }
+        holes.push(std::mem::take(h));
+    }
+    let mut polygon = std::mem::take(&mut ring_idx[0]);
+    if holes.is_empty() {
+        return Some(ear_clip_indexed(&uv, polygon));
+    }
+
+    // Splice holes rightmost-first (Eberly's ordering): a hole's max-u vertex
+    // is guaranteed to see out of its own hole to the right, and taking the
+    // rightmost hole first keeps every later hole's bridge target reachable.
+    holes.sort_by(|a, b| max_u(&uv, b).total_cmp(&max_u(&uv, a)));
+
+    for pos in 0..holes.len() {
+        let hole = &holes[pos];
+        // The hole's rightmost vertex is where the bridge starts.
+        let hi_local = (0..hole.len())
+            .max_by(|&a, &b| uv[hole[a]].0.total_cmp(&uv[hole[b]].0))
+            .expect("hole has at least 3 vertices");
+        let h_idx = hole[hi_local];
+        // Rings the bridge must not cross: this hole and every hole not yet
+        // spliced. Already-spliced holes are polygon segments and so are
+        // covered by the polygon check. A bridge that only dodges the current
+        // hole can still cut a later one, whose splice would then
+        // self-intersect the polygon.
+        let unspliced = &holes[pos..];
+        // Bridge to the nearest polygon vertex the segment can reach without
+        // crossing anything.
+        let mut candidates: Vec<usize> = (0..polygon.len()).collect();
+        candidates.sort_by(|&a, &b| {
+            dist_sq(uv[polygon[a]], uv[h_idx]).total_cmp(&dist_sq(uv[polygon[b]], uv[h_idx]))
+        });
+        let cand = candidates
+            .into_iter()
+            .find(|&c| bridge_is_clear(&uv, &polygon, unspliced, h_idx, polygon[c]))?;
+        // Splice: ...p, h, h+1, ..., h, p... — the hole is traversed once and
+        // the bridge is walked out and back, so the result stays a single
+        // closed polygon whose area is the outer loop's less the holes'.
+        let p_idx = polygon[cand];
+        let hn = holes[pos].len();
+        let mut spliced = Vec::with_capacity(polygon.len() + hn + 2);
+        spliced.extend_from_slice(&polygon[..=cand]);
+        for k in 0..=hn {
+            spliced.push(holes[pos][(hi_local + k) % hn]);
+        }
+        spliced.push(p_idx);
+        spliced.extend_from_slice(&polygon[cand + 1..]);
+        polygon = spliced;
+    }
+
+    Some(ear_clip_indexed(&uv, polygon))
+}
+
+/// Twice the signed area of a closed polygon: positive when counterclockwise,
+/// negative when clockwise. Public because callers assembling rings for
+/// [`ear_clip_rings`] need it to tell the outer loop from the holes.
+pub fn signed_area2(uv: &[(f64, f64)]) -> f64 {
+    let n = uv.len();
     let mut area2 = 0.0;
     for i in 0..n {
         let a = uv[i];
         let b = uv[(i + 1) % n];
         area2 += a.0 * b.1 - b.0 * a.1;
     }
-    let mut idx: Vec<usize> = (0..n).collect();
-    if area2 < 0.0 {
+    area2
+}
+
+/// Largest `u` over a ring's vertices.
+fn max_u(uv: &[(f64, f64)], ring: &[usize]) -> f64 {
+    ring.iter().fold(f64::NEG_INFINITY, |m, &i| m.max(uv[i].0))
+}
+
+/// Does the bridge `from`→`to` cross any polygon segment, or any segment of
+/// the not-yet-spliced hole rings? Segments sharing an endpoint with the
+/// bridge — including the bridge's own two endpoints' incident edges — do not
+/// count as crossings.
+fn bridge_is_clear(
+    uv: &[(f64, f64)],
+    polygon: &[usize],
+    unspliced: &[Vec<usize>],
+    from: usize,
+    to: usize,
+) -> bool {
+    let (p, q) = (uv[from], uv[to]);
+    for ring in std::iter::once(polygon).chain(unspliced.iter().map(Vec::as_slice)) {
+        let n = ring.len();
+        for i in 0..n {
+            if segments_cross(p, q, uv[ring[i]], uv[ring[(i + 1) % n]]) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Strict proper crossing test: segments that merely share an endpoint (as a
+/// bridge always does with the two edges at each of its ends) do not cross.
+fn segments_cross(p1: (f64, f64), p2: (f64, f64), q1: (f64, f64), q2: (f64, f64)) -> bool {
+    let eps = 1e-14;
+    if dist_sq(p1, q1) < eps
+        || dist_sq(p1, q2) < eps
+        || dist_sq(p2, q1) < eps
+        || dist_sq(p2, q2) < eps
+    {
+        return false;
+    }
+    let d = |a: (f64, f64), b: (f64, f64), c: (f64, f64)| {
+        (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0)
+    };
+    let (d1, d2) = (d(q1, q2, p1), d(q1, q2, p2));
+    let (d3, d4) = (d(p1, p2, q1), d(p1, p2, q2));
+    ((d1 > 0.0 && d2 < 0.0) || (d1 < 0.0 && d2 > 0.0))
+        && ((d3 > 0.0 && d4 < 0.0) || (d3 < 0.0 && d4 > 0.0))
+}
+
+/// Ear-clip the closed polygon `idx` (indices into `uv`, either winding).
+/// Indices may repeat — a bridged hole polygon walks its bridge vertices
+/// twice — so the ear tests compare by index, never by position.
+fn ear_clip_indexed(uv: &[(f64, f64)], mut idx: Vec<usize>) -> Vec<[usize; 3]> {
+    let n = idx.len();
+    if n < 3 {
+        return Vec::new();
+    }
+
+    // Ear clipping needs a counterclockwise loop so a positive corner
+    // cross product marks a convex (candidate-ear) corner. Detect the
+    // winding from the signed area and walk the indices in reverse
+    // when it runs clockwise; the emitted triples then always come out
+    // counterclockwise, independent of how the caller wound the loop.
+    let ring: Vec<(f64, f64)> = idx.iter().map(|&i| uv[i]).collect();
+    if signed_area2(&ring) < 0.0 {
         idx.reverse();
     }
 
@@ -209,6 +386,191 @@ mod tests {
         assert!(
             (sum - expected).abs() < 1e-9 * (1.0 + expected),
             "triangle areas sum to {sum}, expected polygon area {expected}"
+        );
+    }
+
+    /// Every triangle is counterclockwise, no triangle straddles a hole, and
+    /// the areas sum to (outer − holes) — i.e. the triangulation tiles the
+    /// holed region exactly, with no overlap, no gaps, and nothing laid down
+    /// over a hole.
+    fn assert_tiles_rings(rings: &[Vec<(f64, f64)>]) {
+        let uv = rings.concat();
+        let tris = ear_clip_rings(rings).expect("rings must triangulate");
+        let mut sum = 0.0;
+        for t in &tris {
+            let area = tri_area(uv[t[0]], uv[t[1]], uv[t[2]]);
+            assert!(
+                area > -1e-12,
+                "triangle {t:?} is not counterclockwise (area {area})"
+            );
+            sum += area;
+            // A triangle centroid inside a hole means the clipper paved over
+            // the hole — the exact failure a bridgeless ear clip makes, and
+            // one the area sum alone can miss if another triangle is dropped.
+            let centroid = (
+                (uv[t[0]].0 + uv[t[1]].0 + uv[t[2]].0) / 3.0,
+                (uv[t[0]].1 + uv[t[1]].1 + uv[t[2]].1) / 3.0,
+            );
+            for hole in &rings[1..] {
+                assert!(
+                    !point_in_polygon(centroid, hole),
+                    "triangle {t:?} lies inside a hole"
+                );
+            }
+        }
+        let expected = signed_area(&rings[0]).abs()
+            - rings[1..].iter().map(|h| signed_area(h).abs()).sum::<f64>();
+        assert!(
+            (sum - expected).abs() < 1e-9 * (1.0 + expected.abs()),
+            "triangle areas sum to {sum}, expected holed area {expected}"
+        );
+    }
+
+    /// Even-odd ray cast; only used on the strict interior (triangle
+    /// centroids), so boundary grazing is not a concern.
+    fn point_in_polygon(p: (f64, f64), poly: &[(f64, f64)]) -> bool {
+        let n = poly.len();
+        let mut inside = false;
+        for i in 0..n {
+            let (a, b) = (poly[i], poly[(i + 1) % n]);
+            if (a.1 > p.1) != (b.1 > p.1) {
+                let x = a.0 + (p.1 - a.1) / (b.1 - a.1) * (b.0 - a.0);
+                if p.0 < x {
+                    inside = !inside;
+                }
+            }
+        }
+        inside
+    }
+
+    fn square(cx: f64, cy: f64, half: f64) -> Vec<(f64, f64)> {
+        vec![
+            (cx - half, cy - half),
+            (cx + half, cy - half),
+            (cx + half, cy + half),
+            (cx - half, cy + half),
+        ]
+    }
+
+    /// A circle of `n` points, counterclockwise — the loop a drilled hole's
+    /// circular edge samples to.
+    fn circle(cx: f64, cy: f64, r: f64, n: usize) -> Vec<(f64, f64)> {
+        (0..n)
+            .map(|k| {
+                let a = std::f64::consts::TAU * k as f64 / n as f64;
+                (cx + r * a.cos(), cy + r * a.sin())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn rings_without_holes_match_ear_clip() {
+        let outer = square(0.0, 0.0, 1.0);
+        assert_eq!(ear_clip_rings(&[outer.clone()]), Some(ear_clip(&outer)));
+        assert_eq!(ear_clip_rings(&[]), Some(Vec::new()));
+    }
+
+    #[test]
+    fn drilled_plate_face_leaves_the_hole_open() {
+        // The of-fc8 case: a plate face with one circular hole. Before hole
+        // bridging this whole shape was rejected outright.
+        assert_tiles_rings(&[square(0.0, 0.0, 2.0), circle(0.0, 0.0, 0.5, 16)]);
+    }
+
+    #[test]
+    fn hole_winding_is_normalized() {
+        // Callers hand holes in whichever winding their topology stores. A
+        // counterclockwise hole must be recognized and reversed, not spliced
+        // into a figure-eight.
+        let mut ccw_hole = circle(0.0, 0.0, 0.5, 12);
+        assert!(signed_area2(&ccw_hole) > 0.0, "fixture must be ccw");
+        assert_tiles_rings(&[square(0.0, 0.0, 2.0), ccw_hole.clone()]);
+        ccw_hole.reverse();
+        assert_tiles_rings(&[square(0.0, 0.0, 2.0), ccw_hole]);
+        // Same for a clockwise outer loop.
+        let mut cw_outer = square(0.0, 0.0, 2.0);
+        cw_outer.reverse();
+        assert_tiles_rings(&[cw_outer, circle(0.0, 0.0, 0.5, 12)]);
+    }
+
+    #[test]
+    fn many_holes_in_one_face() {
+        // A four-hole bolt pattern: each hole bridges independently, and a
+        // bridge must not cut through a hole spliced later (the boolean
+        // clipper's `hole_bridge_avoids_unspliced_holes` case).
+        assert_tiles_rings(&[
+            square(0.0, 0.0, 3.0),
+            circle(-1.5, -1.5, 0.4, 10),
+            circle(1.5, -1.5, 0.4, 10),
+            circle(1.5, 1.5, 0.4, 10),
+            circle(-1.5, 1.5, 0.4, 10),
+        ]);
+    }
+
+    #[test]
+    fn holes_in_a_concave_outline() {
+        // Concave outer loop plus holes: the two features that each broke a
+        // naive triangulator, together.
+        let outer = vec![
+            (0.0, 0.0),
+            (6.0, 0.0),
+            (6.0, 6.0),
+            (4.0, 6.0),
+            (4.0, 2.0),
+            (2.0, 2.0),
+            (2.0, 6.0),
+            (0.0, 6.0),
+        ];
+        assert_tiles_rings(&[outer, circle(1.0, 1.0, 0.4, 10), circle(5.0, 1.0, 0.4, 10)]);
+    }
+
+    #[test]
+    fn hole_touching_the_outer_loop_is_not_a_crossing() {
+        // A slot whose hole vertex sits exactly on the outer edge: the bridge
+        // shares an endpoint with outer segments, which is not a crossing.
+        // Rejecting it would fail an otherwise valid face.
+        assert_tiles_rings(&[square(0.0, 0.0, 2.0), circle(0.0, 0.0, 1.0, 8)]);
+    }
+
+    #[test]
+    fn degenerate_hole_keeps_later_indices_aligned() {
+        // A hole that samples to fewer than 3 points cuts nothing out, but its
+        // vertices still occupy their slots: a caller's parallel 3D point list
+        // is indexed by the same concatenation, so dropping them would shift
+        // every later ring's triangles onto the wrong points.
+        let rings = vec![
+            square(0.0, 0.0, 3.0),
+            vec![(0.0, 0.0), (0.1, 0.0)],
+            circle(1.5, 1.5, 0.4, 10),
+        ];
+        let uv = rings.concat();
+        let tris = ear_clip_rings(&rings).expect("degenerate hole must not fail the face");
+        let real_hole = &rings[2];
+        for t in &tris {
+            let centroid = (
+                (uv[t[0]].0 + uv[t[1]].0 + uv[t[2]].0) / 3.0,
+                (uv[t[0]].1 + uv[t[1]].1 + uv[t[2]].1) / 3.0,
+            );
+            assert!(
+                !point_in_polygon(centroid, real_hole),
+                "triangle {t:?} paved over the real hole — indices shifted"
+            );
+        }
+        let area: f64 = tris
+            .iter()
+            .map(|t| tri_area(uv[t[0]], uv[t[1]], uv[t[2]]))
+            .sum();
+        let expected = 36.0 - signed_area(real_hole).abs();
+        assert!((area - expected).abs() < 1e-9, "area {area} != {expected}");
+    }
+
+    #[test]
+    fn hole_outside_the_outer_loop_is_rejected() {
+        // Not a valid face region: the bridge would have to cross the outer
+        // loop. Better to report it than to emit a garbage triangulation.
+        assert_eq!(
+            ear_clip_rings(&[square(0.0, 0.0, 1.0), circle(5.0, 5.0, 0.4, 8)]),
+            None
         );
     }
 

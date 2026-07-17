@@ -158,7 +158,8 @@ fn assert_counts_equal(
 /// Volume via the standalone store tessellator, only when it produces a
 /// closed manifold — it may not, on bodies with non-rectangular trimmed
 /// quadric faces or sphere/torus caps that still defer to the CDT pass
-/// (of-2i3 handled the iso-rectangular cylinder/cone case).
+/// (of-2i3 handled the iso-rectangular cylinder/cone case; of-fc8 the
+/// planar-faces-with-holes case, so drilled parts now measure).
 fn closed_volume(store: &TopologyStore, geo: &GeometryStore, body: EntityId<Body>) -> Option<f64> {
     let mesh = tessellate_body(store, geo, body, &TessellationOptions::default()).ok()?;
     mass_properties(&mesh).ok().map(|mp| mp.volume)
@@ -216,9 +217,22 @@ fn assert_round_trip_gate(
     );
     assert_counts_equal(store, body, &store2, body2, context);
 
-    if let (Some(v1), Some(v2)) = (closed_volume(store, geo, body), {
-        closed_volume(&store2, &geo2, body2)
-    }) {
+    let (m1, m2) = (
+        closed_volume(store, geo, body),
+        closed_volume(&store2, &geo2, body2),
+    );
+    // Whether a body can be measured at all must survive the round trip. The
+    // deferred CDT cases make *both* sides unmeasurable and are skipped below,
+    // but a body that measures going in and not coming out (or the reverse) is
+    // a round-trip defect the volume comparison would otherwise swallow by
+    // silently not running (of-fc8).
+    assert_eq!(
+        m1.is_some(),
+        m2.is_some(),
+        "{context}: tessellability must survive the round trip \
+         (original {m1:?}, re-imported {m2:?})"
+    );
+    if let (Some(v1), Some(v2)) = (m1, m2) {
         assert!(v1 > 0.0, "{context}: original volume must be positive");
         let drift = (v1 - v2).abs() / v1.max(1.0);
         assert!(

@@ -956,10 +956,6 @@ mod tests {
             store.check(body)
         );
 
-        // The volume half of the gate cannot run here: tessellate_body does
-        // not yet triangulate planar faces with holes (NotImplemented). The
-        // topology gate still applies, and geometry equality is asserted
-        // directly on the re-imported stores instead.
         let text = write_step(&store, &geo, &[body], &StepWriteOptions::default())
             .expect("tube must serialize");
         let (store2, geo2, bodies) = reimport(&text);
@@ -971,6 +967,23 @@ mod tests {
             store2.check(body2)
         );
         assert_counts_equal(&store, body, &store2, body2);
+
+        // The volume half of the gate: the tube's end caps are annular, i.e.
+        // planar faces carrying an inner loop, so measuring either side was
+        // impossible until the tessellator learned to bridge holes (of-fc8).
+        // Both sides are measured against the analytic volume, not just
+        // against each other: a cap that paved over its inner loop would do
+        // so on both sides and agree with itself at the wrong number.
+        let (v1, v2) = (volume(&store, &geo, body), volume(&store2, &geo2, body2));
+        // Annulus π(r_out² - r_in²)·h = 3π, under-measured by the chord
+        // sampling of both circles at the default angular step.
+        let annulus = std::f64::consts::PI * (2.0 * 2.0 - 1.0 * 1.0) * 1.0;
+        assert!(
+            (v1 - annulus).abs() <= 0.02 * annulus,
+            "tube volume {v1} is not the annulus {annulus} — the bore was paved over"
+        );
+        let drift = (v1 - v2).abs() / v1.max(1.0);
+        assert!(drift <= 1e-9, "tube volume drift {drift:e} ({v1} vs {v2})");
 
         // Reals are written in shortest round-trip form, so every surface
         // and curve re-imports bit-identical.
