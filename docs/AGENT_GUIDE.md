@@ -102,6 +102,12 @@ response is the agent's first oracle — it arrives without rendering anything:
 }
 ```
 
+- `boundingBox` is measured off the same mesh the mass properties integrate, so
+  it is the part's real extent to within the meshing accuracy (~0.5% of the
+  extent by default; pass a finer `accuracy` to tighten it). It is *not* the
+  kernel's internal tracked bounds, which are a conservative enclosure and can
+  overstate a blended or repeatedly-rotated part badly. It is `null` only when
+  the mesh has no triangles.
 - `exact: true` routes sharp booleans through the exact B-Rep pipeline (crisp
   edges, analytic STEP) for shapes inside the kernel's exact coverage
   (sphere/box/cylinder/torus, rigid transforms, uniform scale, sharp booleans).

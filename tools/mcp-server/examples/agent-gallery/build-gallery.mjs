@@ -675,12 +675,10 @@ return part.rotate(0, 1, 0, 360);
     t.say(
       `Volume ${mass.volume.toFixed(0)} mm³ = ${(mass.volume / 1000).toFixed(1)} cm³; ` +
         `in 6061 aluminium (2.70 g/cm³) that is about ` +
-        `**${((mass.volume / 1000) * 2.7).toFixed(0)} g**. Note the ` +
-        '`boundingBox` the tools report is the *tracked* box, not the part: it ' +
-        'reads 61.5 × 41.5 × 41.5 for a part that is really 60 × 40 × 40, ' +
-        'because `smoothUnion` pads the tracked box by `radius/4` and the ' +
-        'no-op rotation pads it further. Do not trust it as a measurement. ' +
-        'Exporting:',
+        `**${((mass.volume / 1000) * 2.7).toFixed(0)} g**. The reported ` +
+        '`boundingBox` measures the part itself (it is taken off the same mesh ' +
+        'these mass properties integrate), so it is good to the meshing ' +
+        'accuracy and can be read as a measurement. Exporting:',
     );
     t.export(m.model_id, 'step', 'bracket-right-angle.step');
     t.export(m.model_id, 'stl', 'bracket-right-angle.stl');

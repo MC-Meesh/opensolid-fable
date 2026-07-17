@@ -536,6 +536,28 @@ fn json_num(x: f64) -> String {
     }
 }
 
+/// Format a mesh's axis-aligned extent as a JSON `{min,max,size}` object, or
+/// `null` for a mesh with no triangles (nothing was bounded, and the shape's
+/// tracked box would be a fabricated answer rather than a measured one).
+fn mesh_bbox_json(mesh: &TriangleMesh) -> String {
+    let Some(b) = mesh.bounding_box() else {
+        return "null".to_string();
+    };
+    let (min, max) = (b.min, b.max);
+    format!(
+        "{{\"min\":[{},{},{}],\"max\":[{},{},{}],\"size\":[{},{},{}]}}",
+        json_num(min.x),
+        json_num(min.y),
+        json_num(min.z),
+        json_num(max.x),
+        json_num(max.y),
+        json_num(max.z),
+        json_num(max.x - min.x),
+        json_num(max.y - min.y),
+        json_num(max.z - min.z),
+    )
+}
+
 /// Escape a string for embedding as a JSON string literal (backslash and
 /// quote only — kernel error messages contain no control characters).
 fn json_escape(s: &str) -> String {
@@ -1071,24 +1093,18 @@ impl WasmShape {
     /// adaptive SDF mesh at `accuracy` (same knob as `meshAdaptive`,
     /// defaulting to 0.5% of the shape's extent). When the mesh does not
     /// bound a finite non-zero volume those fields are `null` and
-    /// `massError` explains why; the bounding box is always present.
+    /// `massError` explains why.
+    ///
+    /// `boundingBox` is the extent of that same measured mesh, so it is a
+    /// measurement of the part to within the meshing accuracy — *not* the
+    /// shape's tracked bounds, which are only a conservative enclosure
+    /// (`smoothUnion` pads them by `radius/4`, and each `rotate` re-boxes the
+    /// previous box's corners, so they overstate a blended or rotated part by
+    /// tens of percent). It is `null` only when the mesh has no triangles.
     pub fn measure(&self, accuracy: Option<f64>) -> String {
-        let bounds = &self.inner.bounds;
-        let (min, max) = (bounds.min, bounds.max);
-        let bbox = format!(
-            "\"boundingBox\":{{\"min\":[{},{},{}],\"max\":[{},{},{}],\"size\":[{},{},{}]}}",
-            json_num(min.x),
-            json_num(min.y),
-            json_num(min.z),
-            json_num(max.x),
-            json_num(max.y),
-            json_num(max.z),
-            json_num(max.x - min.x),
-            json_num(max.y - min.y),
-            json_num(max.z - min.z),
-        );
         let exact = self.measured_exact();
         self.with_measure_mesh(accuracy, |mesh| {
+            let bbox = format!("\"boundingBox\":{}", mesh_bbox_json(mesh));
             let counts = format!(
                 "\"triangles\":{},\"vertices\":{},\"exact\":{}",
                 mesh.triangle_count(),
@@ -1365,6 +1381,76 @@ mod tests {
         let rest = &json[start..];
         let end = rest.find([',', '}', ']']).unwrap_or(rest.len());
         rest[..end].trim().parse().ok()
+    }
+
+    /// Pull the `[x,y,z]` array at `"<key>":[…]` out of a JSON object string.
+    fn json_triple(json: &str, key: &str) -> Option<[f64; 3]> {
+        let needle = format!("\"{key}\":[");
+        let start = json.find(&needle)? + needle.len();
+        let rest = &json[start..];
+        let end = rest.find(']')?;
+        let mut it = rest[..end].split(',').map(|s| s.trim().parse::<f64>());
+        let mut next = || it.next()?.ok();
+        Some([next()?, next()?, next()?])
+    }
+
+    /// `[min, max]` of the reported bounding box along `axis` (0=x, 1=y, 2=z).
+    fn bbox_span(json: &str, axis: usize) -> [f64; 2] {
+        let bbox = &json[json.find("\"boundingBox\":").expect("boundingBox present")..];
+        [
+            json_triple(bbox, "min").expect("bbox min")[axis],
+            json_triple(bbox, "max").expect("bbox max")[axis],
+        ]
+    }
+
+    /// The reported box must measure the *part*, not the mesher's tracked
+    /// enclosure. `rotate` re-boxes the previous box's corners, so chained
+    /// rotations inflate the tracked box without bound — here two 45° turns
+    /// (a 90° turn, which is axis-aligned and should cost nothing) balloon
+    /// the tracked y half-extent from 2.5 to 12.5.
+    #[test]
+    fn measure_bbox_tracks_the_part_not_compounded_rotation_bounds() {
+        let q = std::f64::consts::FRAC_PI_4;
+        // Cylinder r=2.5 about the y axis, half-height 10; two 45° turns about
+        // x lay its axis along z. True extent: x,y ∈ ±2.5, z ∈ ±10.
+        let rot = WasmShape::cylinder(2.5, 10.0)
+            .rotate(1.0, 0.0, 0.0, q)
+            .rotate(1.0, 0.0, 0.0, q);
+        assert!(
+            rot.inner.bounds.max.y > 12.0,
+            "precondition: tracked box should be inflated to ~12.5, got {}",
+            rot.inner.bounds.max.y
+        );
+
+        let json = rot.measure(None);
+        for (axis, name, truth) in [(0, "x", 2.5), (1, "y", 2.5), (2, "z", 10.0)] {
+            let [lo, hi] = bbox_span(&json, axis);
+            assert!(
+                (lo + truth).abs() < 0.05 && (hi - truth).abs() < 0.05,
+                "{name} span {lo}..{hi} ≉ ±{truth} in {json}"
+            );
+        }
+    }
+
+    /// `smoothUnion` pads the tracked box by `radius/4` on every side. Where
+    /// the blend genuinely bulges (the flush x/y faces here) that padding is
+    /// real geometry, but along z the far faces are untouched and the tracked
+    /// box overstates the part — the reported box must follow the part.
+    #[test]
+    fn measure_bbox_excludes_smooth_union_padding_on_unblended_faces() {
+        let shape = WasmShape::box3(30.0, 20.0, 20.0).smooth_union(
+            &WasmShape::box3(30.0, 20.0, 20.0).translate(0.0, 0.0, 5.0),
+            Some(3.0),
+        );
+        // Tracked z is padded to -20.75..25.75; the part is really -20..25.
+        assert!(shape.inner.bounds.min.z < -20.5 && shape.inner.bounds.max.z > 25.5);
+
+        let json = shape.measure(None);
+        let [lo, hi] = bbox_span(&json, 2);
+        assert!(
+            (lo + 20.0).abs() < 0.35 && (hi - 25.0).abs() < 0.35,
+            "z span {lo}..{hi} ≉ -20..25 in {json}"
+        );
     }
 
     #[test]

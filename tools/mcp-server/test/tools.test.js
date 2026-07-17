@@ -216,10 +216,24 @@ test('exact booleans flag is honored per model', () => {
 describe('axis convention (+Y) — documented in AGENT_GUIDE.md §3', () => {
   const bbox = (script) => jsonOf(freshTools().call('create_model', { script })).boundingBox;
 
+  // The reported box is measured off the mesh, so it lands within the meshing
+  // accuracy (~0.5% of extent) rather than exactly on the analytic bound. That
+  // is far tighter than the axis swaps these tests exist to catch — a wrong
+  // axis moves a whole extent, not a fraction of a millimetre.
+  const assertCloseTo = (actual, expected, tol = 0.15) => {
+    assert.equal(actual.length, expected.length);
+    actual.forEach((a, i) =>
+      assert.ok(
+        Math.abs(a - expected[i]) < tol,
+        `component ${i}: ${a} ≉ ${expected[i]} (in [${actual}])`,
+      ),
+    );
+  };
+
   test('cylinder is a +Y cylinder: radial in xz, axial in y', () => {
     // r=2, hh=5 -> 4 wide in x and z, 10 tall in y. If this ever reads
     // [4, 4, 10] the kernel has moved to +Z and the docs must follow.
-    assert.deepEqual(bbox('return Shape.cylinder(2, 5);').size, [4, 10, 4]);
+    assertCloseTo(bbox('return Shape.cylinder(2, 5);').size, [4, 10, 4]);
   });
 
   test('extrude sweeps +Y, mapping profile (u,v) -> (x,z)', () => {
@@ -229,15 +243,14 @@ describe('axis convention (+Y) — documented in AGENT_GUIDE.md §3', () => {
       return Shape.extrude(p, 7);
     `);
     // Profile is 10 (u) x 3 (v) -> 10 in x, 3 in z; swept 7 along y.
-    assert.deepEqual(b.size, [10, 7, 3]);
+    assertCloseTo(b.size, [10, 7, 3]);
     // ...and the sweep runs from y=0 to y=height, not centered on the origin.
-    assert.equal(b.min[1], 0);
-    assert.equal(b.max[1], 7);
+    assertCloseTo([b.min[1], b.max[1]], [0, 7]);
   });
 
   test('torus rings in the xz plane', () => {
     // major 10, minor 2 -> 24 across x and z, 4 thick in y.
-    assert.deepEqual(bbox('return Shape.torus(10, 2);').size, [24, 4, 24]);
+    assertCloseTo(bbox('return Shape.torus(10, 2);').size, [24, 4, 24]);
   });
 
   // Rotated shapes must be probed by *volume*, not by boundingBox: the tracked
