@@ -25,8 +25,8 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 >   "name": "enclosure-body",
 >   "exact": false,
 >   "mesh": {
->     "triangles": 25868,
->     "vertices": 12936
+>     "triangles": 29596,
+>     "vertices": 14800
 >   },
 >   "boundingBox": {
 >     "min": [
@@ -45,19 +45,19 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 >       30
 >     ]
 >   },
->   "volume": 34621.162880956064,
+>   "volume": 34763.23671539217,
 >   "valid": true,
 >   "issues": []
 > }
 > ```
 
-**Agent:** Body is valid — volume 34621 mm³ after hollowing. Rendering it to check the wall broke through the top:
+**Agent:** Body is valid — volume 34763 mm³ after hollowing. Rendering it to check the wall broke through the top:
 
 > 🔧 **`get_screenshot`** `{ "model_id": "model-3", "view": "iso", "width": 720, "height": 540 }`
 >
 > ![enclosure — iso view](../output/enclosure-body-iso.png)
 >
-> *(real 720×540 render, 24 KB PNG)*
+> *(real 720×540 render, 23 KB PNG)*
 
 > 🔧 **`export`** `{ "model_id": "model-3", "format": "step", "path": "enclosure-body.step" }`
 > ```json
@@ -65,7 +65,7 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 >   "model_id": "model-3",
 >   "format": "step",
 >   "path": "output/enclosure-body.step",
->   "bytes": 4985617
+>   "bytes": 5924702
 > }
 > ```
 
@@ -75,7 +75,7 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 >   "model_id": "model-3",
 >   "format": "stl",
 >   "path": "output/enclosure-body.stl",
->   "bytes": 1293484
+>   "bytes": 1479884
 > }
 > ```
 
@@ -95,8 +95,8 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 >   "name": "enclosure-lid",
 >   "exact": false,
 >   "mesh": {
->     "triangles": 15124,
->     "vertices": 7564
+>     "triangles": 17284,
+>     "vertices": 8644
 >   },
 >   "boundingBox": {
 >     "min": [
@@ -115,7 +115,7 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 >       7
 >     ]
 >   },
->   "volume": 28863.973766896357,
+>   "volume": 28883.29791850566,
 >   "valid": true,
 >   "issues": []
 > }
@@ -125,7 +125,7 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 >
 > ![enclosure — iso view](../output/enclosure-lid-iso.png)
 >
-> *(real 720×540 render, 21 KB PNG)*
+> *(real 720×540 render, 17 KB PNG)*
 
 > 🔧 **`export`** `{ "model_id": "model-4", "format": "step", "path": "enclosure-lid.step" }`
 > ```json
@@ -133,7 +133,7 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 >   "model_id": "model-4",
 >   "format": "step",
 >   "path": "output/enclosure-lid.step",
->   "bytes": 4416489
+>   "bytes": 4721868
 > }
 > ```
 
@@ -143,7 +143,7 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 >   "model_id": "model-4",
 >   "format": "stl",
 >   "path": "output/enclosure-lid.stl",
->   "bytes": 756284
+>   "bytes": 864284
 > }
 > ```
 

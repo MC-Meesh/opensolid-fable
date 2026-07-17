@@ -8,7 +8,7 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 
 ---
 
-**Agent:** The kernel centers primitives on the origin and takes half-extents, so a 60×40×4 base is `box3(30, 20, 2)` and the back wall is `box3(30, 2, 20)` stood up along −Y. I’ll union them, then punch four Ø6 (r=3) holes through the base on a rectangular pattern — the pattern is just a JS loop. The one thing to get right: the base is a plate lying in xy with its 4 mm thickness along **z**, so the holes must run along **z** — and `Shape.cylinder` is a **+Y** cylinder, so each one needs `rotate(1, 0, 0, 90)` to swing its axis onto +Z. Skip that and the holes bore lengthwise through the 40 mm width instead, which still reports `valid: true`.
+**Agent:** The kernel centers primitives on the origin and takes half-extents, so a 60×40×4 base is `box3(30, 20, 2)` and the back wall is `box3(30, 2, 20)` stood up along −Y. I’ll union them, then punch four Ø6 (r=3) holes through the base on a rectangular pattern — the pattern is just a JS loop. The one thing to get right: the base is a plate lying in xy with its 4 mm thickness along **z**, so the holes must run along **z** — and `Shape.cylinder` is a **+Y** cylinder, so each one needs a quarter turn about X to swing its axis onto +Z. Skip that and the holes bore lengthwise through the 40 mm width instead, which still reports `valid: true`. One API note I have to get right: `rotate` takes its angle in **radians**, so that quarter turn is `rotate(1, 0, 0, Math.PI / 2)`. Writing `90` is not a 90° turn — it is 90 radians, which lands 116.6° round and tilts every bore off axis.
 
 > 🔧 **`create_model`**
 > ```js
@@ -18,8 +18,8 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 > const wall = Shape.box3(30, 2, 20).translate(0, -18, 22);  // 60 × 4 × 40, back edge
 > let bracket = base.union(wall);
 > // cylinder() is +Y-axis; the base plate's thickness is along z, so rotate the
-> // hole onto +Z before punching it through.
-> const hole = Shape.cylinder(3, 6).rotate(1, 0, 0, 90);     // r=3, +Y -> +Z
+> // hole onto +Z before punching it through. rotate() takes RADIANS.
+> const hole = Shape.cylinder(3, 6).rotate(1, 0, 0, Math.PI / 2);  // r=3, +Y -> +Z
 > for (const x of [-20, 20]) for (const y of [-12, 6]) {
 >   bracket = bracket.subtract(hole.translate(x, y, 0));
 > }
@@ -31,8 +31,8 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 >   "name": "angle-bracket",
 >   "exact": false,
 >   "mesh": {
->     "triangles": 19366,
->     "vertices": 9681
+>     "triangles": 24188,
+>     "vertices": 12088
 >   },
 >   "boundingBox": {
 >     "min": [
@@ -51,54 +51,54 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 >       44
 >     ]
 >   },
->   "volume": 18585.712471707368,
+>   "volume": 18736.52541076776,
 >   "valid": true,
 >   "issues": []
 > }
 > ```
 
-**Agent:** `create_model` returns immediately with `valid: true` and volume 18586 mm³ — the four holes and the boolean union all resolved into one closed solid. Let me eyeball it before exporting.
+**Agent:** `create_model` returns immediately with `valid: true` and volume 18737 mm³ — the four holes and the boolean union all resolved into one closed solid. Let me eyeball it before exporting.
 
 > 🔧 **`get_screenshot`** `{ "model_id": "model-1", "view": "iso", "width": 720, "height": 540 }`
 >
 > ![angle-bracket — iso view](../output/angle-bracket-iso.png)
 >
-> *(real 720×540 render, 19 KB PNG)*
+> *(real 720×540 render, 17 KB PNG)*
 
 **Agent:** That looks right — but a render cannot tell me a hole went in sideways, and neither can `valid: true`. The only check that can is the volume, against a number I work out by hand: two 60×40×4 plates meeting at a corner is `60*40*4 + 60*4*40 = 19200 mm³`, less four Ø6 holes through 4 mm of base (`4 * π * 3² * 4 = 452.4`) — **18747.6 mm³**.
 
 > 🔧 **`measure`** `{ "model_id": "model-1", "query": "mass" }`
 > ```json
 > {
->   "volume": 18585.712471707368,
->   "surfaceArea": 10645.158889048333,
+>   "volume": 18736.52541076776,
+>   "surfaceArea": 10723.762830207674,
 >   "centroid": [
->     -0.0017141130990889618,
->     -9.142890079673267,
->     11.236832123975795
+>     -0.000020571797553580846,
+>     -9.146998505174698,
+>     11.26306284369305
 >   ],
 >   "inertia": [
 >     [
->       6275395.541823169,
->       -306.3689073331263,
->       1445.8172902536046
+>       6345533.795163175,
+>       1.9971831435529674,
+>       -10.602795309747968
 >     ],
 >     [
->       -306.3689073331263,
->       9002296.533018937,
->       1851641.4006252699
+>       1.9971831435529674,
+>       9125871.747594982,
+>       1868205.04889089
 >     ],
 >     [
->       1445.8172902536046,
->       1851641.4006252699,
->       8271231.722990537
+>       -10.602795309747968,
+>       1868205.04889089,
+>       8360144.591583632
 >     ]
 >   ],
 >   "exact": false
 > }
 > ```
 
-**Agent:** Volume 18586 mm³ against 18747.6 predicted — -0.9%, which is the SDF mesher reading a hair under true volume at this accuracy, not a modelling error. (Had I left the holes on the default +Y axis they would have bored lengthwise through the plate and landed near 18032 — a 4% miss that looks fine in every render.) So: 18.6 cm³, and in 6061 aluminium (2.70 g/cm³) about **50 g**. Now the files — STL first:
+**Agent:** Volume 18737 mm³ against 18747.6 predicted — -0.1%, which is the SDF mesher reading a hair under true volume at this accuracy, not a modelling error. (Had I left the holes on the default +Y axis they would have bored lengthwise through the plate and landed near 18032 — a 4% miss that looks fine in every render.) So: 18.7 cm³, and in 6061 aluminium (2.70 g/cm³) about **51 g**. Now the files — STL first:
 
 > 🔧 **`export`** `{ "model_id": "model-1", "format": "stl", "path": "angle-bracket.stl" }`
 > ```json
@@ -106,7 +106,7 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 >   "model_id": "model-1",
 >   "format": "stl",
 >   "path": "output/angle-bracket.stl",
->   "bytes": 968384
+>   "bytes": 1209484
 > }
 > ```
 
@@ -115,8 +115,10 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 > 🔧 **`export`** `{ "model_id": "model-1", "format": "step", "path": "angle-bracket.step" }`
 > ```json
 > {
->   "isError": true,
->   "text": "Error: export failed: STEP export failed: degenerate geometry in sdf_to_brep: adaptive meshing did not produce a closed manifold: 2 pinched edge(s) joining 3+ triangles — two surface sheets fused through one cell, typically at a near-tangent CSG feature; this is a mesher defect (of-o0o), and a finer accuracy does not reliably clear it"
+>   "model_id": "model-1",
+>   "format": "step",
+>   "path": "output/angle-bracket.step",
+>   "bytes": 8476931
 > }
 > ```
 

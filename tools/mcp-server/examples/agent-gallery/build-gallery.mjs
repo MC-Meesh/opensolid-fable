@@ -80,6 +80,16 @@ class Transcript {
     const res = this._run('create_model', args);
     if (res.isError) throw new Error(`create_model(${name}) failed: ${res.content[0].text}`);
     const payload = JSON.parse(res.content[0].text);
+    // Every example narrates its volume, so a null one is a build failure, not
+    // a value to format. Say which model and why — a bare `null.toFixed` blames
+    // the prose line that happened to touch it first and hides the massError
+    // the kernel already explained itself with (of-4kr).
+    if (payload.volume === null) {
+      throw new Error(
+        `${name}: volume is null — the mesh does not bound a finite non-zero ` +
+          `volume, so this model cannot be narrated.\n  massError: ${payload.massError}`,
+      );
+    }
     this.turns.push({ kind: 'create_model', args, payload });
     console.error(`  ok  create_model ${name}`);
     return payload;
@@ -245,9 +255,12 @@ example(
         'through the base on a rectangular pattern — the pattern is just a JS loop. ' +
         'The one thing to get right: the base is a plate lying in xy with its 4 mm ' +
         'thickness along **z**, so the holes must run along **z** — and `Shape.cylinder` ' +
-        'is a **+Y** cylinder, so each one needs `rotate(1, 0, 0, 90)` to swing its ' +
+        'is a **+Y** cylinder, so each one needs a quarter turn about X to swing its ' +
         'axis onto +Z. Skip that and the holes bore lengthwise through the 40 mm ' +
-        'width instead, which still reports `valid: true`.',
+        'width instead, which still reports `valid: true`. One API note I have to get ' +
+        'right: `rotate` takes its angle in **radians**, so that quarter turn is ' +
+        '`rotate(1, 0, 0, Math.PI / 2)`. Writing `90` is not a 90° turn — it is 90 ' +
+        'radians, which lands 116.6° round and tilts every bore off axis.',
     );
     const script = `
 // 90° angle bracket: a 60×40×4 horizontal flange and a 60×4×40 vertical
@@ -256,8 +269,8 @@ const base = Shape.box3(30, 20, 2);                        // 60 × 40 × 4
 const wall = Shape.box3(30, 2, 20).translate(0, -18, 22);  // 60 × 4 × 40, back edge
 let bracket = base.union(wall);
 // cylinder() is +Y-axis; the base plate's thickness is along z, so rotate the
-// hole onto +Z before punching it through.
-const hole = Shape.cylinder(3, 6).rotate(1, 0, 0, 90);     // r=3, +Y -> +Z
+// hole onto +Z before punching it through. rotate() takes RADIANS.
+const hole = Shape.cylinder(3, 6).rotate(1, 0, 0, Math.PI / 2);  // r=3, +Y -> +Z
 for (const x of [-20, 20]) for (const y of [-12, 6]) {
   bracket = bracket.subtract(hole.translate(x, y, 0));
 }
@@ -333,9 +346,9 @@ example(
       'A knuckle is a cylinder whose default **+Y** axis I rotate onto +X, then ' +
         'slide along X. Three of them union onto the plate; a long thin cylinder on ' +
         'the same axis subtracts the pin bore. The rotation to reach for is ' +
-        '`rotate(0, 0, 1, 90)` — turning about **Z** is what carries +Y onto X. ' +
-        'Rotating about Y, which is the tempting one to write, would spin the ' +
-        'cylinder about its own axis and change nothing.',
+        '`rotate(0, 0, 1, Math.PI / 2)` — turning about **Z** is what carries +Y onto ' +
+        'X, and the angle is in radians. Rotating about Y, which is the tempting one ' +
+        'to write, would spin the cylinder about its own axis and change nothing.',
     );
     const script = `
 // One leaf of a butt hinge: a flat plate with three barrel knuckles on the
@@ -343,11 +356,12 @@ example(
 // mirrored — pin together into a working hinge.
 const plate = Shape.box3(30, 15, 0.75).translate(0, -15.75, 0);  // 60 × 30 × 1.5 leaf
 // cylinder() is +Y-axis. Rotating about Z carries it onto X (rotating about Y
-// would be a no-op — it is already on Y).
-const knuckle = Shape.cylinder(4, 6).rotate(0, 0, 1, 90);        // r=4, 12 long on X
+// would be a no-op — it is already on Y). rotate() takes RADIANS.
+const Q = Math.PI / 2;                                           // quarter turn
+const knuckle = Shape.cylinder(4, 6).rotate(0, 0, 1, Q);         // r=4, 12 long on X
 let leaf = plate;
 for (const x of [-24, 0, 24]) leaf = leaf.union(knuckle.translate(x, 0, 0));
-const pin = Shape.cylinder(2, 40).rotate(0, 0, 1, 90);           // Ø4 bore on X
+const pin = Shape.cylinder(2, 40).rotate(0, 0, 1, Q);            // Ø4 bore on X
 return leaf.subtract(pin);
 `.trim();
     const m = t.create_model(script, 'hinge-leaf');
@@ -462,7 +476,8 @@ example(
   (t) => {
     t.say(
       'One tooth box, rotated into 16 positions by a loop, unioned onto a root ' +
-        'cylinder, minus a central bore. `(360 * i) / TEETH` spaces the teeth evenly. ' +
+        'cylinder, minus a central bore. `(2 * Math.PI * i) / TEETH` spaces the teeth ' +
+        'evenly — `rotate` is in radians, so a full turn is `2π`, not `360`. ' +
         'The circular pattern has to turn about the **same axis the disk is on** — ' +
         '`Shape.cylinder` is **+Y**, so that is `rotate(0, 1, 0, ...)`. Pattern about ' +
         'Z instead and the teeth swing up out of the disk plane into a ring of ' +
@@ -472,12 +487,12 @@ example(
 // A toothed disk: a root disk with N teeth placed on a circular pattern by
 // rotating one tooth box around the disk's own axis (+Y, the cylinder axis),
 // plus a central bore. The pattern is just a JS loop — the script vocabulary
-// is a real programming language.
+// is a real programming language. rotate() takes RADIANS: a full turn is 2π.
 const TEETH = 16, TH = 4, ROOT = 16, BORE = 4;
 let gear = Shape.cylinder(ROOT, TH);                          // disk faces in xz, axis +Y
 const tooth = Shape.box3(3, TH, 2.2).translate(ROOT + 1.5, 0, 0);  // radial x, thick y
 for (let i = 0; i < TEETH; i++) {
-  gear = gear.union(tooth.rotate(0, 1, 0, (360 * i) / TEETH));     // pattern about +Y
+  gear = gear.union(tooth.rotate(0, 1, 0, (2 * Math.PI * i) / TEETH));  // pattern about +Y
 }
 return gear.subtract(Shape.cylinder(BORE, TH + 2));           // central bore, coaxial
 `.trim();
@@ -638,19 +653,15 @@ const gusset = Shape.extrude(t, 5).translate(0, 17.5, 0);
 let part = ell.smoothUnion(gusset, 3);
 
 // 4× M5 clearance holes (Ø5). cylinder() is +Y-axis, so rotate it onto the
-// drilling axis: +Z for the base plate, +X for the vertical plate.
-const zHole = Shape.cylinder(2.5, 10).rotate(1, 0, 0, 90);   // -> +Z
+// drilling axis: +Z for the base plate, +X for the vertical plate. rotate()
+// takes RADIANS, so a quarter turn is Math.PI / 2.
+const Q = Math.PI / 2;
+const zHole = Shape.cylinder(2.5, 10).rotate(1, 0, 0, Q);    // -> +Z
 for (const y of [10, 30]) part = part.subtract(zHole.translate(15, y, 0));
-const xHole = Shape.cylinder(2.5, 10).rotate(0, 0, 1, 90);   // -> +X
+const xHole = Shape.cylinder(2.5, 10).rotate(0, 0, 1, Q);    // -> +X
 for (const y of [10, 30]) part = part.subtract(xHole.translate(-27.5, y, 32));
 
-// The trailing no-op rotation is a WORKAROUND, not modelling (of-obv):
-// without it this exact part meshes open at the default accuracy and STEP
-// export declines. A 360° rotation is geometrically the identity; all it
-// changes is the shape's tracked bounding box, and that shifts the meshing
-// grid onto an alignment where the mesh closes. This specific expression was
-// found by trial: other identity-equivalent spellings still fail.
-return part.rotate(0, 1, 0, 360);
+return part;
 `.trim();
     const m = t.create_model(script, 'bracket-right-angle');
     t.say(

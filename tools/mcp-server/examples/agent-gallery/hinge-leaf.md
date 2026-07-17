@@ -8,7 +8,7 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 
 ---
 
-**Agent:** A knuckle is a cylinder whose default **+Y** axis I rotate onto +X, then slide along X. Three of them union onto the plate; a long thin cylinder on the same axis subtracts the pin bore. The rotation to reach for is `rotate(0, 0, 1, 90)` — turning about **Z** is what carries +Y onto X. Rotating about Y, which is the tempting one to write, would spin the cylinder about its own axis and change nothing.
+**Agent:** A knuckle is a cylinder whose default **+Y** axis I rotate onto +X, then slide along X. Three of them union onto the plate; a long thin cylinder on the same axis subtracts the pin bore. The rotation to reach for is `rotate(0, 0, 1, Math.PI / 2)` — turning about **Z** is what carries +Y onto X, and the angle is in radians. Rotating about Y, which is the tempting one to write, would spin the cylinder about its own axis and change nothing.
 
 > 🔧 **`create_model`**
 > ```js
@@ -17,11 +17,12 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 > // mirrored — pin together into a working hinge.
 > const plate = Shape.box3(30, 15, 0.75).translate(0, -15.75, 0);  // 60 × 30 × 1.5 leaf
 > // cylinder() is +Y-axis. Rotating about Z carries it onto X (rotating about Y
-> // would be a no-op — it is already on Y).
-> const knuckle = Shape.cylinder(4, 6).rotate(0, 0, 1, 90);        // r=4, 12 long on X
+> // would be a no-op — it is already on Y). rotate() takes RADIANS.
+> const Q = Math.PI / 2;                                           // quarter turn
+> const knuckle = Shape.cylinder(4, 6).rotate(0, 0, 1, Q);         // r=4, 12 long on X
 > let leaf = plate;
 > for (const x of [-24, 0, 24]) leaf = leaf.union(knuckle.translate(x, 0, 0));
-> const pin = Shape.cylinder(2, 40).rotate(0, 0, 1, 90);           // Ø4 bore on X
+> const pin = Shape.cylinder(2, 40).rotate(0, 0, 1, Q);            // Ø4 bore on X
 > return leaf.subtract(pin);
 > ```
 > ```json
@@ -30,48 +31,48 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 >   "name": "hinge-leaf",
 >   "exact": false,
 >   "mesh": {
->     "triangles": 24684,
->     "vertices": 12342
+>     "triangles": 31292,
+>     "vertices": 15642
 >   },
 >   "boundingBox": {
 >     "min": [
->       -31.15627444612003,
+>       -30,
 >       -30.75,
 >       -4
 >     ],
 >     "max": [
->       31.15627444612003,
->       6.264428351177253,
+>       30,
+>       4.000000000000001,
 >       4
 >     ],
 >     "size": [
->       62.31254889224006,
->       37.01442835117725,
+>       60,
+>       34.75,
 >       8
 >     ]
 >   },
->   "volume": 3977.0056213444655,
+>   "volume": 3815.201362779873,
 >   "valid": true,
 >   "issues": []
 > }
 > ```
 
-**Agent:** Valid solid, 24,684 triangles — the pin bore runs cleanly through all three knuckles. One sizing note worth being honest about: I opened the bore to Ø4 because at Ø3.2 this part comes back `valid: false` with a *pinched* mesh — two surface sheets fused through one octree cell where the bore goes tangent. That is a known mesher defect (of-o0o), not a part that is too small to see, and it is worth knowing which it is: a finer `accuracy` does not clear a pinch, and the bore sizes that trip it are not the small ones in particular (Ø2.4 and Ø7 fail; Ø2.8, Ø3.6 and Ø4 are fine). So Ø4 is a workaround I found by moving, not a rule I derived. Let me confirm the mesh is watertight before exporting.
+**Agent:** Valid solid, 31,292 triangles — the pin bore runs cleanly through all three knuckles. One sizing note worth being honest about: I opened the bore to Ø4 because at Ø3.2 this part comes back `valid: false` with a *pinched* mesh — two surface sheets fused through one octree cell where the bore goes tangent. That is a known mesher defect (of-o0o), not a part that is too small to see, and it is worth knowing which it is: a finer `accuracy` does not clear a pinch, and the bore sizes that trip it are not the small ones in particular (Ø2.4 and Ø7 fail; Ø2.8, Ø3.6 and Ø4 are fine). So Ø4 is a workaround I found by moving, not a rule I derived. Let me confirm the mesh is watertight before exporting.
 
 > 🔧 **`get_screenshot`** `{ "model_id": "model-2", "view": "iso", "width": 720, "height": 540 }`
 >
 > ![hinge-leaf — iso view](../output/hinge-leaf-iso.png)
 >
-> *(real 720×540 render, 26 KB PNG)*
+> *(real 720×540 render, 27 KB PNG)*
 
 > 🔧 **`validate`** `{ "model_id": "model-2" }`
 > ```json
 > {
 >   "valid": true,
 >   "closedManifold": true,
->   "triangles": 24684,
->   "vertices": 12342,
->   "volume": 3977.0056213444655,
+>   "triangles": 31292,
+>   "vertices": 15642,
+>   "volume": 3815.201362779873,
 >   "exact": false,
 >   "issues": []
 > }
@@ -82,8 +83,10 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 > 🔧 **`export`** `{ "model_id": "model-2", "format": "step", "path": "hinge-leaf.step" }`
 > ```json
 > {
->   "isError": true,
->   "text": "Error: export failed: STEP export failed: degenerate geometry in sdf_to_brep: adaptive meshing did not produce a closed manifold: 2 pinched edge(s) joining 3+ triangles — two surface sheets fused through one cell, typically at a near-tangent CSG feature; this is a mesher defect (of-o0o), and a finer accuracy does not reliably clear it"
+>   "model_id": "model-2",
+>   "format": "step",
+>   "path": "output/hinge-leaf.step",
+>   "bytes": 18541158
 > }
 > ```
 
@@ -95,7 +98,7 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 >   "model_id": "model-2",
 >   "format": "stl",
 >   "path": "output/hinge-leaf.stl",
->   "bytes": 1234284
+>   "bytes": 1564684
 > }
 > ```
 
