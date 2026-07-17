@@ -8,7 +8,7 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 
 ---
 
-**Agent:** A knuckle is a cylinder whose default +Z axis I rotate onto +X, then slide along X. Three of them union onto the plate; a long thin cylinder on the same axis subtracts the pin bore. `rotate(0, 1, 0, 90)` swings +Z onto +X.
+**Agent:** A knuckle is a cylinder whose default **+Y** axis I rotate onto +X, then slide along X. Three of them union onto the plate; a long thin cylinder on the same axis subtracts the pin bore. The rotation to reach for is `rotate(0, 0, 1, 90)` — turning about **Z** is what carries +Y onto X. Rotating about Y, which is the tempting one to write, would spin the cylinder about its own axis and change nothing.
 
 > 🔧 **`create_model`**
 > ```js
@@ -16,11 +16,12 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 > // pin axis (X) and a pin bore drilled through them. Two of these — one
 > // mirrored — pin together into a working hinge.
 > const plate = Shape.box3(30, 15, 0.75).translate(0, -15.75, 0);  // 60 × 30 × 1.5 leaf
-> // A knuckle is a cylinder whose +Z axis is rotated onto +X, then slid along X.
-> const knuckle = Shape.cylinder(4, 6).rotate(0, 1, 0, 90);        // r=4, 12 long on X
+> // cylinder() is +Y-axis. Rotating about Z carries it onto X (rotating about Y
+> // would be a no-op — it is already on Y).
+> const knuckle = Shape.cylinder(4, 6).rotate(0, 0, 1, 90);        // r=4, 12 long on X
 > let leaf = plate;
 > for (const x of [-24, 0, 24]) leaf = leaf.union(knuckle.translate(x, 0, 0));
-> const pin = Shape.cylinder(1.6, 40).rotate(0, 1, 0, 90);         // Ø3.2 bore on X
+> const pin = Shape.cylinder(2, 40).rotate(0, 0, 1, 90);           // Ø4 bore on X
 > return leaf.subtract(pin);
 > ```
 > ```json
@@ -29,48 +30,48 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 >   "name": "hinge-leaf",
 >   "exact": false,
 >   "mesh": {
->     "triangles": 21368,
->     "vertices": 10684
+>     "triangles": 24684,
+>     "vertices": 12342
 >   },
 >   "boundingBox": {
 >     "min": [
->       -30,
+>       -31.15627444612003,
 >       -30.75,
->       -5.3682811189189135
+>       -4
 >     ],
 >     "max": [
->       30,
->       6,
->       5.3682811189189135
+>       31.15627444612003,
+>       6.264428351177253,
+>       4
 >     ],
 >     "size": [
->       60,
->       36.75,
->       10.736562237837827
+>       62.31254889224006,
+>       37.01442835117725,
+>       8
 >     ]
 >   },
->   "volume": 4013.5680459331566,
+>   "volume": 3977.0056213444655,
 >   "valid": true,
 >   "issues": []
 > }
 > ```
 
-**Agent:** Valid solid, 21,368 triangles — the pin bore runs cleanly through all three knuckles. Let me look at it and confirm the mesh is watertight before exporting.
+**Agent:** Valid solid, 24,684 triangles — the pin bore runs cleanly through all three knuckles. One sizing note worth being honest about: I opened the bore to Ø4. At Ø3.2 this part comes back `valid: false` with a non-manifold mesh, because the default meshing accuracy is derived from the model’s overall bounding box (~62 mm here), and that is too coarse to resolve a bore that small. The fix is a bore the mesher can see; the same Ø3.2 bore meshes fine on a single knuckle in a smaller box. Let me look at it and confirm the mesh is watertight before exporting.
 
 > 🔧 **`get_screenshot`** `{ "model_id": "model-2", "view": "iso", "width": 720, "height": 540 }`
 >
 > ![hinge-leaf — iso view](../output/hinge-leaf-iso.png)
 >
-> *(real 720×540 render, 25 KB PNG)*
+> *(real 720×540 render, 26 KB PNG)*
 
 > 🔧 **`validate`** `{ "model_id": "model-2" }`
 > ```json
 > {
 >   "valid": true,
 >   "closedManifold": true,
->   "triangles": 21368,
->   "vertices": 10684,
->   "volume": 4013.5680459331566,
+>   "triangles": 24684,
+>   "vertices": 12342,
+>   "volume": 3977.0056213444655,
 >   "exact": false,
 >   "issues": []
 > }
@@ -81,10 +82,8 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 > 🔧 **`export`** `{ "model_id": "model-2", "format": "step", "path": "hinge-leaf.step" }`
 > ```json
 > {
->   "model_id": "model-2",
->   "format": "step",
->   "path": "output/hinge-leaf.step",
->   "bytes": 11220052
+>   "isError": true,
+>   "text": "Error: export failed: STEP export failed: degenerate geometry in sdf_to_brep: adaptive meshing did not produce a closed manifold; the surface must lie strictly inside the meshing bounds"
 > }
 > ```
 
@@ -94,7 +93,7 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 >   "model_id": "model-2",
 >   "format": "stl",
 >   "path": "output/hinge-leaf.stl",
->   "bytes": 1068484
+>   "bytes": 1234284
 > }
 > ```
 

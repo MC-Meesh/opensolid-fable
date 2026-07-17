@@ -36,7 +36,7 @@ no `require`, no filesystem or network.
 
 ```js
 // The classic "bolt boss": a cylinder with a bolt hole through it.
-const boss = Shape.cylinder(8, 10);              // radius 8, half-height 10
+const boss = Shape.cylinder(8, 10);              // radius 8, half-height 10, axis +Y
 const hole = Shape.cylinder(3, 12);              // radius 3, taller so it cuts clean
 return boss.subtract(hole);
 ```
@@ -51,11 +51,28 @@ All dimensions are model units. Box/cylinder/torus arguments are **half-extents
 | `Shape.sphere(r)` | sphere, radius `r` |
 | `Shape.box3(hx, hy, hz)` | box, half-extents `hx,hy,hz` (full size `2hx × 2hy × 2hz`) |
 | `Shape.roundedBox(hx, hy, hz, r)` | box with fillet radius `r` |
-| `Shape.cylinder(r, hh)` | cylinder, radius `r`, half-height `hh` (full height `2·hh`), axis +Z |
-| `Shape.torus(major, minor)` | torus in the XY plane |
+| `Shape.cylinder(r, hh)` | cylinder, radius `r`, half-height `hh` (full height `2·hh`), axis **+Y** |
+| `Shape.torus(major, minor)` | torus with its ring in the **XZ** plane |
 | `Shape.capsule(x1,y1,z1, x2,y2,z2, r)` | capsule (swept sphere) between two points |
-| `Shape.extrude(profile, height)` | extrude a `Profile` along +Z |
+| `Shape.extrude(profile, height)` | extrude a `Profile` along **+Y**, from `y=0` to `y=height` |
 | `Shape.revolve(profile, angleDeg)` | revolve a `Profile` about the Y axis |
+
+> **⚠️ The axis convention is +Y — and getting it wrong fails silently.**
+>
+> `cylinder` is radial in **xz** and axial in **y**; `extrude` maps the profile's
+> `(u, v)` to **`(x, z)`** and sweeps **+Y**; `revolve` turns about **Y**; `torus`
+> rings in **xz**. The renderer matches (`y` is up in model space, so the named
+> views assume a y-up part).
+>
+> This cuts against STEP/FreeCAD, which are **z-up**, and the STEP writer emits
+> coordinates verbatim. Model a plate flat in xy with thickness in z — the CAD
+> habit — and its through-holes need `.rotate(1, 0, 0, 90)` to swing `+Y` onto
+> `+Z`. Note that rotating a shape about the axis it already lies on is a **no-op**:
+> `cylinder(...).rotate(0, 1, 0, 90)` does nothing.
+>
+> A hole on the wrong axis still reports `valid: true`, still renders plausibly,
+> and still exports. Only `measure` against a hand-computed volume catches it —
+> see [`test/bracket-acceptance.test.js`](test/bracket-acceptance.test.js).
 
 ### `Shape` — transforms (return a new shape; never mutate)
 

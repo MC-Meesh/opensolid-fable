@@ -1,6 +1,6 @@
 # Agent transcript: a toothed disk from a circular pattern
 
-The script vocabulary is a real programming language, so a circular pattern is just a `for` loop rotating one feature around the axis. This one also surfaces a genuine export limitation — and how the tool reports it.
+The script vocabulary is a real programming language, so a circular pattern is just a `for` loop rotating one feature around the axis — the axis the disk is actually on.
 
 Every tool call and result below is **real, unedited output** from the OpenSolid MCP server, captured by [`build-gallery.mjs`](build-gallery.mjs). The agent narration is prose framing; the numbers, renders, and files are the machine’s. Regenerate with `node examples/agent-gallery/build-gallery.mjs`.
 
@@ -8,20 +8,21 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 
 ---
 
-**Agent:** One tooth box, rotated into 16 positions by a loop, unioned onto a root cylinder, minus a central bore. `(360 * i) / TEETH` spaces the teeth evenly.
+**Agent:** One tooth box, rotated into 16 positions by a loop, unioned onto a root cylinder, minus a central bore. `(360 * i) / TEETH` spaces the teeth evenly. The circular pattern has to turn about the **same axis the disk is on** — `Shape.cylinder` is **+Y**, so that is `rotate(0, 1, 0, ...)`. Pattern about Z instead and the teeth swing up out of the disk plane into a ring of floating blocks, which still meshes and still reports `valid: true`.
 
 > 🔧 **`create_model`**
 > ```js
 > // A toothed disk: a root disk with N teeth placed on a circular pattern by
-> // rotating one tooth box around the Z axis, plus a central bore. The pattern
-> // is just a JS loop — the script vocabulary is a real programming language.
+> // rotating one tooth box around the disk's own axis (+Y, the cylinder axis),
+> // plus a central bore. The pattern is just a JS loop — the script vocabulary
+> // is a real programming language.
 > const TEETH = 16, TH = 4, ROOT = 16, BORE = 4;
-> let gear = Shape.cylinder(ROOT, TH);
-> const tooth = Shape.box3(3, 2.2, TH).translate(ROOT + 1.5, 0, 0);
+> let gear = Shape.cylinder(ROOT, TH);                          // disk faces in xz, axis +Y
+> const tooth = Shape.box3(3, TH, 2.2).translate(ROOT + 1.5, 0, 0);  // radial x, thick y
 > for (let i = 0; i < TEETH; i++) {
->   gear = gear.union(tooth.rotate(0, 0, 1, (360 * i) / TEETH));
+>   gear = gear.union(tooth.rotate(0, 1, 0, (360 * i) / TEETH));     // pattern about +Y
 > }
-> return gear.subtract(Shape.cylinder(BORE, TH + 2));           // central bore
+> return gear.subtract(Shape.cylinder(BORE, TH + 2));           // central bore, coaxial
 > ```
 > ```json
 > {
@@ -29,47 +30,47 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 >   "name": "gear-disk",
 >   "exact": false,
 >   "mesh": {
->     "triangles": 50928,
->     "vertices": 25478
+>     "triangles": 65762,
+>     "vertices": 32881
 >   },
 >   "boundingBox": {
 >     "min": [
 >       -20.614211729823097,
->       -20.577241106166063,
->       -16
+>       -4,
+>       -20.61083951798434
 >     ],
 >     "max": [
 >       20.567131070203015,
->       20.61083951798434,
->       16
+>       4,
+>       20.577241106166063
 >     ],
 >     "size": [
 >       41.181342800026115,
->       41.1880806241504,
->       32
+>       8,
+>       41.1880806241504
 >     ]
 >   },
->   "volume": 8999.588002223581,
+>   "volume": 8373.391779139787,
 >   "valid": true,
 >   "issues": []
 > }
 > ```
 
-**Agent:** All 16 teeth resolved — `valid: true`, volume 9000 mm³. Top view to check the tooth count and spacing, then iso:
+**Agent:** All 16 teeth resolved — `valid: true`, volume 8373 mm³. Top view to check the tooth count and spacing, then iso:
 
 > 🔧 **`get_screenshot`** `{ "model_id": "model-5", "view": "top", "width": 720, "height": 540 }`
 >
 > ![gear-disk — top view](../output/gear-disk-top.png)
 >
-> *(real 720×540 render, 26 KB PNG)*
+> *(real 720×540 render, 19 KB PNG)*
 
 > 🔧 **`get_screenshot`** `{ "model_id": "model-5", "view": "iso", "width": 720, "height": 540 }`
 >
 > ![gear-disk — iso view](../output/gear-disk-iso.png)
 >
-> *(real 720×540 render, 36 KB PNG)*
+> *(real 720×540 render, 32 KB PNG)*
 
-**Agent:** Sixteen evenly-spaced teeth. STL exports the mesh directly:
+**Agent:** Sixteen evenly-spaced teeth, and the disk reads 8 mm thick in y — which is the check that matters here. Had I patterned about Z, the top view would still show a tidy ring of sixteen blocks and `valid` would still be `true`, but the bounding box would come back 41 × 41 × 32 instead of 41 × 8 × 41: teeth orbiting the disk rather than sitting on its rim. STL exports the mesh directly:
 
 > 🔧 **`export`** `{ "model_id": "model-5", "format": "stl", "path": "gear-disk.stl" }`
 > ```json
@@ -77,18 +78,18 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 >   "model_id": "model-5",
 >   "format": "stl",
 >   "path": "output/gear-disk.stl",
->   "bytes": 2546484
+>   "bytes": 3288184
 > }
 > ```
 
-**Agent:** For completeness I’ll also try STEP. The thin teeth sit right at the edge of the model’s bounding box, and the faceted STEP path needs the surface strictly *inside* the meshing region — so this is a case where the export declines rather than emitting a broken file. Watch how it reports:
+**Agent:** And STEP, for the mechanical model:
 
 > 🔧 **`export`** `{ "model_id": "model-5", "format": "step", "path": "gear-disk.step" }`
 > ```json
 > {
->   "isError": true,
->   "text": "Error: export failed: STEP export failed: degenerate geometry in sdf_to_brep: adaptive meshing did not produce a closed manifold; the surface must lie strictly inside the meshing bounds"
+>   "model_id": "model-5",
+>   "format": "step",
+>   "path": "output/gear-disk.step",
+>   "bytes": 33721874
 > }
 > ```
-
-**Agent:** That’s the honest failure mode: `isError: true` with a specific reason, not a silently-corrupt STEP. The STL is unaffected — meshing and STEP’s planar-region recovery are different code paths. For an analytic STEP of a gear you’d thicken the teeth slightly or model them as an extruded `Profile`; the STL here is already print-ready.

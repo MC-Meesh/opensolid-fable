@@ -176,17 +176,46 @@ no `require`, no filesystem or network. Because it's real JavaScript, patterns
 
 ```js
 // A bolt boss with a hole, then four holes on a rectangular pattern.
-const boss = Shape.cylinder(8, 10);              // radius 8, half-height 10
+const boss = Shape.cylinder(8, 10);              // radius 8, half-height 10, axis +Y
 let part = boss.subtract(Shape.cylinder(3, 12)); // central hole, taller so it cuts clean
 const bolt = Shape.cylinder(1.5, 12);
-for (const x of [-5, 5]) for (const y of [-5, 5]) {
-  part = part.subtract(bolt.translate(x, y, 0));
+for (const x of [-5, 5]) for (const z of [-5, 5]) {
+  part = part.subtract(bolt.translate(x, 0, z));  // pattern in xz: bolts run parallel to the boss
 }
 return part;
 ```
 
 Dimensions are model units. Box/cylinder/torus arguments are **half-extents /
 half-heights** — the shape is centered on the origin.
+
+> ### ⚠️ The axis convention: `cylinder` and `extrude` are **+Y**
+>
+> This is the single most common way to ship a wrong part, so read it once and
+> remember it:
+>
+> - **`Shape.cylinder(r, hh)`** is radial in **xz**, axial in **y** — a **+Y** cylinder.
+> - **`Shape.extrude(profile, height)`** maps the profile's `(u, v)` to **`(x, z)`**
+>   and sweeps along **+Y**, from `y = 0` to `y = height`.
+> - **`Shape.revolve`** turns about **Y**; **`Shape.torus`** rings in **xz**. Same convention.
+> - The renderer agrees: `y` is up in model space, so the named views (`top`, `front`, …)
+>   are relative to a **y-up** part.
+>
+> This cuts against STEP/FreeCAD, which are **z-up** — and the STEP writer emits
+> coordinates verbatim. So a part you model "flat on the xy plane with thickness
+> in z" (the CAD-interchange habit) needs its holes **rotated onto +Z**:
+>
+> ```js
+> const through = Shape.cylinder(2.5, 10).rotate(1, 0, 0, 90);  // +Y -> +Z
+> const sideways = Shape.cylinder(2.5, 10).rotate(0, 0, 1, 90);  // +Y -> +X
+> ```
+>
+> **Rotating about the axis a shape is already on is a no-op.** `cylinder(...).rotate(0, 1, 0, 90)`
+> looks like it aims the cylinder somewhere but does nothing at all.
+>
+> **This failure is silent.** A hole bored on the wrong axis still reports
+> `valid: true`, still renders plausibly, and still exports. Neither a screenshot
+> nor `validate` will catch it — **only `measure` checked against a volume you
+> computed by hand will.** Do that for any part that matters.
 
 **`Shape` — primitives**
 
@@ -195,10 +224,10 @@ half-heights** — the shape is centered on the origin.
 | `Shape.sphere(r)` | sphere, radius `r` |
 | `Shape.box3(hx, hy, hz)` | box, half-extents (full size `2hx × 2hy × 2hz`) |
 | `Shape.roundedBox(hx, hy, hz, r)` | box with fillet radius `r` |
-| `Shape.cylinder(r, hh)` | cylinder, radius `r`, half-height `hh`, axis +Z |
-| `Shape.torus(major, minor)` | torus in the XY plane |
+| `Shape.cylinder(r, hh)` | cylinder, radius `r`, half-height `hh`, axis **+Y** |
+| `Shape.torus(major, minor)` | torus with its ring in the **XZ** plane |
 | `Shape.capsule(x1,y1,z1, x2,y2,z2, r)` | capsule between two points |
-| `Shape.extrude(profile, height)` | extrude a `Profile` along +Z |
+| `Shape.extrude(profile, height)` | extrude a `Profile` along **+Y**, from `y=0` to `y=height` |
 | `Shape.revolve(profile, angleDeg)` | revolve a `Profile` about the Y axis |
 
 **`Shape` — transforms** (return a new shape; never mutate)
@@ -291,11 +320,18 @@ tool **declines rather than emitting a broken file**:
 }
 ```
 
-This is exactly what the [gear-disk transcript](../tools/mcp-server/examples/agent-gallery/gear-disk.md)
-hits: 16 thin radial teeth reach the bounding box, so faceted STEP declines while
-STL exports fine (meshing and STEP's planar-region recovery are different code
-paths). To get an analytic STEP of such a part, thicken the feature slightly or
-model it as an extruded `Profile` so it carries an exact B-Rep.
+STL is unaffected when this happens — meshing and STEP's planar-region recovery
+are different code paths. To get an analytic STEP of such a part, thicken the
+feature slightly or model it as an extruded `Profile` so it carries an exact
+B-Rep.
+
+The same root cause bites *before* export, too. Meshing accuracy is derived from
+the model's overall bounding box, so a small feature inside a large part gets
+proportionally less resolution and can fail to close on its own — `create_model`
+returns `valid: false` with `mesh is not a closed, consistently oriented
+manifold` and a `null` volume. A Ø3.2 bore that meshes cleanly on a single
+knuckle will fail once that knuckle is one of three spread across a 62 mm leaf.
+Widen the feature, or model the part smaller and scale it up.
 
 Other export errors:
 

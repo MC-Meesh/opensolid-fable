@@ -5,12 +5,12 @@
     "turns": [
       {
         "kind": "narration",
-        "text": "The kernel centers primitives on the origin and takes half-extents, so a 60×40×4 base is `box3(30, 20, 2)` and the back wall is `box3(30, 2, 20)` stood up along −Y. I’ll union them, then punch four Ø6 (r=3) holes through the base on a rectangular pattern — the pattern is just a JS loop."
+        "text": "The kernel centers primitives on the origin and takes half-extents, so a 60×40×4 base is `box3(30, 20, 2)` and the back wall is `box3(30, 2, 20)` stood up along −Y. I’ll union them, then punch four Ø6 (r=3) holes through the base on a rectangular pattern — the pattern is just a JS loop. The one thing to get right: the base is a plate lying in xy with its 4 mm thickness along **z**, so the holes must run along **z** — and `Shape.cylinder` is a **+Y** cylinder, so each one needs `rotate(1, 0, 0, 90)` to swing its axis onto +Z. Skip that and the holes bore lengthwise through the 40 mm width instead, which still reports `valid: true`."
       },
       {
         "kind": "create_model",
         "args": {
-          "script": "// 90° angle bracket: a 60×40×4 horizontal flange and a 60×4×40 vertical\n// flange along the back edge, with four Ø6 mounting holes in the base.\nconst base = Shape.box3(30, 20, 2);                        // 60 × 40 × 4\nconst wall = Shape.box3(30, 2, 20).translate(0, -18, 22);  // 60 × 4 × 40, back edge\nlet bracket = base.union(wall);\nconst hole = Shape.cylinder(3, 6);                         // r=3, punches through\nfor (const x of [-20, 20]) for (const y of [-12, 6]) {\n  bracket = bracket.subtract(hole.translate(x, y, 0));\n}\nreturn bracket;",
+          "script": "// 90° angle bracket: a 60×40×4 horizontal flange and a 60×4×40 vertical\n// flange along the back edge, with four Ø6 mounting holes in the base.\nconst base = Shape.box3(30, 20, 2);                        // 60 × 40 × 4\nconst wall = Shape.box3(30, 2, 20).translate(0, -18, 22);  // 60 × 4 × 40, back edge\nlet bracket = base.union(wall);\n// cylinder() is +Y-axis; the base plate's thickness is along z, so rotate the\n// hole onto +Z before punching it through.\nconst hole = Shape.cylinder(3, 6).rotate(1, 0, 0, 90);     // r=3, +Y -> +Z\nfor (const x of [-20, 20]) for (const y of [-12, 6]) {\n  bracket = bracket.subtract(hole.translate(x, y, 0));\n}\nreturn bracket;",
           "name": "angle-bracket"
         },
         "payload": {
@@ -18,8 +18,8 @@
           "name": "angle-bracket",
           "exact": false,
           "mesh": {
-            "triangles": 22166,
-            "vertices": 11077
+            "triangles": 19366,
+            "vertices": 9681
           },
           "boundingBox": {
             "min": [
@@ -38,14 +38,14 @@
               44
             ]
           },
-          "volume": 18032.011256997677,
+          "volume": 18585.712471707368,
           "valid": true,
           "issues": []
         }
       },
       {
         "kind": "narration",
-        "text": "`create_model` returns immediately with `valid: true` and volume 18032 mm³ — the four holes and the boolean union all resolved into one closed solid. Let me eyeball it before exporting."
+        "text": "`create_model` returns immediately with `valid: true` and volume 18586 mm³ — the four holes and the boolean union all resolved into one closed solid. Let me eyeball it before exporting."
       },
       {
         "kind": "screenshot",
@@ -56,11 +56,11 @@
           "height": 540
         },
         "file": "angle-bracket-iso.png",
-        "bytes": 17210
+        "bytes": 19590
       },
       {
         "kind": "narration",
-        "text": "That matches the spec. Mass properties, then the files:"
+        "text": "That looks right — but a render cannot tell me a hole went in sideways, and neither can `valid: true`. The only check that can is the volume, against a number I work out by hand: two 60×40×4 plates meeting at a corner is `60*40*4 + 60*4*40 = 19200 mm³`, less four Ø6 holes through 4 mm of base (`4 * π * 3² * 4 = 452.4`) — **18747.6 mm³**."
       },
       {
         "kind": "measure",
@@ -69,28 +69,28 @@
           "query": "mass"
         },
         "payload": {
-          "volume": 18032.011256997677,
-          "surfaceArea": 10703.113814485621,
+          "volume": 18585.712471707368,
+          "surfaceArea": 10645.158889048333,
           "centroid": [
-            -0.0018492654194972567,
-            -9.333888727169896,
-            11.583349370088724
+            -0.0017141130990889618,
+            -9.142890079673267,
+            11.236832123975795
           ],
           "inertia": [
             [
-              6124309.147046339,
-              -275.66871196687083,
-              1414.1311746387219
+              6275395.541823169,
+              -306.3689073331263,
+              1445.8172902536046
             ],
             [
-              -275.66871196687083,
-              8707097.60635368,
-              1812303.553753316
+              -306.3689073331263,
+              9002296.533018937,
+              1851641.4006252699
             ],
             [
-              1414.1311746387219,
-              1812303.553753316,
-              7971354.13934768
+              1445.8172902536046,
+              1851641.4006252699,
+              8271231.722990537
             ]
           ],
           "exact": false
@@ -98,7 +98,7 @@
       },
       {
         "kind": "narration",
-        "text": "Volume 18032 mm³ = 18.0 cm³; in 6061 aluminium (2.70 g/cm³) that’s about **49 g**. Exporting STEP and STL:"
+        "text": "Volume 18586 mm³ against 18747.6 predicted — -0.9%, which is the SDF mesher reading a hair under true volume at this accuracy, not a modelling error. (Had I left the holes on the default +Y axis they would have bored lengthwise through the plate and landed near 18032 — a 4% miss that looks fine in every render.) So: 18.6 cm³, and in 6061 aluminium (2.70 g/cm³) about **50 g**. Exporting STEP and STL:"
       },
       {
         "kind": "export",
@@ -107,12 +107,7 @@
           "format": "step",
           "path": "angle-bracket.step"
         },
-        "payload": {
-          "model_id": "model-1",
-          "format": "step",
-          "path": "output/angle-bracket.step",
-          "bytes": 6517305
-        }
+        "error": "Error: export failed: STEP export failed: degenerate geometry in sdf_to_brep: adaptive meshing did not produce a closed manifold; the surface must lie strictly inside the meshing bounds"
       },
       {
         "kind": "export",
@@ -125,7 +120,7 @@
           "model_id": "model-1",
           "format": "stl",
           "path": "output/angle-bracket.stl",
-          "bytes": 1108384
+          "bytes": 968384
         }
       },
       {
@@ -140,12 +135,12 @@
     "turns": [
       {
         "kind": "narration",
-        "text": "A knuckle is a cylinder whose default +Z axis I rotate onto +X, then slide along X. Three of them union onto the plate; a long thin cylinder on the same axis subtracts the pin bore. `rotate(0, 1, 0, 90)` swings +Z onto +X."
+        "text": "A knuckle is a cylinder whose default **+Y** axis I rotate onto +X, then slide along X. Three of them union onto the plate; a long thin cylinder on the same axis subtracts the pin bore. The rotation to reach for is `rotate(0, 0, 1, 90)` — turning about **Z** is what carries +Y onto X. Rotating about Y, which is the tempting one to write, would spin the cylinder about its own axis and change nothing."
       },
       {
         "kind": "create_model",
         "args": {
-          "script": "// One leaf of a butt hinge: a flat plate with three barrel knuckles on the\n// pin axis (X) and a pin bore drilled through them. Two of these — one\n// mirrored — pin together into a working hinge.\nconst plate = Shape.box3(30, 15, 0.75).translate(0, -15.75, 0);  // 60 × 30 × 1.5 leaf\n// A knuckle is a cylinder whose +Z axis is rotated onto +X, then slid along X.\nconst knuckle = Shape.cylinder(4, 6).rotate(0, 1, 0, 90);        // r=4, 12 long on X\nlet leaf = plate;\nfor (const x of [-24, 0, 24]) leaf = leaf.union(knuckle.translate(x, 0, 0));\nconst pin = Shape.cylinder(1.6, 40).rotate(0, 1, 0, 90);         // Ø3.2 bore on X\nreturn leaf.subtract(pin);",
+          "script": "// One leaf of a butt hinge: a flat plate with three barrel knuckles on the\n// pin axis (X) and a pin bore drilled through them. Two of these — one\n// mirrored — pin together into a working hinge.\nconst plate = Shape.box3(30, 15, 0.75).translate(0, -15.75, 0);  // 60 × 30 × 1.5 leaf\n// cylinder() is +Y-axis. Rotating about Z carries it onto X (rotating about Y\n// would be a no-op — it is already on Y).\nconst knuckle = Shape.cylinder(4, 6).rotate(0, 0, 1, 90);        // r=4, 12 long on X\nlet leaf = plate;\nfor (const x of [-24, 0, 24]) leaf = leaf.union(knuckle.translate(x, 0, 0));\nconst pin = Shape.cylinder(2, 40).rotate(0, 0, 1, 90);           // Ø4 bore on X\nreturn leaf.subtract(pin);",
           "name": "hinge-leaf"
         },
         "payload": {
@@ -153,34 +148,34 @@
           "name": "hinge-leaf",
           "exact": false,
           "mesh": {
-            "triangles": 21368,
-            "vertices": 10684
+            "triangles": 24684,
+            "vertices": 12342
           },
           "boundingBox": {
             "min": [
-              -30,
+              -31.15627444612003,
               -30.75,
-              -5.3682811189189135
+              -4
             ],
             "max": [
-              30,
-              6,
-              5.3682811189189135
+              31.15627444612003,
+              6.264428351177253,
+              4
             ],
             "size": [
-              60,
-              36.75,
-              10.736562237837827
+              62.31254889224006,
+              37.01442835117725,
+              8
             ]
           },
-          "volume": 4013.5680459331566,
+          "volume": 3977.0056213444655,
           "valid": true,
           "issues": []
         }
       },
       {
         "kind": "narration",
-        "text": "Valid solid, 21,368 triangles — the pin bore runs cleanly through all three knuckles. Let me look at it and confirm the mesh is watertight before exporting."
+        "text": "Valid solid, 24,684 triangles — the pin bore runs cleanly through all three knuckles. One sizing note worth being honest about: I opened the bore to Ø4. At Ø3.2 this part comes back `valid: false` with a non-manifold mesh, because the default meshing accuracy is derived from the model’s overall bounding box (~62 mm here), and that is too coarse to resolve a bore that small. The fix is a bore the mesher can see; the same Ø3.2 bore meshes fine on a single knuckle in a smaller box. Let me look at it and confirm the mesh is watertight before exporting."
       },
       {
         "kind": "screenshot",
@@ -191,7 +186,7 @@
           "height": 540
         },
         "file": "hinge-leaf-iso.png",
-        "bytes": 25791
+        "bytes": 26640
       },
       {
         "kind": "validate",
@@ -201,9 +196,9 @@
         "payload": {
           "valid": true,
           "closedManifold": true,
-          "triangles": 21368,
-          "vertices": 10684,
-          "volume": 4013.5680459331566,
+          "triangles": 24684,
+          "vertices": 12342,
+          "volume": 3977.0056213444655,
           "exact": false,
           "issues": []
         }
@@ -219,12 +214,7 @@
           "format": "step",
           "path": "hinge-leaf.step"
         },
-        "payload": {
-          "model_id": "model-2",
-          "format": "step",
-          "path": "output/hinge-leaf.step",
-          "bytes": 11220052
-        }
+        "error": "Error: export failed: STEP export failed: degenerate geometry in sdf_to_brep: adaptive meshing did not produce a closed manifold; the surface must lie strictly inside the meshing bounds"
       },
       {
         "kind": "export",
@@ -237,7 +227,7 @@
           "model_id": "model-2",
           "format": "stl",
           "path": "output/hinge-leaf.stl",
-          "bytes": 1068484
+          "bytes": 1234284
         }
       },
       {
@@ -424,12 +414,12 @@
     "turns": [
       {
         "kind": "narration",
-        "text": "One tooth box, rotated into 16 positions by a loop, unioned onto a root cylinder, minus a central bore. `(360 * i) / TEETH` spaces the teeth evenly."
+        "text": "One tooth box, rotated into 16 positions by a loop, unioned onto a root cylinder, minus a central bore. `(360 * i) / TEETH` spaces the teeth evenly. The circular pattern has to turn about the **same axis the disk is on** — `Shape.cylinder` is **+Y**, so that is `rotate(0, 1, 0, ...)`. Pattern about Z instead and the teeth swing up out of the disk plane into a ring of floating blocks, which still meshes and still reports `valid: true`."
       },
       {
         "kind": "create_model",
         "args": {
-          "script": "// A toothed disk: a root disk with N teeth placed on a circular pattern by\n// rotating one tooth box around the Z axis, plus a central bore. The pattern\n// is just a JS loop — the script vocabulary is a real programming language.\nconst TEETH = 16, TH = 4, ROOT = 16, BORE = 4;\nlet gear = Shape.cylinder(ROOT, TH);\nconst tooth = Shape.box3(3, 2.2, TH).translate(ROOT + 1.5, 0, 0);\nfor (let i = 0; i < TEETH; i++) {\n  gear = gear.union(tooth.rotate(0, 0, 1, (360 * i) / TEETH));\n}\nreturn gear.subtract(Shape.cylinder(BORE, TH + 2));           // central bore",
+          "script": "// A toothed disk: a root disk with N teeth placed on a circular pattern by\n// rotating one tooth box around the disk's own axis (+Y, the cylinder axis),\n// plus a central bore. The pattern is just a JS loop — the script vocabulary\n// is a real programming language.\nconst TEETH = 16, TH = 4, ROOT = 16, BORE = 4;\nlet gear = Shape.cylinder(ROOT, TH);                          // disk faces in xz, axis +Y\nconst tooth = Shape.box3(3, TH, 2.2).translate(ROOT + 1.5, 0, 0);  // radial x, thick y\nfor (let i = 0; i < TEETH; i++) {\n  gear = gear.union(tooth.rotate(0, 1, 0, (360 * i) / TEETH));     // pattern about +Y\n}\nreturn gear.subtract(Shape.cylinder(BORE, TH + 2));           // central bore, coaxial",
           "name": "gear-disk"
         },
         "payload": {
@@ -437,34 +427,34 @@
           "name": "gear-disk",
           "exact": false,
           "mesh": {
-            "triangles": 50928,
-            "vertices": 25478
+            "triangles": 65762,
+            "vertices": 32881
           },
           "boundingBox": {
             "min": [
               -20.614211729823097,
-              -20.577241106166063,
-              -16
+              -4,
+              -20.61083951798434
             ],
             "max": [
               20.567131070203015,
-              20.61083951798434,
-              16
+              4,
+              20.577241106166063
             ],
             "size": [
               41.181342800026115,
-              41.1880806241504,
-              32
+              8,
+              41.1880806241504
             ]
           },
-          "volume": 8999.588002223581,
+          "volume": 8373.391779139787,
           "valid": true,
           "issues": []
         }
       },
       {
         "kind": "narration",
-        "text": "All 16 teeth resolved — `valid: true`, volume 9000 mm³. Top view to check the tooth count and spacing, then iso:"
+        "text": "All 16 teeth resolved — `valid: true`, volume 8373 mm³. Top view to check the tooth count and spacing, then iso:"
       },
       {
         "kind": "screenshot",
@@ -475,7 +465,7 @@
           "height": 540
         },
         "file": "gear-disk-top.png",
-        "bytes": 26349
+        "bytes": 19552
       },
       {
         "kind": "screenshot",
@@ -486,11 +476,11 @@
           "height": 540
         },
         "file": "gear-disk-iso.png",
-        "bytes": 37032
+        "bytes": 33168
       },
       {
         "kind": "narration",
-        "text": "Sixteen evenly-spaced teeth. STL exports the mesh directly:"
+        "text": "Sixteen evenly-spaced teeth, and the disk reads 8 mm thick in y — which is the check that matters here. Had I patterned about Z, the top view would still show a tidy ring of sixteen blocks and `valid` would still be `true`, but the bounding box would come back 41 × 41 × 32 instead of 41 × 8 × 41: teeth orbiting the disk rather than sitting on its rim. STL exports the mesh directly:"
       },
       {
         "kind": "export",
@@ -503,12 +493,12 @@
           "model_id": "model-5",
           "format": "stl",
           "path": "output/gear-disk.stl",
-          "bytes": 2546484
+          "bytes": 3288184
         }
       },
       {
         "kind": "narration",
-        "text": "For completeness I’ll also try STEP. The thin teeth sit right at the edge of the model’s bounding box, and the faceted STEP path needs the surface strictly *inside* the meshing region — so this is a case where the export declines rather than emitting a broken file. Watch how it reports:"
+        "text": "And STEP, for the mechanical model:"
       },
       {
         "kind": "export",
@@ -517,11 +507,12 @@
           "format": "step",
           "path": "gear-disk.step"
         },
-        "error": "Error: export failed: STEP export failed: degenerate geometry in sdf_to_brep: adaptive meshing did not produce a closed manifold; the surface must lie strictly inside the meshing bounds"
-      },
-      {
-        "kind": "narration",
-        "text": "That’s the honest failure mode: `isError: true` with a specific reason, not a silently-corrupt STEP. The STL is unaffected — meshing and STEP’s planar-region recovery are different code paths. For an analytic STEP of a gear you’d thicken the teeth slightly or model them as an extruded `Profile`; the STL here is already print-ready."
+        "payload": {
+          "model_id": "model-5",
+          "format": "step",
+          "path": "output/gear-disk.step",
+          "bytes": 33721874
+        }
       }
     ]
   },
