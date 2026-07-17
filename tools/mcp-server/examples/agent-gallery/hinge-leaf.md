@@ -77,7 +77,7 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 > }
 > ```
 
-**Agent:** `closedManifold: true`, no issues — a real solid, not a surface soup. Exporting STEP for the mechanical model:
+**Agent:** `closedManifold: true`, no issues — a real solid, not a surface soup. The STEP file you asked for:
 
 > 🔧 **`export`** `{ "model_id": "model-2", "format": "step", "path": "hinge-leaf.step" }`
 > ```json
@@ -86,6 +86,8 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 >   "text": "Error: export failed: STEP export failed: degenerate geometry in sdf_to_brep: adaptive meshing did not produce a closed manifold; the surface must lie strictly inside the meshing bounds"
 > }
 > ```
+
+**Agent:** STEP declines here. This part has no exact B-Rep companion, so STEP takes the faceted SDF→B-Rep path, which needs the surface to close strictly inside the meshing region — a Ø4 bore threaded through three knuckles across a 62 mm leaf is too fine for the accuracy that box implies. The tool says so plainly rather than emitting a broken file. I can still give you the mesh:
 
 > 🔧 **`export`** `{ "model_id": "model-2", "format": "stl", "path": "hinge-leaf.stl" }`
 > ```json
@@ -97,4 +99,4 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 > }
 > ```
 
-**Agent:** Mirror this leaf about X and pin the two together and you have a working hinge.
+**Agent:** So: a valid, watertight STL, and an honest no on STEP. If the STEP file is the deliverable, the route is to build the leaf from an extruded `Profile` so it carries an exact B-Rep (see the [right-angle bracket](bracket-right-angle.md)) rather than from rotated primitives. Mirror this leaf about X and pin the two together and you have a working hinge.

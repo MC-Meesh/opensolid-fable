@@ -1,7 +1,7 @@
 // End-to-end tests for the MCP tool handlers, exercising the real wasm
 // kernel. Requires the built pkg (`npm run build`).
 
-import { test } from 'node:test';
+import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, existsSync, readFileSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -133,4 +133,88 @@ test('exact booleans flag is honored per model', () => {
   assert.equal(exact.exact, true);
   // Exact box-minus-box is a clean solid.
   assert.equal(exact.valid, true);
+});
+
+// ── Axis convention ────────────────────────────────────────────────────────
+// cylinder/extrude/torus are +Y (radial in xz), which is unusual — it cuts
+// against z-up CAD interchange, and getting it wrong fails *silently*: a hole
+// on the wrong axis still reports valid:true and still renders plausibly.
+// These lock the convention the docs promise (AGENT_GUIDE.md §3, README.md).
+// If one of these ever fails, the docs and two gallery transcripts are wrong
+// too — see of-4tu, which is exactly that bug.
+describe('axis convention (+Y) — documented in AGENT_GUIDE.md §3', () => {
+  const bbox = (script) => jsonOf(freshTools().call('create_model', { script })).boundingBox;
+
+  test('cylinder is a +Y cylinder: radial in xz, axial in y', () => {
+    // r=2, hh=5 -> 4 wide in x and z, 10 tall in y. If this ever reads
+    // [4, 4, 10] the kernel has moved to +Z and the docs must follow.
+    assert.deepEqual(bbox('return Shape.cylinder(2, 5);').size, [4, 10, 4]);
+  });
+
+  test('extrude sweeps +Y, mapping profile (u,v) -> (x,z)', () => {
+    const b = bbox(`
+      const p = new Profile(0, 0);
+      p.lineTo(10, 0); p.lineTo(10, 3); p.lineTo(0, 3); p.close();
+      return Shape.extrude(p, 7);
+    `);
+    // Profile is 10 (u) x 3 (v) -> 10 in x, 3 in z; swept 7 along y.
+    assert.deepEqual(b.size, [10, 7, 3]);
+    // ...and the sweep runs from y=0 to y=height, not centered on the origin.
+    assert.equal(b.min[1], 0);
+    assert.equal(b.max[1], 7);
+  });
+
+  test('torus rings in the xz plane', () => {
+    // major 10, minor 2 -> 24 across x and z, 4 thick in y.
+    assert.deepEqual(bbox('return Shape.torus(10, 2);').size, [24, 4, 24]);
+  });
+
+  // Rotated shapes must be probed by *volume*, not by boundingBox: the tracked
+  // box is conservative (rotating an AABB inflates it), so a rotated cylinder
+  // reports a fatter box than it occupies. Volume is the honest instrument —
+  // which is the same lesson the bracket acceptance test teaches.
+  //
+  // Probe: bore a cylinder through a 20 x 20 x 2 plate that is thin in z.
+  // A hole truly on +Z punches through the 2 mm thickness and removes
+  // pi*2^2*2 = 25.1 mm^3. A hole left on +Y instead lies *in* the plate and
+  // scoops out a ~78 mm^3 slot — a 3x difference, and the exact silent failure
+  // that shipped in the angle-bracket transcript.
+  const PLATE = 'Shape.box3(10, 10, 1)';
+  const removedBy = (rot) => {
+    const solid = (s) => jsonOf(freshTools().call('create_model', { script: s })).volume;
+    return solid(`return ${PLATE};`) - solid(`return ${PLATE}.subtract(Shape.cylinder(2, 5)${rot});`);
+  };
+  const THROUGH_HOLE = Math.PI * 2 ** 2 * 2; // 25.1 mm^3
+
+  test('rotating a cylinder about its own axis (+Y) is a no-op', () => {
+    // The documented trap: rotate(0,1,0,90) *looks* like it aims the cylinder
+    // somewhere but spins it about itself. The hinge-leaf transcript shipped
+    // this bug for real. Same geometry in, same material out — equal to within
+    // float noise (the mesher sums in a different order, ~1e-13).
+    const spun = removedBy('.rotate(0, 1, 0, 90)');
+    const plainly = removedBy('');
+    assert.ok(
+      Math.abs(spun - plainly) < 1e-9,
+      `rotating a +Y cylinder about Y should change nothing; got ${spun} vs ${plainly}`,
+    );
+  });
+
+  test('rotate(1,0,0,90) swings +Y onto +Z, giving a real through-hole', () => {
+    // The rotation the docs hand you for a z-up plate. Generous band: the SDF
+    // mesher runs over on a feature this small, but the miss we care about is
+    // 3x, not percent.
+    const removed = removedBy('.rotate(1, 0, 0, 90)');
+    assert.ok(
+      removed > THROUGH_HOLE * 0.8 && removed < THROUGH_HOLE * 1.3,
+      `expected ~${THROUGH_HOLE.toFixed(1)} mm^3 (a through-hole), got ${removed.toFixed(1)}`,
+    );
+    // ...and decisively less than leaving it on +Y, which slots the plate.
+    assert.ok(removed < removedBy('') / 2);
+  });
+
+  test('rotate(0,0,1,90) swings +Y onto +X', () => {
+    // Onto X the cylinder lies *along* the plate, so it slots rather than
+    // bores — same signature as +Y, nothing like the +Z through-hole.
+    assert.ok(removedBy('.rotate(0, 0, 1, 90)') > THROUGH_HOLE * 2);
+  });
 });
