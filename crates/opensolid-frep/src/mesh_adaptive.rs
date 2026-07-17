@@ -631,6 +631,25 @@ fn number_leaves(node: &mut Node, positions: &mut Vec<Point3>) {
     }
 }
 
+/// Field values on the `3x3x3` lattice of a cell's child corners, indexed
+/// `(i * 3 + j) * 3 + k` with each of `i`, `j`, `k` in `0..=2`, filled
+/// lazily. Even coordinates on every axis are the cell's own corners, so
+/// those eight arrive already known.
+struct SubLattice {
+    vals: [Option<f64>; 27],
+}
+
+impl SubLattice {
+    fn seeded(corners: &[f64; 8]) -> Self {
+        let mut vals: [Option<f64>; 27] = [None; 27];
+        for (c, &v) in corners.iter().enumerate() {
+            let (dx, dy, dz) = corner(c);
+            vals[(2 * dx * 3 + 2 * dy) * 3 + 2 * dz] = Some(v);
+        }
+        Self { vals }
+    }
+}
+
 impl GradedBuilder<'_> {
     /// Build the subtree for the cell at `coords`/`depth`, whose interval
     /// was already checked by the parent and whose corner field values are
@@ -639,12 +658,39 @@ impl GradedBuilder<'_> {
         if depth == self.max_depth {
             return self.max_depth_leaf(depth, coords, corners);
         }
+        // The child-corner lattice serves both the leaf probe and, if the
+        // cell goes on to subdivide, the children themselves — the probe
+        // samples exactly the points refinement would need anyway, so a
+        // cell rejected by the probe re-reads them for free.
+        let mut lattice = SubLattice::seeded(&corners);
         if depth >= MIN_GRADED_DEPTH && has_sign_change(&corners) {
-            if let Some(node) = self.try_leaf(depth, coords, corners) {
+            if let Some(node) = self.try_leaf(depth, coords, corners, &mut lattice) {
                 return node;
             }
         }
-        self.subdivide(depth, coords, corners)
+        self.subdivide(depth, coords, lattice)
+    }
+
+    /// Field value at child-corner lattice point `(i, j, k)` (each in
+    /// `0..=2`) of the cell at `coords`/`depth`, evaluating it only on the
+    /// first request.
+    fn lattice_at(
+        &self,
+        lattice: &mut SubLattice,
+        depth: u32,
+        coords: [u32; 3],
+        (i, j, k): (usize, usize, usize),
+    ) -> f64 {
+        let child_shift = self.max_depth - depth - 1;
+        let base = [coords[0] << 1, coords[1] << 1, coords[2] << 1];
+        let slot = &mut lattice.vals[(i * 3 + j) * 3 + k];
+        *slot.get_or_insert_with(|| {
+            self.sdf.eval(&self.g.point_at([
+                (base[0] + i as u32) << child_shift,
+                (base[1] + j as u32) << child_shift,
+                (base[2] + k as u32) << child_shift,
+            ]))
+        })
     }
 
     /// Crossing point and unit normal for each sign-changing cell edge, at
@@ -669,7 +715,13 @@ impl GradedBuilder<'_> {
     /// reference it. A returned leaf is always single-component: two-sheet
     /// cells (whose crossing normals disagree) are forced to subdivide so
     /// each sheet gets its own vertex at `max_depth`.
-    fn try_leaf(&self, depth: u32, coords: [u32; 3], corners: [f64; 8]) -> Option<Node> {
+    fn try_leaf(
+        &self,
+        depth: u32,
+        coords: [u32; 3],
+        corners: [f64; 8],
+        lattice: &mut SubLattice,
+    ) -> Option<Node> {
         let (comp_of_edge, count) = classify_components(&corners);
         debug_assert!(count >= 1, "sign change must produce a component");
         // Two sheets in one cell cannot be modeled by a single vertex; refine
@@ -714,6 +766,9 @@ impl GradedBuilder<'_> {
         if self.sdf.eval(&vertices[0]).abs() > self.accuracy {
             return None;
         }
+        if !self.model_holds_inside(depth, coords, &crossings, &vertices[0], lattice) {
+            return None;
+        }
         Some(Node::Leaf(Box::new(Leaf {
             depth,
             corners,
@@ -722,6 +777,73 @@ impl GradedBuilder<'_> {
             vertices,
             indices: [usize::MAX; 4],
         })))
+    }
+
+    /// Does the cell's one-vertex plane model predict the field across the
+    /// cell's *interior*, not just on its boundary lattice?
+    ///
+    /// Corner signs and edge crossings only sample the cell's boundary. A
+    /// feature living entirely inside the cell — the rim of a hole whose
+    /// footprint clears all eight corners — leaves every corner and every
+    /// crossing agreeing on one flat sheet, so the error and normal tests
+    /// above pass and the cell terminates carrying a single vertex for what
+    /// are really two sheets. Neighbouring fine leaves then route both
+    /// sheets' stitch edges onto that one vertex, pinching them into
+    /// four-triangle (non-manifold) edges (of-obv).
+    ///
+    /// Probing the child-corner sublattice — the points the next refinement
+    /// level would sample anyway — catches such interiors: the model here is
+    /// the dual patch itself, a plane through the QEF vertex with the mean
+    /// crossing normal, so this is the same chordal-deviation bound the edge
+    /// test applies, extended from the boundary to the cell's inside.
+    ///
+    /// Sampling is not a proof: a feature thinner than the sublattice can
+    /// still hide. It is the same bet the edge and vertex tests already make,
+    /// taken on a strictly finer point set.
+    fn model_holds_inside(
+        &self,
+        depth: u32,
+        coords: [u32; 3],
+        crossings: &[Option<(Vector3, Vector3)>; 12],
+        vertex: &Point3,
+        lattice: &mut SubLattice,
+    ) -> bool {
+        let normal_sum = crossings
+            .iter()
+            .filter_map(|c| c.map(|(_, n)| n))
+            .fold(Vector3::zeros(), |acc, n| acc + n);
+        // No usable mean normal (opposed or all-zero crossings): the cell has
+        // no trustworthy plane model, so refine rather than guess.
+        let Some(normal) = normal_sum.try_normalize(1e-12) else {
+            return false;
+        };
+
+        // Corners of this cell's eight children: the 3x3x3 sublattice. The
+        // eight parent corners (even index on every axis) sit on the plane
+        // model's own data and are already covered by the tests above.
+        let child_shift = self.max_depth - depth - 1;
+        let base = [coords[0] << 1, coords[1] << 1, coords[2] << 1];
+        for i in 0..3usize {
+            for j in 0..3usize {
+                for k in 0..3usize {
+                    if i != 1 && j != 1 && k != 1 {
+                        continue;
+                    }
+                    let p = self.g.point_at([
+                        (base[0] + i as u32) << child_shift,
+                        (base[1] + j as u32) << child_shift,
+                        (base[2] + k as u32) << child_shift,
+                    ]);
+                    let model = normal.dot(&(p - vertex));
+                    if (self.lattice_at(lattice, depth, coords, (i, j, k)) - model).abs()
+                        > self.accuracy
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
     }
 
     /// Finest-level cell: a leaf if any edge crosses, otherwise `Empty`
@@ -751,7 +873,10 @@ impl GradedBuilder<'_> {
         }))
     }
 
-    fn subdivide(&self, depth: u32, coords: [u32; 3], corners: [f64; 8]) -> Node {
+    /// Build the cell's eight children. `lattice` carries whatever child
+    /// corners the leaf probe already sampled (it is seeded with this cell's
+    /// own corners), so no field point is evaluated twice.
+    fn subdivide(&self, depth: u32, coords: [u32; 3], lattice: SubLattice) -> Node {
         let child_shift = self.max_depth - depth - 1;
         let base = [coords[0] << 1, coords[1] << 1, coords[2] << 1];
 
@@ -786,14 +911,9 @@ impl GradedBuilder<'_> {
             std::array::from_fn(|_| drain.next().expect("eight children"))
         } else {
             // Sequential: share field samples between siblings through the
-            // 3x3x3 lattice of child corners, seeded with the parent's
-            // corners and filled lazily for interval-surviving children only.
-            let lidx = |i: usize, j: usize, k: usize| (i * 3 + j) * 3 + k;
-            let mut vals: [Option<f64>; 27] = [None; 27];
-            for (c, &v) in corners.iter().enumerate() {
-                let (dx, dy, dz) = corner(c);
-                vals[lidx(2 * dx, 2 * dy, 2 * dz)] = Some(v);
-            }
+            // 3x3x3 lattice of child corners, carried over from the leaf
+            // probe and filled lazily for interval-surviving children only.
+            let mut lattice = lattice;
             let mut children: [Node; 8] = std::array::from_fn(|_| Node::Empty);
             for (c, child) in children.iter_mut().enumerate() {
                 let (dx, dy, dz) = corner(c);
@@ -811,14 +931,7 @@ impl GradedBuilder<'_> {
                 }
                 let child_corners: [f64; 8] = std::array::from_fn(|k| {
                     let (ex, ey, ez) = corner(k);
-                    let (i, j, l) = (dx + ex, dy + ey, dz + ez);
-                    *vals[lidx(i, j, l)].get_or_insert_with(|| {
-                        self.sdf.eval(&self.g.point_at([
-                            (base[0] + i as u32) << child_shift,
-                            (base[1] + j as u32) << child_shift,
-                            (base[2] + l as u32) << child_shift,
-                        ]))
-                    })
+                    self.lattice_at(&mut lattice, depth, coords, (dx + ex, dy + ey, dz + ez))
                 });
                 *child = self.build(depth + 1, cc, child_corners);
             }
@@ -1590,11 +1703,29 @@ mod tests {
         assert!(dev <= 2.0 * acc, "deviation {dev} exceeds 2x target {acc}");
     }
 
-    /// Flat-dominated scenes must also save field evaluations, not just
-    /// triangles: early leaf termination skips the fine levels entirely
-    /// outside the feature bands.
+    /// Flat-dominated scenes must pay off: grading collapses the flat
+    /// regions into a fraction of the triangles, and must not blow up the
+    /// field-evaluation count doing it.
+    ///
+    /// This asserted >2x *eval* savings at this depth until the of-obv
+    /// interior-feature probe ([`GradedBuilder::model_holds_inside`]) landed.
+    /// The probe costs ~19 evals on a *terminating* leaf — the one case with
+    /// no skipped subtree to amortize them against — which pushed the eval
+    /// break-even a level deeper. Measured on this shape: evals 2.5x worse
+    /// than uniform at depth 6, parity at depth 8 (222k vs 232k), and 2.2x
+    /// better at depth 9 (425k vs 930k), while triangles improve from 2.1x
+    /// to 8.0x to 20.3x fewer. Depth 9 is where the old claim still holds,
+    /// but meshing a ~930k-triangle uniform reference there takes ~74s —
+    /// too slow to gate on.
+    ///
+    /// The probe is not optional: without it the mesher pinches two surface
+    /// sheets onto one vertex and faceted STEP export fails outright. So
+    /// this guards what survives at a depth cheap enough to run — triangle
+    /// count, which is what a STEP body actually pays for — plus a ceiling
+    /// that still catches an eval blowup. of-9gw tracks winning the evals
+    /// back via global lattice memoization.
     #[test]
-    fn graded_box_union_samples_fewer_points_than_uniform_depth() {
+    fn graded_box_union_collapses_flat_regions_without_eval_blowup() {
         let make = || Union {
             a: Box3 {
                 center: Point3::origin(),
@@ -1618,22 +1749,29 @@ mod tests {
             max_depth: 8,
             accuracy: Some(0.005),
         };
-        mesh_sdf_adaptive_indexed(&graded, &opts);
-        mesh_sdf_adaptive_indexed(
+        let gm = mesh_sdf_adaptive_indexed(&graded, &opts);
+        let um = mesh_sdf_adaptive_indexed(
             &uniform,
             &AdaptiveMeshOptions {
                 accuracy: None,
                 ..opts
             },
         );
+        let (gt, ut) = (gm.triangle_count(), um.triangle_count());
+        // Measured 8.0x here; assert half of it so ordinary drift in the
+        // grading heuristics does not trip the gate.
+        assert!(
+            ut > 4 * gt,
+            "graded produced {gt} triangles, uniform depth {ut}: expected >4x fewer"
+        );
         let g = graded.evals.load(Ordering::Relaxed);
         let u = uniform.evals.load(Ordering::Relaxed);
-        // Graded descent pays per-level corner samples and error probes, so
-        // the eval win needs depth to amortize: measured 2.4x at depth 8
-        // (and slightly *worse* than uniform at depth 6 — that is expected).
+        // Deliberately NOT a savings claim at this depth (measured 1.04x —
+        // too thin a margin to gate on). A ceiling: the probe, or anything
+        // that follows it, must not make grading pathologically eval-hungry.
         assert!(
-            g * 2 < u,
-            "graded sampled {g} points, uniform depth sampled {u}: expected >2x savings"
+            g * 2 < u * 3,
+            "graded sampled {g} points, uniform depth sampled {u}: expected under 1.5x"
         );
     }
 
@@ -1660,6 +1798,52 @@ mod tests {
                 },
             );
             assert_eq!(mesh.triangle_count(), uniform.triangle_count());
+        }
+    }
+
+    /// A plate with a through-hole — the most common feature in mechanical
+    /// CAD — must mesh closed at every grid alignment (of-obv).
+    ///
+    /// The hole's rim can fall entirely between a coarse cell's corners, so
+    /// the cell reads as one flat sheet and used to terminate with a single
+    /// vertex, pinching the plate face and the bore wall onto it. Whether a
+    /// corner lands in the bore depends only on grid alignment, which is why
+    /// this used to pass or fail on identity transforms of the same part;
+    /// the offsets sweep alignments that previously failed.
+    #[test]
+    fn plate_with_through_hole_closes_at_any_grid_alignment() {
+        for (i, &offset) in [0.0, 0.37, 1.4, 2.6, -0.9].iter().enumerate() {
+            let shape = Subtraction {
+                a: Box3 {
+                    center: Point3::new(0.0, 0.0, 0.0),
+                    half_extents: [30.0, 2.5, 20.0],
+                },
+                b: Cylinder {
+                    center: Point3::new(15.0, 0.0, 0.0),
+                    radius: 2.5,
+                    half_height: 10.0,
+                },
+            };
+            // Mirrors the STEP export path: 10% pad, 0.5%-of-extent accuracy.
+            let pad = 6.0 + offset;
+            let bounds = BoundingBox3::new(
+                Point3::new(-30.0 - pad, -2.5 - pad, -20.0 - pad),
+                Point3::new(30.0 + pad, 2.5 + pad, 20.0 + pad),
+            );
+            let extent = 60.0 + 2.0 * pad;
+            let mesh = mesh_sdf_adaptive_indexed(
+                &shape,
+                &AdaptiveMeshOptions {
+                    bounds,
+                    max_depth: 8,
+                    accuracy: Some(5e-3 * extent),
+                },
+            );
+            assert!(!mesh.is_empty(), "case {i}: empty mesh");
+            assert!(
+                mesh.is_closed_manifold(),
+                "case {i} (pad {pad}): plate with through-hole did not close"
+            );
         }
     }
 }

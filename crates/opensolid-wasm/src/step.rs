@@ -230,6 +230,43 @@ mod tests {
         assert_eq!(bodies.len(), 1);
     }
 
+    /// A plate with a through-hole is the most common feature in mechanical
+    /// CAD, and the faceted path is the only STEP path once a part carries a
+    /// blend — so this must export regardless of how the part is spelled
+    /// (of-obv).
+    ///
+    /// The bore's rim used to fall between the corners of a coarse mesher
+    /// cell, which then terminated as a single flat sheet and pinched the
+    /// plate face against the bore wall, failing to close. Whether a corner
+    /// landed inside the bore depended only on where the tracked bounding
+    /// box put the octree grid, so geometrically identical spellings of the
+    /// same part disagreed: `.rotate(0, 1, 0, 360)` — an identity that only
+    /// loosens the tracked box — used to be the difference between a clean
+    /// export and a hard error.
+    #[test]
+    fn plate_with_through_hole_exports_however_it_is_spelled() {
+        // 60x40x5 plate, one d5 bore through the thickness.
+        let plate = || {
+            BoundedShape::box3(30.0, 2.5, 20.0).subtract(
+                &BoundedShape::cylinder(2.5, 10.0)
+                    .translate(opensolid_core::types::Vector3::new(15.0, 0.0, 0.0)),
+            )
+        };
+        // The bare spelling, and the same part after a 360-degree identity
+        // rotation: same geometry, different tracked box, different grid.
+        let full_turn = opensolid_core::types::Vector3::new(0.0, std::f64::consts::TAU, 0.0);
+        for (name, shape) in [
+            ("as-built", plate()),
+            ("identity-rotated", plate().rotate(full_turn)),
+        ] {
+            let export = export_step(&shape, None, None, None)
+                .unwrap_or_else(|e| panic!("{name} spelling failed to export: {e}"));
+            assert!(!export.exact, "{name}: bore forces the faceted path");
+            let (_, _, bodies) = reimport(&export.text);
+            assert_eq!(bodies.len(), 1, "{name}: one solid body");
+        }
+    }
+
     /// The bead's faceted acceptance test: an organic (smooth-blended)
     /// shape exports as a faceted body that round-trips through the reader
     /// without check() failures.
