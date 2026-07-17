@@ -168,17 +168,17 @@
             "min": [
               -30,
               -30.75,
-              -4
+              -3.9999607582315595
             ],
             "max": [
               30,
-              4.000000000000001,
-              4
+              3.999932899561649,
+              3.999962822786223
             ],
             "size": [
               60,
-              34.75,
-              8
+              34.74993289956165,
+              7.999923581017782
             ]
           },
           "volume": 3815.201362779873,
@@ -289,12 +289,12 @@
             "max": [
               40,
               30,
-              15
+              15.001301777746544
             ],
             "size": [
               80,
               60,
-              30
+              30.001301777746544
             ]
           },
           "volume": 34763.23671539217,
@@ -365,18 +365,18 @@
           },
           "boundingBox": {
             "min": [
-              -40,
-              -30,
+              -39.59760855470059,
+              -29.593651240604697,
               11
             ],
             "max": [
-              40,
-              30,
+              39.59760855469844,
+              29.59258910921366,
               18
             ],
             "size": [
-              80,
-              60,
+              79.19521710939904,
+              59.186240349818355,
               7
             ]
           },
@@ -456,7 +456,7 @@
             "min": [
               -20.5,
               -4,
-              -20.5
+              -20.500000000000004
             ],
             "max": [
               20.5,
@@ -562,19 +562,19 @@
           },
           "boundingBox": {
             "min": [
-              -18.768181818181816,
-              0,
-              -18.768181818181816
+              -18.708655072485083,
+              -3.5525888480913304e-15,
+              -18.70865507245069
             ],
             "max": [
-              18.768181818181816,
-              74,
-              18.768181818181816
+              18.708655072468762,
+              74.0000000001367,
+              18.70865507247004
             ],
             "size": [
-              37.53636363636363,
-              74,
-              37.53636363636363
+              37.417310144953845,
+              74.0000000001367,
+              37.417310144920734
             ]
           },
           "volume": 21522.428820026827,
@@ -693,19 +693,19 @@
           },
           "boundingBox": {
             "min": [
-              -30.75,
-              -0.75,
-              -0.75
+              -30.000000000000167,
+              -1.7015596003106645e-15,
+              -2.5604518505418055e-10
             ],
             "max": [
-              30.75,
-              40.75,
-              40.75
+              30,
+              40,
+              40
             ],
             "size": [
-              61.5,
-              41.5,
-              41.5
+              60.00000000000017,
+              40,
+              40.000000000256044
             ]
           },
           "volume": 19786.79765644562,
@@ -790,7 +790,7 @@
       },
       {
         "kind": "narration",
-        "text": "Volume 19787 mm³ = 19.8 cm³; in 6061 aluminium (2.70 g/cm³) that is about **53 g**. Note the `boundingBox` the tools report is the *tracked* box, not the part: it reads 61.5 × 41.5 × 41.5 for a part that is really 60 × 40 × 40, because `smoothUnion` pads the tracked box by `radius/4`. It is a conservative bound the kernel carries for meshing, not a measurement — do not read dimensions off it. Exporting:"
+        "text": "Volume 19787 mm³ = 19.8 cm³; in 6061 aluminium (2.70 g/cm³) that is about **53 g**. The reported `boundingBox` measures the part itself (it is taken off the same mesh these mass properties integrate), so it is good to the meshing accuracy and can be read as a measurement. Exporting:"
       },
       {
         "kind": "export",

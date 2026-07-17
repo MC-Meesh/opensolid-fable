@@ -62,19 +62,19 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 >   },
 >   "boundingBox": {
 >     "min": [
->       -30.75,
->       -0.75,
->       -0.75
+>       -30.000000000000167,
+>       -1.7015596003106645e-15,
+>       -2.5604518505418055e-10
 >     ],
 >     "max": [
->       30.75,
->       40.75,
->       40.75
+>       30,
+>       40,
+>       40
 >     ],
 >     "size": [
->       61.5,
->       41.5,
->       41.5
+>       60.00000000000017,
+>       40,
+>       40.000000000256044
 >     ]
 >   },
 >   "volume": 19786.79765644562,
@@ -136,7 +136,7 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 > }
 > ```
 
-**Agent:** Volume 19787 mm³ = 19.8 cm³; in 6061 aluminium (2.70 g/cm³) that is about **53 g**. Note the `boundingBox` the tools report is the *tracked* box, not the part: it reads 61.5 × 41.5 × 41.5 for a part that is really 60 × 40 × 40, because `smoothUnion` pads the tracked box by `radius/4`. It is a conservative bound the kernel carries for meshing, not a measurement — do not read dimensions off it. Exporting:
+**Agent:** Volume 19787 mm³ = 19.8 cm³; in 6061 aluminium (2.70 g/cm³) that is about **53 g**. The reported `boundingBox` measures the part itself (it is taken off the same mesh these mass properties integrate), so it is good to the meshing accuracy and can be read as a measurement. Exporting:
 
 > 🔧 **`export`** `{ "model_id": "model-7", "format": "step", "path": "bracket-right-angle.step" }`
 > ```json

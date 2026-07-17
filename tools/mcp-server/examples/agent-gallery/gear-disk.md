@@ -37,7 +37,7 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 >     "min": [
 >       -20.5,
 >       -4,
->       -20.5
+>       -20.500000000000004
 >     ],
 >     "max": [
 >       20.5,

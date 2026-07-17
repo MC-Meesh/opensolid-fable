@@ -37,12 +37,12 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 >     "max": [
 >       40,
 >       30,
->       15
+>       15.001301777746544
 >     ],
 >     "size": [
 >       80,
 >       60,
->       30
+>       30.001301777746544
 >     ]
 >   },
 >   "volume": 34763.23671539217,
@@ -100,18 +100,18 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 >   },
 >   "boundingBox": {
 >     "min": [
->       -40,
->       -30,
+>       -39.59760855470059,
+>       -29.593651240604697,
 >       11
 >     ],
 >     "max": [
->       40,
->       30,
+>       39.59760855469844,
+>       29.59258910921366,
 >       18
 >     ],
 >     "size": [
->       80,
->       60,
+>       79.19521710939904,
+>       59.186240349818355,
 >       7
 >     ]
 >   },
