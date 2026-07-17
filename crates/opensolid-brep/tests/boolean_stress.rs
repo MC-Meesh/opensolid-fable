@@ -28,11 +28,11 @@
 //! fallback. The campaigns' history — the bugs they filed and the fixes
 //! that retired them — is in the git log, not here.
 //!
-//! One case is `#[ignore]`d, naming its open blocker: of-9ia, where the
-//! marched non-coaxial cone-cone imprint is hosted as an open chain
-//! ending in a face interior — a reconstruction gap, not an SSI gap
-//! (`skew_frustums_inclusion_exclusion`). The coaxial cone-cone pair goes
-//! through the analytic SSI and runs live
+//! Every case here is live. The last `#[ignore]` (of-9ia,
+//! `skew_frustums_inclusion_exclusion`) lifted with of-37i.5: its two
+//! blockers were both in imprint hosting and neither was specific to the
+//! marched cone-cone arc, which had been correct all along. The coaxial
+//! cone-cone pair goes through the analytic SSI
 //! (`opposed_cones_intersection`, `coaxial_frustums_union_identity`).
 //! The no-panic guard `no_panics_on_cone_configurations` stays live across
 //! the promotion — it accepts both a valid exact solid and the structured
@@ -2245,7 +2245,7 @@ fn no_panics_on_awkward_configurations() {
 //
 // Written tests-first while `Chart::build` still rejected
 // `Surface3::Cone`; the gate has since lifted (of-dtj) and every case
-// here is live except `skew_frustums_inclusion_exclusion` (of-9ia).
+// here is live.
 // Volumes use `frustum_volume` closed forms
 // (`π h (r1² + r1·r2 + r2²)/3`); tilted/overlap cases fall back to the
 // scale-free inclusion–exclusion identity `vol(A)+vol(B)=vol(∪)+vol(∩)`.
@@ -2354,13 +2354,10 @@ fn crossing_frustums_intersection() {
 /// (radii > 0, no apex pole), so promotion rides on the SSI alone. The
 /// removed/overlap geometry has no closed form, so the invariant is the
 /// scale-free inclusion–exclusion identity across all three ops.
+/// Was `#[ignore]`d as of-9ia. Both of its blockers were in the imprint
+/// hosting, and both were mis-scoped as cone-cone problems when neither
+/// involves the marched arc at all — see of-9ia's close notes.
 #[test]
-#[ignore = "of-9ia: the non-coaxial cone-cone SSI marches correctly (of-dtj.4, \
-            unit test marched_bounded_cone_cone_offset_axes), but hosting the \
-            marched imprint on the two curved cone faces yields an open chain \
-            that ends in the face interior (boolean::imprint Degenerate, \
-            'an imprint chain ends in a face interior') — a reconstruction \
-            gap, not an SSI gap"]
 fn skew_frustums_inclusion_exclusion() {
     let context = "non-coaxial frustums ∪/∩ identity";
     let mut scene = Scene::new();
@@ -2554,7 +2551,7 @@ fn rotated_frustum_bite_invariance() {
 /// the `Chart::build` gate closed). Both outcomes are still accepted —
 /// only a panic or an invalid `Ok` is a bug — so this guard holds the line
 /// either way, including for any configuration that still diverts to the
-/// fallback (e.g. non-coaxial cone–cone, of-9ia).
+/// fallback.
 #[test]
 fn no_panics_on_cone_configurations() {
     let mut scene = Scene::new();

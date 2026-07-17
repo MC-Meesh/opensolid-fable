@@ -2338,7 +2338,6 @@ impl<'a> Pipeline<'a> {
             // Refine entry point (before the run's first sample).
             let first_idx = run[0];
             let prev_idx = (first_idx + total - 1) % total;
-            let marched = matches!(curve, Curve3::Polyline { .. });
             if (closed_curve || first_idx > 0) && !flags[prev_idx] {
                 let mut t_out = ts[prev_idx];
                 let t_in = ts[first_idx];
@@ -2349,11 +2348,7 @@ impl<'a> Pipeline<'a> {
                 // parameters are on the sheet the crossing belongs to.
                 let t = refine_clip_crossing(&inside, t_out, t_in, Some(station_uv[first_idx]))?;
                 let p = curve.point(t);
-                pts.push(if marched {
-                    self.polish_clip_endpoint(p, fa, fb)
-                } else {
-                    p
-                });
+                pts.push(self.polish_clip_endpoint(p, fa, fb));
             }
             pts.extend(run.iter().map(|&i| curve.point(ts[i])));
             // Refine exit point (after the run's last sample).
@@ -2367,11 +2362,7 @@ impl<'a> Pipeline<'a> {
                 }
                 let t = refine_clip_crossing(&inside, t_out, t_in, Some(station_uv[last_idx]))?;
                 let p = curve.point(t);
-                pts.push(if marched {
-                    self.polish_clip_endpoint(p, fa, fb)
-                } else {
-                    p
-                });
+                pts.push(self.polish_clip_endpoint(p, fa, fb));
             }
             // An open marched fragment can genuinely close on itself: a
             // ring cut at a single chart seam ends where it starts. Keep
@@ -2422,22 +2413,54 @@ impl<'a> Pipeline<'a> {
         Ok(())
     }
 
-    /// Polish a marched imprint's clip endpoint onto the exact junction it
-    /// approximates. The bisected crossing lies on a polyline **chord**, up
-    /// to a chord sagitta off the true intersection curve — but the true
-    /// endpoint is where that curve crosses a boundary edge of one host
-    /// face, i.e. the point on the crossed edge's exact curve where the
-    /// *other* solid's surface residual vanishes (the edge already lies on
-    /// its own solid's surface). Every imprint ending at that junction
-    /// solves the same one-dimensional root, so the polished endpoints
-    /// weld exactly; unpolished, two chords disagree by O(sagitta), far
-    /// beyond the welding snap, and the arrangement tears (chains end
-    /// mid-face, split points duplicate on the edge).
+    /// Polish an imprint's clip endpoint onto the exact junction it
+    /// approximates. The true endpoint is where the intersection curve
+    /// crosses a boundary edge of one host face — a *triple* point, on
+    /// both solids' surfaces and on the crossed edge at once — i.e. the
+    /// point on that edge's exact curve where the *other* solid's surface
+    /// residual vanishes (the edge already lies on its own solid's
+    /// surface). Every imprint ending at that junction solves the same
+    /// one-dimensional root, so the polished endpoints weld exactly.
+    /// Unpolished, two imprints meeting there disagree far beyond the
+    /// welding snap and the arrangement tears: the gap materializes as
+    /// spurious two-point bridge atoms, making the junction degree 3,
+    /// which [`merge_imprint_chains`] cannot resolve — it stops, and the
+    /// chain is reported as ending in the face interior (of-9ia).
+    ///
+    /// **Every** clip endpoint needs this, not just marched ones. It is
+    /// tempting to assume an exact curve lands exactly — but
+    /// [`refine_clip_crossing`] bisects against the host region's
+    /// *discretized* boundary polygon, so the endpoint carries that
+    /// polygon's chord sagitta no matter how exact the curve is. A
+    /// closed-form ellipse clipped against a 96-segment circle of radius
+    /// 2.5 lands 1.3e-3 off the junction, five orders above the snap; the
+    /// marched arc meeting it there polishes onto the true root and the
+    /// two no longer weld. Marched endpoints additionally sit a polyline
+    /// chord's sagitta off the true curve, but that is the same error, not
+    /// a different one.
     ///
     /// Returns `p` unchanged when no boundary edge is plausibly involved
-    /// (a fragment endpoint pinned on a chart seam and already exact) or
-    /// the root refinement fails.
+    /// (a fragment endpoint pinned on a chart seam and already exact), when
+    /// the endpoint sits on a chart pole, or when the root refinement
+    /// fails.
     fn polish_clip_endpoint(&self, p: Point3, fa: usize, fb: usize) -> Point3 {
+        // A pole endpoint is not this root. Every boundary edge meeting a
+        // pole runs *through* it, so the residual of the other surface
+        // along that edge has no isolated zero there to Newton onto — the
+        // seed already sits on a whole tangential stretch of near-zero
+        // residual, and iterating walks the endpoint along the seam to an
+        // unrelated crossing. Pole endpoints are also already exact and
+        // owned by [`Self::snap_imprint_endpoints_to_poles`], which welds
+        // every imprint arriving at a pole onto the one pole vertex — the
+        // same job this polish does at a transversal junction (of-rb4).
+        let pole_band = self.snap * EDGE_MATCH_SNAP * 4.0;
+        for (s, f) in [(0usize, fa), (1usize, fb)] {
+            for pole in self.face_polys[s][f].chart.pole_points() {
+                if (p - pole).norm() <= pole_band {
+                    return p;
+                }
+            }
+        }
         // The crossed edge: nearest over both faces' boundaries, accepted
         // within a discretization-scale band (the endpoint can sit a chord
         // sagitta off a curved boundary, but distinct edges are a face
@@ -2579,8 +2602,23 @@ impl<'a> Pipeline<'a> {
                         }
                     }
                 }
-                continue;
             }
+            // Seam crossings, for open runs as well as closed rings. An
+            // open imprint is not exempt: what cannot cross a periodic
+            // cover's seam is the *chord hosted in it*, and that is a
+            // property of the run's parameter range, not of whether the
+            // run happens to close. Marched fragments do arrive pre-cut
+            // (the tracer's domain bounds stop them at the seam), which is
+            // why open runs went unscanned for so long — but an ANALYTIC
+            // imprint is clipped only against the face regions, so its run
+            // crosses the seam freely. Two such open arcs meeting at their
+            // endpoints then merge into a ring that wraps the cover, whose
+            // uv polygon is unlocalizable and whose even-odd containment is
+            // meaningless: both the band inside it and the face outside it
+            // then classify from garbage interior samples. of-9ia's
+            // non-coaxial cone-cone pair is exactly that — its companion
+            // imprint is a full-wrap ellipse clipped to an arc, and the
+            // ring it forms spans the cone's whole u-cover.
             for (s, f) in [(0usize, imp.face_a), (1usize, imp.face_b)] {
                 let fp = &self.face_polys[s][f];
                 for (axis, period) in [
@@ -2590,7 +2628,14 @@ impl<'a> Pipeline<'a> {
                     if period.is_none() {
                         continue;
                     }
-                    for seam_point in seam_crossings(fp, &imp.curve, &imp.sampled.points, axis)? {
+                    for seam_point in seam_crossings(
+                        fp,
+                        &imp.curve,
+                        &imp.sampled.points,
+                        imp.sampled.closed,
+                        axis,
+                        self.snap,
+                    )? {
                         events.push((CurveSource::Imprint { index: ii }, seam_point));
                         // Exact-curve edge matching: sphere/torus seam edges
                         // are circular arcs whose sampled polylines sag far
@@ -3461,11 +3506,17 @@ fn seam_crossings(
     face_poly: &FaceRegionPoly,
     curve: &Curve3,
     points: &[Point3],
+    closed: bool,
     axis: SeamAxis,
+    snap: f64,
 ) -> CoreResult<Vec<Point3>> {
     let uv = map_polyline(&face_poly.chart, points)?;
-    // Closing segment: unwrap the first point relative to the last.
-    let close_w = {
+    // Closing segment: unwrap the first point relative to the last. An
+    // open run has none — its last sample is an endpoint, not a neighbour
+    // of the first — and scanning the phantom segment between them invents
+    // a crossing wherever the two ends straddle a seam level, which for a
+    // run spanning the cover is essentially always.
+    let close_w = closed.then(|| {
         let mut w = axis.coord(uv[0]);
         let last = axis.coord(uv[uv.len() - 1]);
         while w - last > std::f64::consts::PI {
@@ -3475,7 +3526,7 @@ fn seam_crossings(
             w += TWO_PI;
         }
         w
-    };
+    });
     // Seam level: the face cover's minimum along the axis.
     let mut seam_w = f64::INFINITY;
     for lp in &face_poly.loops {
@@ -3486,7 +3537,7 @@ fn seam_crossings(
     let (w_min, w_max) = uv
         .iter()
         .map(|&q| axis.coord(q))
-        .chain([close_w])
+        .chain(close_w)
         .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), w| {
             (lo.min(w), hi.max(w))
         });
@@ -3501,25 +3552,46 @@ fn seam_crossings(
     }
     let n = uv.len();
     let mut crossings = Vec::new();
+    let segments = if closed { n } else { n - 1 };
+    let pole_band = snap * EDGE_MATCH_SNAP * 4.0;
     while level <= w_max {
-        for i in 0..n {
+        for i in 0..segments {
             let w0 = axis.coord(uv[i]);
             let w1 = if i + 1 < n {
                 axis.coord(uv[i + 1])
             } else {
-                close_w
+                close_w.expect("the closing segment is scanned only for a closed run")
             };
             if (w0 - level) * (w1 - level) <= 0.0 && (w1 - w0).abs() > 1e-15 {
                 let p0 = points[i];
                 let p1 = points[(i + 1) % n];
-                crossings.push(refine_seam_point(
+                let seam_point = refine_seam_point(
                     &face_poly.chart,
                     curve,
                     axis,
                     level,
                     (uv[i], w1),
                     (&p0, &p1),
-                )?);
+                )?;
+                // A pole is not a seam crossing. `u` is undefined there, so
+                // an imprint merely passing THROUGH a pole shows the same
+                // near-period jump between consecutive samples that a real
+                // seam crossing does, and lands here as an artifact of the
+                // chart's singularity rather than of the curve. Poles are
+                // owned by the pole machinery, which splits imprints on
+                // them and registers them as chain barriers (of-rb4);
+                // re-reporting one as a seam crossing splits the run a
+                // second time at the same place and strands the chain.
+                if pole_band > 0.0
+                    && face_poly
+                        .chart
+                        .pole_points()
+                        .iter()
+                        .any(|pole| (seam_point - pole).norm() <= pole_band)
+                {
+                    continue;
+                }
+                crossings.push(seam_point);
             }
         }
         level += TWO_PI;
@@ -6465,6 +6537,12 @@ mod tests {
     use crate::surface::SurfaceEval;
     use crate::transform::{rotate_body, translate_body};
 
+    /// A representative welding snap for the unit-scale charts these
+    /// tests build: `geometric_snap` yields ~1e-9 of the point cloud's
+    /// extent, and the pole band derived from it only has to separate a
+    /// genuine seam crossing from a pole, which sit a chart apart.
+    const SNAP: f64 = 1e-9;
+
     fn tol() -> ToleranceContext {
         ToleranceContext::default()
     }
@@ -7931,7 +8009,7 @@ mod tests {
             minor_radius: r,
         };
         let points = ring_samples(&curve);
-        let crossings = seam_crossings(&fp, &curve, &points, SeamAxis::U).unwrap();
+        let crossings = seam_crossings(&fp, &curve, &points, true, SeamAxis::U, SNAP).unwrap();
         assert_eq!(crossings.len(), 1, "wrap-once ring crosses the seam once");
         let p = crossings[0];
         // Seam angle u = π on this ring is curve parameter t = π - phase.
@@ -7961,7 +8039,7 @@ mod tests {
             minor_radius: r,
         };
         let points = ring_samples(&curve);
-        let crossings = seam_crossings(&fp, &curve, &points, SeamAxis::U).unwrap();
+        let crossings = seam_crossings(&fp, &curve, &points, true, SeamAxis::U, SNAP).unwrap();
         assert_eq!(crossings.len(), 1, "wrap-once ring crosses the seam once");
         let p = crossings[0];
         // This section satisfies u(t) = t, so the seam angle is hit at
@@ -8390,7 +8468,7 @@ mod tests {
         let curve = Curve3::circle(Point3::new(0.0, 0.0, v0.sin()), Vector3::z(), v0.cos())
             .expect("valid cap circle");
         let points = ring_samples(&curve);
-        let crossings = seam_crossings(&fp, &curve, &points, SeamAxis::U).unwrap();
+        let crossings = seam_crossings(&fp, &curve, &points, true, SeamAxis::U, SNAP).unwrap();
         assert_eq!(crossings.len(), 1, "cap ring wraps the period once");
         let p = crossings[0];
         assert!(
@@ -8439,7 +8517,7 @@ mod tests {
             minor_radius: 2.4,
         };
         let points = ring_samples(&curve);
-        let crossings = seam_crossings(&fp, &curve, &points, SeamAxis::U).unwrap();
+        let crossings = seam_crossings(&fp, &curve, &points, true, SeamAxis::U, SNAP).unwrap();
         assert_eq!(crossings.len(), 1, "latitude ring wraps u once");
         let p = crossings[0];
         let expected = Point3::new(2.4, 0.0, 0.3);
@@ -8449,7 +8527,7 @@ mod tests {
             (p - expected).norm()
         );
         assert!(
-            seam_crossings(&fp, &curve, &points, SeamAxis::V)
+            seam_crossings(&fp, &curve, &points, true, SeamAxis::V, SNAP)
                 .unwrap()
                 .is_empty(),
             "constant-v ring must not report a v-seam crossing"
@@ -8466,7 +8544,7 @@ mod tests {
         let curve = Curve3::circle(Point3::new(0.0, 2.0, 0.0), Vector3::x(), 0.5)
             .expect("valid tube circle");
         let points = ring_samples(&curve);
-        let crossings = seam_crossings(&fp, &curve, &points, SeamAxis::V).unwrap();
+        let crossings = seam_crossings(&fp, &curve, &points, true, SeamAxis::V, SNAP).unwrap();
         assert_eq!(crossings.len(), 1, "tube ring wraps v once");
         let p = crossings[0];
         let expected = Point3::new(0.0, 2.5, 0.0);
@@ -8476,7 +8554,7 @@ mod tests {
             (p - expected).norm()
         );
         assert!(
-            seam_crossings(&fp, &curve, &points, SeamAxis::U)
+            seam_crossings(&fp, &curve, &points, true, SeamAxis::U, SNAP)
                 .unwrap()
                 .is_empty(),
             "constant-u ring must not report a u-seam crossing"
@@ -8526,7 +8604,7 @@ mod tests {
         )
         .expect("valid cap circle");
         let points = ring_samples(&curve);
-        let mut crossings = seam_crossings(&fp, &curve, &points, SeamAxis::U).unwrap();
+        let mut crossings = seam_crossings(&fp, &curve, &points, true, SeamAxis::U, SNAP).unwrap();
         assert_eq!(
             crossings.len(),
             2,
@@ -8557,7 +8635,7 @@ mod tests {
         .expect("valid cap circle");
         let points = ring_samples(&curve);
         assert!(
-            seam_crossings(&fp, &curve, &points, SeamAxis::U)
+            seam_crossings(&fp, &curve, &points, true, SeamAxis::U, SNAP)
                 .unwrap()
                 .is_empty(),
             "cap away from the seam must not report a crossing"

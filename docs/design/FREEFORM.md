@@ -363,15 +363,36 @@ the uv comes from `params_a`/`params_b` and the projection disappears (per point
 circle clipped against a NURBS face's region — it does not, and each sample is a
 seeded Newton.
 
-**The known gap to expect.** `apply_chain` (`:3385`) already errors with
-*"boolean imprints chording a hole boundary (transversal MVP)"*, and of-9ia
-records that non-coaxial cone–cone SSI marches correctly but **hosting the
-marched imprint on two curved faces leaves an open chain**. NURBS↔NURBS is the
-same shape of problem: two curved hosts, a marched imprint, chains that must
-close. **Expect of-9ia to bite here, and expect it to be the phase-3 blocker.**
-It is plausible that fixing chain closure for NURBS fixes of-9ia too — both are
-"marched imprint on two curved hosts" — and phase 3 should check that
-explicitly rather than route around it.
+**The known gap to expect — RESOLVED in phase 3 (of-37i.5); kept here because
+its lesson outlived it.** of-9ia recorded that non-coaxial cone–cone SSI marches
+correctly but **hosting the marched imprint on two curved faces leaves an open
+chain**, and this note predicted it would be the phase-3 blocker and possibly
+the epic's longest pole. That framing was wrong in an instructive way: *nothing
+about it was specific to marched imprints, to two curved hosts, or to cones.*
+Both defects were general imprint-hosting bugs that the cone–cone pair merely
+happened to expose first, and both were one-line guards:
+
+1. `polish_clip_endpoint` — which already solved the triple-point junction
+   generically — ran only for `Curve3::Polyline` imprints. The premise that an
+   exact curve needs no polish is false: `refine_clip_crossing` bisects against
+   the host region's *discretized* boundary polygon, so an endpoint carries that
+   polygon's chord sagitta however exact the curve is. Here a closed-form
+   ellipse landed 1.3e-3 off the junction the marched arc had polished onto, and
+   the two would not weld.
+2. The seam-crossing scan in `collect_splits` ran only for *closed* imprints.
+   Two *open* arcs that merge into a ring wrapping a periodic cover were
+   therefore never cut at the seam, and their unlocalizable uv polygon made
+   even-odd containment meaningless.
+
+The transferable lesson for the rest of this epic: when a failure first appears
+on the newest, hardest surface pair, the tempting reading is that the new
+geometry broke it. Check the general path first. Both fixes are NURBS-safe by
+construction — `polish_clip_endpoint` goes through `surface_residual`, which
+phase 2 made NURBS-capable via the projection signed distance (no implicit form
+required), and a clamped NURBS chart has no seam for the second fix to scan.
+
+`apply_chain` (`:3385`) still errors with *"boolean imprints chording a hole
+boundary (transversal MVP)"*; that gap is unrelated and remains open.
 
 ## 5. Classification: the wall nobody budgets for
 
@@ -590,9 +611,23 @@ Three corrections this phase made to the plan above, worth carrying forward:
 **Phase 3 — imprint, region split, classification (`of-37i.5`).**
 Carry `MarchedCurve::params_a/params_b` into `Imprint` instead of re-projecting;
 `marched_polylines` de-`Surface3`-ified; classification via the F-Rep sign test
-for NURBS operands (§5). **Expect of-9ia (open chain from a marched imprint on
-two curved hosts) to bite** — check explicitly whether the fix generalizes.
+for NURBS operands (§5). of-9ia **did** bite and is now closed — it was two
+general imprint-hosting guard bugs, not a curved-host or marched-imprint gap,
+and both fixes generalize to NURBS by construction (§4).
 **Gate:** the stress suite (below) green. **This is the promotion gate.**
+
+**Phase 3's real blocker is §5, not §4.** The F-Rep sign test cannot be reached
+from where classification lives: `Pipeline::contains_point` is in
+`opensolid-brep`, while the only SDF for a B-Rep NURBS operand is `MeshSdf` in
+`opensolid-kernel`, which *depends on* `opensolid-brep`. "`HybridBody` already
+carries the SDF" is true of the operand and false of the pipeline. Resolving it
+means either plumbing an inside-test callback down from `hybrid::boolean` into
+brep's boolean entry points (matching this note's intent, and inheriting the
+mesh's accuracy — the stated asymmetry), or writing a brep-local exact
+nearest-point test (more accurate, but a new algorithm with its own robustness
+surface at edges and vertices, where the sign needs an angle-weighted
+pseudonormal). This is a real design decision that §5 does not settle, and it
+gates the promotion.
 
 **Phase 3 stress suite** — extend `crates/opensolid-brep/tests/boolean_stress.rs`
 (2584 lines, already the model: `assert_valid`, `volume`, randomized rotations,
@@ -642,6 +677,15 @@ SP-curves.
   implicit residuals fix cone–cone and do nothing for a patch. Phase 2 made this
   possible — `boolean::surface_residual`/`_gradient` now return `Some` for
   `Surface3::Nurbs` via the projection signed distance.
+  **Phase 3 postscript (of-37i.5): closed, and the prescribed fix was already
+  written.** `polish_clip_endpoint` had solved that 3-surface junction against
+  the generic residual since of-yet — it was simply guarded to
+  `Curve3::Polyline` imprints, so the *companion* imprint (a closed-form
+  ellipse) never ran it. Dropping the guard welds all four endpoints to ~1e-15.
+  A second, independent guard then surfaced: the seam scan skipped open
+  imprints, so the ring the two arcs form was never cut at the cone's u-seam.
+  Neither defect was about cones, curved hosts, or marching; the pair just
+  exposed them first. See §4.
 - **Is F-Rep-sign classification (§5) acceptable long-term?** It makes NURBS
   classification resolution-bound while the geometry is exact. Acceptable for
   promotion; the asymmetry should be stated in the phase-1 bead, and ray–NURBS
