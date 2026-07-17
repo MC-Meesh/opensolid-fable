@@ -437,6 +437,56 @@ all-analytic operand keeps the exact ray path unchanged.
 
 `keep_table` (`:2448`) is pure combinatorics and is unaffected.
 
+### 5.1 What actually landed, and what it costs (of-3oj)
+
+Option 3, with one correction to the sketch above and one cost the sketch
+understates.
+
+**The correction.** "`HybridBody` already carries the SDF" is true of the
+*operand* and false of the *pipeline*. Ray parity lives in `contains_point`, in
+`opensolid-brep`. The only SDF a B-Rep body has is `MeshSdf`, which needs brep's
+tessellation and so lives in `opensolid-kernel` — which *depends on* brep. The
+pipeline cannot name the SDF without inverting that dependency. So the test is
+**injected**: `boolean_with_inside_tests` takes an optional
+`&dyn Fn(&Point3) -> Option<bool>` per operand, and `hybrid::boolean` — the one
+place both halves exist — builds a `MeshSdf` for each operand that has a NURBS
+face and hands its sign down. Analytic-only operands are handed nothing and keep
+exact parity; abstention (`None`) falls through to parity, which refuses the
+patch and diverts to the F-Rep fallback. Never a guess.
+
+**The cost: the asymmetry is doubled.** Section 5 above says to state one
+asymmetry plainly — NURBS classification is F-Rep-resolution-bound while the
+geometry is exact. Under injection there are **two** bounds, because the field
+handed in is a `MeshSdf` over the operand's *tessellation*, not the F-Rep grid:
+
+1. **F-Rep resolution**, as section 5 already says — the hybrid path's stated
+   accuracy bar.
+2. **The operand tessellation's chord deviation.** The `MeshSdf`'s zero set is
+   the chords, not the true patch. Its sign is trustworthy only where the query
+   point stands off further than that deviation — which is exactly option 2's
+   objection ("parity is only as good as the mesh") reappearing one level down.
+   It bites less hard here than it does for a ray: a ray traverses the whole
+   operand and can grazes a chord anywhere along its length, while a sign test
+   is evaluated at one point that classification chooses. The pipeline only asks
+   about region *interior* samples, and the case that would sit inside the
+   deviation — a region lying on the other solid's boundary — never reaches the
+   sign test at all: `coincident_partner_sense` settles it structurally first
+   (of-bxl.4). The `inside_test` abstention band is the linear tolerance, which
+   is a floor and *not* the deviation bound, so this is an argument about where
+   samples actually land, not a guarantee.
+
+So: exact geometry, doubly-approximate classification. A NURBS operand's boolean
+is exact in every face it emits and F-Rep-and-tessellation-bound in its decision
+about *which* faces to emit. Anyone tightening one bound should know the other
+is there.
+
+**This is transitional.** `boolean_with_inside_tests`, `InsideTest`, and
+`body_has_nurbs_face` exist only because `ray_surface_hits` has no NURBS arm.
+When option 1 lands (of-37i.7, phase 5 — Bézier clipping), `contains_point`
+classifies patches on its own, both bounds go away with it, and all three should
+be **deleted**. `unite`/`subtract`/`intersect` are the permanent API; their
+signatures did not change.
+
 ## 6. Tolerance strategy
 
 The bead's framing is exactly right: **there is no exact arithmetic here.**

@@ -49,7 +49,7 @@ use crate::convert::{MeshSdf, SdfToBrepOptions, sdf_to_brep};
 use crate::massprops::mass_properties;
 use crate::mesh::{MeshOptions, TriangleMesh, mesh_sdf_indexed};
 use opensolid_brep::boolean::{
-    intersect as brep_intersect, subtract as brep_subtract, unite as brep_unite,
+    InsideTest, body_has_nurbs_face, boolean_with_inside_tests as brep_boolean,
 };
 use opensolid_brep::{
     Body, BooleanOutput, GeometryStore, TessellationOptions, TopologyStore, tessellate_body,
@@ -62,6 +62,10 @@ use opensolid_frep::primitives::Sdf;
 use opensolid_frep::shape::Shape;
 
 pub use opensolid_brep::BooleanOp;
+
+/// Transitional (of-3oj): an owned inside test, borrowed as
+/// [`InsideTest`] when handed to the exact pipeline. Removed with of-37i.7.
+type OwnedInsideTest = Box<dyn Fn(&Point3) -> Option<bool>>;
 
 /// Fewer cells than this across the sampling cube loses features; matches
 /// the floor used by [`Part::mesh`].
@@ -355,11 +359,23 @@ pub fn boolean(
         && std::ptr::eq(*sa, *sb)
         && std::ptr::eq(*ga, *gb)
     {
-        let exact = match op {
-            BooleanOp::Unite => brep_unite(sa, ga, *ba, *bb, &opts.tol),
-            BooleanOp::Subtract => brep_subtract(sa, ga, *ba, *bb, &opts.tol),
-            BooleanOp::Intersect => brep_intersect(sa, ga, *ba, *bb, &opts.tol),
-        };
+        // Transitional (of-3oj): an operand with a NURBS face cannot be
+        // classified by the exact pipeline's ray parity, so hand it the sign
+        // of its own MeshSdf as an inside test. Built here because this is
+        // the only place both halves exist: brep owns the pipeline, kernel
+        // owns the only SDF a B-Rep body has. Skipped for analytic-only
+        // operands — they classify exactly without it, and tessellating one
+        // just to pass a test the pipeline will never call is pure cost.
+        // Goes away with of-37i.7 (ray-NURBS).
+        let sdfs = [(sa, ga, *ba), (sb, gb, *bb)].map(|(store, geo, body)| {
+            body_has_nurbs_face(store, geo, body)
+                .then(|| MeshSdf::from_body(store, geo, body, &TessellationOptions::default()).ok())
+                .flatten()
+        });
+        let tests: [Option<OwnedInsideTest>; 2] =
+            sdfs.map(|sdf| sdf.map(|sdf| inside_test(sdf, opts.tol.linear)));
+        let inside: [Option<InsideTest<'_>>; 2] = [tests[0].as_deref(), tests[1].as_deref()];
+        let exact = brep_boolean(op, sa, ga, *ba, *bb, &opts.tol, inside);
         // Any shortfall in the exact pipeline — an error, a tessellation
         // that comes out non-manifold, or one whose chords stray from the
         // analytic surfaces by more than an F-Rep grid cell (the fallback
@@ -534,6 +550,30 @@ fn combined_field(
     })
 }
 
+/// Transitional (of-3oj): the sign of `sdf` as an inside test for the exact
+/// pipeline, abstaining within `band` of the boundary.
+///
+/// The abstention band is the honest part. `sdf` is a [`MeshSdf`] over the
+/// operand's *tessellation*, so its zero set is the chords, not the true
+/// surface, and its sign is trustworthy only where the query point stands
+/// off further than that chord deviation. `band` is the linear tolerance,
+/// which is the scale at which a signed distance means nothing at all — it
+/// is a floor, not the deviation bound, so a sample within a chord's
+/// deviation of a patch can still be called wrongly. In practice the
+/// pipeline only asks about region *interior* samples, and a region lying
+/// on the other solid's boundary — the case that would sit inside the
+/// deviation — never reaches here: it is settled structurally by
+/// `coincident_partner_sense` before parity is consulted (of-bxl.4).
+/// Abstaining returns `None`, which falls through to ray parity, which
+/// errors on the patch and diverts to the F-Rep fallback. FREEFORM.md
+/// section 5 states the resulting accuracy asymmetry in full.
+fn inside_test(sdf: MeshSdf, band: f64) -> OwnedInsideTest {
+    Box::new(move |p: &Point3| {
+        let d = sdf.eval(p);
+        (d.abs() > band).then_some(d < 0.0)
+    })
+}
+
 /// An operand as (field, surface bounds).
 fn field_of(body: &HybridBody) -> CoreResult<(Shape, BoundingBox3)> {
     match body {
@@ -578,6 +618,7 @@ mod tests {
     use super::*;
     use crate::builder::shape;
     use crate::massprops::mass_properties;
+    use opensolid_brep::boolean::{subtract as brep_subtract, unite as brep_unite};
     use opensolid_brep::{primitives, translate_body};
     use std::f64::consts::PI;
 
@@ -696,6 +737,70 @@ mod tests {
             &out.mesh,
             (7.0 / 8.0) * (4.0 / 3.0) * PI,
             "sphere minus octant block",
+        );
+    }
+
+    /// of-3oj: the sign the exact pipeline classifies a NURBS operand by.
+    /// A unit block's own field must call its centre in, a far point out,
+    /// and abstain on its boundary rather than call a coin flip.
+    #[test]
+    fn inside_test_signs_the_operand_and_abstains_on_its_boundary() {
+        let mut store = TopologyStore::new();
+        let mut geo = GeometryStore::new();
+        let body = primitives::block(&mut store, &mut geo, 2.0, 2.0, 2.0).unwrap();
+        let sdf = MeshSdf::from_body(&store, &geo, body, &TessellationOptions::default())
+            .expect("block tessellates");
+        let band = 1e-6;
+        let test = inside_test(sdf, band);
+
+        assert_eq!(test(&Point3::origin()), Some(true), "centre is inside");
+        assert_eq!(
+            test(&Point3::new(0.9, 0.0, 0.0)),
+            Some(true),
+            "inside but near the wall is still a verdict"
+        );
+        assert_eq!(
+            test(&Point3::new(5.0, 0.0, 0.0)),
+            Some(false),
+            "far outside"
+        );
+        assert_eq!(
+            test(&Point3::new(1.0, 0.0, 0.0)),
+            None,
+            "a point on the boundary is not callable, and must abstain \
+             rather than guess"
+        );
+        assert_eq!(
+            test(&Point3::new(1.0 + band / 2.0, 0.0, 0.0)),
+            None,
+            "within the band on the outside abstains too — the band is \
+             two-sided"
+        );
+    }
+
+    /// of-3oj: an analytic-only operand is handed no test at all, so the
+    /// exact path keeps classifying by exact ray parity and pays nothing for
+    /// a field it would never consult.
+    #[test]
+    fn no_inside_test_is_built_for_an_analytic_operand() {
+        let mut store = TopologyStore::new();
+        let mut geo = GeometryStore::new();
+        let a = primitives::block(&mut store, &mut geo, 2.0, 2.0, 2.0).unwrap();
+        assert!(!body_has_nurbs_face(&store, &geo, a));
+
+        let b = primitives::block(&mut store, &mut geo, 2.0, 2.0, 2.0).unwrap();
+        translate_body(&mut store, &mut geo, b, Vector3::new(1.0, 1.0, 1.0)).unwrap();
+        let out = boolean(
+            BooleanOp::Unite,
+            &HybridBody::brep(&store, &geo, a),
+            &HybridBody::brep(&store, &geo, b),
+            &opts(),
+        )
+        .expect("planar union");
+        assert!(
+            matches!(out.path, HybridPath::Brep(_)),
+            "the injection plumbing must not perturb the all-analytic \
+             exact path"
         );
     }
 

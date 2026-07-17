@@ -367,7 +367,7 @@ pub fn unite(
     b: EntityId<Body>,
     tol: &ToleranceContext,
 ) -> CoreResult<BooleanOutput> {
-    boolean(BooleanOp::Unite, store, geo, a, b, tol)
+    boolean(BooleanOp::Unite, store, geo, a, b, tol, [None, None])
 }
 
 /// Material of A and not B. See [`unite`] for errors.
@@ -378,7 +378,7 @@ pub fn subtract(
     b: EntityId<Body>,
     tol: &ToleranceContext,
 ) -> CoreResult<BooleanOutput> {
-    boolean(BooleanOp::Subtract, store, geo, a, b, tol)
+    boolean(BooleanOp::Subtract, store, geo, a, b, tol, [None, None])
 }
 
 /// Material of A and B. See [`unite`] for errors.
@@ -389,7 +389,87 @@ pub fn intersect(
     b: EntityId<Body>,
     tol: &ToleranceContext,
 ) -> CoreResult<BooleanOutput> {
-    boolean(BooleanOp::Intersect, store, geo, a, b, tol)
+    boolean(BooleanOp::Intersect, store, geo, a, b, tol, [None, None])
+}
+
+/// A caller-injected inside test for one operand: `Some(true)` if the point
+/// is strictly inside that solid, `Some(false)` if strictly outside, `None`
+/// if the test cannot answer (the point is too close to the boundary to
+/// call, or the test does not apply). See [`boolean_with_inside_tests`].
+pub type InsideTest<'a> = &'a dyn Fn(&Point3) -> Option<bool>;
+
+/// **Transitional (of-3oj); scheduled for removal by of-37i.7.** As
+/// [`unite`]/[`subtract`]/[`intersect`], but each operand may carry an
+/// inside test that replaces ray parity when that operand has a NURBS face.
+///
+/// This parameter exists for one reason: [`ray_surface_hits`] has no NURBS
+/// arm, so [`Pipeline::contains_point`] cannot classify against a patch and
+/// errors out, which sends the whole boolean to the kernel's F-Rep
+/// fallback. A NURBS operand *does* have a usable inside test — the sign of
+/// a signed distance field — but the only field a B-Rep body has is
+/// `MeshSdf`, which lives in `opensolid-kernel` and so cannot be named from
+/// this crate (kernel depends on brep, not the reverse). Rather than invert
+/// that dependency, the caller that already has both — `hybrid::boolean` —
+/// hands the test down.
+///
+/// When of-37i.7 lands ray-NURBS intersection (Bezier clipping),
+/// `ray_surface_hits` gains its NURBS arm, `contains_point` classifies
+/// patches on its own, and this entry point should be **deleted** along with
+/// [`InsideTest`] and [`body_has_nurbs_face`] — no negotiation needed.
+/// [`unite`], [`subtract`], and [`intersect`] are the permanent API.
+///
+/// # Accuracy
+/// A test is consulted *only* for an operand with at least one NURBS face,
+/// so analytic-only operands keep exact ray parity regardless of what is
+/// passed. For a NURBS operand, classification is only as good as the
+/// injected test: when it is a `MeshSdf`, the verdict inherits the operand
+/// *tessellation's* chord deviation even though the resulting geometry stays
+/// exact. `None` from the test falls through to ray parity, which then
+/// errors on the patch — a diversion to the fallback, never a guess.
+/// FREEFORM.md section 5 states the full asymmetry.
+///
+/// # Errors
+/// As [`unite`].
+pub fn boolean_with_inside_tests(
+    op: BooleanOp,
+    store: &TopologyStore,
+    geo: &GeometryStore,
+    a: EntityId<Body>,
+    b: EntityId<Body>,
+    tol: &ToleranceContext,
+    inside: [Option<InsideTest<'_>>; 2],
+) -> CoreResult<BooleanOutput> {
+    boolean(op, store, geo, a, b, tol, inside)
+}
+
+/// **Transitional (of-3oj); scheduled for removal by of-37i.7.** Whether
+/// any face of `body` binds a NURBS surface — i.e. whether an inside test
+/// for it would be consulted at all (see [`boolean_with_inside_tests`]).
+///
+/// Lets a caller skip building a field for an operand that does not need
+/// one: an analytic-only operand classifies by exact ray parity, and
+/// tessellating it up front just to hand down a test it will never call
+/// would be pure cost. Stale ids and faces without bound geometry answer
+/// `false`; the boolean itself reports those as
+/// [`CoreError::InvalidArgument`].
+pub fn body_has_nurbs_face(
+    store: &TopologyStore,
+    geo: &GeometryStore,
+    body: EntityId<Body>,
+) -> bool {
+    // `shells_of_body` panics on a dead id rather than answering empty.
+    if store.body(body).is_none() {
+        return false;
+    }
+    store.shells_of_body(body).iter().any(|&shell_id| {
+        store.faces_of_shell(shell_id).iter().any(|&face_id| {
+            store
+                .face(face_id)
+                .and_then(|face| face.surface)
+                .and_then(|sid| geo.surface(sid))
+                .is_some_and(|s| matches!(s, Surface3::Nurbs(_)))
+        })
+    })
 }
 
 // ---------------------------------------------------------------------
@@ -1481,6 +1561,12 @@ struct Pipeline<'a> {
     /// rediscovering it by sampling — an on-boundary sample is precisely
     /// what [`Pipeline::contains_point`] evades.
     coincident_pairs: Vec<(usize, usize)>,
+    /// Transitional (of-3oj): caller-injected inside test per solid, and
+    /// whether that solid has any NURBS face. [`Pipeline::contains_point`]
+    /// consults the test only where both hold — see
+    /// [`boolean_with_inside_tests`], which goes away with of-37i.7.
+    inside: [Option<InsideTest<'a>>; 2],
+    has_nurbs: [bool; 2],
 }
 
 /// Broad-phase bounding box for one face.
@@ -1681,10 +1767,11 @@ fn boolean(
     a: EntityId<Body>,
     b: EntityId<Body>,
     tol: &ToleranceContext,
+    inside: [Option<InsideTest<'_>>; 2],
 ) -> CoreResult<BooleanOutput> {
     let solid_a = extract_solid(store, geo, a, "a")?;
     let solid_b = extract_solid(store, geo, b, "b")?;
-    let mut pipe = Pipeline::new(&solid_a, &solid_b, tol)?;
+    let mut pipe = Pipeline::new(&solid_a, &solid_b, tol, inside)?;
     pipe.find_imprints()?;
     pipe.collect_splits()?;
     let (atoms, atoms_by_source) = pipe.build_atoms();
@@ -1692,8 +1779,18 @@ fn boolean(
 }
 
 impl<'a> Pipeline<'a> {
-    fn new(a: &'a AnalyticSolid, b: &'a AnalyticSolid, tol: &ToleranceContext) -> CoreResult<Self> {
+    fn new(
+        a: &'a AnalyticSolid,
+        b: &'a AnalyticSolid,
+        tol: &ToleranceContext,
+        inside: [Option<InsideTest<'a>>; 2],
+    ) -> CoreResult<Self> {
         let solids = [a, b];
+        let has_nurbs = solids.map(|s| {
+            s.faces
+                .iter()
+                .any(|f| matches!(f.surface, Surface3::Nurbs(_)))
+        });
         let edge_samples = [
             a.edges.iter().map(sample_edge).collect::<Vec<_>>(),
             b.edges.iter().map(sample_edge).collect::<Vec<_>>(),
@@ -1752,6 +1849,8 @@ impl<'a> Pipeline<'a> {
             splits: HashMap::new(),
             seam_barriers: HashMap::new(),
             coincident_pairs: Vec::new(),
+            inside,
+            has_nurbs,
         })
     }
 
@@ -3062,8 +3161,27 @@ impl<'a> Pipeline<'a> {
         })
     }
 
-    /// Ray-parity containment of a point in one of the input solids.
+    /// Containment of a point in one of the input solids: the caller's
+    /// injected inside test where solid `s` has a NURBS face and a test was
+    /// given (of-3oj), ray parity everywhere else.
+    ///
+    /// The test is scoped to NURBS operands deliberately. Ray parity here is
+    /// exact — closed-form roots against analytic surfaces — while an
+    /// injected test is not (the kernel hands down a `MeshSdf`, whose sign
+    /// is only as good as the tessellation). Consulting it on an operand
+    /// that parity can already classify would trade accuracy away for
+    /// nothing. A test that answers `None` falls through to parity, which
+    /// then errors on the patch and diverts the whole boolean to the F-Rep
+    /// fallback — the same safe outcome as before the test existed. See
+    /// [`boolean_with_inside_tests`]; both this arm and that entry point go
+    /// away when of-37i.7 gives [`ray_surface_hits`] its NURBS arm.
     fn contains_point(&self, s: SolidTag, p: &Point3) -> CoreResult<bool> {
+        if self.has_nurbs[s]
+            && let Some(test) = self.inside[s]
+            && let Some(verdict) = test(p)
+        {
+            return Ok(verdict);
+        }
         'dirs: for raw in RAY_DIRECTIONS {
             let dir = Vector3::new(raw[0], raw[1], raw[2]).normalize();
             let mut hits = 0usize;
@@ -3089,9 +3207,12 @@ impl<'a> Pipeline<'a> {
                     // previous uv from. That costs nothing today because
                     // `ray_surface_hits` rejects NURBS above, so this is
                     // reached only on analytic charts, whose inverses are
-                    // closed-form and ignore the hint anyway. of-37i.5
-                    // classifies NURBS operands by the F-Rep sign test
-                    // instead of reaching here at all.
+                    // closed-form and ignore the hint anyway. A NURBS
+                    // operand is answered by the injected inside test at the
+                    // top of this function and never walks this loop
+                    // (of-3oj). Re-check this when of-37i.7 lands the NURBS
+                    // arm: patch inversion is iterative and *does* want a
+                    // hint, and there will still be none to give.
                     let (nu, nv) = fp.chart.param(&hit, None)?;
                     // Grazing incidence: retry with another direction.
                     let n = fp.chart.normal(nu, nv);
@@ -6535,6 +6656,7 @@ mod tests {
     use crate::check::MAX_ALLOWED_TOLERANCE;
     use crate::primitives;
     use crate::surface::SurfaceEval;
+    use crate::topology::Face;
     use crate::transform::{rotate_body, translate_body};
 
     /// A representative welding snap for the unit-scale charts these
@@ -7429,6 +7551,227 @@ mod tests {
                 FaceSense::Negative => FaceSense::Positive,
             };
         }
+    }
+
+    /// Rebind one planar face of `body` to a NURBS patch **coincident with
+    /// the plane it replaces**, giving a genuine closed solid with a NURBS
+    /// face and a volume that is still exactly known (of-3oj).
+    ///
+    /// Planar on purpose. The point under test is *classification routing* —
+    /// whether a NURBS operand reaches the injected inside test and gets the
+    /// right verdict — not patch geometry. A flat patch keeps the answer
+    /// analytically checkable while still being a `Surface3::Nurbs` at every
+    /// point the pipeline touches: `Chart::build` takes the NURBS arm,
+    /// `param` inverts iteratively, and `ray_surface_hits` refuses it exactly
+    /// as it would for a bulging patch. Curved-patch operands are the
+    /// of-37i.5 stress suite's job.
+    ///
+    /// The patch is degree-1 with a control grid spanning `pad` beyond the
+    /// face, so the face's trim region sits strictly inside the patch domain
+    /// rather than on its boundary.
+    fn nurbs_ify_face(
+        store: &mut TopologyStore,
+        geo: &mut GeometryStore,
+        body: EntityId<Body>,
+        want_normal: Vector3,
+        pad: f64,
+    ) -> EntityId<Face> {
+        let face_id = store
+            .faces_of_body(body)
+            .into_iter()
+            .find(|&f| {
+                let sid = store.face(f).unwrap().surface.expect("bound surface");
+                matches!(
+                    geo.surface(sid).expect("live surface"),
+                    Surface3::Plane { normal, .. } if (normal - want_normal).norm() < 1e-9
+                )
+            })
+            .expect("body has a face whose plane normal matches");
+
+        let sid = store.face(face_id).unwrap().surface.unwrap();
+        let Surface3::Plane { origin, normal } = *geo.surface(sid).expect("live surface") else {
+            unreachable!("selected by plane match")
+        };
+        // Patch extent must cover the face's trim; the block faces here are
+        // well inside a pad-dilated square about the face's own origin.
+        let (du, dv) = plane_basis(&normal);
+        let extent = |p: &Point3| {
+            store
+                .vertices_of_face(face_id)
+                .iter()
+                .filter_map(|&v| store.vertex(v))
+                .map(|v| v.point)
+                .map(|q| (q - p).norm())
+                .fold(0.0_f64, f64::max)
+        };
+        let half = extent(&origin) + pad;
+        let corner = |su: f64, sv: f64| origin + du * (su * half) + dv * (sv * half);
+        let grid = vec![
+            vec![corner(-1.0, -1.0), corner(-1.0, 1.0)],
+            vec![corner(1.0, -1.0), corner(1.0, 1.0)],
+        ];
+        let patch = NurbsSurface::bspline(
+            grid,
+            KnotVector::clamped_uniform(1, 2).expect("valid knots"),
+            KnotVector::clamped_uniform(1, 2).expect("valid knots"),
+        )
+        .expect("valid bilinear patch");
+
+        // The patch's own normal (du x dv) may oppose the plane's, and the
+        // face's stored sense is relative to its surface — flip the sense to
+        // keep the *outward* side of the solid where it was.
+        let flipped = du.cross(&dv).dot(&normal) < 0.0;
+        let new_id = geo.add_surface(Surface3::nurbs(patch));
+        let face = store.faces.get_mut(face_id).expect("live face");
+        face.surface = Some(new_id);
+        if flipped {
+            face.sense = match face.sense {
+                FaceSense::Positive => FaceSense::Negative,
+                FaceSense::Negative => FaceSense::Positive,
+            };
+        }
+        face_id
+    }
+
+    #[test]
+    fn body_has_nurbs_face_sees_only_a_bound_nurbs_surface() {
+        let (mut store, mut geo) = stores();
+        let body = block_at(&mut store, &mut geo, (2.0, 2.0, 2.0), (0.0, 0.0, 0.0));
+        assert!(
+            !body_has_nurbs_face(&store, &geo, body),
+            "an all-planar block has no NURBS face"
+        );
+        nurbs_ify_face(&mut store, &mut geo, body, Vector3::z(), 0.5);
+        assert!(
+            body_has_nurbs_face(&store, &geo, body),
+            "the rebound top face makes the block a NURBS operand"
+        );
+    }
+
+    #[test]
+    fn body_has_nurbs_face_is_false_for_a_stale_body() {
+        // An id from another store pair resolves to nothing here, so there
+        // is no face to find. The boolean itself reports the staleness as
+        // InvalidArgument; this must answer `false` on the way there rather
+        // than panic.
+        let (mut other, mut other_geo) = stores();
+        let foreign = block_at(&mut other, &mut other_geo, (2.0, 2.0, 2.0), (0.0, 0.0, 0.0));
+        nurbs_ify_face(&mut other, &mut other_geo, foreign, Vector3::z(), 0.5);
+
+        let (store, geo) = stores();
+        assert!(!body_has_nurbs_face(&store, &geo, foreign));
+    }
+
+    /// of-3oj, the promotion gate: a NURBS operand classifies correctly.
+    ///
+    /// Without the injected test this errors — `ray_surface_hits` refuses the
+    /// patch, so every region of the *other* solid that must be classified
+    /// against this one fails and the whole boolean diverts to the kernel's
+    /// F-Rep fallback. With it, the exact pipeline runs end to end.
+    ///
+    /// The patch is coincident with the plane it replaced, so the answer is
+    /// the plain block-block union: identical to the all-planar result, face
+    /// for face and volume for volume.
+    #[test]
+    fn unite_with_a_nurbs_operand_classifies_against_the_injected_test() {
+        let (mut store, mut geo) = stores();
+        let a = block_at(&mut store, &mut geo, (2.0, 2.0, 2.0), (0.0, 0.0, 0.0));
+        let b = block_at(&mut store, &mut geo, (2.0, 2.0, 2.0), (1.0, 1.0, 1.0));
+        nurbs_ify_face(&mut store, &mut geo, a, Vector3::z(), 0.5);
+        assert!(store.check(a).is_empty(), "{:?}", store.check(a));
+
+        // Without a test, the NURBS operand cannot be classified at all.
+        let bare = unite(&store, &geo, a, b, &tol());
+        assert!(
+            matches!(bare, Err(CoreError::NotImplemented { .. })),
+            "a NURBS operand must refuse ray parity rather than guess, got {bare:?}"
+        );
+
+        // A's material is the same region as the all-planar block: the
+        // half-space test below is exact for it, standing in for the
+        // kernel's MeshSdf without dragging the kernel into this crate.
+        let a_inside = |p: &Point3| {
+            let d = p.x.abs().max(p.y.abs()).max(p.z.abs()) - 1.0;
+            (d.abs() > 1e-9).then_some(d < 0.0)
+        };
+        let out = boolean_with_inside_tests(
+            BooleanOp::Unite,
+            &store,
+            &geo,
+            a,
+            b,
+            &tol(),
+            [Some(&a_inside), None],
+        )
+        .expect("NURBS operand classifies through the injected test");
+        assert_valid(&out, "unite with a NURBS operand");
+        assert_geometry_bound(&out, "unite with a NURBS operand");
+
+        let (mut s2, mut g2) = stores();
+        let a2 = block_at(&mut s2, &mut g2, (2.0, 2.0, 2.0), (0.0, 0.0, 0.0));
+        let b2 = block_at(&mut s2, &mut g2, (2.0, 2.0, 2.0), (1.0, 1.0, 1.0));
+        let want = unite(&s2, &g2, a2, b2, &tol()).expect("all-planar union");
+        assert_eq!(
+            out.face_count(),
+            want.face_count(),
+            "a coincident NURBS patch must not change the union"
+        );
+        assert_eq!(out.shell_count(), want.shell_count());
+    }
+
+    /// The test is scoped to NURBS operands: an analytic operand keeps exact
+    /// ray parity, and a caller that passes a test for one is ignored
+    /// (of-3oj). Asserted with a *deliberately wrong* test — if the pipeline
+    /// ever consults it, the union collapses and this fails loudly.
+    #[test]
+    fn an_injected_test_is_ignored_for_an_analytic_operand() {
+        let (mut store, mut geo) = stores();
+        let a = block_at(&mut store, &mut geo, (2.0, 2.0, 2.0), (0.0, 0.0, 0.0));
+        let b = block_at(&mut store, &mut geo, (2.0, 2.0, 2.0), (1.0, 1.0, 1.0));
+        let lies = |_: &Point3| Some(true);
+
+        let out = boolean_with_inside_tests(
+            BooleanOp::Unite,
+            &store,
+            &geo,
+            a,
+            b,
+            &tol(),
+            [Some(&lies), Some(&lies)],
+        )
+        .expect("all-planar union ignores the tests");
+        let want = unite(&store, &geo, a, b, &tol()).expect("all-planar union");
+        assert_eq!(
+            out.face_count(),
+            want.face_count(),
+            "planar operands must classify by exact parity, not the injected test"
+        );
+    }
+
+    /// An abstaining test (`None`) must fall through to ray parity rather
+    /// than be read as a verdict — on a NURBS operand that means the patch
+    /// refusal, i.e. a diversion to the fallback, never a guess (of-3oj).
+    #[test]
+    fn an_abstaining_test_falls_through_to_parity() {
+        let (mut store, mut geo) = stores();
+        let a = block_at(&mut store, &mut geo, (2.0, 2.0, 2.0), (0.0, 0.0, 0.0));
+        let b = block_at(&mut store, &mut geo, (2.0, 2.0, 2.0), (1.0, 1.0, 1.0));
+        nurbs_ify_face(&mut store, &mut geo, a, Vector3::z(), 0.5);
+        let abstains = |_: &Point3| None;
+
+        let out = boolean_with_inside_tests(
+            BooleanOp::Unite,
+            &store,
+            &geo,
+            a,
+            b,
+            &tol(),
+            [Some(&abstains), None],
+        );
+        assert!(
+            matches!(out, Err(CoreError::NotImplemented { .. })),
+            "abstention must reach the patch refusal, got {out:?}"
+        );
     }
 
     #[test]
