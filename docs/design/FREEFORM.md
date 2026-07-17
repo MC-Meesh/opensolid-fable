@@ -47,7 +47,10 @@ cheap early wins:
   (`:483`) already accepts **mixed** pairs. `intersect_nurbs` (`:467`) works and
   has six tests — it is a fully-built, fully-unwired component with no
   non-test callers anywhere in the workspace. Wiring is a dispatch problem, not
-  a numerics problem.
+  a numerics problem. *(Phase 2 has since done that wiring, and this held: the
+  routing went in without touching the numerics. The pipeline reaches a patch
+  through `intersect_marched_bounded`, not through `intersect_nurbs`, which
+  stays the bare-patch entry point.)*
 - **The of-lcx constrained-Delaunay tessellator is surface-agnostic.**
   `FlipMesh` (`src/boolean.rs:4415`), `boundary_cdt` (`:5247`), and
   `refine_curved_region` (`:4825`) are pure 2D uv combinatorics. They touch the
@@ -259,11 +262,13 @@ fn march_boxed<A: MarchSurface, B: MarchSurface>(
 
 ### Coverage matrix
 
-| Pair | Today | After phase 2 | Route |
+Phase 2 has landed, so the "after phase 2" column is now the behaviour.
+
+| Pair | Before phase 2 | After phase 2 | Route |
 |---|---|---|---|
-| NURBS ↔ NURBS, transversal | `intersect_nurbs`, unwired | ✅ exact | `march_boxed`, both knot domains |
-| NURBS ↔ plane | ✗ nothing | ✅ exact | `march_boxed`; plane domain clipped to the joint face box |
-| NURBS ↔ cylinder/sphere/cone/torus | ✗ nothing | ✅ exact | `march_boxed`; same clipping |
+| NURBS ↔ NURBS, transversal | `intersect_nurbs`, unwired | ✅ exact | `intersect_marched_bounded` → `march_boxed`, both knot domains |
+| NURBS ↔ plane | ✗ nothing | ✅ exact | `intersect_marched_bounded`; plane domain clipped to the joint face box |
+| NURBS ↔ cylinder/sphere/cone/torus | ✗ nothing | ✅ exact | same; the patch is gridded, the partner clipped |
 | NURBS ↔ anything, tangential | ✗ | **→ F-Rep** | `Degenerate` at `NEAR_TANGENCY_SIN` |
 | NURBS ↔ anything, coincident | ✗ | **→ F-Rep** | existing `Coincident` rejection (`:1520`) |
 | NURBS with degenerate edge | ✗ | **→ F-Rep** | rejected at `Chart::build` (§2) |
@@ -292,6 +297,12 @@ when the variant is added — they are the dangerous half of the work list:
   wearing a cone's error message.
 - `marched_ssi_supported` (`src/boolean.rs:1384`) and `is_bounded_marched`
   (`:1409`) are `matches!` over primitive shapes — both return `false` for NURBS.
+  **Only `is_bounded_marched` should change.** Phase 2 admitted NURBS there and
+  deliberately left `marched_ssi_supported` reporting `false`: the pipeline
+  tries it *first*, so admitting NURBS in both sends every NURBS pair to
+  `intersect_marched` — the unbounded-domain trap above, not a second route to
+  the same place. Reading this list as "two `matches!` to widen" reintroduces
+  exactly the NaN seeding it warns about.
 - `intersect_marched`'s `_ =>` (`src/ssi/marching.rs:763`) and
   `intersect_marched_bounded`'s `_ =>` (`:823`).
 
@@ -429,14 +440,21 @@ The proposed acceptance ladder, each rung a testable assertion:
 
 Two NURBS-specific pressures:
 
-- **Marching step vs. curvature.** The marcher's fixed 16×16 seed grid
-  (`GRID_DIVISIONS`) is tuned for primitives. A high-knot-count patch can hide a
-  whole intersection branch between grid nodes — a **missed branch is a silently
-  wrong boolean**, and unlike a missed face pair there is no downstream check
-  that catches it. Seeding should be **per-knot-span** (as
-  `NurbsSurface::project_point` already does, `src/project.rs:509`: `degree+2`
-  samples per span) rather than a fixed grid over the whole domain. This is a
-  phase-2 must, not a hardening nicety.
+- **Marching step vs. curvature.** *(Done in phase 2.)* The marcher's fixed 16×16
+  seed grid (`GRID_DIVISIONS`) is tuned for primitives. A high-knot-count patch
+  can hide a whole intersection branch between grid nodes — a **missed branch is
+  a silently wrong boolean**, and unlike a missed face pair there is no
+  downstream check that catches it. Seeding is now **per-knot-span** for a patch
+  (`MarchSurface::seed_samples`, sharing `project.rs`'s `span_samples`: `degree+2`
+  per span); primitives keep the uniform grid, whose bounded curvature justifies
+  it. Regression: `narrow_knot_span_branch_is_not_missed`.
+
+  Note the residual limit that test ran into, because it bounds what seeding can
+  buy: two branches closer than the tracer's branch-merge distance (`2·h0`, i.e.
+  the step scale) still collapse — the second seed is discarded as a duplicate of
+  the first curve. Seeding density fixes *finding* a branch, not *resolving* two
+  branches within one step of each other. If a real part hits that, the step
+  size is the lever, not the grid.
 - **Parametric tolerance is not scale-free.** `tol.parametric` is documented as
   *"relative to a unit-scale parameter domain."* A knot domain is arbitrary
   (`[0, 1]`, `[0, 17.3]`, whatever the loft produced). Every parametric test on
@@ -544,17 +562,30 @@ NURBS body can be *constructed and checked*; `param`/`chart_point` round-trip to
 `tol.linear` on a randomized patch corpus over randomized knot scalings; all
 1187 existing tests unchanged; `clippy -D warnings`.
 
-**Phase 2 — SSI wiring (`of-37i.4`).**
+**Phase 2 — SSI wiring (`of-37i.4`). DELIVERED.**
 `ssi::intersect` gets an explicit NURBS arm erroring with a NURBS-specific
-message (kill the cone-message fallthrough); `marched_ssi_supported` /
-`is_bounded_marched` admit NURBS pairs, routing **every** NURBS↔analytic pair
-through the bounded entry point; per-knot-span seeding replaces the fixed 16×16
-grid; extract the marcher's two-surface Newton corrector to replace
-`surface_residual`/`_gradient` for NURBS.
+message; `is_bounded_marched` admits NURBS pairs, routing **every** NURBS↔analytic
+pair through the bounded entry point; per-knot-span seeding replaces the fixed
+16×16 grid; `surface_residual`/`_gradient` gain a NURBS arm.
 **Gate:** NURBS↔plane matches an analytic section to `tol.linear`; NURBS↔NURBS
 transversal yields a single continuous branch, boundary-to-boundary; a patch
 with an intersection branch narrower than a 16×16 cell is *found* (the
 missed-branch regression test); every unsupported pair errors naming NURBS.
+
+Three corrections this phase made to the plan above, worth carrying forward:
+
+1. *`marched_ssi_supported` must NOT admit NURBS* — see "the dispatch traps".
+   Only `is_bounded_marched` changes.
+2. *The cone-message fallthrough is not killed, only bypassed.* `ssi::intersect`'s
+   `_ =>` arm still legitimately covers cone–sphere, cone–cylinder and cone–torus,
+   where the cone message is accurate. The NURBS arm goes in front of it.
+3. *`surface_residual` does not use the marcher's two-surface corrector.* That
+   solves a 4-parameter gap system between two surfaces; `polish_clip_endpoint`
+   needs a 1-unknown root along an *edge curve*, so the corrector is the wrong
+   solver. The NURBS residual is instead the projection signed distance
+   `(p − foot) · n̂(foot)` with the foot's normal as its gradient — which *is* the
+   share-don't-rewrite the plan intended: it is exactly what `march_boxed` already
+   seeds its grid with.
 
 **Phase 3 — imprint, region split, classification (`of-37i.5`).**
 Carry `MarchedCurve::params_a/params_b` into `Imprint` instead of re-projecting;
@@ -593,11 +624,24 @@ SP-curves.
 
 ## 10. Open questions
 
-- **Does the of-9ia fix generalize?** Non-coaxial cone–cone and NURBS↔NURBS are
-  the same shape — marched imprint, two curved hosts, chain must close. If one
-  fix serves both, phase 3 shrinks and of-9ia closes for free. If not, phase 3
-  is the longest pole in the epic. **This is the single biggest schedule
-  uncertainty and should be probed first, in phase 2, before phase 3 is scoped.**
+- ~~**Does the of-9ia fix generalize?**~~ **ANSWERED in phase 2 — yes, one fix
+  serves both, so phase 3 shrinks and of-9ia closes with it.** Probed by
+  instrumenting the failing chain merge; full evidence on `of-9ia` and
+  `of-37i.4`. The three causes of-9ia records are all wrong: the marched arc is
+  *exact* (its endpoint sits on the partner's cap plane to 1e-16) and correctly
+  ends where the curve exits the partner face through that face's edge. The
+  fault is the weld at that junction — the marched imprint and the companion
+  imprint (`A × B`'s neighbour face) disagree at the shared triple point by
+  1.7e-3, five orders above `snap`, so instead of welding they leave 2-point
+  bridge atoms and a degree-3 junction that chain merging cannot resolve. That
+  shape — marched imprint on `A` terminating where it exits `B` through `B`'s
+  edge, companion imprint required to meet it there — is identical for
+  NURBS↔NURBS on a trimmed patch. The fix is to solve the 3-surface junction
+  once and snap both chains to it. **Caveat that decides whether it actually
+  generalizes:** write that solve against the *generic* residual. Closed-form
+  implicit residuals fix cone–cone and do nothing for a patch. Phase 2 made this
+  possible — `boolean::surface_residual`/`_gradient` now return `Some` for
+  `Surface3::Nurbs` via the projection signed distance.
 - **Is F-Rep-sign classification (§5) acceptable long-term?** It makes NURBS
   classification resolution-bound while the geometry is exact. Acceptable for
   promotion; the asymmetry should be stated in the phase-1 bead, and ray–NURBS
