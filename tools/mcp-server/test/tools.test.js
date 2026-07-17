@@ -171,24 +171,26 @@ test('unknown model_id and unknown tool return errors, not throws', () => {
 
 test('export surfaces the kernel error message, not "undefined"', () => {
   // wasm-bindgen rejects a Rust Result::Err(String) by throwing the raw string
-  // (not an Error), so `err.message` is undefined. A thin toothed disk whose
-  // teeth reach the bounding box makes the faceted STEP path decline — the
-  // handler must report the kernel's reason, never a bare "undefined".
+  // (not an Error), so `err.message` is undefined. This asserts the handler
+  // reports the kernel's own reason rather than a bare "undefined".
+  //
+  // The decline has to be one the kernel chooses on purpose, or the test drifts
+  // with the mesher: this previously used a toothed disk that declined only
+  // because its teeth failed to mesh, and of-obv's mesher fix closed that mesh
+  // and left the test red on main (of-4kr). A box around a fully-enclosed
+  // spherical void is a STEP limitation, not a mesh accident — two shells,
+  // which the faceted writer declines until it emits BREP_WITH_VOIDS.
   const t = freshTools();
   const id = jsonOf(
     t.call('create_model', {
-      script:
-        'let g = Shape.cylinder(16, 4);' +
-        'const tooth = Shape.box3(3, 2.2, 4).translate(17.5, 0, 0);' +
-        'for (let i = 0; i < 16; i++) g = g.union(tooth.rotate(0, 0, 1, (360 * i) / 16));' +
-        'return g.subtract(Shape.cylinder(4, 6));',
-      name: 'gear',
+      script: 'return Shape.box3(10, 10, 10).subtract(Shape.sphere(4));',
+      name: 'void-box',
     }),
   ).model_id;
   const bad = t.call('export', { model_id: id, format: 'step' });
   assert.equal(bad.isError, true);
   assert.doesNotMatch(bad.content[0].text, /undefined/);
-  assert.match(bad.content[0].text, /export failed: .*meshing/i);
+  assert.match(bad.content[0].text, /export failed: STEP export failed: .*shells/i);
   // STL of the same model still works — different code path.
   assert.equal(jsonOf(t.call('export', { model_id: id, format: 'stl' })).format, 'stl');
 });
