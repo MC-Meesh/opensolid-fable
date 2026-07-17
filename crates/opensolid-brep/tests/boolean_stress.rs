@@ -2644,11 +2644,10 @@ fn coplanar_disjoint_faces_unite_clear_miss_tilted() {
 /// nothing to imprint and the target must come through whole.
 ///
 /// Only `subtract` is asserted here, and deliberately so:
-/// - `unite` of this pair is legitimately NON-MANIFOLD (the cubes stay two
-///   shells joined at the shared edge's two endpoints, which `check`
-///   reports as `VertexSharedBetweenShells`). That it returns `Ok` with an
-///   unusable body rather than rejecting is of-n5g — the edge-contact
-///   degeneracy, not this gate's business.
+/// - `unite` of this pair is legitimately NON-MANIFOLD (the cubes would stay
+///   two shells joined at the shared edge's two endpoints). It is rejected
+///   rather than returned — the edge-contact degeneracy, not this gate's
+///   business; see `edge_adjacent_blocks_unite_is_not_implemented` (of-n5g).
 /// - `intersect` is empty, which the kernel reports as `SolidWithoutShells`
 ///   for *any* disjoint pair (verified against fully separated blocks),
 ///   coincident faces or not.
@@ -2926,4 +2925,80 @@ fn touching_cubes_unite_is_rotation_invariant() {
             .unwrap_or_else(|e| panic!("{context}: rejected after rotation: {e:?}"));
         assert_close(volume(&out, context), 2.0, PLANAR_VOLUME_RTOL, context);
     }
+}
+
+// =====================================================================
+// (12) Solids meeting only at a vertex or an edge (of-n5g)
+// =====================================================================
+
+/// The `unite` half of the pair above (of-n5g).
+///
+/// The union of two cubes meeting along one edge is genuinely non-manifold.
+/// The bug was that it came back as `Ok` — a body that `check()` faults,
+/// `tessellate()` cannot close, and `mass_properties` refuses to measure.
+/// Callers had no way to tell it apart from a good result, and the hybrid
+/// kernel diverts to its F-Rep fallback only on `Err` (`hybrid.rs`, "any
+/// shortfall in the exact pipeline"), so this config silently produced an
+/// unusable exact result instead of falling back. `Err` is therefore the
+/// whole contract here: *which* `Err` is not observable to any caller,
+/// because every variant diverts identically.
+///
+/// Two different gates reject this pair, and which one fires depends on
+/// of-bxl.4's atom welding rather than on anything this test should pin:
+///
+/// - Since of-bxl.4, the contact edge's coincident atoms weld, so the pair
+///   reconstructs as ONE pinched shell with `chi = 3`, and the Euler gate
+///   in `build_output` rejects it before the of-n5g gate is reached.
+/// - Before of-bxl.4 it reconstructed as two shells sharing the contact
+///   vertices, which is what the of-n5g gate catches.
+///
+/// So accept either rejection, but demand it be one of those two — a bare
+/// `is_err` would also pass on an unrelated failure and quietly stop
+/// testing this bug. The of-n5g gate is NOT dead code: corner contact
+/// (below) still reaches it, because two shells that touch at one vertex
+/// each have a valid `chi = 2` and sail past the Euler gate.
+#[test]
+fn edge_adjacent_blocks_unite_is_rejected() {
+    let context = "blocks touching along one edge, unite";
+    let mut scene = Scene::new();
+    let a = scene.block([0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
+    let b = scene.block([1.0, 1.0, 0.0], [2.0, 2.0, 1.0]);
+    let err = scene
+        .unite(a, b)
+        .err()
+        .unwrap_or_else(|| panic!("{context}: expected rejection, got a body"));
+    let recognized = match &err {
+        // The of-n5g gate.
+        CoreError::NotImplemented { .. } => err.to_string().contains("vertex or edge"),
+        // The Euler gate in build_output, on the pinched single shell.
+        CoreError::Degenerate { context: c, .. } => {
+            *c == "boolean::build_output" && err.to_string().contains("Euler characteristic")
+        }
+        _ => false,
+    };
+    assert!(
+        recognized,
+        "{context}: expected the of-n5g vertex/edge gate or the build_output \
+         Euler gate, got {err:?}"
+    );
+}
+
+/// Corner-to-corner contact: the same degeneracy reduced to a single shared
+/// vertex, reached without any coincident face pair (the blocks are offset
+/// in all three axes, so no two planes coincide). Guards the gate against
+/// being narrowed to the edge case alone.
+#[test]
+fn corner_touching_blocks_unite_is_not_implemented() {
+    let context = "blocks touching at one corner, unite";
+    let mut scene = Scene::new();
+    let a = scene.block([0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
+    let b = scene.block([1.0, 1.0, 1.0], [2.0, 2.0, 2.0]);
+    let err = scene
+        .unite(a, b)
+        .err()
+        .unwrap_or_else(|| panic!("{context}: expected rejection, got a body"));
+    assert!(
+        matches!(err, CoreError::NotImplemented { .. }),
+        "{context}: expected NotImplemented, got {err:?}"
+    );
 }

@@ -4949,6 +4949,48 @@ fn build_output(
             .genus = genus;
     }
 
+    // Shells meeting only at a vertex: reject, don't return.
+    //
+    // The union-find above fuses kept regions that share an *atom*, so two
+    // surviving shells never share an edge — but vertex identity is
+    // positional (`vertex_of` snaps coincident points to one id), so solids
+    // touching at a corner land as separate shells that share the vertex id
+    // at the contact. Each such shell is a closed box with a perfectly valid
+    // chi = 2, so the Euler check above passes it; this is the only gate that
+    // sees the contact. That body is genuinely non-manifold: `check()`
+    // reports `VertexSharedBetweenShells`, `tessellate()` yields an unclosed
+    // mesh, and `mass_properties` refuses to measure it. Returning `Ok` hands
+    // the caller a result nothing downstream can consume, and the hybrid
+    // kernel diverts to its F-Rep fallback only on `Err`, so it never
+    // diverts. Reject as `NotImplemented` like every other degeneracy on this
+    // path (of-n5g).
+    //
+    // Edge contact reaches this too, but only when the contact atoms do NOT
+    // weld: since of-bxl.4 they generally do, fusing the pair into one
+    // pinched shell whose chi = 3 the Euler check above rejects first. Both
+    // outcomes are `Err` and divert identically, so the split is invisible to
+    // callers — but keep the vertex arm, since corner contact never welds.
+    //
+    // Properly nested shells (a void inside a solid) share no vertices, so
+    // they are unaffected.
+    let mut shell_of_vertex: HashMap<EntityId<crate::topology::Vertex>, usize> = HashMap::new();
+    for (si, shell_id) in shell_ids.iter().enumerate() {
+        for v in vertices_of_shell(&store, *shell_id) {
+            match shell_of_vertex.get(&v) {
+                Some(&other) if other != si => {
+                    return Err(CoreError::NotImplemented {
+                        feature: "boolean operations on solids meeting only at \
+                                  a vertex or edge (transversal MVP)",
+                    });
+                }
+                Some(_) => {}
+                None => {
+                    shell_of_vertex.insert(v, si);
+                }
+            }
+        }
+    }
+
     let shell_count = shells.len();
     Ok(BooleanOutput {
         store,
@@ -4974,6 +5016,25 @@ fn shell_genus_from_euler(chi: i64) -> Option<u32> {
     // V - E + F - R = 2(1 - H)  =>  H = 1 - chi/2.
     let h = 1 - chi / 2;
     (h >= 0).then_some(h as u32)
+}
+
+/// Vertices reached through one shell's faces.
+fn vertices_of_shell(
+    store: &TopologyStore,
+    shell: EntityId<crate::topology::Shell>,
+) -> std::collections::HashSet<EntityId<crate::topology::Vertex>> {
+    let mut vs = std::collections::HashSet::new();
+    for &f in store.faces_of_shell(shell) {
+        for lp in store.loops_of_face(f) {
+            for &fin in store.fins_of_loop(lp) {
+                let fin_data = store.fin(fin).expect("live fin");
+                let edge = store.edge(fin_data.edge).expect("live edge");
+                vs.insert(edge.start_vertex);
+                vs.insert(edge.end_vertex);
+            }
+        }
+    }
+    vs
 }
 
 /// V/E/F/R counts of one shell (vertices and edges reached via its faces).
