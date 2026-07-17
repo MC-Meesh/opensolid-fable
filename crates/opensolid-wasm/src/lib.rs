@@ -740,13 +740,13 @@ impl WasmShape {
         }
     }
 
-    /// This shape rotated about the origin by `angle` radians around the
+    /// This shape rotated about the origin by `angleDegrees` around the
     /// axis `(ax, ay, az)` (any non-zero length). A zero or non-finite
     /// axis or angle is the identity rotation.
-    pub fn rotate(&self, ax: f64, ay: f64, az: f64, angle: f64) -> WasmShape {
+    pub fn rotate(&self, ax: f64, ay: f64, az: f64, angle_degrees: f64) -> WasmShape {
         let axis = Vector3::new(ax, ay, az);
-        let axis_angle = if axis.norm().is_normal() && angle.is_finite() {
-            axis.normalize() * angle
+        let axis_angle = if axis.norm().is_normal() && angle_degrees.is_finite() {
+            axis.normalize() * angle_degrees.to_radians()
         } else {
             Vector3::zeros()
         };
@@ -1410,7 +1410,7 @@ mod tests {
     /// the tracked y half-extent from 2.5 to 12.5.
     #[test]
     fn measure_bbox_tracks_the_part_not_compounded_rotation_bounds() {
-        let q = std::f64::consts::FRAC_PI_4;
+        let q = 45.0; // degrees — rotate() takes degrees (of-5r7)
         // Cylinder r=2.5 about the y axis, half-height 10; two 45° turns about
         // x lay its axis along z. True extent: x,y ∈ ±2.5, z ∈ ±10.
         let rot = WasmShape::cylinder(2.5, 10.0)
@@ -1507,7 +1507,7 @@ mod tests {
     #[test]
     fn rotate_and_scale_mesh_via_wasm_api() {
         let s = WasmShape::box3(1.0, 0.4, 0.6)
-            .rotate(0.0, 0.0, 1.0, std::f64::consts::FRAC_PI_2)
+            .rotate(0.0, 0.0, 1.0, 90.0)
             .scale(1.5, 1.0, 2.0)
             .expect("valid factors")
             .translate(0.2, -0.1, 0.3);
@@ -1515,7 +1515,7 @@ mod tests {
 
         // Quarter turn about z swaps the box's x/y bounds (then scaled).
         let b = WasmShape::box3(2.0, 1.0, 0.5)
-            .rotate(0.0, 0.0, 1.0, std::f64::consts::FRAC_PI_2)
+            .rotate(0.0, 0.0, 1.0, 90.0)
             .bounds();
         assert!((b[3] - 1.0).abs() < 1e-12 && (b[4] - 2.0).abs() < 1e-12);
     }
@@ -1529,6 +1529,56 @@ mod tests {
         assert_eq!(b, vec![-2.5, -2.5, -2.5, 2.5, 2.5, 2.5]);
         assert!(WasmShape::sphere(1.0).uniform_scale(-1.0).is_err());
         assert!(WasmShape::sphere(1.0).scale(1.0, 0.0, 1.0).is_err());
+    }
+
+    /// `rotate` takes DEGREES, matching every other angle on this surface
+    /// (`revolve`, `draft`, `pattern`, `ellipseArcTo`) and `Part::rotate`.
+    /// Each assertion below is unit-sensitive: read as radians, 90 is 5157
+    /// degrees (= 116.6 mod 360) and none of these bounds would hold.
+    #[test]
+    fn rotate_angle_is_degrees() {
+        // A quarter turn about z carries +Y onto -X exactly, swapping the
+        // box's x/y extents. At 90 radians the long axis lands askew and
+        // the x extent balloons past its own half-extent of 2.
+        let b = WasmShape::box3(2.0, 1.0, 0.5)
+            .rotate(0.0, 0.0, 1.0, 90.0)
+            .bounds();
+        assert!(
+            (b[3] - 1.0).abs() < 1e-12,
+            "x half-extent should be 1, got {}",
+            b[3]
+        );
+        assert!(
+            (b[4] - 2.0).abs() < 1e-12,
+            "y half-extent should be 2, got {}",
+            b[4]
+        );
+
+        // 360 degrees is a full turn back to identity; 360 radians is not.
+        let b = WasmShape::box3(2.0, 1.0, 0.5)
+            .rotate(0.0, 1.0, 0.0, 360.0)
+            .bounds();
+        assert!(
+            b.iter()
+                .zip(&[-2.0, -1.0, -0.5, 2.0, 1.0, 0.5])
+                .all(|(a, e)| (a - e).abs() < 1e-9)
+        );
+
+        // The rotation the docs hand agents for a z-up plate: a +Y cylinder
+        // swung onto +Z. Its axis must land on z, leaving y at the radius.
+        let b = WasmShape::cylinder(2.5, 10.0)
+            .rotate(1.0, 0.0, 0.0, 90.0)
+            .bounds();
+        assert!(
+            (b[4] - 2.5).abs() < 1e-9,
+            "y half-extent should be the radius 2.5, got {}",
+            b[4]
+        );
+        assert!(
+            (b[5] - 10.0).abs() < 1e-9,
+            "z half-extent should be the half-height 10, got {}",
+            b[5]
+        );
     }
 
     #[test]
@@ -1936,7 +1986,7 @@ mod tests {
         // Rigid transforms and uniform scale keep the spec exact: the
         // sphere bites a shallow cap out of the moved box's top face.
         let moved = WasmShape::box3(1.0, 1.0, 1.0)
-            .rotate(0.0, 1.0, 0.0, 0.3)
+            .rotate(0.0, 1.0, 0.0, 17.0)
             .uniform_scale(2.0)
             .expect("valid factor")
             .translate(3.0, 0.0, 0.0);

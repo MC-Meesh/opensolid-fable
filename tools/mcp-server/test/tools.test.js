@@ -301,6 +301,29 @@ describe('axis convention (+Y) — documented in AGENT_GUIDE.md §3', () => {
     assert.ok(removed < removedBy('') / 2);
   });
 
+  // The angle is DEGREES (of-5r7: it was radians, and every caller here —
+  // plus the docs and AGENT_GUIDE — already assumed degrees). The volume
+  // bands above are too generous to notice: read as radians, 90 is 116.6
+  // degrees mod 360, which still bores a slanted-but-real hole and still
+  // lands inside the band. These two assertions are the ones that bite.
+  test('rotate angle is in degrees, not radians', () => {
+    // 360 degrees is a full turn — identity. As radians it is 63.7 degrees,
+    // which tips the hole off +Z and changes what gets removed.
+    const fullTurn = removedBy('.rotate(1, 0, 0, 90).rotate(0, 0, 1, 360)');
+    const noTurn = removedBy('.rotate(1, 0, 0, 90)');
+    assert.ok(
+      Math.abs(fullTurn - noTurn) < 1e-9,
+      `a 360-degree turn should be identity; got ${fullTurn} vs ${noTurn}`,
+    );
+
+    // -270 and +90 are the same rotation in degrees, nothing alike in radians.
+    const negative = removedBy('.rotate(1, 0, 0, -270)');
+    assert.ok(
+      Math.abs(negative - noTurn) < 1e-9,
+      `rotate(1,0,0,-270) should match rotate(1,0,0,90); got ${negative} vs ${noTurn}`,
+    );
+  });
+
   test('rotate(0,0,1,90) swings +Y onto +X', () => {
     // Onto X the cylinder lies *along* the plate, so it slots rather than
     // bores — same signature as +Y, nothing like the +Z through-hole.
