@@ -76,7 +76,7 @@ persistence. Exports and screenshots are written to `OPENSOLID_MCP_OUTPUT_DIR`.
 |------------------|----------------------------------------------------|---------|
 | `create_model`   | **`script`**, `name`, `exact`                      | `model_id` + mesh stats + validation summary |
 | `get_screenshot` | **`model_id`**, `view`, `width`, `height`          | inline PNG image |
-| `export`         | **`model_id`**, **`format`**, `path`               | file path + byte size |
+| `export`         | **`model_id`**, **`format`**, `path`, `accuracy`   | file path + byte size |
 | `measure`        | **`model_id`**, `query`, `accuracy`                | mass properties |
 | `validate`       | **`model_id`**, `accuracy`                          | structural report |
 | `list_models`    | —                                                  | models registered this session |
@@ -127,6 +127,21 @@ optional (absolute, or relative to the output dir; defaults to
   companion, otherwise a faceted-but-valid B-Rep via SDF→B-Rep planar-region
   recovery. See §4 for when the faceted path declines.
 - **STL / OBJ** write the current mesh.
+
+`accuracy` sets the target chordal deviation of the exported facets in model
+units, defaulting to 0.5% of the model's extent. It is the file-size lever —
+pass a coarser value when the export only needs to be eyeballed. The exact-B-Rep
+STEP path ignores it; analytic surfaces have no tessellation error.
+
+The lever saturates. Meshing depth is `ceil(log2(extent / accuracy))` clamped to
+a minimum of 4, so any accuracy coarser than about `extent / 16` produces the
+same file, and the useful range spans roughly 4× in size rather than orders of
+magnitude. On a 1.3-unit organic solid: 5.8 MB at `accuracy: 0.002`, 3.0 MB at
+the default, 765 KB at `0.2` — and `0.5` is byte-identical to `0.2`.
+
+Accuracy also changes the meshing depth and grid, so it is worth trying when the
+faceted STEP path declines (§4) — though it is a coarse instrument, not a
+guaranteed fix.
 
 ### `measure`
 

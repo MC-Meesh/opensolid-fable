@@ -122,6 +122,47 @@ test('export writes step, stl, and obj files', () => {
   assert.match(readFileSync(step.path, 'utf8'), /ISO-10303-21/);
 });
 
+test('export accuracy is the file-size lever on every faceted path', () => {
+  // An organic shape has no exact B-Rep companion, so STEP takes the faceted
+  // path and honours accuracy just as STL and OBJ do.
+  const t = freshTools();
+  const id = jsonOf(
+    t.call('create_model', {
+      script:
+        'return Shape.roundedBox(0.8, 0.5, 0.6, 0.15)' +
+        '.smoothUnion(Shape.sphere(0.45).translate(0, 0.55, 0), 0.2);',
+      name: 'organic',
+    }),
+  ).model_id;
+  for (const format of ['step', 'stl', 'obj']) {
+    const coarse = jsonOf(t.call('export', { model_id: id, format, path: `coarse.${format}` }));
+    const fine = jsonOf(
+      t.call('export', { model_id: id, format, path: `fine.${format}`, accuracy: 0.002 }),
+    );
+    assert.ok(
+      fine.bytes > coarse.bytes,
+      `${format}: accuracy 0.002 must produce more facets than the default (` +
+        `${fine.bytes} vs ${coarse.bytes} bytes)`,
+    );
+  }
+  // The lever saturates: meshing depth clamps to a minimum of 4, so anything
+  // coarser than roughly extent/16 (~0.08 here) exports identically. AGENT_GUIDE
+  // §2 documents this, and agents chasing a smaller file need to know it stops.
+  const at = (accuracy) =>
+    jsonOf(t.call('export', { model_id: id, format: 'stl', path: `s${accuracy}.stl`, accuracy })).bytes;
+  assert.equal(at(0.2), at(0.5), 'past the min-depth floor, coarser accuracy changes nothing');
+});
+
+test('export ignores a non-positive or non-numeric accuracy rather than failing', () => {
+  const t = freshTools();
+  const id = jsonOf(t.call('create_model', { script: 'return Shape.sphere(1);' })).model_id;
+  const base = jsonOf(t.call('export', { model_id: id, format: 'stl', path: 'a.stl' })).bytes;
+  for (const bad of [0, -1, Number.NaN, 'coarse']) {
+    const out = jsonOf(t.call('export', { model_id: id, format: 'stl', path: 'b.stl', accuracy: bad }));
+    assert.equal(out.bytes, base, `accuracy ${String(bad)} falls back to the default`);
+  }
+});
+
 test('unknown model_id and unknown tool return errors, not throws', () => {
   const t = freshTools();
   assert.equal(t.call('measure', { model_id: 'missing' }).isError, true);

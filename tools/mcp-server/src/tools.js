@@ -186,6 +186,14 @@ export function createTools(config = {}) {
                 'Optional output path (absolute, or relative to the server output dir). ' +
                 'Defaults to <name>.<format> in the output dir.',
             },
+            accuracy: {
+              type: 'number',
+              description:
+                'Target chordal deviation of the exported facets (model units); defaults ' +
+                'to 0.5% of the extent. Coarser values mean fewer facets and smaller ' +
+                'files, saturating once the octree hits its minimum depth (roughly ' +
+                'accuracy = extent/16). Ignored for STEP when the model has an exact B-Rep.',
+            },
           },
           required: ['model_id', 'format'],
         },
@@ -202,15 +210,16 @@ export function createTools(config = {}) {
           return fail(err.message);
         }
         const dest = exportPath(args.path, outputDir, model, format);
+        const accuracy = accuracyArg(args.accuracy);
         try {
           mkdirSync(resolve(dest, '..'), { recursive: true });
           if (format === 'step') {
-            writeFileSync(dest, model.shape.exportStep(undefined), 'utf8');
+            writeFileSync(dest, model.shape.exportStep(accuracy), 'utf8');
           } else if (format === 'stl') {
-            const mesh = getMesh(model.shape);
+            const mesh = getMesh(model.shape, { accuracy });
             writeFileSync(dest, buildBinaryStl(mesh.positions, mesh.indices));
           } else {
-            const mesh = getMesh(model.shape);
+            const mesh = getMesh(model.shape, { accuracy });
             writeFileSync(dest, buildObj(mesh.positions, mesh.normals, mesh.indices), 'utf8');
           }
         } catch (err) {
