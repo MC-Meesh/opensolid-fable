@@ -30,6 +30,22 @@ function errMessage(err) {
   return String(err);
 }
 
+// A null volume is never self-explanatory: the kernel says why in `massError`,
+// and on the SDF path the cause is often just a mesh too coarse to close, which
+// a finer `accuracy` fixes. Carry both onto any payload that reports volume, so
+// a null always arrives with its reason rather than looking like a broken model.
+function withMassError(view, full) {
+  if (!full.massError) return view;
+  const annotated = { ...view, massError: full.massError };
+  if (!full.exact) {
+    annotated.hint =
+      'Mass properties are integrated over the measured mesh; at this accuracy the mesh ' +
+      'does not close. Retry with a smaller `accuracy` (e.g. half the current value) ' +
+      'before concluding the model itself is bad.';
+  }
+  return annotated;
+}
+
 /** Resolve where an export should be written. */
 function exportPath(requested, outputDir, model, format) {
   if (requested) {
@@ -89,16 +105,21 @@ export function createTools(config = {}) {
         }
         const measure = JSON.parse(model.shape.measure(undefined));
         const validation = JSON.parse(model.shape.validate(undefined));
-        return text({
-          model_id: model.id,
-          name: model.name,
-          exact: model.exact,
-          mesh: { triangles: measure.triangles, vertices: measure.vertices },
-          boundingBox: measure.boundingBox,
-          volume: measure.volume,
-          valid: validation.valid,
-          issues: validation.issues,
-        });
+        return text(
+          withMassError(
+            {
+              model_id: model.id,
+              name: model.name,
+              exact: model.exact,
+              mesh: { triangles: measure.triangles, vertices: measure.vertices },
+              boundingBox: measure.boundingBox,
+              volume: measure.volume,
+              valid: validation.valid,
+              issues: validation.issues,
+            },
+            measure,
+          ),
+        );
       },
     },
 
@@ -205,7 +226,9 @@ export function createTools(config = {}) {
         description:
           'Compute mass properties of a model: volume, surface area, centroid, inertia, ' +
           'and bounding box (exact polyhedral integrals over the mesh). `query` narrows ' +
-          `the result. Queries: ${MEASURE_QUERIES.join(', ')} (default all).`,
+          `the result. Queries: ${MEASURE_QUERIES.join(', ')} (default all). ` +
+          'When the mesh does not bound a finite non-zero volume the mass fields are null ' +
+          'and `massError` says why; the bounding box is still returned.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -242,7 +265,10 @@ export function createTools(config = {}) {
             exact: full.exact,
           },
         }[query];
-        return text(view ?? full);
+        // `bbox` is the one view that never reports a mass property — it is
+        // always present and correct, so a mass failure is not its business.
+        if (query === 'bbox') return text(view);
+        return text(withMassError(view ?? full, full));
       },
     },
 

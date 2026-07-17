@@ -52,6 +52,36 @@ test('measure returns the exact box volume', () => {
   assert.deepEqual(Object.keys(volumeOnly).sort(), ['exact', 'volume']);
 });
 
+// A subtraction that removes everything: the mesh is empty, so no mass property
+// exists. The point of these tests is that the agent is never handed a bare
+// null — every payload reporting a null volume also carries the reason.
+const EMPTY_SCRIPT = 'return Shape.box3(1,1,1).subtract(Shape.box3(2,2,2));';
+
+test('measure explains a null volume instead of returning a bare null', () => {
+  const t = freshTools();
+  const id = jsonOf(t.call('create_model', { script: EMPTY_SCRIPT })).model_id;
+
+  for (const query of ['all', 'volume', 'mass', 'centroid', 'surface_area']) {
+    const out = jsonOf(t.call('measure', { model_id: id, query }));
+    assert.match(out.massError, /closed, consistently oriented manifold/, `query ${query}`);
+    assert.match(out.hint, /accuracy/, `query ${query} should suggest a finer accuracy`);
+  }
+});
+
+test('measure keeps the bounding box free of mass-failure noise', () => {
+  const t = freshTools();
+  const id = jsonOf(t.call('create_model', { script: EMPTY_SCRIPT })).model_id;
+  const bbox = jsonOf(t.call('measure', { model_id: id, query: 'bbox' }));
+  assert.deepEqual(Object.keys(bbox), ['boundingBox']);
+});
+
+test('create_model reports why volume is null in its summary', () => {
+  const t = freshTools();
+  const out = jsonOf(t.call('create_model', { script: EMPTY_SCRIPT }));
+  assert.equal(out.volume, null);
+  assert.match(out.massError, /closed, consistently oriented manifold/);
+});
+
 test('validate reports a watertight boolean result as valid', () => {
   const t = freshTools();
   const id = jsonOf(
