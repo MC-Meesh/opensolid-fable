@@ -29,6 +29,37 @@ cargo test
 cargo clippy -- -D warnings
 ```
 
+## Troubleshooting: `cargo test` hangs before any test runs
+
+If a freshly compiled binary hangs at `_dyld_start` using 0% CPU — while
+already-built binaries like `git`/`cargo` still run fine — the host's `amfid`
+daemon has been idle-reaped by jetsam. `amfid` validates code signatures on a
+binary's *first* exec, so while it is dead every fresh `cargo test` binary blocks
+in dyld. Previously-run binaries are already validated and are unaffected, which
+makes this look like a Rust or toolchain problem. It is not.
+
+Check it first:
+
+```bash
+pgrep -q amfid || echo "amfid is dead — this is the hang, not your code"
+```
+
+It resolves on its own: `launchd` respawns `amfid` on demand, typically within
+~20-30 minutes, and the hang clears with no reboot. To recover immediately, an
+operator (not an agent — SIP blocks unprivileged attempts) can run:
+
+```bash
+sudo launchctl kickstart -k system/com.apple.MobileFileIntegrity
+```
+
+Do **not** escalate this as a machine fault, and do not ask for a reboot. This
+signature has been misdiagnosed three times (as a wedged `syspolicyd`, and as the
+Claude Code Bash sandbox blocking exec) and cost hours of blocked gates. The Bash
+sandbox is *off* unless explicitly enabled and is not the cause; adding a sandbox
+allowlist is a no-op here. Because the wedge self-heals, whatever you changed last
+will look like the fix — verify `amfid` before concluding anything. See `of-zis`
+for the kernel-log evidence.
+
 ## Research
 
 See `research/` for landscape analysis and `spec/` for the v1 spec. The v1 spec assumed
