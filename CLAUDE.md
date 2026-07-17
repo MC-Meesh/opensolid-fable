@@ -31,22 +31,42 @@ cargo clippy -- -D warnings
 
 ## Troubleshooting: `cargo test` hangs before any test runs
 
-If a freshly compiled binary hangs at `_dyld_start` using 0% CPU — while
-already-built binaries like `git`/`cargo` still run fine — the host's `amfid`
-daemon has been idle-reaped by jetsam. `amfid` validates code signatures on a
-binary's *first* exec, so while it is dead every fresh `cargo test` binary blocks
-in dyld. Previously-run binaries are already validated and are unaffected, which
-makes this look like a Rust or toolchain problem. It is not.
+The signature is a *first exec* wedge: freshly compiled binaries hang at
+`_dyld_start` using 0% CPU, while already-validated binaries like `git`/`cargo`
+run fine. Note the asymmetry — `cargo check` and `cargo build` keep working
+throughout, because `rustc` and `cargo` have already been exec'd before. Only
+the brand-new test binary blocks. That asymmetry is most of why this reads as a
+Rust or toolchain problem. It is not.
 
-Check it first:
+Diagnose it with these two checks, in order. Both are cheap, neither needs root,
+and both are positive evidence rather than inference:
 
 ```bash
-pgrep -q amfid || echo "amfid is dead — this is the hang, not your code"
+# 1. Sample the hung process. Wedged output is unambiguous: every sample is in
+#    dyld and never reaches main. Physical footprint stays ~96K, State S, 0% CPU.
+sample <pid> 2 -mayDie
+#      1626 Thread_xxx: Main Thread
+#        1626 _dyld_start  (in dyld) + 0
+
+# 2. Trivial-binary control — proves it is machine-wide, not your code.
+printf 'fn main(){println!("hi");}' > /tmp/w.rs && rustc -o /tmp/w /tmp/w.rs && /tmp/w
 ```
 
-It resolves on its own: `launchd` respawns `amfid` on demand, typically within
-~20-30 minutes, and the hang clears with no reboot. To recover immediately, an
-operator (not an agent — SIP blocks unprivileged attempts) can run:
+If a one-line hello-world hangs too, the problem is not the project, and there is
+nothing to fix in your change.
+
+One known cause is the host's `amfid` daemon being idle-reaped by jetsam. `amfid`
+validates code signatures on a binary's *first* exec, so while it is dead every
+fresh binary blocks in dyld — see `of-zis` for the kernel-log evidence. But
+`pgrep -q amfid` is **not** a sufficient check and must not be your first move:
+an instance on 2026-07-16 (`of-kra`) ran 50+ minutes with `amfid` alive the whole
+time and every fresh binary still hanging. A live `amfid` does not rule this out.
+
+It has always resolved on its own without a reboot, but do not count on a
+particular window — `launchd` respawns `amfid` on demand, sometimes in ~20-30
+minutes, sometimes considerably longer (the `of-kra` instance never cleared
+within the session). If `amfid` is in fact dead, an operator (not an agent — SIP
+blocks unprivileged attempts) can force it back immediately:
 
 ```bash
 sudo launchctl kickstart -k system/com.apple.MobileFileIntegrity
@@ -57,8 +77,8 @@ signature has been misdiagnosed three times (as a wedged `syspolicyd`, and as th
 Claude Code Bash sandbox blocking exec) and cost hours of blocked gates. The Bash
 sandbox is *off* unless explicitly enabled and is not the cause; adding a sandbox
 allowlist is a no-op here. Because the wedge self-heals, whatever you changed last
-will look like the fix — verify `amfid` before concluding anything. See `of-zis`
-for the kernel-log evidence.
+will look like the fix — get the sample and the hello-world control before
+concluding anything.
 
 ## Research
 
