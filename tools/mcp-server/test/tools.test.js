@@ -171,9 +171,14 @@ test('unknown model_id and unknown tool return errors, not throws', () => {
 
 test('export surfaces the kernel error message, not "undefined"', () => {
   // wasm-bindgen rejects a Rust Result::Err(String) by throwing the raw string
-  // (not an Error), so `err.message` is undefined. A thin toothed disk whose
-  // teeth reach the bounding box makes the faceted STEP path decline — the
-  // handler must report the kernel's reason, never a bare "undefined".
+  // (not an Error), so `err.message` is undefined. A thin toothed disk gives the
+  // faceted STEP path something to decline — the handler must report the string
+  // the kernel threw, never a bare "undefined".
+  //
+  // Assert on the kernel's "STEP export failed:" prefix, not on *why* it
+  // declined: which reason this gear trips is the kernel's business and has
+  // already moved once (it used to fail on meshing bounds, now on shell count).
+  // The prefix is the part that proves the raw throw survived errMessage.
   const t = freshTools();
   const id = jsonOf(
     t.call('create_model', {
@@ -188,7 +193,7 @@ test('export surfaces the kernel error message, not "undefined"', () => {
   const bad = t.call('export', { model_id: id, format: 'step' });
   assert.equal(bad.isError, true);
   assert.doesNotMatch(bad.content[0].text, /undefined/);
-  assert.match(bad.content[0].text, /export failed: .*meshing/i);
+  assert.match(bad.content[0].text, /export failed: STEP export failed: \S/i);
   // STL of the same model still works — different code path.
   assert.equal(jsonOf(t.call('export', { model_id: id, format: 'stl' })).format, 'stl');
 });
