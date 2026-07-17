@@ -584,7 +584,7 @@ for (const y of [10, 30]) part = part.subtract(zHole.translate(15, y, 0));
 const xHole = Shape.cylinder(2.5, 10).rotate(0, 0, 1, 90);   // -> +X
 for (const y of [10, 30]) part = part.subtract(xHole.translate(-27.5, y, 32));
 
-// The trailing no-op rotation is a WORKAROUND, not modelling (of-2y4.1):
+// The trailing no-op rotation is a WORKAROUND, not modelling (of-obv):
 // without it this exact part meshes open at the default accuracy and STEP
 // export declines. A 360° rotation is geometrically the identity; all it
 // changes is the shape's tracked bounding box, and that shifts the meshing
@@ -688,6 +688,12 @@ Exported files (STEP/STL/OBJ) and PNG renders land in
 machine-readable record of the run. See the
 [Agent Guide](../../../../docs/AGENT_GUIDE.md) for how to connect a client, the
 full tool reference, and the failure modes these examples exercise.
+
+\`bracket-right-angle\` is also the acceptance part, built over the real MCP
+stdio transport and gated by
+[\`test/bracket-acceptance.test.js\`](../../test/bracket-acceptance.test.js). What
+it cost to build — and the kernel bugs it surfaced — is written up in the
+[friction log](../../../../docs/dogfood-bracket-friction-log.md).
 `;
 writeFileSync(resolve(galleryDir, 'README.md'), index, 'utf8');
 

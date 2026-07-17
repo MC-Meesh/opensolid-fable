@@ -10,6 +10,8 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 
 **Agent:** Two kernel facts drive the whole script. First, the extrusion axis is **+Y**, not +Z: `Shape.extrude` sweeps a profile’s `(u, v)` into `(x, z)` and pushes it along +Y (`bounded.rs`), and `Shape.cylinder` is likewise a **+Y**-axis cylinder — radial in xz, axial in y (`primitives.rs`). Second, that makes the L-section a *profile* problem: I can draw the whole cross-section in (x, z) — including the 3 mm interior fillet as a real arc — and sweep it 40 mm along +Y for the width. `arcTo`’s bulge is the DXF convention, `tan(sweep/4)`, so a 90° arc is `tan(22.5°) = 0.4142`; negative sweeps it clockwise, which is the concave direction here.
 
+**Agent:** That leaves the part **z-up**: x is its 60 mm length, y its 40 mm width, z its 40 mm height. I am keeping it that way deliberately — STEP, FreeCAD, and CAD interchange generally are z-up, and the STEP writer emits coordinates verbatim, so a z-up model lands upright in FreeCAD. Be aware this cuts against the *renderer*, whose named views assume y is up (`render.js`). So for this part `top` (looking down −Y) is the view that shows the L-section, and `front` (looking down −Z) is the plan view of the base plate. The view names are worth reading literally, not geometrically.
+
 > 🔧 **`create_model`**
 > ```js
 > // Right-angle bracket: 60×40×5 base plate, 40×40×5 vertical plate, triangular
@@ -45,11 +47,12 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 > const xHole = Shape.cylinder(2.5, 10).rotate(0, 0, 1, 90);   // -> +X
 > for (const y of [10, 30]) part = part.subtract(xHole.translate(-27.5, y, 32));
 > 
-> // The trailing no-op rotation is a WORKAROUND, not modelling (of-2y4.1):
+> // The trailing no-op rotation is a WORKAROUND, not modelling (of-obv):
 > // without it this exact part meshes open at the default accuracy and STEP
 > // export declines. A 360° rotation is geometrically the identity; all it
-> // changes is the shape's tracked bounding box, which loosens the meshing
-> // grid enough to close the mesh. See the gallery notes below.
+> // changes is the shape's tracked bounding box, and that shifts the meshing
+> // grid onto an alignment where the mesh closes. This specific expression was
+> // found by trial: other identity-equivalent spellings still fail.
 > return part.rotate(0, 1, 0, 360);
 > ```
 > ```json
@@ -92,19 +95,19 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 >
 > *(real 720×540 render, 17 KB PNG)*
 
+> 🔧 **`get_screenshot`** `{ "model_id": "model-7", "view": "top", "width": 720, "height": 540 }`
+>
+> ![bracket-right-angle — top view](../output/bracket-right-angle-top.png)
+>
+> *(real 720×540 render, 20 KB PNG)*
+
 > 🔧 **`get_screenshot`** `{ "model_id": "model-7", "view": "front", "width": 720, "height": 540 }`
 >
 > ![bracket-right-angle — front view](../output/bracket-right-angle-front.png)
 >
 > *(real 720×540 render, 21 KB PNG)*
 
-> 🔧 **`get_screenshot`** `{ "model_id": "model-7", "view": "right", "width": 720, "height": 540 }`
->
-> ![bracket-right-angle — right view](../output/bracket-right-angle-right.png)
->
-> *(real 720×540 render, 29 KB PNG)*
-
-**Agent:** The front view shows the L with the filleted interior corner, the right view shows the gusset blended into both plates, and the iso shows all four holes. Mass properties:
+**Agent:** The `top` render is the elevation that matters: the L-section with the 3 mm fillet blended into the interior corner and the gusset filling the angle. `front` is the plan view of the base plate with its two M5 holes, and the iso ties it together. Mass properties:
 
 > 🔧 **`measure`** `{ "model_id": "model-7", "query": "mass" }`
 > ```json
@@ -159,4 +162,4 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 > }
 > ```
 
-**Agent:** A valid, watertight right-angle bracket — gusset blended, corner filleted, four M5 holes drilled on two axes — as a faceted STEP and a print-ready STL. Two caveats an agent should carry forward: the **+Y** axis convention for `extrude`/`cylinder` (get this wrong and holes silently become channels, with no error), and the fact that faceted STEP export succeeded here only because of the trailing no-op rotation — the identical part without it meshes open and declines to export.
+**Agent:** A valid, watertight right-angle bracket — gusset blended, corner filleted, four M5 holes drilled on two axes — as a faceted STEP and a print-ready STL. Two caveats an agent should carry forward. The **+Y** axis convention for `extrude`/`cylinder`: get it wrong and a hole silently becomes a channel through the part, with no error and a `valid: true` mesh — the volume delta is the only thing that catches it, which is why measuring against a hand-computed number is not optional here. And the faceted STEP path is fragile: this part exports only because of the trailing no-op rotation. The identical part without it, and every other identity-equivalent spelling tried, meshes open and declines to export — while STL, which uses a different mesher, exports fine either way.

@@ -661,9 +661,13 @@
         "text": "Two kernel facts drive the whole script. First, the extrusion axis is **+Y**, not +Z: `Shape.extrude` sweeps a profile’s `(u, v)` into `(x, z)` and pushes it along +Y (`bounded.rs`), and `Shape.cylinder` is likewise a **+Y**-axis cylinder — radial in xz, axial in y (`primitives.rs`). Second, that makes the L-section a *profile* problem: I can draw the whole cross-section in (x, z) — including the 3 mm interior fillet as a real arc — and sweep it 40 mm along +Y for the width. `arcTo`’s bulge is the DXF convention, `tan(sweep/4)`, so a 90° arc is `tan(22.5°) = 0.4142`; negative sweeps it clockwise, which is the concave direction here."
       },
       {
+        "kind": "narration",
+        "text": "That leaves the part **z-up**: x is its 60 mm length, y its 40 mm width, z its 40 mm height. I am keeping it that way deliberately — STEP, FreeCAD, and CAD interchange generally are z-up, and the STEP writer emits coordinates verbatim, so a z-up model lands upright in FreeCAD. Be aware this cuts against the *renderer*, whose named views assume y is up (`render.js`). So for this part `top` (looking down −Y) is the view that shows the L-section, and `front` (looking down −Z) is the plan view of the base plate. The view names are worth reading literally, not geometrically."
+      },
+      {
         "kind": "create_model",
         "args": {
-          "script": "// Right-angle bracket: 60×40×5 base plate, 40×40×5 vertical plate, triangular\n// gusset, 4× M5 clearance holes, 3 mm fillets on the interior corner and gusset.\n//\n// extrude() sweeps a profile along +Y, mapping profile (u,v) -> (x,z). So the\n// L cross-section is drawn in (x, z) and swept 40 mm for the bracket's width.\nconst B = 0.41421356237309503;          // tan(90°/4): a 90° arc, DXF bulge\nconst p = new Profile(-30, 0);          // base underside, at the wall end\np.lineTo(30, 0);                        // base plate, 60 long\np.lineTo(30, 5);                        // base plate, 5 thick\np.lineTo(-22, 5);                       // top of base, out to the fillet tangent\np.arcTo(-25, 8, -B);                    // 3 mm fillet on the interior corner\np.lineTo(-25, 40);                      // wall inner face, 40 tall\np.lineTo(-30, 40);                      // wall top, 5 thick\np.close();\nconst ell = Shape.extrude(p, 40);       // sweep +Y: the 40 mm width\n\n// Triangular gusset: 20 mm legs, 5 mm thick, centered across the width.\nconst t = new Profile(-25, 5);\nt.lineTo(-5, 5);\nt.lineTo(-25, 25);\nt.close();\nconst gusset = Shape.extrude(t, 5).translate(0, 17.5, 0);\n\n// smoothUnion blends the gusset into both plates: the 3 mm gusset fillets.\nlet part = ell.smoothUnion(gusset, 3);\n\n// 4× M5 clearance holes (Ø5). cylinder() is +Y-axis, so rotate it onto the\n// drilling axis: +Z for the base plate, +X for the vertical plate.\nconst zHole = Shape.cylinder(2.5, 10).rotate(1, 0, 0, 90);   // -> +Z\nfor (const y of [10, 30]) part = part.subtract(zHole.translate(15, y, 0));\nconst xHole = Shape.cylinder(2.5, 10).rotate(0, 0, 1, 90);   // -> +X\nfor (const y of [10, 30]) part = part.subtract(xHole.translate(-27.5, y, 32));\n\n// The trailing no-op rotation is a WORKAROUND, not modelling (of-2y4.1):\n// without it this exact part meshes open at the default accuracy and STEP\n// export declines. A 360° rotation is geometrically the identity; all it\n// changes is the shape's tracked bounding box, which loosens the meshing\n// grid enough to close the mesh. See the gallery notes below.\nreturn part.rotate(0, 1, 0, 360);",
+          "script": "// Right-angle bracket: 60×40×5 base plate, 40×40×5 vertical plate, triangular\n// gusset, 4× M5 clearance holes, 3 mm fillets on the interior corner and gusset.\n//\n// extrude() sweeps a profile along +Y, mapping profile (u,v) -> (x,z). So the\n// L cross-section is drawn in (x, z) and swept 40 mm for the bracket's width.\nconst B = 0.41421356237309503;          // tan(90°/4): a 90° arc, DXF bulge\nconst p = new Profile(-30, 0);          // base underside, at the wall end\np.lineTo(30, 0);                        // base plate, 60 long\np.lineTo(30, 5);                        // base plate, 5 thick\np.lineTo(-22, 5);                       // top of base, out to the fillet tangent\np.arcTo(-25, 8, -B);                    // 3 mm fillet on the interior corner\np.lineTo(-25, 40);                      // wall inner face, 40 tall\np.lineTo(-30, 40);                      // wall top, 5 thick\np.close();\nconst ell = Shape.extrude(p, 40);       // sweep +Y: the 40 mm width\n\n// Triangular gusset: 20 mm legs, 5 mm thick, centered across the width.\nconst t = new Profile(-25, 5);\nt.lineTo(-5, 5);\nt.lineTo(-25, 25);\nt.close();\nconst gusset = Shape.extrude(t, 5).translate(0, 17.5, 0);\n\n// smoothUnion blends the gusset into both plates: the 3 mm gusset fillets.\nlet part = ell.smoothUnion(gusset, 3);\n\n// 4× M5 clearance holes (Ø5). cylinder() is +Y-axis, so rotate it onto the\n// drilling axis: +Z for the base plate, +X for the vertical plate.\nconst zHole = Shape.cylinder(2.5, 10).rotate(1, 0, 0, 90);   // -> +Z\nfor (const y of [10, 30]) part = part.subtract(zHole.translate(15, y, 0));\nconst xHole = Shape.cylinder(2.5, 10).rotate(0, 0, 1, 90);   // -> +X\nfor (const y of [10, 30]) part = part.subtract(xHole.translate(-27.5, y, 32));\n\n// The trailing no-op rotation is a WORKAROUND, not modelling (of-obv):\n// without it this exact part meshes open at the default accuracy and STEP\n// export declines. A 360° rotation is geometrically the identity; all it\n// changes is the shape's tracked bounding box, and that shifts the meshing\n// grid onto an alignment where the mesh closes. This specific expression was\n// found by trial: other identity-equivalent spellings still fail.\nreturn part.rotate(0, 1, 0, 360);",
           "name": "bracket-right-angle"
         },
         "payload": {
@@ -715,6 +719,17 @@
         "kind": "screenshot",
         "args": {
           "model_id": "model-7",
+          "view": "top",
+          "width": 720,
+          "height": 540
+        },
+        "file": "bracket-right-angle-top.png",
+        "bytes": 20373
+      },
+      {
+        "kind": "screenshot",
+        "args": {
+          "model_id": "model-7",
           "view": "front",
           "width": 720,
           "height": 540
@@ -723,19 +738,8 @@
         "bytes": 21524
       },
       {
-        "kind": "screenshot",
-        "args": {
-          "model_id": "model-7",
-          "view": "right",
-          "width": 720,
-          "height": 540
-        },
-        "file": "bracket-right-angle-right.png",
-        "bytes": 29494
-      },
-      {
         "kind": "narration",
-        "text": "The front view shows the L with the filleted interior corner, the right view shows the gusset blended into both plates, and the iso shows all four holes. Mass properties:"
+        "text": "The `top` render is the elevation that matters: the L-section with the 3 mm fillet blended into the interior corner and the gusset filling the angle. `front` is the plan view of the base plate with its two M5 holes, and the iso ties it together. Mass properties:"
       },
       {
         "kind": "measure",
@@ -805,7 +809,7 @@
       },
       {
         "kind": "narration",
-        "text": "A valid, watertight right-angle bracket — gusset blended, corner filleted, four M5 holes drilled on two axes — as a faceted STEP and a print-ready STL. Two caveats an agent should carry forward: the **+Y** axis convention for `extrude`/`cylinder` (get this wrong and holes silently become channels, with no error), and the fact that faceted STEP export succeeded here only because of the trailing no-op rotation — the identical part without it meshes open and declines to export."
+        "text": "A valid, watertight right-angle bracket — gusset blended, corner filleted, four M5 holes drilled on two axes — as a faceted STEP and a print-ready STL. Two caveats an agent should carry forward. The **+Y** axis convention for `extrude`/`cylinder`: get it wrong and a hole silently becomes a channel through the part, with no error and a `valid: true` mesh — the volume delta is the only thing that catches it, which is why measuring against a hand-computed number is not optional here. And the faceted STEP path is fragile: this part exports only because of the trailing no-op rotation. The identical part without it, and every other identity-equivalent spelling tried, meshes open and declines to export — while STL, which uses a different mesher, exports fine either way."
       }
     ]
   }

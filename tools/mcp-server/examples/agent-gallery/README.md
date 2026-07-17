@@ -29,3 +29,9 @@ Exported files (STEP/STL/OBJ) and PNG renders land in
 machine-readable record of the run. See the
 [Agent Guide](../../../../docs/AGENT_GUIDE.md) for how to connect a client, the
 full tool reference, and the failure modes these examples exercise.
+
+`bracket-right-angle` is also the acceptance part, built over the real MCP
+stdio transport and gated by
+[`test/bracket-acceptance.test.js`](../../test/bracket-acceptance.test.js). What
+it cost to build — and the kernel bugs it surfaced — is written up in the
+[friction log](../../../../docs/dogfood-bracket-friction-log.md).

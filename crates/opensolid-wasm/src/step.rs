@@ -111,6 +111,7 @@ mod tests {
     use opensolid_core::EntityId;
     use opensolid_kernel::brep::BooleanOp;
     use opensolid_kernel::brep::topology::Body;
+
     use opensolid_kernel::io::step::read::{SolidOutcome, StepReadOptions, read_step};
     use opensolid_kernel::massprops::mass_properties;
     use std::rc::Rc;
@@ -250,6 +251,158 @@ mod tests {
         );
         let (_, _, bodies) = reimport(&export.text);
         assert_eq!(bodies.len(), 1, "one faceted solid expected");
+    }
+
+    /// The right-angle bracket from the agent gallery
+    /// (`examples/agent-gallery/bracket-right-angle.md`), built here through
+    /// the same `BoundedShape` API the JS `create_model` script drives, so
+    /// this is the Rust-side half of that part's acceptance gate (of-2y4.1):
+    /// the faceted STEP it exports must re-import through our own reader with
+    /// volume identity.
+    ///
+    /// Volume identity follows the same reasoning as
+    /// [`exact_sphere_minus_cylinder_round_trips_with_volume_identity`] —
+    /// measure the exported body against the closed form, then require
+    /// `write ∘ read` to be a fixed point — with one adaptation per side.
+    /// The body cannot be measured after import (`tessellate_body` refuses
+    /// planar faces with hole loops, and every drilled plate here has them),
+    /// and the fixed point is numeric rather than bytewise (the reader
+    /// re-normalizes `DIRECTION` vectors, moving scattered facet normals by
+    /// ~1 ULP). Both are noted inline where they bite.
+    ///
+    /// The trailing 360° rotation mirrors the gallery script and is a
+    /// workaround, not modelling: it is geometrically the identity, but it
+    /// perturbs the tracked bounding box, and without that perturbation this
+    /// part meshes open and `sdf_to_brep` refuses to close it (of-obv).
+    #[test]
+    fn bracket_faceted_step_round_trips_with_volume_identity() {
+        use opensolid_core::types::Vector3;
+        use opensolid_frep::Profile2D;
+        use std::f64::consts::PI;
+
+        // The L cross-section, drawn in (x, z); extrude sweeps it along +Y.
+        // Bulge is the DXF convention, tan(sweep/4); negative is clockwise,
+        // the concave direction for this interior corner.
+        let bulge = (PI / 8.0).tan(); // tan(90°/4) = 0.41421356…
+        let l_section = Profile2D::builder([-30.0, 0.0])
+            .line_to([30.0, 0.0])
+            .line_to([30.0, 5.0])
+            .line_to([-22.0, 5.0])
+            .arc_to([-25.0, 8.0], -bulge) // 3 mm interior fillet
+            .line_to([-25.0, 40.0])
+            .line_to([-30.0, 40.0])
+            .build()
+            .expect("L-section profile is a valid closed loop");
+        let ell = BoundedShape::extrude(l_section, 40.0).expect("extrude the 40 mm width");
+
+        let gusset_tri = Profile2D::builder([-25.0, 5.0])
+            .line_to([-5.0, 5.0])
+            .line_to([-25.0, 25.0])
+            .build()
+            .expect("gusset triangle is a valid closed loop");
+        let gusset = BoundedShape::extrude(gusset_tri, 5.0)
+            .expect("extrude the gusset")
+            .translate(Vector3::new(0.0, 17.5, 0.0));
+
+        // smoothUnion(gusset, 3): the 3 mm fillets on the gusset edges.
+        let mut part = ell.smooth_union(&gusset, Some(3.0));
+
+        // 4x M5 clearance holes. cylinder() is a +Y-axis cylinder, so each is
+        // rotated onto its drilling axis: +Z for the base, +X for the wall.
+        let z_hole = BoundedShape::cylinder(2.5, 10.0).rotate(Vector3::new(PI / 2.0, 0.0, 0.0));
+        for y in [10.0, 30.0] {
+            part = part.subtract(&z_hole.translate(Vector3::new(15.0, y, 0.0)));
+        }
+        let x_hole = BoundedShape::cylinder(2.5, 10.0).rotate(Vector3::new(0.0, 0.0, PI / 2.0));
+        for y in [10.0, 30.0] {
+            part = part.subtract(&x_hole.translate(Vector3::new(-27.5, y, 32.0)));
+        }
+        let part = part.rotate(Vector3::new(0.0, 2.0 * PI, 0.0)); // see doc comment
+
+        // Hand-computed section (mm^3): the filleted L swept 40, plus the
+        // gusset, less four Ø5 holes through 5 mm of plate. The smoothUnion
+        // blend adds ~127 more at the gusset joints, so the tolerance is a
+        // band: the mesher also reads ~0.3% under at this accuracy.
+        let l_area = 300.0 + 175.0 + (9.0 - PI * 9.0 / 4.0);
+        let analytic = l_area * 40.0 + 1000.0 - 4.0 * PI * 2.5f64.powi(2) * 5.0;
+        // NAN accuracy falls back to 0.5% of the meshed extent — the same
+        // default `export_step` applies below, so this measures the body the
+        // export actually facets.
+        let volume = mass_properties(&part.mesh_adaptive(f64::NAN, None))
+            .expect("bracket mesh is a closed manifold")
+            .volume;
+        let rel = (volume - analytic).abs() / analytic;
+        assert!(
+            rel <= 2e-2,
+            "bracket volume {volume} deviates {rel:e} from the analytic {analytic}; \
+             a hole drilled on the wrong axis shows up here and nowhere else"
+        );
+
+        let export = export_step(&part, None, None, None).expect("faceted STEP export succeeds");
+        assert!(
+            !export.exact,
+            "a smooth-blended part takes the faceted path"
+        );
+        assert!(
+            export.text.contains("PLANE"),
+            "faceted export is planar faces"
+        );
+
+        let (store2, geo2, bodies) = reimport(&export.text);
+        assert_eq!(bodies.len(), 1, "one MANIFOLD_SOLID_BREP expected");
+
+        // Measuring the re-imported body directly is not possible today:
+        // `tessellate_body` refuses a planar face carrying hole loops
+        // ("needs constrained triangulation"), which every drilled plate on
+        // this part has. `step_corpus.rs`'s own `closed_volume` hits the same
+        // wall and returns None. So identity is established the same way the
+        // exact test does — `write ∘ read` as a fixed point — but compared
+        // numerically rather than bytewise, because the reader re-normalizes
+        // DIRECTION vectors and shifts scattered facet normals by ~1 ULP.
+        // Identical geometry to 1e-9 relative encloses an identical volume;
+        // the analytic pin above is what rules out agreeing on a wrong solid.
+        let text2 = write_step(&store2, &geo2, &[bodies[0]], &StepWriteOptions::default())
+            .expect("re-imported body must serialize");
+        assert_step_numerically_identical(&export.text, &text2);
+    }
+
+    /// Compare two STEP texts, requiring every non-numeric token to match
+    /// exactly and every numeric token to agree within 1e-9 relative. This is
+    /// the float-tolerant sibling of a byte-identity assertion, for paths
+    /// where a round-trip legitimately perturbs the last ULP.
+    fn assert_step_numerically_identical(a: &str, b: &str) {
+        let (la, lb): (Vec<_>, Vec<_>) = (a.lines().collect(), b.lines().collect());
+        assert_eq!(la.len(), lb.len(), "STEP line counts differ");
+        for (n, (x, y)) in la.iter().zip(lb.iter()).enumerate() {
+            if x == y {
+                continue;
+            }
+            let split = |s: &str| -> Vec<String> {
+                s.split(|c: char| c == ',' || c == '(' || c == ')' || c == ' ')
+                    .map(str::to_owned)
+                    .collect()
+            };
+            let (tx, ty) = (split(x), split(y));
+            assert_eq!(
+                tx.len(),
+                ty.len(),
+                "line {} tokenizes differently:\n{x}\n{y}",
+                n + 1
+            );
+            for (p, q) in tx.iter().zip(ty.iter()) {
+                match (p.parse::<f64>(), q.parse::<f64>()) {
+                    (Ok(fp), Ok(fq)) => {
+                        let scale = fp.abs().max(fq.abs()).max(1.0);
+                        assert!(
+                            (fp - fq).abs() / scale <= 1e-9,
+                            "line {} numeric drift: {fp} vs {fq}",
+                            n + 1
+                        );
+                    }
+                    _ => assert_eq!(p, q, "line {} differs on a non-numeric token", n + 1),
+                }
+            }
+        }
     }
 
     /// A spec whose primitive has no exact B-Rep constructor (spindle
