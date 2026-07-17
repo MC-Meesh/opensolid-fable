@@ -13,6 +13,7 @@ use opensolid_kernel::brep::{
 };
 use opensolid_kernel::builder::shape;
 use opensolid_kernel::core::EntityId;
+use opensolid_kernel::core::error::CoreError;
 use opensolid_kernel::core::mesh::TriangleMesh;
 use opensolid_kernel::core::types::{BoundingBox3, Point3, Vector3};
 use opensolid_kernel::hybrid::{self, HybridBody, HybridOptions, HybridPath};
@@ -113,24 +114,32 @@ fn brep_cylinder_united_with_frep_torus_is_closed_and_volume_accurate() {
     );
 }
 
-/// Acceptance (2): force an exact-pipeline failure — the tool block shares
-/// four coincident side planes with the target, which the B-Rep boolean
-/// rejects — and verify the kernel diverts to the F-Rep fallback and still
-/// returns a valid, volume-accurate result.
+/// Acceptance (2): the tool block shares four coincident side planes with
+/// the target. This was the kernel's headline gap — the exact pipeline
+/// refused the input and the kernel quietly served a mesh-derived answer
+/// where an exact one was asked for — and of-bxl.4 closed it, so the same
+/// input must now come back down the *exact* path.
+///
+/// Rewritten rather than deleted, per COINCIDENT.md §7: the comment this
+/// replaces anticipated exactly this change. What it asserted (that the
+/// coincident case diverts) is now false; what it was really protecting —
+/// that the answer is watertight and volume-accurate whichever path serves
+/// it — is kept, and tightened, since the exact path owes a far better
+/// tolerance than the F-Rep fallback's 3%.
 #[test]
-fn coincident_face_failure_falls_back_to_frep_and_stays_valid() {
+fn coincident_face_subtract_now_takes_the_exact_path() {
     let mut store = TopologyStore::new();
     let mut geo = GeometryStore::new();
     let target = primitives::block(&mut store, &mut geo, 2.0, 2.0, 2.0).unwrap();
     let tool = primitives::block(&mut store, &mut geo, 1.0, 2.0, 2.0).unwrap();
     translate_body(&mut store, &mut geo, tool, Vector3::new(0.75, 0.0, 0.0)).unwrap();
 
-    // Precondition: the exact pipeline really does refuse this input. If
-    // it ever learns to handle coincident faces, this test should be
-    // rethought rather than silently passing.
+    let exact = brep_subtract(&store, &geo, target, tool, &opts().tol)
+        .expect("of-bxl.4: exact B-Rep subtract handles coincident side faces");
     assert!(
-        brep_subtract(&store, &geo, target, tool, &opts().tol).is_err(),
-        "precondition: exact B-Rep subtract must reject coincident faces"
+        exact.check().is_empty(),
+        "exact result must be a valid solid: {:?}",
+        exact.check()
     );
 
     let out = hybrid::subtract(
@@ -141,27 +150,35 @@ fn coincident_face_failure_falls_back_to_frep_and_stays_valid() {
     .unwrap();
 
     assert!(
-        matches!(out.path, HybridPath::Frep { .. }),
-        "exact-pipeline failure must divert to the F-Rep fallback"
+        matches!(out.path, HybridPath::Brep(_)),
+        "coincident faces must no longer divert to the F-Rep fallback"
     );
     assert!(out.mesh.is_closed_manifold(), "result must be watertight");
     // Tool overlaps x ∈ [0.25, 1.0] of the target: 8 − 0.75·2·2 = 5.
-    assert_volume_within(&out.mesh, 5.0, 0.03, "subtract with coincident side faces");
+    assert_volume_within(
+        &out.mesh,
+        5.0,
+        1e-9,
+        "exact subtract with coincident side faces",
+    );
 }
 
-/// Same forced-failure check for unite, mirroring the classic coincident
-/// overlap: two blocks of equal cross-section partially overlapping along
-/// X, all four side planes coincident.
+/// The same for unite: the classic coincident overlap — two blocks of equal
+/// cross-section partially overlapping along X, all four side planes
+/// coincident — now runs exactly (of-bxl.4).
 #[test]
-fn coincident_face_union_falls_back_to_frep_and_stays_valid() {
+fn coincident_face_union_now_takes_the_exact_path() {
     let mut store = TopologyStore::new();
     let mut geo = GeometryStore::new();
     let a = primitives::block(&mut store, &mut geo, 1.0, 1.0, 1.0).unwrap();
     let b = primitives::block(&mut store, &mut geo, 1.2, 1.0, 1.0).unwrap();
     translate_body(&mut store, &mut geo, b, Vector3::new(0.35, 0.0, 0.0)).unwrap();
+    let exact = brep_unite(&store, &geo, a, b, &opts().tol)
+        .expect("of-bxl.4: exact B-Rep unite handles coincident side faces");
     assert!(
-        brep_unite(&store, &geo, a, b, &opts().tol).is_err(),
-        "precondition: exact B-Rep unite must reject coincident faces"
+        exact.check().is_empty(),
+        "exact result must be a valid solid: {:?}",
+        exact.check()
     );
 
     let out = hybrid::unite(
@@ -170,10 +187,59 @@ fn coincident_face_union_falls_back_to_frep_and_stays_valid() {
         &opts(),
     )
     .unwrap();
-    assert!(matches!(out.path, HybridPath::Frep { .. }));
+    assert!(matches!(out.path, HybridPath::Brep(_)));
     assert!(out.mesh.is_closed_manifold());
     // Union spans x ∈ [-0.5, 0.95] with unit cross-section.
-    assert_volume_within(&out.mesh, 1.45, 0.03, "unite with coincident side faces");
+    assert_volume_within(
+        &out.mesh,
+        1.45,
+        1e-9,
+        "exact unite with coincident side faces",
+    );
+}
+
+/// The F-Rep fallback acceptance the two tests above used to carry.
+///
+/// Their coincident-block inputs no longer reach the fallback, but the
+/// property they were really pinning — that an exact-pipeline shortfall
+/// diverts to F-Rep and still returns a watertight, volume-accurate body —
+/// is permanent, and must keep a live test. So it moves to a contact the
+/// exact path genuinely still refuses: a cylinder tangent to a block's face
+/// plane, which is of-bxl.6's tier and stays `NotImplemented` by design
+/// (COINCIDENT.md §5 — the fallback is not a gap to close, it is the
+/// backstop).
+#[test]
+fn exact_pipeline_shortfall_still_falls_back_to_frep_and_stays_valid() {
+    let mut store = TopologyStore::new();
+    let mut geo = GeometryStore::new();
+    let block = primitives::block(&mut store, &mut geo, 2.0, 2.0, 2.0).unwrap();
+    let tool = primitives::cylinder(&mut store, &mut geo, 0.5, 4.0).unwrap();
+    // Wall tangent to the block's x = 1 face plane from outside.
+    translate_body(&mut store, &mut geo, tool, Vector3::new(1.5, 0.0, 0.0)).unwrap();
+
+    // Precondition: the exact pipeline really does refuse this input. If it
+    // ever learns tangent contact (of-bxl.6), rethink this test rather than
+    // let it silently pass.
+    let err = brep_subtract(&store, &geo, block, tool, &opts().tol)
+        .expect_err("precondition: exact B-Rep must still reject tangent contact");
+    assert!(
+        matches!(err, CoreError::NotImplemented { .. }),
+        "expected a structured shortfall, got {err:?}"
+    );
+
+    let out = hybrid::subtract(
+        &HybridBody::brep(&store, &geo, block),
+        &HybridBody::brep(&store, &geo, tool),
+        &opts(),
+    )
+    .unwrap();
+    assert!(
+        matches!(out.path, HybridPath::Frep { .. }),
+        "an exact-pipeline shortfall must divert to the F-Rep fallback"
+    );
+    assert!(out.mesh.is_closed_manifold(), "result must be watertight");
+    // Tangent from outside: the cylinder removes nothing.
+    assert_volume_within(&out.mesh, 8.0, 0.03, "subtract with tangent contact");
 }
 
 /// One representation conversion cycle: tessellate the body into a mesh

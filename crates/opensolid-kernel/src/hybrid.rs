@@ -700,17 +700,19 @@ mod tests {
     }
 
     #[test]
-    fn coincident_faces_fall_back_to_frep() {
-        // B overlaps A with four coplanar side faces: the exact pipeline
-        // rejects coincident contacts, so the hybrid path must rescue it.
+    fn coincident_faces_take_the_exact_path() {
+        // B overlaps A with four coplanar side faces. The exact pipeline
+        // used to refuse coincident contacts and the hybrid path rescued
+        // them approximately; of-bxl.4 made the exact path handle them, so
+        // the router must no longer divert this input.
         let mut store = TopologyStore::new();
         let mut geo = GeometryStore::new();
         let a = primitives::block(&mut store, &mut geo, 1.0, 1.0, 1.0).unwrap();
         let b = primitives::block(&mut store, &mut geo, 1.2, 1.0, 1.0).unwrap();
         translate_body(&mut store, &mut geo, b, Vector3::new(0.35, 0.0, 0.0)).unwrap();
         assert!(
-            brep_unite(&store, &geo, a, b, &opts().tol).is_err(),
-            "precondition: the exact pipeline refuses coincident faces"
+            brep_unite(&store, &geo, a, b, &opts().tol).is_ok(),
+            "of-bxl.4: the exact pipeline handles coincident faces"
         );
         let out = boolean(
             BooleanOp::Unite,
@@ -719,7 +721,7 @@ mod tests {
             &opts(),
         )
         .unwrap();
-        assert!(matches!(out.path, HybridPath::Frep { .. }));
+        assert!(matches!(out.path, HybridPath::Brep(_)));
         assert!(out.mesh.is_closed_manifold());
         assert_volume(&out.mesh, 1.45, "union with coincident faces");
     }

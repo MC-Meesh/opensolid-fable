@@ -1282,12 +1282,54 @@ enum CurveSource {
     Imprint { index: usize },
 }
 
-/// An imprint: one transversal intersection curve piece clipped to both
-/// host face regions.
+/// Where an imprint came from, which decides both the trims that clip it
+/// and the faces it cuts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImprintKind {
+    /// A transversal SSI curve. It lies in both surfaces and crosses both
+    /// trims, so both regions clip it and it cuts both faces.
+    Transversal,
+    /// One trim edge of a *coincident* partner face, imprinted onto the
+    /// face of solid `host` (of-bxl.4).
+    ///
+    /// Coincidence means the partner's edges already lie exactly in this
+    /// face's surface, so they need no intersection curve computed — they
+    /// *are* the overlap's boundary. But they lie on the **partner's own
+    /// region boundary**, and that makes them behave unlike a transversal
+    /// curve in two ways this variant exists to record:
+    ///
+    /// - **Only `host`'s trim may clip it.** The partner's own even-odd test
+    ///   on the curve is a float coin flip along its entire length, since
+    ///   every sample sits exactly on the partner's outline
+    ///   ([`FaceRegionPoly::contains_for_clip`]'s nudge rescues seams on
+    ///   periodic charts, not this). Asking it would shred the curve into
+    ///   noise; the partner's answer is a known `true` (on its closure) and
+    ///   is not asked.
+    /// - **Only `host`'s face is cut.** On the partner the curve *is* an
+    ///   existing boundary edge, so hosting it there would drive
+    ///   [`apply_chain`] to split that region along its own outline, slicing
+    ///   off a zero-area sliver whose interior sample does not exist.
+    CoincidentEdge { host: SolidTag },
+}
+
+impl ImprintKind {
+    /// Whether solid `s`'s trim clips this imprint, and equivalently
+    /// whether its face is cut by it.
+    fn binds(self, s: SolidTag) -> bool {
+        match self {
+            ImprintKind::Transversal => true,
+            ImprintKind::CoincidentEdge { host } => host == s,
+        }
+    }
+}
+
+/// An imprint: one intersection curve piece clipped to the host face
+/// regions that bind it (see [`ImprintKind`]).
 #[derive(Debug)]
 struct Imprint {
     face_a: usize,
     face_b: usize,
+    kind: ImprintKind,
     /// The exact SSI curve the samples came from (bound to result edges).
     curve: Curve3,
     sampled: SampledCurve,
@@ -1430,6 +1472,15 @@ struct Pipeline<'a> {
     /// re-merging the seam-split chords of a winding-0 ring back into a
     /// full ring whose uv embedding would straddle the cover edge (of-43n).
     seam_barriers: HashMap<(SolidTag, usize), Vec<Point3>>,
+    /// Face pairs `(face of A, face of B)` whose surfaces are coincident at
+    /// the weld length *and* whose trims share area (of-bxl.4).
+    ///
+    /// Recorded by [`Pipeline::find_imprints`] and read by
+    /// [`Pipeline::coincident_partner_sense`]. Coincidence is known here by
+    /// construction, so classification propagates it structurally instead of
+    /// rediscovering it by sampling — an on-boundary sample is precisely
+    /// what [`Pipeline::contains_point`] evades.
+    coincident_pairs: Vec<(usize, usize)>,
 }
 
 /// Broad-phase bounding box for one face.
@@ -1700,6 +1751,7 @@ impl<'a> Pipeline<'a> {
             imprints: Vec::new(),
             splits: HashMap::new(),
             seam_barriers: HashMap::new(),
+            coincident_pairs: Vec::new(),
         })
     }
 
@@ -1727,20 +1779,40 @@ impl<'a> Pipeline<'a> {
                     // Coincident *surfaces* only bar the transversal path
                     // where the trimmed regions actually share area; faces
                     // that merely touch or miss imprint nothing (of-bxl.2).
-                    if self.regions_overlap(fa, fb) {
-                        return Err(CoreError::NotImplemented {
-                            feature: "boolean operations on coincident faces \
-                                      (transversal MVP)",
-                        });
+                    if self.regions_overlap(fa, fb) && self.coincident_at_snap(sa, sb) {
+                        // The overlap's boundary IS the partner's trim edges:
+                        // coincidence means they already lie exactly in this
+                        // face's surface, so no intersection curve has to be
+                        // computed for them. Imprinting each onto the other
+                        // face cuts both regions down to the overlap, and
+                        // then the ordinary machinery — collect_splits,
+                        // build_atoms, merge_imprint_chains, apply_chain —
+                        // arranges them like any other imprint.
+                        //
+                        // Where no partner edge crosses the other's interior
+                        // the trims nest and every one of these calls clips
+                        // to nothing: the overlap is a whole region already
+                        // (two boxes meeting face to face), and the ON
+                        // verdict alone reconstructs it.
+                        self.imprint_coincident(fa, fb, box_a, box_b)?;
+                        self.coincident_pairs.push((fa, fb));
                     }
+                    // Regions disjoint (of-bxl.2), or coincident to SSI's
+                    // absolute `linear` but further apart than the weld
+                    // length: two distinct parallel surfaces, so the pair
+                    // contributes no imprint and no ON region.
                 }
                 Ok(SurfaceIntersection::TangentPoint(p)) => {
                     // Likewise: a tangency of the infinite surfaces is only a
                     // contact when the touch point is inside both trims.
-                    let in_a = self.face_polys[0][fa]
-                        .contains_for_clip(self.face_polys[0][fa].chart.param(&p, None), self.snap);
-                    let in_b = self.face_polys[1][fb]
-                        .contains_for_clip(self.face_polys[1][fb].chart.param(&p, None), self.snap);
+                    let in_a = self.face_polys[0][fa].contains_for_clip(
+                        self.face_polys[0][fa].chart.param(&p, None)?,
+                        self.snap,
+                    );
+                    let in_b = self.face_polys[1][fb].contains_for_clip(
+                        self.face_polys[1][fb].chart.param(&p, None)?,
+                        self.snap,
+                    );
                     if in_a && in_b {
                         return Err(CoreError::NotImplemented {
                             feature: "boolean operations with tangent face contact \
@@ -1756,7 +1828,14 @@ impl<'a> Pipeline<'a> {
                                           intersection curves (transversal MVP)",
                             });
                         }
-                        self.clip_imprint(&ic.curve, fa, fb, box_a, box_b)?;
+                        self.clip_imprint(
+                            &ic.curve,
+                            fa,
+                            fb,
+                            box_a,
+                            box_b,
+                            ImprintKind::Transversal,
+                        )?;
                     }
                 }
                 // Analytic SSI classifies the special configurations of the
@@ -1768,7 +1847,14 @@ impl<'a> Pipeline<'a> {
                 Err(CoreError::NotImplemented { .. }) if marched_ssi_supported(sa, sb) => {
                     for mc in intersect_marched(sa, sb, &self.tol)? {
                         for curve in self.marched_polylines(mc, sa, sb) {
-                            self.clip_imprint(&curve, fa, fb, box_a, box_b)?;
+                            self.clip_imprint(
+                                &curve,
+                                fa,
+                                fb,
+                                box_a,
+                                box_b,
+                                ImprintKind::Transversal,
+                            )?;
                         }
                     }
                 }
@@ -1784,7 +1870,14 @@ impl<'a> Pipeline<'a> {
                     let bounds = (joint.center(), 0.5 * joint.extents().norm());
                     for mc in intersect_marched_bounded(sa, sb, bounds, &self.tol)? {
                         for curve in self.marched_polylines(mc, sa, sb) {
-                            self.clip_imprint(&curve, fa, fb, box_a, box_b)?;
+                            self.clip_imprint(
+                                &curve,
+                                fa,
+                                fb,
+                                box_a,
+                                box_b,
+                                ImprintKind::Transversal,
+                            )?;
                         }
                     }
                 }
@@ -1909,6 +2002,95 @@ impl<'a> Pipeline<'a> {
             .collect()
     }
 
+    /// Imprint a coincident face pair with each other's trim edges
+    /// (of-bxl.4, COINCIDENT.md §3).
+    ///
+    /// The closed form the whole approach rests on: for a coincident pair,
+    /// the overlap region's boundary is made of *the other face's trim
+    /// edges*, and those edges already lie exactly in this face's surface —
+    /// that is what coincidence means. So the imprint curves are literally
+    /// the partner's existing [`Curve3`] edge geometry. Nothing is
+    /// intersected, no new curve type appears, and no 2D polygon-boolean
+    /// library is needed: the overlap arrangement is a special case of the
+    /// arrangement the pipeline already builds, not a parallel path.
+    ///
+    /// Each edge is clipped to the *host* region only, and cuts the host
+    /// only — see [`ImprintKind::CoincidentEdge`] for why the partner's own
+    /// trim must neither clip nor host it.
+    ///
+    /// # Errors
+    /// Propagates [`Pipeline::clip_imprint`]'s inversion failures.
+    fn imprint_coincident(
+        &mut self,
+        fa: usize,
+        fb: usize,
+        box_a: &BoundingBox3,
+        box_b: &BoundingBox3,
+    ) -> CoreResult<()> {
+        // B's edges cut A's face and vice versa. Collected first: clipping
+        // borrows `self` mutably.
+        for (host, other_s, other_f) in [(0, 1, fb), (1, 0, fa)] {
+            let curves: Vec<Curve3> = self.solids[other_s].faces[other_f]
+                .loops
+                .iter()
+                .flatten()
+                .map(|de| self.solids[other_s].edges[de.edge].curve.clone())
+                .collect();
+            for curve in curves {
+                self.clip_imprint(
+                    &curve,
+                    fa,
+                    fb,
+                    box_a,
+                    box_b,
+                    ImprintKind::CoincidentEdge { host },
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether two surfaces SSI has already called `Coincident` are still
+    /// coincident at the arrangement's *weld length* (of-bxl.4, COINCIDENT.md
+    /// §5).
+    ///
+    /// SSI decides coincidence with `tol.approx_zero` — an absolute length,
+    /// `linear = 1e-6` by default (`plane_plane`, `ssi/analytic.rs:155`) —
+    /// while the arrangement welds at [`Pipeline::snap`], the feature-derived
+    /// length from [`geometric_snap`]. The two disagree, and on a unit-scale
+    /// part they disagree by three orders of magnitude: `snap` is ~1e-9 of
+    /// the feature extent, so SSI calls surfaces 1e-7 apart coincident while
+    /// nothing about them welds. Imprinting such a pair would feed the
+    /// arrangement partner edges that do *not* lie in this face's surface —
+    /// the premise the whole coincident path rests on — and classify regions
+    /// ON a boundary they are visibly off.
+    ///
+    /// Re-asking SSI with `linear` set to `snap` reconciles them without
+    /// threading a snap parameter through SSI, which keeps it a pure
+    /// surface-level function (COINCIDENT.md §9's recommended resolution).
+    /// It also covers all five `Coincident` producers — `plane_plane`,
+    /// `cylinder_cylinder`, `coaxial_profiles`, `sphere_sphere`, `cone_cone`
+    /// — for free, rather than special-casing planes.
+    ///
+    /// `angular` is deliberately left alone: parallelism is scale-free, and
+    /// only the *positional* test keys off `linear`.
+    ///
+    /// The converse mismatch — SSI reporting `Empty` for surfaces closer than
+    /// `snap`, which the arrangement would weld — needs `snap > tol.linear`,
+    /// i.e. a part whose feature extent exceeds ~1e3. It is not reachable
+    /// from this match arm (SSI never reports `Coincident` there) and is left
+    /// to of-bxl.5 rather than re-testing every `Empty` pair here.
+    fn coincident_at_snap(&self, sa: &Surface3, sb: &Surface3) -> bool {
+        let at_snap = ToleranceContext {
+            linear: self.snap,
+            ..self.tol
+        };
+        matches!(
+            ssi_intersect(sa, sb, &at_snap),
+            Ok(SurfaceIntersection::Coincident)
+        )
+    }
+
     /// Whether the two faces' *trimmed regions* share positive area, given
     /// that their host surfaces are already known to be coincident (of-bxl.2).
     ///
@@ -1945,10 +2127,15 @@ impl<'a> Pipeline<'a> {
     fn regions_overlap(&self, fa: usize, fb: usize) -> bool {
         let fpa = &self.face_polys[0][fa];
         let fpb = &self.face_polys[1][fb];
-        let inside_both = |p: &Point3| {
-            fpa.contains_for_clip(fpa.chart.param(p, None), self.snap)
-                && fpb.contains_for_clip(fpb.chart.param(p, None), self.snap)
+        // A chart inversion that does not converge (iterative NURBS charts)
+        // proves nothing about containment, so it reads as "not inside" and
+        // the probe is discarded below rather than counted.
+        let inside = |fp: &FaceRegionPoly, p: &Point3| {
+            fp.chart
+                .param(p, None)
+                .is_ok_and(|uv| fp.contains_for_clip(uv, self.snap))
         };
+        let inside_both = |p: &Point3| inside(fpa, p) && inside(fpb, p);
         let mut probed = false;
         for fp in [fpa, fpb] {
             for lp in &fp.loops {
@@ -1965,7 +2152,7 @@ impl<'a> Pipeline<'a> {
                     );
                     // A hole loop triangulates across its own opening, so
                     // drop any centroid that its own region rejects.
-                    if !fp.contains_for_clip(fp.chart.param(&c, None), self.snap) {
+                    if !inside(fp, &c) {
                         continue;
                     }
                     probed = true;
@@ -1995,6 +2182,7 @@ impl<'a> Pipeline<'a> {
         fb: usize,
         box_a: &BoundingBox3,
         box_b: &BoundingBox3,
+        kind: ImprintKind,
     ) -> CoreResult<()> {
         // Sampling stations: the full period for closed conics, a bbox
         // slab clip for lines, the vertices for (marched) polylines. For
@@ -2045,9 +2233,37 @@ impl<'a> Pipeline<'a> {
             };
             let pa = self.face_polys[0][fa].chart.param(&p, hint_a)?;
             let pb = self.face_polys[1][fb].chart.param(&p, hint_b)?;
-            let is_inside = self.face_polys[0][fa].contains_for_clip(pa, self.snap)
-                && self.face_polys[1][fb].contains_for_clip(pb, self.snap);
+            // Both inversions run regardless: each seeds the next station's
+            // hint, and a coincident partner's curve still has to stay
+            // walkable on the side that does not clip it.
+            let is_inside = [(0, fa, pa), (1, fb, pb)].into_iter().all(|(s, f, uv)| {
+                !kind.binds(s) || self.face_polys[s][f].contains_for_clip(uv, self.snap)
+            });
             Ok((is_inside, (pa, pb)))
+        };
+        // A run lying *entirely* along a host's own trim boundary cuts that
+        // face into nothing: it re-traces an edge the arrangement already
+        // carries. Two cubes meeting face to face are made of such runs —
+        // the coincident `x = 1` pair re-imprints its own identical outline,
+        // and the transversal pairs (A's `x = 1` plane against B's `y = 0`
+        // plane) meet in a line that is already an edge of both. Every
+        // even-odd test along such a run sits exactly on the outline, where
+        // it is a float coin flip, so whichever way it lands the run is
+        // noise: kept, it splits off a zero-area sliver whose interior
+        // sample does not exist, and the boolean dies in `classify` rather
+        // than producing a wrong answer.
+        //
+        // Whole runs are judged rather than single stations, which is what
+        // keeps this from disturbing the transversal path: an ordinary
+        // imprint that merely *ends* on the boundary — how every imprint
+        // anchors to its face — keeps every station it had.
+        let run_on_trim_boundary = |points: &[Point3]| -> bool {
+            [(0, fa), (1, fb)].into_iter().any(|(s, f)| {
+                kind.binds(s)
+                    && points.iter().all(|p| {
+                        on_trim_boundary(self.solids[s], &self.edge_samples[s], f, p, self.snap)
+                    })
+            })
         };
         // Walked in station order so each inversion seeds the next.
         let mut flags: Vec<bool> = Vec::with_capacity(ts.len());
@@ -2061,16 +2277,20 @@ impl<'a> Pipeline<'a> {
         }
 
         if closed_curve && flags.iter().all(|&f| f) {
-            // Entire ring inside both regions.
-            self.imprints.push(Imprint {
-                face_a: fa,
-                face_b: fb,
-                curve: curve.clone(),
-                sampled: SampledCurve {
-                    points: ts.iter().map(|&t| curve.point(t)).collect(),
-                    closed: true,
-                },
-            });
+            // Entire ring inside every region that binds it.
+            let points: Vec<Point3> = ts.iter().map(|&t| curve.point(t)).collect();
+            if !run_on_trim_boundary(&points) {
+                self.imprints.push(Imprint {
+                    face_a: fa,
+                    face_b: fb,
+                    kind,
+                    curve: curve.clone(),
+                    sampled: SampledCurve {
+                        points,
+                        closed: true,
+                    },
+                });
+            }
             return Ok(());
         }
 
@@ -2164,10 +2384,14 @@ impl<'a> Pipeline<'a> {
                 && matches!(curve, Curve3::Polyline { .. })
                 && endpoints_coincide
                 && polyline_length(&pts) > self.snap * 4.0;
+            if run_on_trim_boundary(&pts) {
+                continue;
+            }
             if pts.len() >= 2 && (!endpoints_coincide || seam_cut_ring) {
                 self.imprints.push(Imprint {
                     face_a: fa,
                     face_b: fb,
+                    kind,
                     curve: curve.clone(),
                     sampled: SampledCurve {
                         points: pts,
@@ -2180,15 +2404,19 @@ impl<'a> Pipeline<'a> {
                 // the excluded stretch is below resolution, so the ring is
                 // inside. Dropping it instead would silently no-op the
                 // boolean (of-ipt.5).
-                self.imprints.push(Imprint {
-                    face_a: fa,
-                    face_b: fb,
-                    curve: curve.clone(),
-                    sampled: SampledCurve {
-                        points: ts.iter().map(|&t| curve.point(t)).collect(),
-                        closed: true,
-                    },
-                });
+                let points: Vec<Point3> = ts.iter().map(|&t| curve.point(t)).collect();
+                if !run_on_trim_boundary(&points) {
+                    self.imprints.push(Imprint {
+                        face_a: fa,
+                        face_b: fb,
+                        kind,
+                        curve: curve.clone(),
+                        sampled: SampledCurve {
+                            points,
+                            closed: true,
+                        },
+                    });
+                }
             }
         }
         Ok(())
@@ -2643,7 +2871,11 @@ impl<'a> Pipeline<'a> {
                 // Imprint atoms hosted on this face, merged into chains.
                 let mut imprint_ids: Vec<usize> = Vec::new();
                 for (i, imp) in self.imprints.iter().enumerate() {
-                    let hosted = (s == 0 && imp.face_a == f) || (s == 1 && imp.face_b == f);
+                    // A coincident partner's edge is only a *cut* on the face
+                    // it was imprinted onto; on the partner it is an existing
+                    // boundary edge already (of-bxl.4).
+                    let hosted = imp.kind.binds(s)
+                        && ((s == 0 && imp.face_a == f) || (s == 1 && imp.face_b == f));
                     if hosted {
                         imprint_ids
                             .extend(atoms_by_source[&CurveSource::Imprint { index: i }].iter());
@@ -2679,13 +2911,15 @@ impl<'a> Pipeline<'a> {
                                     .into(),
                             }
                         })?;
-                    // Ray parity answers In/Out only. Coincident faces (the
-                    // source of On) do not imprint yet, so no region reaching
-                    // here can be on the other boundary (of-bxl.4).
-                    let verdict = if self.contains_point(other, &sample)? {
-                        Verdict::In
-                    } else {
-                        Verdict::Out
+                    // Structural first, ray parity only as the fallback: a
+                    // region sitting on the other solid's boundary is the
+                    // case parity evades, so it is settled from the
+                    // coincidence found at imprint time rather than
+                    // rediscovered by sampling (of-bxl.4).
+                    let verdict = match self.coincident_partner_sense(s, f, &sample)? {
+                        Some(sense) => Verdict::On(sense),
+                        None if self.contains_point(other, &sample)? => Verdict::In,
+                        None => Verdict::Out,
                     };
                     let (keep, reverse) = keep_table(op, s, verdict);
                     if keep {
@@ -2714,6 +2948,73 @@ impl<'a> Pipeline<'a> {
             .collect();
 
         build_output(self, op, &atoms, &atom_source, kept)
+    }
+
+    /// The [`Sense`] of the coincident partner region covering `p`, or `None`
+    /// if face `(s, f)` has no coincident partner there (of-bxl.4).
+    ///
+    /// This is the structural half of classification, and it exists because
+    /// ray parity cannot answer the question. A point on the other solid's
+    /// boundary is exactly what [`Pipeline::contains_point`] *evades* — it
+    /// abandons the ray (`:2712`) rather than classify it, and an ON sample
+    /// abandons all six, erroring out. So ON is never rediscovered by
+    /// sampling; it is propagated from the coincidence
+    /// [`Pipeline::find_imprints`] already established by construction, and
+    /// decided by point-in-polygon in the partner's own chart. No ray, no
+    /// degeneracy: the case that is hardest for parity is the easy one here.
+    ///
+    /// `Sense` is the sign of `n_host · n_partner` taken with *outward*
+    /// normals (the chart normal flipped by `outward_along_normal`), which is
+    /// what makes it a statement about the solids rather than the surfaces:
+    /// two boxes meeting face to face have identical chart normals but
+    /// oppositely-oriented faces, and it is the opposition that says the
+    /// material lies on opposite sides — the wall between them is interior
+    /// and must go.
+    ///
+    /// # Errors
+    /// Propagates [`Chart::param`]'s inversion failure on a NURBS host.
+    fn coincident_partner_sense(
+        &self,
+        s: SolidTag,
+        f: usize,
+        p: &Point3,
+    ) -> CoreResult<Option<Sense>> {
+        for &(fa, fb) in &self.coincident_pairs {
+            let (host, partner) = match s {
+                0 if fa == f => (fa, fb),
+                1 if fb == f => (fb, fa),
+                _ => continue,
+            };
+            let other = 1 - s;
+            let fp = &self.face_polys[other][partner];
+            if !fp.contains_for_clip(fp.chart.param(p, None)?, self.snap) {
+                continue;
+            }
+            let n_host = self.outward_normal(s, host, p)?;
+            let n_partner = self.outward_normal(other, partner, p)?;
+            return Ok(Some(if n_host.dot(&n_partner) >= 0.0 {
+                Sense::Same
+            } else {
+                Sense::Opposite
+            }));
+        }
+        Ok(None)
+    }
+
+    /// Face `(s, f)`'s outward normal at a point assumed to lie on it: the
+    /// chart normal, flipped where the face's outward side opposes it.
+    ///
+    /// # Errors
+    /// Propagates [`Chart::param`]'s inversion failure on a NURBS host.
+    fn outward_normal(&self, s: SolidTag, f: usize, p: &Point3) -> CoreResult<Vector3> {
+        let fp = &self.face_polys[s][f];
+        let (u, v) = fp.chart.param(p, None)?;
+        let n = fp.chart.normal(u, v);
+        Ok(if self.solids[s].faces[f].outward_along_normal {
+            n
+        } else {
+            -n
+        })
     }
 
     /// Ray-parity containment of a point in one of the input solids.
@@ -2787,10 +3088,11 @@ impl<'a> Pipeline<'a> {
 /// Which side of the other solid a face region lies on.
 ///
 /// `On` is only produced for regions of a face that is coincident with a
-/// face of the other solid — a case the imprint stage cannot yet build, so
-/// nothing constructs it before of-bxl.4. Ray parity must never *discover*
-/// `On`: an on-boundary sample is exactly what [`Pipeline::contains_point`]
-/// evades, so coincidence is propagated structurally instead.
+/// face of the other solid, from the pairs [`Pipeline::find_imprints`]
+/// records (of-bxl.4). Ray parity must never *discover* `On`: an
+/// on-boundary sample is exactly what [`Pipeline::contains_point`] evades,
+/// so coincidence is propagated structurally instead — see
+/// [`Pipeline::coincident_partner_sense`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Verdict {
     /// Strictly inside the other solid.
@@ -2799,19 +3101,11 @@ enum Verdict {
     Out,
     /// On the other solid's boundary, with the two normals agreeing
     /// (`Same`) or opposing (`Opposite`).
-    #[allow(
-        dead_code,
-        reason = "constructed once coincident faces imprint (of-bxl.4)"
-    )]
     On(Sense),
 }
 
 /// Relative orientation of two coincident faces: the sign of `n_a · n_b`
 /// at the sample point.
-#[allow(
-    dead_code,
-    reason = "constructed once coincident faces imprint (of-bxl.4)"
-)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Sense {
     /// Normals agree: the solids lie on the same side of the shared face.
@@ -2946,6 +3240,31 @@ fn refine_clip_crossing(
 }
 
 /// Distance from `p` to a polyline (closed if `closed`).
+/// Whether `p` lies on face `f`'s trim boundary, at the weld length.
+///
+/// Distinct from [`Pipeline::near_face_boundary`], which bands a whole
+/// *fraction of the face extent* to steer ray classification away from
+/// boundaries it cannot resolve. Here the question is the exact one — is this
+/// point ON the outline — so the band is `snap`, the length at which the
+/// arrangement would weld `p` onto that edge anyway.
+///
+/// Free rather than a `Pipeline` method so [`Pipeline::clip_imprint`]'s
+/// station closure can call it: a method call captures all of `*self`, which
+/// would collide with the `self.imprints` push that follows, while passing the
+/// two fields it reads keeps the capture disjoint.
+fn on_trim_boundary(
+    solid: &AnalyticSolid,
+    edge_samples: &[SampledCurve],
+    f: usize,
+    p: &Point3,
+    snap: f64,
+) -> bool {
+    solid.faces[f].loops.iter().flatten().any(|de| {
+        let sampled = &edge_samples[de.edge];
+        polyline_distance(&sampled.points, sampled.closed, p) <= snap
+    })
+}
+
 fn polyline_distance(points: &[Point3], closed: bool, p: &Point3) -> f64 {
     let n = points.len();
     let segs = if closed { n } else { n - 1 };
@@ -4258,6 +4577,96 @@ fn source_curve<'p>(pipe: &'p Pipeline<'_>, source: CurveSource) -> &'p Curve3 {
     }
 }
 
+/// Arc-length midpoint of a polyline: the point half its length along.
+///
+/// Used as an atom's positional signature, and taken by length rather than
+/// by sample index because two atoms tracing the *same* curve can carry
+/// different sample counts (they come from different solids' edges, sampled
+/// independently), which makes `points[len / 2]` disagree where the geometry
+/// does not.
+fn polyline_midpoint(points: &[Point3], closed: bool) -> Point3 {
+    let mut ring: Vec<Point3> = points.to_vec();
+    if closed {
+        ring.push(points[0]);
+    }
+    let half = polyline_length(&ring) * 0.5;
+    let mut walked = 0.0;
+    for w in ring.windows(2) {
+        let seg = (w[1] - w[0]).norm();
+        if walked + seg >= half && seg > 0.0 {
+            return w[0] + (w[1] - w[0]) * ((half - walked) / seg);
+        }
+        walked += seg;
+    }
+    ring[ring.len() - 1]
+}
+
+/// Group atoms that trace the same curve into one class, so the output
+/// carries one edge where the arrangement built several (of-bxl.4).
+///
+/// Atoms are per-solid: A's boundary edges and B's are distinct curves in the
+/// split network even when they lie on top of each other. That is invisible
+/// for transversal booleans, where two solids' edges coincide only by
+/// accident — but it is the *rule* once faces are coincident. Two cubes
+/// meeting face to face fuse along a square whose four sides are an edge of A
+/// AND an edge of B, at the same place.
+///
+/// Left ungrouped, [`build_output`] keys both the shell partition and the
+/// edge dedup on the raw atom id, so those coincident pairs become distinct
+/// output edges: A's five surviving faces never union with B's, each group
+/// closes into its own shell with the shared face missing, and the Euler
+/// check fires (`chi = 8 - 12 + 5 = 1`, an open shell) — the boolean dies
+/// rather than emitting the fused box.
+///
+/// Two atoms are the same edge when they have the same endpoints and the same
+/// arc-length midpoint, at the weld length. Endpoints alone would merge the
+/// two halves of a split boundary loop; the midpoint separates them.
+///
+/// Returns each atom's class representative and whether it runs *against* that
+/// representative. The direction is not incidental bookkeeping: coincident
+/// atoms generally arrive reversed (the shared edge of two adjacent coplanar
+/// faces is traversed one way by each, which is exactly the manifold
+/// condition), so a dart reusing the representative's edge must flip its fin
+/// sense to keep saying what it said about its own atom.
+fn canonical_atoms(atoms: &[Atom], snap: f64) -> Vec<(usize, bool)> {
+    let tol = snap * 4.0;
+    let ends = |a: &Atom| (a.points[0], a.points[a.points.len() - 1]);
+    // `Some(reversed)` when the two atoms trace the same curve.
+    let same = |i: usize, j: usize| -> Option<bool> {
+        let (a, b) = (&atoms[i], &atoms[j]);
+        if a.closed != b.closed {
+            return None;
+        }
+        if (polyline_midpoint(&a.points, a.closed) - polyline_midpoint(&b.points, b.closed)).norm()
+            > tol
+        {
+            return None;
+        }
+        let ((a0, a1), (b0, b1)) = (ends(a), ends(b));
+        if (a0 - b0).norm() <= tol && (a1 - b1).norm() <= tol {
+            Some(false)
+        } else if (a0 - b1).norm() <= tol && (a1 - b0).norm() <= tol {
+            Some(true)
+        } else {
+            None
+        }
+    };
+    let mut class: Vec<(usize, bool)> = (0..atoms.len()).map(|i| (i, false)).collect();
+    let mut by_mid: SnapMap<usize> = SnapMap::new(tol);
+    for i in 0..atoms.len() {
+        let mid = polyline_midpoint(&atoms[i].points, atoms[i].closed);
+        let hit = by_mid
+            .matches(&mid)
+            .into_iter()
+            .find_map(|j| same(i, j).map(|rev| (j, rev)));
+        match hit {
+            Some((j, rev)) => class[i] = (class[j].0, rev != class[j].1),
+            None => by_mid.insert(mid, i),
+        }
+    }
+    class
+}
+
 fn build_output(
     pipe: &Pipeline<'_>,
     _op: BooleanOp,
@@ -4266,6 +4675,10 @@ fn build_output(
     kept: Vec<KeptRegion>,
 ) -> CoreResult<BooleanOutput> {
     let snap = pipe.snap;
+    // Coincident atoms are one edge of the result, whichever solid built
+    // them; this is the key both the shell partition and the edge dedup
+    // below join on.
+    let atom_class = canonical_atoms(atoms, snap);
     let mut store = TopologyStore::new();
     let mut geo = GeometryStore::new();
     let body = store.create_body(BodyType::Solid);
@@ -4283,6 +4696,7 @@ fn build_output(
     for (ri, kr) in kept.iter().enumerate() {
         for cy in &kr.region.cycles {
             for &(ai, _) in &cy.darts {
+                let ai = atom_class[ai].0;
                 if let Some(&other) = atom_user.get(&ai) {
                     let (a, b) = (find(&mut parent, ri), find(&mut parent, other));
                     if a != b {
@@ -4354,6 +4768,10 @@ fn build_output(
                 cycle.darts.clone()
             };
             for (ai, forward) in darts {
+                // The class representative owns the output edge; a dart on an
+                // atom that runs against it flips to keep its own sense.
+                let (ai, reversed) = atom_class[ai];
+                let forward = forward != reversed;
                 let atom = &atoms[ai];
                 let edge_id = match edge_of_atom.get(&ai) {
                     Some(&edge_id) => edge_id,
@@ -7330,19 +7748,27 @@ mod tests {
     }
 
     #[test]
-    fn coincident_faces_are_not_implemented() {
-        // Blocks sharing the x = 1 plane: coincident faces.
+    fn coincident_faces_fuse_two_touching_blocks() {
+        // Blocks sharing the x = 2 plane: coincident faces, identical trims,
+        // opposing outward normals. Until of-bxl.4 this was the pipeline's
+        // most conspicuous gap — `NotImplemented`, served approximately by
+        // the F-Rep fallback. The shared wall is interior to the union and
+        // both copies drop, fusing the pair into one 4x2x2 box.
         let (mut store, mut geo) = stores();
         let a = block_at(&mut store, &mut geo, (2.0, 2.0, 2.0), (0.0, 0.0, 0.0));
         let b = block_at(&mut store, &mut geo, (2.0, 2.0, 2.0), (2.0, 0.0, 0.0));
-        let err = unite(&store, &geo, a, b, &tol()).unwrap_err();
+        let out = unite(&store, &geo, a, b, &tol()).expect("touching blocks unite exactly");
         assert!(
-            matches!(err, CoreError::NotImplemented { .. }),
-            "expected NotImplemented for coincident faces, got {err:?}"
+            out.check().is_empty(),
+            "fused box must be a valid solid: {:?}",
+            out.check()
         );
-        assert!(
-            err.to_string().contains("coincident"),
-            "unhelpful error: {err}"
+        // Each block's five surviving faces. A retained wall would leave 11
+        // or 12 and trip the manifoldness check above first.
+        assert_eq!(
+            out.store.faces_of_body(out.body).len(),
+            10,
+            "both x = 2 regions must drop"
         );
     }
 
@@ -7824,6 +8250,7 @@ mod tests {
         let imp = Imprint {
             face_a: 0,
             face_b: 0,
+            kind: ImprintKind::Transversal,
             curve,
             sampled: SampledCurve {
                 points,

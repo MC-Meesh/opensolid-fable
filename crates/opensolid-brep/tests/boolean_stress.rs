@@ -42,9 +42,9 @@ use nalgebra::{Rotation3, Unit};
 use opensolid_brep::boolean::{intersect, subtract, unite};
 use opensolid_brep::curve::plane_basis;
 use opensolid_brep::{
-    Body, BodyType, BooleanOutput, Curve3, FaceSense, FinSense, GeometryStore, LoopType,
-    SYSTEM_RESOLUTION, ShellOrientation, Surface3, TopologyStore, primitives, rotate_body,
-    translate_body,
+    Body, BodyType, BooleanOutput, CheckFailure, Curve3, FaceSense, FinSense, GeometryStore,
+    LoopType, SYSTEM_RESOLUTION, ShellOrientation, Surface3, TopologyStore, primitives,
+    rotate_body, translate_body,
 };
 use opensolid_core::EntityId;
 use opensolid_core::error::{CoreError, CoreResult};
@@ -2662,4 +2662,268 @@ fn edge_adjacent_blocks_subtract_leaves_target_whole() {
         .subtract(a, b)
         .unwrap_or_else(|e| panic!("{context}: rejected a zero-area contact: {e:?}"));
     assert_close(volume(&out, context), 1.0, PLANAR_VOLUME_RTOL, context);
+}
+
+// =====================================================================
+// (11) Coincident faces carrying OVERLAPPING trims (of-bxl.4)
+// =====================================================================
+//
+// The other half of section (10). There the coincident surfaces' trims
+// missed, so the pair was ordinary transversal work; here they genuinely
+// share area, which is the case that needs the ON verdict and — where a
+// partner edge crosses a face's interior — the coincident imprint.
+//
+// `check()` is the PRIMARY gate for this section, and the volume oracle is
+// secondary (COINCIDENT.md §7). The instinct is backwards here: a leftover
+// interior wall has ZERO volume, so union two stacked boxes, fail to drop
+// the shared wall, and the volume still comes out exactly right. What
+// `check()` catches is precisely that — a retained wall puts four fins on
+// its edges and trips the manifoldness check; an ON region dropped from
+// both solids opens the shell; a same-sense face kept twice duplicates into
+// four fins. `volume()` runs `assert_valid` (hence `check()`) on every call
+// below, so every case is gated on both.
+//
+// Volume still earns its place against SENSE errors — a kept face with a
+// flipped normal, or the same-sense region kept from the wrong solid —
+// which are geometric, and which `check()` passes happily. Hence explicit
+// expected-volume asserts throughout rather than mere relative divergence,
+// plus face counts, which pin the tie-break that neither gate can see.
+
+/// Two unit cubes meeting face to face: A spans `x ∈ [0,1]`, B `x ∈ [1,2]`.
+///
+/// The headline case, and the most common real CAD operation the exact
+/// pipeline could not do (COINCIDENT.md §3's first worked check). The
+/// `x = 1` faces are coincident with *identical* trims and opposing outward
+/// normals (+X against −X), so they are ON(Opposite): the wall between the
+/// cubes is interior and must vanish.
+///
+/// No imprint is involved. The trims are identical, so neither face's edges
+/// cross the other's interior and there is nothing to cut — the overlap is
+/// already a whole region. Classification alone fuses the bodies.
+#[test]
+fn touching_cubes_unite_fuses_into_one_box() {
+    let context = "cubes touching at x = 1, unite";
+    let mut scene = Scene::new();
+    let a = scene.block([0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
+    let b = scene.block([1.0, 0.0, 0.0], [2.0, 1.0, 1.0]);
+    let out = scene
+        .unite(a, b)
+        .unwrap_or_else(|e| panic!("{context}: exact pipeline rejected touching cubes: {e:?}"));
+    // The fused 2x1x1 box. A retained wall would ALSO measure 2.0 — check()
+    // inside volume() is what rules it out.
+    assert_close(volume(&out, context), 2.0, PLANAR_VOLUME_RTOL, context);
+    // Both x = 1 regions dropped, leaving each cube's other five faces. The
+    // two halves of each side plane (say A's y = 0 over x ∈ [0,1] and B's
+    // over x ∈ [1,2]) are coplanar but are NOT merged into one face: they
+    // are separate trims meeting along a 2-fin edge, which is manifold and
+    // is what the kernel emits. 11 or 12 would mean a wall survived.
+    assert_eq!(
+        out.store.faces_of_body(out.body).len(),
+        10,
+        "{context}: expected each cube's five surviving faces"
+    );
+}
+
+/// A − B where the two merely touch: nothing of A is inside B, and A's
+/// `x = 1` face is ON(Opposite), which subtract KEEPS as the exposed face
+/// of the cut (COINCIDENT.md §3, table row 5). So `A − B == A`, whole.
+#[test]
+fn touching_cubes_subtract_leaves_target_whole() {
+    let context = "cubes touching at x = 1, subtract";
+    let mut scene = Scene::new();
+    let a = scene.block([0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
+    let b = scene.block([1.0, 0.0, 0.0], [2.0, 1.0, 1.0]);
+    let out = scene
+        .subtract(a, b)
+        .unwrap_or_else(|e| panic!("{context}: exact pipeline rejected touching cubes: {e:?}"));
+    assert_close(volume(&out, context), 1.0, PLANAR_VOLUME_RTOL, context);
+    // Exactly A: were A's ON(Opposite) face dropped instead of kept, the
+    // shell would be open and check() would fire before the count.
+    assert_eq!(
+        out.store.faces_of_body(out.body).len(),
+        6,
+        "{context}: A must come through whole"
+    );
+}
+
+/// Intersection of two merely-touching solids is EMPTY, not a
+/// zero-thickness sheet (COINCIDENT.md §6). The true intersection is a unit
+/// square of zero volume; the kernel models solids, and a square is not one.
+///
+/// Both ON(Opposite) regions drop and nothing else is inside, so the result
+/// keeps no faces at all. An empty solid is spelled `SolidWithoutShells` —
+/// the same way any disjoint pair's intersection is, coincident faces or not
+/// (see section (10)) — so that verdict here is the assertion, not a
+/// failure. What would be wrong is a body with faces: that is the sheet.
+#[test]
+fn touching_cubes_intersect_is_empty_not_a_sheet() {
+    let mut scene = Scene::new();
+    let a = scene.block([0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
+    let b = scene.block([1.0, 0.0, 0.0], [2.0, 1.0, 1.0]);
+    let out = scene
+        .intersect(a, b)
+        .expect("intersection of touching cubes is empty, not an error");
+    assert_eq!(
+        out.store.faces_of_body(out.body).len(),
+        0,
+        "the shared square must not survive as a zero-volume sheet"
+    );
+    assert!(
+        matches!(
+            out.check().as_slice(),
+            [CheckFailure::SolidWithoutShells(_)]
+        ),
+        "an empty solid is the correct answer here: {:?}",
+        out.check()
+    );
+}
+
+/// Two unit cubes overlapping along x and flush on all four side planes:
+/// A spans `x ∈ [0,1]`, B `x ∈ [0.5,1.5]`. COINCIDENT.md §3's second worked
+/// check, and the configuration all three F-Rep tripwires were built from.
+///
+/// This is the case that needs the imprint. Each side plane (`y = 0`,
+/// `y = 1`, `z = 0`, `z = 1`) carries a coincident pair whose trims overlap
+/// only PARTIALLY, so the overlap's boundary runs through the middle of
+/// both faces: B's `x = 0.5` edge cuts A's side faces, A's `x = 1` edge cuts
+/// B's. Those edges already lie exactly in the partner's surface — that is
+/// what coincidence means — so they are imprinted directly, with no
+/// intersection curve computed for them.
+///
+/// The four side pairs are ON(Same): both cubes lie on the same side of
+/// each shared side plane. Same-sense ON is kept from A ONLY — the
+/// canonical tie-break, without which the shared strip is emitted twice and
+/// the shell is non-manifold. That tie-break is exactly what `check()`
+/// catches and volume cannot.
+fn flush_overlapping_cubes(op: &str, expected: f64) {
+    let context = &format!("cubes flush-overlapping on four side planes, {op}");
+    let mut scene = Scene::new();
+    let a = scene.block([0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
+    let b = scene.block([0.5, 0.0, 0.0], [1.5, 1.0, 1.0]);
+    let out = match op {
+        "unite" => scene.unite(a, b),
+        "subtract" => scene.subtract(a, b),
+        "intersect" => scene.intersect(a, b),
+        _ => unreachable!(),
+    }
+    .unwrap_or_else(|e| panic!("{context}: exact pipeline rejected the pair: {e:?}"));
+    assert_close(volume(&out, context), expected, PLANAR_VOLUME_RTOL, context);
+}
+
+#[test]
+fn flush_overlapping_cubes_unite() {
+    // x ∈ [0, 1.5], unit cross-section.
+    flush_overlapping_cubes("unite", 1.5);
+}
+
+#[test]
+fn flush_overlapping_cubes_subtract() {
+    // A minus the overlap: x ∈ [0, 0.5].
+    flush_overlapping_cubes("subtract", 0.5);
+}
+
+#[test]
+fn flush_overlapping_cubes_intersect() {
+    // The overlap itself: x ∈ [0.5, 1].
+    flush_overlapping_cubes("intersect", 0.5);
+}
+
+/// Inclusion–exclusion over the flush-overlapping pair:
+/// `vol(A) + vol(B) == vol(A∪B) + vol(A∩B)`.
+///
+/// The identity is the sharpest oracle available for this configuration
+/// because it is blind to none of the sense errors: it ties union and
+/// intersection to each other, so a region kept from the wrong solid, or
+/// kept with a flipped normal, breaks it even where each operation's own
+/// volume looks plausible in isolation.
+#[test]
+fn flush_overlapping_cubes_inclusion_exclusion() {
+    let context = "flush-overlapping cubes, inclusion-exclusion";
+    let mut scene = Scene::new();
+    let a = scene.block([0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
+    let b = scene.block([0.5, 0.0, 0.0], [1.5, 1.0, 1.0]);
+    let united = scene.unite(a, b).expect("unite of coincident-flush cubes");
+    let intersected = scene
+        .intersect(a, b)
+        .expect("intersect of coincident-flush cubes");
+    let sum = volume(&united, context) + volume(&intersected, context);
+    assert_close(sum, 1.0 + 1.0, PLANAR_VOLUME_RTOL, context);
+}
+
+/// An L: A spans `x ∈ [0,2], z ∈ [0,1]`, B sits on top of A's right half at
+/// `x ∈ [1,2], z ∈ [1,3]`. B's bottom face is coincident with A's top face
+/// and NESTED strictly inside it.
+///
+/// The nesting is the point. B's `x = 1` bottom edge lies in A's top face's
+/// INTERIOR, so it must be imprinted for the overlap to exist at all: A's
+/// top face splits into `x ∈ [0,1]` (Out, kept — the exposed top of the L's
+/// foot) and `x ∈ [1,2]` (ON(Opposite), dropped, fusing the two boxes).
+/// Getting this wrong in the quiet direction — failing to imprint, so the
+/// whole top face takes one verdict — either buries the foot's top inside
+/// the solid or leaves the wall in, and `check()` catches both.
+#[test]
+fn stacked_l_shape_unite_imprints_nested_face() {
+    let context = "L-shape: box stacked on half of a wider box, unite";
+    let mut scene = Scene::new();
+    let a = scene.block([0.0, 0.0, 0.0], [2.0, 1.0, 1.0]);
+    let b = scene.block([1.0, 0.0, 1.0], [2.0, 1.0, 3.0]);
+    let out = scene
+        .unite(a, b)
+        .unwrap_or_else(|e| panic!("{context}: exact pipeline rejected the pair: {e:?}"));
+    // 2·1·1 + 1·1·2 = 4. A retained wall between them measures the same;
+    // check() inside volume() is the gate that sees it.
+    assert_close(volume(&out, context), 4.0, PLANAR_VOLUME_RTOL, context);
+}
+
+/// The same L subtracted: nothing of B is inside A (they only share the
+/// nested face), so `A − B == A`.
+#[test]
+fn stacked_l_shape_subtract_leaves_target_whole() {
+    let context = "L-shape stacked boxes, subtract";
+    let mut scene = Scene::new();
+    let a = scene.block([0.0, 0.0, 0.0], [2.0, 1.0, 1.0]);
+    let b = scene.block([1.0, 0.0, 1.0], [2.0, 1.0, 3.0]);
+    let out = scene
+        .subtract(a, b)
+        .unwrap_or_else(|e| panic!("{context}: exact pipeline rejected the pair: {e:?}"));
+    assert_close(volume(&out, context), 2.0, PLANAR_VOLUME_RTOL, context);
+}
+
+/// Rotation invariance, the regression that catches snap-scaling bugs
+/// (of-lxk, of-260).
+///
+/// Coincidence here is decided at the arrangement's weld length rather than
+/// at an absolute epsilon, and the weld length is derived from the feature
+/// extent. So a rigid rotation of BOTH operands — which changes every
+/// coordinate but no distance between them — must not change which faces
+/// read as coincident, and must land the same volume. Keying coincidence
+/// off an absolute epsilon, or off point magnitude, is exactly what
+/// reintroduces that bug class.
+#[test]
+fn touching_cubes_unite_is_rotation_invariant() {
+    for (name, rot) in [
+        (
+            "45° about z",
+            Rotation3::from_axis_angle(&Unit::new_normalize(Vector3::z()), FRAC_PI_4),
+        ),
+        (
+            "45° about y",
+            Rotation3::from_axis_angle(&Unit::new_normalize(Vector3::y()), FRAC_PI_4),
+        ),
+        (
+            "oblique",
+            Rotation3::from_axis_angle(&Unit::new_normalize(Vector3::new(1.0, 1.0, 1.0)), 0.7),
+        ),
+    ] {
+        let context = &format!("touching cubes united, rotated {name}");
+        let mut scene = Scene::new();
+        let a = scene.block([0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
+        let b = scene.block([1.0, 0.0, 0.0], [2.0, 1.0, 1.0]);
+        scene.rotate(a, &rot, &Point3::origin());
+        scene.rotate(b, &rot, &Point3::origin());
+        let out = scene
+            .unite(a, b)
+            .unwrap_or_else(|e| panic!("{context}: rejected after rotation: {e:?}"));
+        assert_close(volume(&out, context), 2.0, PLANAR_VOLUME_RTOL, context);
+    }
 }

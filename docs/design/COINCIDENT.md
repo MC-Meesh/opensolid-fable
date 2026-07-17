@@ -104,6 +104,41 @@ exactly as they do for transversal imprints. This is the single most
 important property of this option: **the overlap arrangement is a
 special case of the arrangement we already build, not a parallel path.**
 
+> **Amended by of-bxl.4 (implementation).** The claim above holds for the
+> *arrangement* — the four stages did produce the regions unchanged — but
+> the sentence in §8's table row that "splits, atoms, and reconstruction
+> are untouched" was **wrong about reconstruction**, and three gaps had to
+> be closed before touching boxes would fuse. Each is worth stating here
+> because each is invisible from design altitude:
+>
+> 1. **The clip is one-sided.** A partner's trim edge lies on the
+>    *partner's own* region boundary, so `contains_for_clip` is a float
+>    coin flip along its whole length there (its nudge rescue fires on
+>    periodic axes, not on planes). Only the *host*'s trim may clip it, and
+>    only the host may be cut by it — hosting it on the partner drives
+>    `apply_chain` to split that region along its own outline. Hence
+>    `ImprintKind::{Transversal, CoincidentEdge { host }}`.
+> 2. **Boundary-lying runs must be dropped.** An imprint run lying entirely
+>    along a host's own outline cuts nothing and splits off a zero-area
+>    sliver with no interior sample. This is *not* coincidence-specific:
+>    two cubes meeting face to face also make A's `x = 1` plane meet B's
+>    `y = 0` plane **transversally** in a line that is already an edge of
+>    both. Judged per-run, not per-station, so an imprint that merely
+>    *ends* on a boundary — how every imprint anchors — is untouched.
+> 3. **Coincident atoms must weld across solids**, and this is the one the
+>    "reconstruction is untouched" claim missed entirely. `build_output`
+>    partitions shells by union-find over **shared atom id** and dedups
+>    edges by atom id. A's and B's coincident boundary edges are *distinct
+>    atoms at the same place*, so A's five surviving faces never union with
+>    B's: each group closes into its own open shell and the Euler check
+>    fires (`chi = 8 - 12 + 5 = 1`) instead of the fused box appearing.
+>    `canonical_atoms` groups atoms tracing the same curve and — load-
+>    bearing — records that they generally run **reversed** relative to each
+>    other, since the shared edge of two adjacent coplanar faces is
+>    traversed oppositely by each. That opposition *is* the manifold
+>    condition, and a dart reusing the class representative's edge must flip
+>    its fin sense to preserve it.
+
 **Classification of the resulting regions.** Do *not* rediscover ON by
 sampling — that is precisely the degenerate case ray-parity evades.
 Coincidence is known by construction, so propagate it. For a region of
@@ -314,7 +349,7 @@ Child beads of of-bxl, in dependency order:
 |---|---|---|
 | **of-bxl.2** | **Face-level transversality gate.** Move the `Coincident` rejection from surface level to face level: if the trimmed regions do not overlap, proceed as transversal. No new geometry, no verdict change. | coplanar-disjoint and edge-adjacent boxes pass; the three tripwires still fail (unchanged) |
 | **of-bxl.3** | **ON verdict.** `Verdict`/`Sense` enums, `coincident_partner_region`, `contains_point` returns `Verdict`, `keep_table` on `Verdict` (§3 table) + A-only tie-break. Dead code until of-bxl.4 produces ON regions. | unit tests on `keep_table`; no behaviour change |
-| **of-bxl.4** | **Coincident planar imprint.** Imprint each coincident face with the partner's trim edges via the existing `clip_imprint`. Reconcile the `approx_zero`-vs-`snap` tolerance mismatch (§5). Rewrite the three tripwires. | full §7 matrix for planes; `check()` clean; explicit volume asserts |
+| **of-bxl.4** | **Coincident planar imprint.** *Done.* Imprint each coincident face with the partner's trim edges via `clip_imprint`, one-sided (`ImprintKind`). Reconcile the tolerance mismatch by re-running SSI at `snap` (§5, §9). Weld coincident atoms across solids in `build_output` (`canonical_atoms`) — not anticipated by §3, see its amendment. Four tripwires rewritten, not three. | full §7 matrix for planes in `boolean_stress.rs` §(11); `check()` clean; explicit volume asserts |
 | **of-bxl.5** | **Coincident curved surfaces.** Extend to the other four `Coincident` producers (`cylinder_cylinder:482`, `coaxial_profiles:586`, `sphere_sphere:654`, `cone_cone:980`). Chart-sharing on periodic surfaces is the new risk — seam handling per `contains_for_clip` (`boolean.rs:873`). | coaxial cylinders, concentric spheres; §7 matrix |
 | **of-bxl.6** | **Tangent triage (tier 1).** Contact locus outside trimmed regions → empty imprint, proceed. Tiers 2 and 3 stay `NotImplemented`. | tangent-outside-trim cases pass; non-manifold cases still fall back |
 | **of-bxl.7** | **Tangential curves (tier 3).** Deferred; open only if traffic justifies it against the F-Rep fallback. | — |
@@ -325,12 +360,25 @@ results.
 
 ## 9. Open questions
 
-- **Tolerance reconciliation (§5)** — should `plane_plane` take the
-  pipeline's `snap`? SSI has no `Pipeline` and no access to the joint
-  feature extent. Either SSI grows a snap parameter, or `find_imprints`
-  re-tests coincidence at `snap` after SSI reports it. The latter is
-  less invasive and keeps SSI a pure surface-level function; it is the
-  recommended starting point, decided in of-bxl.4.
+- **Tolerance reconciliation (§5)** — ~~should `plane_plane` take the
+  pipeline's `snap`?~~ **Decided in of-bxl.4: neither.** `find_imprints`
+  re-tests coincidence by re-running the *whole* SSI with `linear` set to
+  `snap` (`Pipeline::coincident_at_snap`). SSI stays a pure surface-level
+  function with no snap parameter threaded through it, and because the test
+  is the SSI verdict itself rather than a hand-written plane comparison, it
+  covers all five `Coincident` producers for free instead of special-casing
+  planes. `angular` is left alone: parallelism is scale-free, and only the
+  positional `approx_zero` test keys off `linear`.
+
+  Worth recording which direction actually bites. On a unit-scale part
+  `snap` (~1e-9 of the feature extent) is *three orders of magnitude
+  tighter* than `tol.linear` (1e-6), so **SSI is the permissive one**: it
+  calls surfaces 1e-7 apart coincident when nothing about them welds.
+  Those are now rejected as two distinct parallel surfaces. The converse —
+  SSI reporting `Empty` for surfaces closer than `snap` — needs
+  `snap > tol.linear`, i.e. a feature extent above ~1e3, and is not
+  reachable from the `Coincident` arm at all. Left to of-bxl.5 rather than
+  re-testing every `Empty` pair.
 - **Partial coincidence of curved faces** — two cylinders coaxial and
   equal-radius are coincident over their whole surface; two *nearly*
   coaxial ones are transversal with a near-tangential curve. The
