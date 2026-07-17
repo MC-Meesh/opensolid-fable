@@ -73,3 +73,14 @@ structure (it's different now).
 - `cargo clippy -- -D warnings` must pass.
 - Keep dependencies minimal (nalgebra, thiserror, rayon — that's it).
 - F-Rep booleans are the fast path. B-Rep is for precision when needed.
+
+## Merge-completion protocol (all polecats — added after 5 dropped-merge incidents)
+
+`gt done` can silently fail to create an MR (known gt bug, tracked in HQ as hq-iheg;
+a post-merge sync can also repoint your local branch ref to a foreign tip).
+Before going idle after `gt done`:
+
+1. Verify your MR bead exists: `bd list --type=merge-request --status=open` must show your branch.
+2. If it doesn't, push your branch to origin explicitly and re-run `gt done` (or `gt mq submit`).
+3. Trust the GitHub-side ref over your local branch ref — if your local branch suddenly
+   points at someone else's commit, your content is still safe on `origin/<your-branch>`.
