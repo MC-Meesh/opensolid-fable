@@ -30,6 +30,6 @@ pub use arena::{Arena, ArenaSnapshot, EntityId};
 pub use bvh::Bvh;
 pub use error::{CoreError, CoreResult};
 pub use interval::Interval;
-pub use mesh::{Triangle, TriangleMesh};
+pub use mesh::{ManifoldDefects, Triangle, TriangleMesh};
 pub use tolerance::{ANGULAR_RESOLUTION, SYSTEM_RESOLUTION, ToleranceContext};
 pub use types::{BoundingBox3, Point3, Ray3, Transform3, Vector3};

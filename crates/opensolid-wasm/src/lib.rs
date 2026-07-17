@@ -1119,13 +1119,24 @@ impl WasmShape {
                         counts,
                     )
                 }
-                Err(e) => format!(
-                    "{{\"volume\":null,\"surfaceArea\":null,\"centroid\":null,\
-                     \"inertia\":null,{},{},\"massError\":\"{}\"}}",
-                    bbox,
-                    counts,
-                    json_escape(&e.to_string()),
-                ),
+                Err(e) => {
+                    // `MassPropertiesError::NotClosedManifold` only says *that*
+                    // the mesh is open, which leaves a caller with nothing to
+                    // act on. Append which defect kind actually blocked the
+                    // integral — an open rim and a pinch call for opposite
+                    // responses (see `ManifoldDefects`).
+                    let mut msg = e.to_string();
+                    if let Some(reason) = mesh.manifold_defects().describe() {
+                        msg = format!("{msg}: {reason}");
+                    }
+                    format!(
+                        "{{\"volume\":null,\"surfaceArea\":null,\"centroid\":null,\
+                         \"inertia\":null,{},{},\"massError\":\"{}\"}}",
+                        bbox,
+                        counts,
+                        json_escape(&msg),
+                    )
+                }
             }
         })
     }
@@ -1139,17 +1150,26 @@ impl WasmShape {
         let exact = self.measured_exact();
         self.with_measure_mesh(accuracy, |mesh| {
             let mut issues: Vec<String> = Vec::new();
-            if mesh.triangle_count() == 0 {
+            let defects = mesh.manifold_defects();
+            let closed = defects.is_closed();
+            if defects.empty {
                 issues.push("mesh is empty".to_string());
-            }
-            let closed = mesh.is_closed_manifold();
-            if !closed {
-                issues.push("mesh is not a closed, consistently oriented manifold".to_string());
+            } else if let Some(reason) = defects.describe() {
+                issues.push(format!(
+                    "mesh is not a closed, consistently oriented manifold: {reason}"
+                ));
             }
             let volume = match mass_properties(mesh) {
                 Ok(mp) => json_num(mp.volume),
                 Err(e) => {
-                    issues.push(e.to_string());
+                    // A mesh that is not closed fails the integral for exactly
+                    // the reason already recorded above, and used to be
+                    // reported a second time in the same words — reading as
+                    // two independent defects. Only speak up if the integral
+                    // failed for some *other* reason.
+                    if closed {
+                        issues.push(e.to_string());
+                    }
                     "null".to_string()
                 }
             };

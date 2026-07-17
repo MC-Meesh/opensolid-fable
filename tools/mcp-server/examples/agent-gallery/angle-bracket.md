@@ -116,10 +116,10 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 > ```json
 > {
 >   "isError": true,
->   "text": "Error: export failed: STEP export failed: degenerate geometry in sdf_to_brep: adaptive meshing did not produce a closed manifold; the surface must lie strictly inside the meshing bounds"
+>   "text": "Error: export failed: STEP export failed: degenerate geometry in sdf_to_brep: adaptive meshing did not produce a closed manifold: 2 pinched edge(s) joining 3+ triangles — two surface sheets fused through one cell, typically at a near-tangent CSG feature; this is a mesher defect (of-o0o), and a finer accuracy does not reliably clear it"
 > }
 > ```
 
-**Agent:** STEP declines on this one, and that is worth showing rather than hiding. The shape has no exact B-Rep companion, so STEP goes through the faceted SDF→B-Rep path, which needs the surface to close strictly inside the meshing region — and this part sits right at that edge: four through-holes in a 4 mm plate, meshed at an accuracy derived from the part’s full 44 mm height. The tool reports `isError: true` with a specific reason instead of writing a corrupt file. The STL is unaffected (different code path) and is print-ready.
+**Agent:** STEP declines on this one, and that is worth showing rather than hiding. The shape has no exact B-Rep companion, so STEP goes through the faceted SDF→B-Rep path, which needs a closed manifold — and the mesher hands it one with two *pinched* edges, where two surface sheets fuse through a single cell. The tempting read is that four Ø6 holes in a 4 mm plate are simply too fine for an accuracy derived from the part’s full 44 mm height, but that is not what is happening: a pinch is a mesher defect (of-o0o) and a finer accuracy does not clear it. The tool reports `isError: true` naming the real defect instead of writing a corrupt file. The STL is unaffected (different code path) and is print-ready.
 
 **Agent:** To get an analytic STEP of a bracket like this, model the L-section as an extruded `Profile` so it carries an exact B-Rep — that is exactly what the [right-angle bracket](bracket-right-angle.md) transcript does, and its STEP export succeeds. Same part, different construction, different export path.

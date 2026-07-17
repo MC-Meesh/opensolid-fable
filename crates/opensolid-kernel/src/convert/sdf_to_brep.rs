@@ -117,37 +117,8 @@ impl SdfToBrepOptions {
 /// # Errors
 /// [`CoreError::InvalidArgument`] if the surface does not cross
 /// `opts.mesh.bounds`; [`CoreError::Degenerate`] if meshing does not
-/// produce a closed manifold — the surface reaching the boundary layer of
-/// the bounds, or the mesher failing to close a surface strictly inside
-/// them, which the message tells apart — or produces a zero-area triangle.
-/// Why an unclosed mesh failed, distinguishing the two causes instead of
-/// blaming the bounds for both.
-///
-/// The mesher does not stitch crossings in the boundary cell layer, so a
-/// surface reaching that layer really does leave holes — but that is a
-/// property we can *check* rather than assume. Reporting it unconditionally
-/// sent callers hunting a padding bug while the true cause was the mesher
-/// failing to close a surface sitting well inside the bounds (of-obv).
-fn unclosed_reason(mesh: &TriangleMesh, opts: &SdfToBrepOptions) -> String {
-    let bounds = &opts.mesh.bounds;
-    let cell = (bounds.max - bounds.min) / f64::from(1u32 << opts.mesh.max_depth);
-    let touches_boundary = mesh.bounding_box().is_some_and(|b| {
-        (0..3).any(|i| b.min[i] - bounds.min[i] < cell[i] || bounds.max[i] - b.max[i] < cell[i])
-    });
-    if touches_boundary {
-        "adaptive meshing did not produce a closed manifold: the surface \
-         reaches the boundary layer of the meshing bounds, where crossings \
-         are not stitched; enlarge the bounds so the surface lies strictly \
-         inside them"
-            .to_string()
-    } else {
-        "adaptive meshing did not produce a closed manifold, although the \
-         surface lies strictly inside the meshing bounds; this is a mesher \
-         defect, not a bounds problem — please report the shape"
-            .to_string()
-    }
-}
-
+/// produce a closed manifold (surface not strictly inside the bounds) or
+/// produces a zero-area triangle.
 pub fn sdf_to_brep(
     sdf: &dyn Sdf,
     store: &mut TopologyStore,
@@ -165,10 +136,15 @@ pub fn sdf_to_brep(
             reason: "surface does not cross the meshing bounds".to_string(),
         });
     }
-    if !mesh.is_closed_manifold() {
+    // Name the actual defect rather than asserting one cause. The old text
+    // blamed the meshing bounds unconditionally, which is wrong — and
+    // misleading — for the pinched-edge case, where the surface is strictly
+    // inside the bounds and no accuracy resolves it (of-o0o).
+    let defects = mesh.manifold_defects();
+    if let Some(reason) = defects.describe() {
         return Err(CoreError::Degenerate {
             context: "sdf_to_brep",
-            reason: unclosed_reason(&mesh, opts),
+            reason: format!("adaptive meshing did not produce a closed manifold: {reason}"),
         });
     }
 

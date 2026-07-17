@@ -30,18 +30,28 @@ function errMessage(err) {
   return String(err);
 }
 
-// A null volume is never self-explanatory: the kernel says why in `massError`,
-// and on the SDF path the cause is often just a mesh too coarse to close, which
-// a finer `accuracy` fixes. Carry both onto any payload that reports volume, so
-// a null always arrives with its reason rather than looking like a broken model.
+// A null volume is never self-explanatory: the kernel says why in `massError`.
+// Carry it onto any payload that reports volume, so a null always arrives with
+// its reason rather than looking like a broken model.
+//
+// The hint deliberately does *not* just say "retry with a finer accuracy". That
+// advice was measured against the failure agents actually hit here (of-9l3) and
+// it is a dead end: on the gallery hinge leaf, 16x finer accuracy quadrupled the
+// triangle count and the mesh still did not close, because the defect is a
+// mesher pinch at a near-tangent feature (of-o0o), not coarseness. `massError`
+// now names the defect kind, so key the advice off that instead of guessing.
 function withMassError(view, full) {
   if (!full.massError) return view;
   const annotated = { ...view, massError: full.massError };
   if (!full.exact) {
-    annotated.hint =
-      'Mass properties are integrated over the measured mesh; at this accuracy the mesh ' +
-      'does not close. Retry with a smaller `accuracy` (e.g. half the current value) ' +
-      'before concluding the model itself is bad.';
+    annotated.hint = /pinched edge/.test(full.massError)
+      ? 'Mass properties are integrated over the measured mesh, and this mesh is pinched ' +
+        'rather than under-resolved: a finer `accuracy` will not reliably close it, and ' +
+        'resizing the feature only moves the pinch. Nudging the feature size or the ' +
+        'overall proportions is the available workaround; the model itself may be fine.'
+      : 'Mass properties are integrated over the measured mesh; at this accuracy the mesh ' +
+        'does not close. Retry with a smaller `accuracy` (e.g. half the current value) ' +
+        'before concluding the model itself is bad.';
   }
   return annotated;
 }

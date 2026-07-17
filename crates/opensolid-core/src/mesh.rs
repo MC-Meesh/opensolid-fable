@@ -12,6 +12,81 @@ pub struct Triangle {
     pub normals: [Vector3; 3],
 }
 
+/// Why a mesh is not a closed manifold, counted by kind of edge defect.
+///
+/// Worth separating because the kinds have unrelated causes, and a caller
+/// told only "not a closed manifold" cannot act. `boundary_edges` are edges
+/// used by one triangle — an open rim, typically the surface running out of
+/// the meshed region. `pinched_edges` are edges used by three or more — two
+/// surface sheets fused through a single cell, a mesher defect that refining
+/// does not reliably clear (of-o0o). The two point in opposite directions:
+/// a rim means the meshing region is wrong, a pinch means it is not.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ManifoldDefects {
+    /// The mesh has no triangles at all.
+    pub empty: bool,
+    /// Edges incident to exactly one triangle (an open rim).
+    pub boundary_edges: usize,
+    /// Edges incident to three or more triangles (fused sheets).
+    pub pinched_edges: usize,
+    /// Edges shared by two triangles that traverse them the same way.
+    pub misoriented_edges: usize,
+    /// Triangles with a repeated or out-of-range vertex index.
+    pub degenerate_triangles: usize,
+}
+
+impl ManifoldDefects {
+    /// True when no defect was found — the mesh is a closed, consistently
+    /// oriented 2-manifold. An empty mesh is never closed.
+    pub fn is_closed(&self) -> bool {
+        !self.empty
+            && self.boundary_edges == 0
+            && self.pinched_edges == 0
+            && self.misoriented_edges == 0
+            && self.degenerate_triangles == 0
+    }
+
+    /// A one-line account of what is wrong, naming each defect and the
+    /// action it implies. `None` when the mesh is closed.
+    pub fn describe(&self) -> Option<String> {
+        if self.is_closed() {
+            return None;
+        }
+        if self.empty {
+            return Some("the mesh is empty".to_string());
+        }
+        let mut parts = Vec::new();
+        if self.boundary_edges > 0 {
+            parts.push(format!(
+                "{} open edge(s) — the surface reaches the meshing bounds \
+                 instead of closing strictly inside them",
+                self.boundary_edges,
+            ));
+        }
+        if self.pinched_edges > 0 {
+            parts.push(format!(
+                "{} pinched edge(s) joining 3+ triangles — two surface sheets fused \
+                 through one cell, typically at a near-tangent CSG feature; this is a \
+                 mesher defect (of-o0o), and a finer accuracy does not reliably clear it",
+                self.pinched_edges,
+            ));
+        }
+        if self.misoriented_edges > 0 {
+            parts.push(format!(
+                "{} inconsistently oriented edge(s)",
+                self.misoriented_edges,
+            ));
+        }
+        if self.degenerate_triangles > 0 {
+            parts.push(format!(
+                "{} degenerate triangle(s)",
+                self.degenerate_triangles,
+            ));
+        }
+        Some(parts.join("; "))
+    }
+}
+
 /// Indexed triangle mesh: shared vertices referenced by index triples.
 ///
 /// `positions` and `normals` are parallel arrays; `indices` holds one
@@ -187,8 +262,20 @@ impl TriangleMesh {
     /// opposite directions, no triangle has a degenerate edge, and all
     /// indices are in bounds. An empty mesh is not considered closed.
     pub fn is_closed_manifold(&self) -> bool {
+        self.manifold_defects().is_closed()
+    }
+
+    /// Break the closed-manifold check down by *kind* of edge defect.
+    ///
+    /// The kinds have different causes and different fixes, and a bare
+    /// "not a closed manifold" cannot tell them apart — see
+    /// [`ManifoldDefects`]. `is_closed_manifold` is exactly
+    /// `manifold_defects().is_closed()`.
+    pub fn manifold_defects(&self) -> ManifoldDefects {
+        let mut defects = ManifoldDefects::default();
         if self.indices.is_empty() {
-            return false;
+            defects.empty = true;
+            return defects;
         }
         let n = self.positions.len();
         // Per undirected edge: (use count, sum of directions).
@@ -198,16 +285,23 @@ impl TriangleMesh {
                 let a = tri[e];
                 let b = tri[(e + 1) % 3];
                 if a == b || a >= n || b >= n {
-                    return false;
+                    defects.degenerate_triangles += 1;
+                    continue;
                 }
                 let entry = edges.entry((a.min(b), a.max(b))).or_insert((0, 0));
                 entry.0 += 1;
                 entry.1 += if a < b { 1 } else { -1 };
             }
         }
-        edges
-            .values()
-            .all(|&(count, dir_sum)| count == 2 && dir_sum == 0)
+        for &(count, dir_sum) in edges.values() {
+            match count {
+                1 => defects.boundary_edges += 1,
+                2 if dir_sum != 0 => defects.misoriented_edges += 1,
+                2 => {}
+                _ => defects.pinched_edges += 1,
+            }
+        }
+        defects
     }
 
     /// Axis-aligned bounding box of all vertices referenced by triangles;
@@ -531,6 +625,71 @@ mod tests {
             indices: vec![[0, 1, 7]],
         };
         assert!(!mesh.is_closed_manifold());
+    }
+
+    #[test]
+    fn defects_distinguish_an_open_rim_from_a_pinch() {
+        // A closed mesh reports nothing to describe.
+        let closed = tetrahedron().manifold_defects();
+        assert!(closed.is_closed());
+        assert_eq!(closed, ManifoldDefects::default());
+        assert!(closed.describe().is_none());
+
+        // Drop a face: the three edges it held are now used once each.
+        let mut open = tetrahedron();
+        open.indices.pop();
+        let d = open.manifold_defects();
+        assert!(!d.is_closed());
+        assert_eq!(d.boundary_edges, 3);
+        assert_eq!(d.pinched_edges, 0);
+        assert!(d.describe().expect("open").contains("open edge"));
+
+        // Two closed tetrahedra fused along the single shared edge (0, 1).
+        // Every edge is used twice except that one, which joins four
+        // triangles — the exact signature the adaptive mesher produces at a
+        // near-tangent feature, with no open rim anywhere to confuse it.
+        let mut pinched = tetrahedron();
+        pinched.positions.push(Point3::new(3.0, 1.0, -1.0));
+        pinched.positions.push(Point3::new(3.0, -1.0, 1.0));
+        pinched.normals.push(unit_normal());
+        pinched.normals.push(unit_normal());
+        pinched
+            .indices
+            .extend_from_slice(&[[0, 1, 4], [0, 5, 1], [0, 4, 5], [1, 5, 4]]);
+        let d = pinched.manifold_defects();
+        assert!(!d.is_closed());
+        assert_eq!(d.pinched_edges, 1);
+        assert_eq!(d.boundary_edges, 0);
+        let described = d.describe().expect("pinched");
+        assert!(described.contains("pinched edge"));
+        // The distinction is the whole point: a pinch must never be reported
+        // as the surface escaping the meshing bounds (of-9l3 / of-o0o).
+        assert!(!described.contains("meshing bounds"));
+    }
+
+    #[test]
+    fn defects_flag_misorientation_and_degeneracy_separately() {
+        let mut flipped = tetrahedron();
+        flipped.indices[0].swap(1, 2);
+        let d = flipped.manifold_defects();
+        assert!(!d.is_closed());
+        assert_eq!(d.misoriented_edges, 3);
+        assert_eq!(d.boundary_edges, 0);
+        assert_eq!(d.pinched_edges, 0);
+
+        let degenerate = TriangleMesh {
+            positions: vec![Point3::origin(), Point3::new(1.0, 0.0, 0.0)],
+            normals: vec![unit_normal(); 2],
+            indices: vec![[0, 0, 1]],
+        };
+        assert_eq!(degenerate.manifold_defects().degenerate_triangles, 1);
+
+        let empty = TriangleMesh::new();
+        assert!(empty.manifold_defects().empty);
+        assert_eq!(
+            empty.manifold_defects().describe().as_deref(),
+            Some("the mesh is empty")
+        );
     }
 
     #[test]

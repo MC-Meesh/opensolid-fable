@@ -56,7 +56,7 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 > }
 > ```
 
-**Agent:** Valid solid, 24,684 triangles — the pin bore runs cleanly through all three knuckles. One sizing note worth being honest about: I opened the bore to Ø4. At Ø3.2 this part comes back `valid: false` with a non-manifold mesh, because the default meshing accuracy is derived from the model’s overall bounding box (~62 mm here), and that is too coarse to resolve a bore that small. The fix is a bore the mesher can see; the same Ø3.2 bore meshes fine on a single knuckle in a smaller box. Let me look at it and confirm the mesh is watertight before exporting.
+**Agent:** Valid solid, 24,684 triangles — the pin bore runs cleanly through all three knuckles. One sizing note worth being honest about: I opened the bore to Ø4 because at Ø3.2 this part comes back `valid: false` with a *pinched* mesh — two surface sheets fused through one octree cell where the bore goes tangent. That is a known mesher defect (of-o0o), not a part that is too small to see, and it is worth knowing which it is: a finer `accuracy` does not clear a pinch, and the bore sizes that trip it are not the small ones in particular (Ø2.4 and Ø7 fail; Ø2.8, Ø3.6 and Ø4 are fine). So Ø4 is a workaround I found by moving, not a rule I derived. Let me confirm the mesh is watertight before exporting.
 
 > 🔧 **`get_screenshot`** `{ "model_id": "model-2", "view": "iso", "width": 720, "height": 540 }`
 >
@@ -83,11 +83,11 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 > ```json
 > {
 >   "isError": true,
->   "text": "Error: export failed: STEP export failed: degenerate geometry in sdf_to_brep: adaptive meshing did not produce a closed manifold; the surface must lie strictly inside the meshing bounds"
+>   "text": "Error: export failed: STEP export failed: degenerate geometry in sdf_to_brep: adaptive meshing did not produce a closed manifold: 2 pinched edge(s) joining 3+ triangles — two surface sheets fused through one cell, typically at a near-tangent CSG feature; this is a mesher defect (of-o0o), and a finer accuracy does not reliably clear it"
 > }
 > ```
 
-**Agent:** STEP declines here. This part has no exact B-Rep companion, so STEP takes the faceted SDF→B-Rep path, which needs the surface to close strictly inside the meshing region — a Ø4 bore threaded through three knuckles across a 62 mm leaf is too fine for the accuracy that box implies. The tool says so plainly rather than emitting a broken file. I can still give you the mesh:
+**Agent:** STEP declines here, and the reason it gives is the same pinch as above — this part has no exact B-Rep companion, so STEP takes the faceted SDF→B-Rep path, which needs a closed manifold and does not get one. Note it names the actual defect (pinched edges) rather than blaming resolution, so I know not to burn time retrying at a finer accuracy. The tool says no plainly rather than emitting a broken file. I can still give you the mesh:
 
 > 🔧 **`export`** `{ "model_id": "model-2", "format": "stl", "path": "hinge-leaf.stl" }`
 > ```json

@@ -296,11 +296,14 @@ return bracket;
     t.say(
       'STEP declines on this one, and that is worth showing rather than hiding. The ' +
         'shape has no exact B-Rep companion, so STEP goes through the faceted ' +
-        'SDF→B-Rep path, which needs the surface to close strictly inside the meshing ' +
-        'region — and this part sits right at that edge: four through-holes in a 4 mm ' +
-        'plate, meshed at an accuracy derived from the part’s full 44 mm height. The ' +
-        'tool reports `isError: true` with a specific reason instead of writing a ' +
-        'corrupt file. The STL is unaffected (different code path) and is print-ready.',
+        'SDF→B-Rep path, which needs a closed manifold — and the mesher hands it one ' +
+        'with two *pinched* edges, where two surface sheets fuse through a single ' +
+        'cell. The tempting read is that four Ø6 holes in a 4 mm plate are simply too ' +
+        'fine for an accuracy derived from the part’s full 44 mm height, but that is ' +
+        'not what is happening: a pinch is a mesher defect (of-o0o) and a finer ' +
+        'accuracy does not clear it. The tool reports `isError: true` naming the real ' +
+        'defect instead of writing a corrupt file. The STL is unaffected (different ' +
+        'code path) and is print-ready.',
     );
     t.say(
       'To get an analytic STEP of a bracket like this, model the L-section as an ' +
@@ -351,13 +354,14 @@ return leaf.subtract(pin);
     t.say(
       `Valid solid, ${m.mesh.triangles.toLocaleString('en-US')} triangles — the pin ` +
         'bore runs cleanly through all three knuckles. One sizing note worth being ' +
-        'honest about: I opened the bore to Ø4. At Ø3.2 this part comes back ' +
-        '`valid: false` with a non-manifold mesh, because the default meshing ' +
-        'accuracy is derived from the model’s overall bounding box (~62 mm here), ' +
-        'and that is too coarse to resolve a bore that small. The fix is a bore the ' +
-        'mesher can see; the same Ø3.2 bore meshes fine on a single knuckle in a ' +
-        'smaller box. Let me look at it and confirm the mesh is watertight before ' +
-        'exporting.',
+        'honest about: I opened the bore to Ø4 because at Ø3.2 this part comes back ' +
+        '`valid: false` with a *pinched* mesh — two surface sheets fused through one ' +
+        'octree cell where the bore goes tangent. That is a known mesher defect ' +
+        '(of-o0o), not a part that is too small to see, and it is worth knowing which ' +
+        'it is: a finer `accuracy` does not clear a pinch, and the bore sizes that ' +
+        'trip it are not the small ones in particular (Ø2.4 and Ø7 fail; Ø2.8, Ø3.6 ' +
+        'and Ø4 are fine). So Ø4 is a workaround I found by moving, not a rule I ' +
+        'derived. Let me confirm the mesh is watertight before exporting.',
     );
     t.screenshot(m.model_id, 'hinge-leaf-iso.png', 'iso');
     const v = t.validate(m.model_id);
@@ -367,11 +371,12 @@ return leaf.subtract(pin);
     );
     t.export(m.model_id, 'step', 'hinge-leaf.step');
     t.say(
-      'STEP declines here. This part has no exact B-Rep companion, so STEP takes the ' +
-        'faceted SDF→B-Rep path, which needs the surface to close strictly inside the ' +
-        'meshing region — a Ø4 bore threaded through three knuckles across a 62 mm ' +
-        'leaf is too fine for the accuracy that box implies. The tool says so plainly ' +
-        'rather than emitting a broken file. I can still give you the mesh:',
+      'STEP declines here, and the reason it gives is the same pinch as above — this ' +
+        'part has no exact B-Rep companion, so STEP takes the faceted SDF→B-Rep path, ' +
+        'which needs a closed manifold and does not get one. Note it names the actual ' +
+        'defect (pinched edges) rather than blaming resolution, so I know not to burn ' +
+        'time retrying at a finer accuracy. The tool says no plainly rather than ' +
+        'emitting a broken file. I can still give you the mesh:',
     );
     t.export(m.model_id, 'stl', 'hinge-leaf.stl');
     t.say(
