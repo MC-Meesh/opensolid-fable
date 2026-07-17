@@ -61,6 +61,7 @@ use crate::topology::{
     Body, BodyType, FaceSense, FinSense, LoopType, SYSTEM_RESOLUTION, ShellOrientation,
     TopologyStore,
 };
+use crate::triangulate::ear_clip;
 use opensolid_core::EntityId;
 use opensolid_core::bvh::Bvh;
 use opensolid_core::error::{CoreError, CoreResult};
@@ -1516,16 +1517,29 @@ impl<'a> Pipeline<'a> {
             match ssi_intersect(sa, sb, &self.tol) {
                 Ok(SurfaceIntersection::Empty) => {}
                 Ok(SurfaceIntersection::Coincident) => {
-                    return Err(CoreError::NotImplemented {
-                        feature: "boolean operations on coincident faces \
-                                  (transversal MVP)",
-                    });
+                    // Coincident *surfaces* only bar the transversal path
+                    // where the trimmed regions actually share area; faces
+                    // that merely touch or miss imprint nothing (of-bxl.2).
+                    if self.regions_overlap(fa, fb) {
+                        return Err(CoreError::NotImplemented {
+                            feature: "boolean operations on coincident faces \
+                                      (transversal MVP)",
+                        });
+                    }
                 }
-                Ok(SurfaceIntersection::TangentPoint(_)) => {
-                    return Err(CoreError::NotImplemented {
-                        feature: "boolean operations with tangent face contact \
-                                  (transversal MVP)",
-                    });
+                Ok(SurfaceIntersection::TangentPoint(p)) => {
+                    // Likewise: a tangency of the infinite surfaces is only a
+                    // contact when the touch point is inside both trims.
+                    let in_a = self.face_polys[0][fa]
+                        .contains_for_clip(self.face_polys[0][fa].chart.param(&p, None), self.snap);
+                    let in_b = self.face_polys[1][fb]
+                        .contains_for_clip(self.face_polys[1][fb].chart.param(&p, None), self.snap);
+                    if in_a && in_b {
+                        return Err(CoreError::NotImplemented {
+                            feature: "boolean operations with tangent face contact \
+                                      (transversal MVP)",
+                        });
+                    }
                 }
                 Ok(SurfaceIntersection::Curves(curves)) => {
                     for ic in curves {
@@ -1686,6 +1700,77 @@ impl<'a> Pipeline<'a> {
                 )
             })
             .collect()
+    }
+
+    /// Whether the two faces' *trimmed regions* share positive area, given
+    /// that their host surfaces are already known to be coincident (of-bxl.2).
+    ///
+    /// SSI decides coincidence from the infinite surfaces — `plane_plane` and
+    /// its four siblings compare origins and axes, never the trims — so it
+    /// reports `Coincident` for any two coplanar faces, including ones whose
+    /// regions merely touch along an edge or miss each other entirely (two
+    /// boxes set corner to corner). Those are ordinary transversal work; only
+    /// a genuine area overlap needs the coincident-imprint machinery this MVP
+    /// lacks.
+    ///
+    /// Probes are triangle centroids of each region's own loops, tested
+    /// against the *other* region through 3D — the same `param` +
+    /// `contains_for_clip` route `clip_imprint` uses, which is what makes the
+    /// two faces' independent charts comparable. Centroids are used rather
+    /// than boundary vertices because they sit strictly *interior* to their
+    /// region: on the configurations this gate exists to pass, the two
+    /// boundaries are collinear (touching boxes) or identical (a full shared
+    /// face), so a boundary vertex lands exactly on the other region's
+    /// outline, where the even-odd test is a float coin flip. An interior
+    /// probe is unambiguous in both directions.
+    ///
+    /// Sound on the cases that matter, by probing both directions:
+    /// - regions nest or coincide → the inner region's centroids lie inside
+    ///   the outer, so a full shared face still reads as overlapping;
+    /// - regions touch or are disjoint → no centroid of either lands in the
+    ///   other, and no probe sits on a boundary to flip.
+    ///
+    /// The blind spot is sampling density: an overlap thinner than the gap
+    /// between centroids can fall between probes and read as disjoint. That
+    /// is the of-bxl.4/of-bxl.6 hardening pass; here it is bounded by
+    /// answering `true` (keep today's rejection) whenever no probe is
+    /// available at all.
+    fn regions_overlap(&self, fa: usize, fb: usize) -> bool {
+        let fpa = &self.face_polys[0][fa];
+        let fpb = &self.face_polys[1][fb];
+        let inside_both = |p: &Point3| {
+            fpa.contains_for_clip(fpa.chart.param(p, None), self.snap)
+                && fpb.contains_for_clip(fpb.chart.param(p, None), self.snap)
+        };
+        let mut probed = false;
+        for fp in [fpa, fpb] {
+            for lp in &fp.loops {
+                let uv: Vec<(f64, f64)> = lp.iter().map(|&(uv, _)| uv).collect();
+                for tri in ear_clip(&uv) {
+                    // Chord centroid of a loop triangle. On a plane it lies
+                    // exactly on the surface; on a curved coincident pair it
+                    // sags inside, and `param` projects it back along the
+                    // chart's radial/axial inverse, still interior to the
+                    // triangle. Either way it is a point of this region's
+                    // interior, which is all the probe needs.
+                    let c = Point3::from(
+                        (lp[tri[0]].1.coords + lp[tri[1]].1.coords + lp[tri[2]].1.coords) / 3.0,
+                    );
+                    // A hole loop triangulates across its own opening, so
+                    // drop any centroid that its own region rejects.
+                    if !fp.contains_for_clip(fp.chart.param(&c, None), self.snap) {
+                        continue;
+                    }
+                    probed = true;
+                    if inside_both(&c) {
+                        return true;
+                    }
+                }
+            }
+        }
+        // No usable probe (degenerate or self-intersecting loops): nothing
+        // was proven, so keep the conservative rejection.
+        !probed
     }
 
     /// Clip one SSI curve to both face regions; store surviving pieces as
