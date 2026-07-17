@@ -50,7 +50,8 @@
 use crate::check::CheckFailure;
 use crate::curve::{Curve3, CurveEval, TWO_PI, plane_basis};
 use crate::geometry::GeometryStore;
-use crate::project::CurveProject;
+use crate::nurbs::surface::NurbsSurface;
+use crate::project::{CurveProject, SurfaceProject};
 use crate::ssi::{
     IntersectionKind, MarchedCurve, SurfaceIntersection, intersect as ssi_intersect,
     intersect_marched, intersect_marched_bounded,
@@ -449,15 +450,62 @@ enum Chart {
         half_angle: f64,
         radius: f64,
     },
+    /// Chart of a clamped NURBS patch: **the plane case with a bounded
+    /// domain**, not a new kind of thing. `(u, v)` are the knot parameters,
+    /// so the domain is the finite knot rectangle `domain_u × domain_v` —
+    /// unlike every analytic chart, which is unbounded or angular.
+    ///
+    /// Neither axis is periodic (clamped representation), so `period_u` and
+    /// `period_v` are both `None` and every seam mechanism in the pipeline
+    /// degenerates to the plane path: `FaceRegionPoly::localize` is a
+    /// no-op, `seam_crossings` yields nothing. A geometrically closed
+    /// spline body carries its wrap as a topology seam **edge** instead.
+    ///
+    /// The chart has no poles by construction — [`Chart::build`] rejects
+    /// patches with a degenerate (collapsed) edge, which are the only NURBS
+    /// analogue of one, so `pole_v`/`apex`/`pole_points` are all empty.
+    ///
+    /// Its inverse ([`Chart::param`]) is the pipeline's only iterative one.
+    Nurbs {
+        surface: Box<NurbsSurface>,
+        /// Captured from the pipeline at build time: [`Chart::param`] needs
+        /// a tolerance to judge whether its projection actually landed on
+        /// `p`, and has no other source for one. Every analytic chart
+        /// inverts in closed form and needs no such bound.
+        tol: ToleranceContext,
+    },
 }
 
 impl Chart {
-    /// Build the parameter chart for any analytic surface OpenSolid can
-    /// invert. Spheres and tori are admitted (the of-7ld promotion); cones
-    /// are admitted (the of-dtj promotion) — a boolean whose cone SSI is
-    /// still unsupported simply falls back to F-Rep from a later stage.
-    fn build(surface: &Surface3) -> CoreResult<Self> {
+    /// Build the parameter chart for any surface OpenSolid can invert.
+    /// Spheres and tori are admitted (the of-7ld promotion); cones are
+    /// admitted (the of-dtj promotion); NURBS patches are admitted here
+    /// (of-37i.3) but their SSI is not wired until of-37i.4 — a boolean
+    /// whose SSI is still unsupported simply falls back to F-Rep from a
+    /// later stage.
+    ///
+    /// # Errors
+    /// [`CoreError::NotImplemented`] for a NURBS patch with a degenerate
+    /// (collapsed) edge. The pole machinery — `pole_v`, the `CoverEmbedder`
+    /// pole rows — relies on a *known* pole location and on a limit normal
+    /// there, both of which a sphere has and a collapsed control row does
+    /// not ([`SurfaceEval::normal`] returns `None` at one). Rejecting the
+    /// patch here routes it to F-Rep intact; degenerate tips are their own
+    /// campaign (of-37i.7).
+    fn build(surface: &Surface3, tol: &ToleranceContext) -> CoreResult<Self> {
         match surface {
+            Surface3::Nurbs(nurbs) => {
+                if nurbs.has_degenerate_edge() {
+                    return Err(CoreError::NotImplemented {
+                        feature: "boolean on a NURBS patch with a degenerate (collapsed) edge \
+                                  (of-37i.7); the chart has no pole analogue for one",
+                    });
+                }
+                Ok(Chart::Nurbs {
+                    surface: nurbs.clone(),
+                    tol: *tol,
+                })
+            }
             Surface3::Plane { origin, normal } => {
                 let (e_u, e_v) = plane_basis(normal);
                 Ok(Chart::Plane {
@@ -537,6 +585,27 @@ impl Chart {
     /// polyline stays continuous across a seam: `u` for cylinder, sphere,
     /// and torus charts, and additionally `v` for the torus.
     ///
+    /// **`hint` carries two different meanings**, one per chart family. For
+    /// the analytic charts it selects *which period to unwrap into*. For
+    /// NURBS — which has no period — it is the **Newton seed**, and passing
+    /// one is worth far more than speed: a patch that approaches itself has
+    /// several local minima, and an unseeded projection can converge onto
+    /// the wrong sheet. Pass a hint wherever one exists.
+    ///
+    /// # Errors
+    /// Never, for the analytic charts: every one is closed-form and total,
+    /// so their arms return `Ok` unconditionally and this signature costs
+    /// them nothing but the `?`.
+    ///
+    /// [`CoreError::Degenerate`] when the NURBS arm's projection fails to
+    /// converge, or converges to a point too far from `p` to be the
+    /// inverse. Both mean the caller handed us a point that is not on this
+    /// patch, or one the iteration cannot resolve — either way the boolean
+    /// must abort to the F-Rep fallback. **Never guess a uv here.** A wrong
+    /// uv does not fail loudly; it silently corrupts region parity and
+    /// yields a plausible solid with the wrong volume (the of-ipt.4 failure
+    /// mode, which is what the volume-identity gate exists to catch).
+    ///
     /// **Sphere pole convention.** Longitude is undefined at the poles
     /// (`v = ±π/2`), where the whole `u`-circle collapses to one point. A
     /// point within a hair of a pole (its distance from the axis below a
@@ -545,8 +614,9 @@ impl Chart {
     /// keeps a continuous longitude across the pole instead of snapping to
     /// an arbitrary `atan2` of near-zero components, which would otherwise
     /// spawn a zero-width UV wedge (a degenerate region) at the pole.
-    fn param(&self, p: &Point3, hint: Option<(f64, f64)>) -> (f64, f64) {
-        match self {
+    fn param(&self, p: &Point3, hint: Option<(f64, f64)>) -> CoreResult<(f64, f64)> {
+        Ok(match self {
+            Chart::Nurbs { surface, tol } => return nurbs_param(surface, p, hint, tol),
             Chart::Plane {
                 origin, e_u, e_v, ..
             } => {
@@ -625,7 +695,7 @@ impl Chart {
                 };
                 (u, v)
             }
-        }
+        })
     }
 
     /// Outward unit surface normal at parameters `(u, v)`. `v` is ignored
@@ -653,13 +723,22 @@ impl Chart {
                 let (sin_a, cos_a) = half_angle.sin_cos();
                 radial * cos_a - axis * sin_a
             }
+            // `Chart::build` rejects degenerate-edge patches, so a normal
+            // exists everywhere on an admitted one.
+            Chart::Nurbs { surface, .. } => surface
+                .normal(u, v)
+                .expect("Chart::build rejects NURBS patches with a degenerate edge"),
         }
     }
 
-    /// Arc-length scale factors `(du_scale, dv_scale)` at latitude/minor
-    /// angle `v`: multiplying a small parameter step by these yields the
-    /// model-space displacement, putting both axes in one metric so uv
-    /// distances mix units correctly (of-9n8).
+    /// Arc-length scale factors `(du_scale, dv_scale)` **at `uv`**:
+    /// multiplying a small parameter step by these yields the model-space
+    /// displacement, putting both axes in one metric so uv distances mix
+    /// units correctly (of-9n8).
+    ///
+    /// Every analytic chart's scale is closed-form and depends on `v`
+    /// alone; the freeform arm needs the whole point, which is why this
+    /// takes `uv` rather than `v`.
     ///
     /// - Plane: `(1, 1)` — both axes already model units.
     /// - Cylinder: `(radius, 1)` — `u` is an angle, `v` a length.
@@ -670,7 +749,11 @@ impl Chart {
     /// - Cone: `(radius + v·tan α, 1/cos α)` — the `u`-circle radius grows
     ///   linearly with `v` (→ 0 at the apex); `v` is axial length, whose
     ///   slant step `1/cos α` accounts for the surface tilt.
-    fn uv_scale(&self, v: f64) -> (f64, f64) {
+    /// - NURBS: `(|S_u|, |S_v|)`, the first fundamental form's diagonal —
+    ///   the same quantity the analytic arms state in closed form, here
+    ///   evaluated. Varies with `u` and `v` both.
+    fn uv_scale(&self, uv: (f64, f64)) -> (f64, f64) {
+        let (u, v) = uv;
         match self {
             Chart::Plane { .. } => (1.0, 1.0),
             Chart::Cylinder { radius, .. } => (*radius, 1.0),
@@ -683,25 +766,39 @@ impl Chart {
             Chart::Cone {
                 radius, half_angle, ..
             } => (radius + v * half_angle.tan(), 1.0 / half_angle.cos()),
+            Chart::Nurbs { surface, .. } => {
+                let ders = surface.derivatives(u, v, 1);
+                (ders[1][0].norm(), ders[0][1].norm())
+            }
         }
     }
 
-    /// Period of the `u` axis (radians), or `None` when `u` is unbounded
-    /// (planes). Every curved chart wraps `u` every 2π.
+    /// Period of the `u` axis (radians), or `None` when `u` does not wrap:
+    /// planes (unbounded) and NURBS (a clamped knot domain — a closed
+    /// spline body wraps at a topology seam edge, not in the chart). Every
+    /// analytic *curved* chart wraps `u` every 2π.
     fn period_u(&self) -> Option<f64> {
         match self {
-            Chart::Plane { .. } => None,
-            _ => Some(TWO_PI),
+            Chart::Plane { .. } | Chart::Nurbs { .. } => None,
+            Chart::Cylinder { .. }
+            | Chart::Sphere { .. }
+            | Chart::Torus { .. }
+            | Chart::Cone { .. } => Some(TWO_PI),
         }
     }
 
     /// Period of the `v` axis (radians), set only for the torus (whose
-    /// minor angle wraps). Cylinder `v` is an unbounded length and sphere
-    /// `v` is clamped latitude, so both are `None`.
+    /// minor angle wraps). Cylinder `v` is an unbounded length, sphere `v`
+    /// is clamped latitude, and NURBS `v` is a clamped knot domain, so all
+    /// are `None`.
     fn period_v(&self) -> Option<f64> {
         match self {
             Chart::Torus { .. } => Some(TWO_PI),
-            _ => None,
+            Chart::Plane { .. }
+            | Chart::Cylinder { .. }
+            | Chart::Sphere { .. }
+            | Chart::Cone { .. }
+            | Chart::Nurbs { .. } => None,
         }
     }
 
@@ -743,7 +840,13 @@ impl Chart {
                 (d.dot(e_u).hypot(d.dot(e_v)) <= radius.abs() * POLE_REL_EPS)
                     .then(|| -radius / half_angle.tan())
             }
-            _ => None,
+            // NURBS has no pole *by construction*: the only analogue is a
+            // collapsed control row, and `Chart::build` rejects patches
+            // with one. Plane/cylinder/torus never collapse a point.
+            Chart::Plane { .. }
+            | Chart::Cylinder { .. }
+            | Chart::Torus { .. }
+            | Chart::Nurbs { .. } => None,
         }
     }
 
@@ -777,7 +880,12 @@ impl Chart {
                 ..
             } => vec![center - axis * *radius, center + axis * *radius],
             Chart::Cone { .. } => self.apex().into_iter().collect(),
-            _ => Vec::new(),
+            // See `pole_v`: no analogue, and the degenerate-edge patches
+            // that would be one never reach a chart.
+            Chart::Plane { .. }
+            | Chart::Cylinder { .. }
+            | Chart::Torus { .. }
+            | Chart::Nurbs { .. } => Vec::new(),
         }
     }
 }
@@ -785,6 +893,53 @@ impl Chart {
 /// Relative floor (fraction of the sphere radius) on a point's distance
 /// from the polar axis below which its longitude is treated as undefined.
 const POLE_REL_EPS: f64 = 1e-9;
+
+/// [`Chart::param`]'s iterative inverse for a NURBS patch: the closest
+/// point on the patch to `p`, seeded by `hint` when there is one.
+///
+/// This is the one chart inverse that can fail, and it must be allowed to.
+/// `p` is *assumed* to lie on the patch, so a converged projection lands on
+/// it to within float noise; a residual above `linear_tol` means the
+/// assumption was false. Both that and non-convergence return an error
+/// rather than a best guess, because the caller cannot tell a wrong uv from
+/// a right one — it just embeds it in a region polygon and produces a solid
+/// with silently wrong parity.
+fn nurbs_param(
+    surface: &NurbsSurface,
+    p: &Point3,
+    hint: Option<(f64, f64)>,
+    tol: &ToleranceContext,
+) -> CoreResult<(f64, f64)> {
+    // A seeded Newton both costs less than the per-span search and, more
+    // importantly, picks the intended sheet where the patch approaches
+    // itself and several local minima compete.
+    let proj = match hint {
+        Some(seed) => surface.project_point_seeded(p, seed),
+        None => surface.project_point(p),
+    };
+    if !proj.converged {
+        return Err(CoreError::Degenerate {
+            context: "boolean::Chart::param(Nurbs)",
+            reason: format!(
+                "closest-point projection of {p:?} onto the NURBS patch did not converge"
+            ),
+        });
+    }
+    // `points_approx_eq` keeps the bound absolute for unit-scale geometry
+    // and relative for large models, so a patch does not fail this check
+    // merely by sitting far from the origin.
+    if !tol.points_approx_eq(&proj.point, p) {
+        return Err(CoreError::Degenerate {
+            context: "boolean::Chart::param(Nurbs)",
+            reason: format!(
+                "point {p:?} is {} from the NURBS patch: it does not lie on this surface, \
+                 so it has no inverse here",
+                proj.distance
+            ),
+        });
+    }
+    Ok((proj.u, proj.v))
+}
 
 /// Shift `angle` by whole turns so it lands within π of `hint` (no-op when
 /// `hint` is `None`).
@@ -875,7 +1030,7 @@ impl FaceRegionPoly {
         if self.contains(local) {
             return true;
         }
-        let (u_scale, v_scale) = self.chart.uv_scale(local.1);
+        let (u_scale, v_scale) = self.chart.uv_scale(local);
         if self.chart.period_u().is_some() {
             let eps = (snap / u_scale.max(1e-12)).max(1e-12);
             if self.contains(self.localize((local.0 + eps, local.1)))
@@ -1286,8 +1441,15 @@ fn broad_phase_face_box(
 /// Signed implicit residual of `p` against a primitive's locus: zero on
 /// the surface, smooth nearby. Used to polish marched clip endpoints onto
 /// exact face-boundary junctions.
+///
+/// `None` for a NURBS patch, which has no implicit form. Unlike
+/// [`ray_surface_hits`], `None` is safe here: the caller reads it as "no
+/// polish available" and keeps the unpolished endpoint, costing accuracy
+/// rather than correctness. Phase 2 replaces this for NURBS with the
+/// marcher's two-surface Newton corrector.
 fn surface_residual(s: &Surface3, p: &Point3) -> Option<f64> {
     match *s {
+        Surface3::Nurbs(_) => None,
         Surface3::Plane { origin, normal } => Some(normal.dot(&(p - origin))),
         Surface3::Sphere { center, radius, .. } => Some((p - center).norm() - radius),
         Surface3::Cylinder {
@@ -1329,13 +1491,15 @@ fn surface_residual(s: &Surface3, p: &Point3) -> Option<f64> {
 
 /// Spatial gradient of [`surface_residual`] at `p` (the unit normal of the
 /// residual's level set). `None` on the residual's singular sets (axis,
-/// center, tube centerline), where the polish gives up.
+/// center, tube centerline) and for NURBS (no implicit form), where the
+/// polish gives up.
 fn surface_residual_gradient(s: &Surface3, p: &Point3) -> Option<Vector3> {
     let unit = |v: Vector3| {
         let n = v.norm();
         (n > f64::MIN_POSITIVE).then(|| v / n)
     };
     match *s {
+        Surface3::Nurbs(_) => None,
         Surface3::Plane { normal, .. } => Some(normal),
         Surface3::Sphere { center, .. } => unit(p - center),
         Surface3::Cylinder { origin, axis, .. } => {
@@ -2396,7 +2560,7 @@ impl<'a> Pipeline<'a> {
             let mut hits = 0usize;
             for (f, face) in self.solids[s].faces.iter().enumerate() {
                 let fp = &self.face_polys[s][f];
-                for t in ray_surface_hits(&face.surface, p, &dir) {
+                for t in ray_surface_hits(&face.surface, p, &dir)? {
                     let ambiguous = self.snap * 10.0;
                     if t < -ambiguous {
                         continue; // behind the ray: irrelevant
@@ -3689,12 +3853,25 @@ fn chart_point(chart: &Chart, uv: (f64, f64)) -> Point3 {
 /// (a graze) flips no sign, and skipping a root pair changes no parity;
 /// genuinely tangent hits are already rejected by the caller's grazing
 /// check and retried along another direction.
-fn ray_surface_hits(surface: &Surface3, p: &Point3, dir: &Vector3) -> Vec<f64> {
-    match surface {
+///
+/// # Errors
+/// [`CoreError::NotImplemented`] for a NURBS patch, which has no implicit
+/// form to intersect a ray against. Erroring is the whole point: an empty
+/// hit list is indistinguishable from "the ray misses this face", so
+/// guessing one would flip the parity of every point behind the patch and
+/// return a *wrong solid* rather than a failure.
+fn ray_surface_hits(surface: &Surface3, p: &Point3, dir: &Vector3) -> CoreResult<Vec<f64>> {
+    Ok(match surface {
+        Surface3::Nurbs(_) => {
+            return Err(CoreError::NotImplemented {
+                feature: "ray-parity classification against a NURBS face \
+                          (of-37i.5 routes NURBS operands through the F-Rep sign test)",
+            });
+        }
         Surface3::Plane { origin, normal } => {
             let denom = normal.dot(dir);
             if denom.abs() < 1e-12 {
-                return Vec::new();
+                return Ok(Vec::new());
             }
             vec![normal.dot(&(origin - p)) / denom]
         }
@@ -3711,11 +3888,11 @@ fn ray_surface_hits(surface: &Surface3, p: &Point3, dir: &Vector3) -> Vec<f64> {
             let b = 2.0 * o_perp.dot(&d_perp);
             let c = o_perp.norm_squared() - radius * radius;
             if a < 1e-15 {
-                return Vec::new();
+                return Ok(Vec::new());
             }
             let disc = b * b - 4.0 * a * c;
             if disc <= 0.0 {
-                return Vec::new();
+                return Ok(Vec::new());
             }
             let sq = disc.sqrt();
             vec![(-b - sq) / (2.0 * a), (-b + sq) / (2.0 * a)]
@@ -3728,7 +3905,7 @@ fn ray_surface_hits(surface: &Surface3, p: &Point3, dir: &Vector3) -> Vec<f64> {
             let c = oc.norm_squared() - radius * radius;
             let disc = b * b - 4.0 * a * c;
             if disc <= 0.0 {
-                return Vec::new();
+                return Ok(Vec::new());
             }
             let sq = disc.sqrt();
             vec![(-b - sq) / (2.0 * a), (-b + sq) / (2.0 * a)]
@@ -3761,14 +3938,14 @@ fn ray_surface_hits(surface: &Surface3, p: &Point3, dir: &Vector3) -> Vec<f64> {
             let on_nappe = |t: f64| am + t * ad >= 0.0;
             if qa.abs() < 1e-15 {
                 if qb.abs() < 1e-15 {
-                    return Vec::new();
+                    return Ok(Vec::new());
                 }
                 let t = -qc / qb;
-                return if on_nappe(t) { vec![t] } else { Vec::new() };
+                return Ok(if on_nappe(t) { vec![t] } else { Vec::new() });
             }
             let disc = qb * qb - 4.0 * qa * qc;
             if disc <= 0.0 {
-                return Vec::new();
+                return Ok(Vec::new());
             }
             let sq = disc.sqrt();
             [(-qb - sq) / (2.0 * qa), (-qb + sq) / (2.0 * qa)]
@@ -3776,7 +3953,7 @@ fn ray_surface_hits(surface: &Surface3, p: &Point3, dir: &Vector3) -> Vec<f64> {
                 .filter(|&t| on_nappe(t))
                 .collect()
         }
-    }
+    })
 }
 
 /// Samples along the ray window that can intersect the torus's bounding

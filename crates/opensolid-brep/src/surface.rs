@@ -29,6 +29,7 @@
 //! apex), [`SurfaceEval::normal`] returns `None`.
 
 use crate::curve::{TWO_PI, plane_basis};
+use crate::nurbs::surface::NurbsSurface;
 use crate::topology::SYSTEM_RESOLUTION;
 use opensolid_core::error::{CoreError, CoreResult};
 use opensolid_core::types::{BoundingBox3, Point3, Vector3};
@@ -119,6 +120,13 @@ pub enum Surface3 {
         major_radius: f64,
         minor_radius: f64,
     },
+    /// Freeform clamped NURBS patch. Unlike every analytic variant, its
+    /// parameter domain is the finite knot rectangle `domain_u × domain_v`
+    /// and its point→uv inverse has no closed form (see `Chart::Nurbs`).
+    ///
+    /// Boxed: [`NurbsSurface`] owns three `Vec`s, and inlining them would
+    /// grow every `Surface3` — the analytic variants are the hot ones.
+    Nurbs(Box<NurbsSurface>),
 }
 
 /// Normalize `axis`, rejecting zero or non-finite length with `context`.
@@ -246,9 +254,19 @@ impl Surface3 {
         })
     }
 
+    /// Freeform clamped NURBS patch over its knot rectangle.
+    ///
+    /// Accepts any patch [`NurbsSurface`] itself accepts, including ones
+    /// with a degenerate (collapsed) edge — the *chart* rejects those, so a
+    /// boolean on such a body falls back to F-Rep rather than being
+    /// unconstructible.
+    pub fn nurbs(surface: NurbsSurface) -> Self {
+        Surface3::Nurbs(Box::new(surface))
+    }
+
     /// Exact axis-aligned bounding box of the full surface, for the
-    /// bounded primitives (sphere, torus); `None` for the unbounded ones
-    /// (plane, cylinder, cone).
+    /// bounded primitives (sphere, torus) and the NURBS control hull;
+    /// `None` for the unbounded ones (plane, cylinder, cone).
     ///
     /// The torus box comes from the tube-center circle's box dilated by
     /// the tube radius: the circle's half-extent along world axis `i` is
@@ -274,25 +292,38 @@ impl Surface3 {
                 );
                 Some(BoundingBox3::new(center - h, center + h))
             }
+            // Control hull: exact by the convex hull property, and cheap.
+            // A patch's own box must never be tighter than its geometry —
+            // see `broad_phase_face_box`, where a too-tight box silently
+            // drops a face pair rather than raising an error.
+            Surface3::Nurbs(nurbs) => nurbs.control_hull_box(),
             Surface3::Plane { .. } | Surface3::Cylinder { .. } | Surface3::Cone { .. } => None,
         }
     }
 
-    /// The unit axis defining this surface's frame.
-    fn frame_axis(&self) -> &Vector3 {
+    /// The unit axis defining this surface's frame, or `None` for the
+    /// freeform variants that have no axis of revolution.
+    fn frame_axis(&self) -> Option<&Vector3> {
         match self {
-            Surface3::Plane { normal, .. } => normal,
+            Surface3::Plane { normal, .. } => Some(normal),
             Surface3::Cylinder { axis, .. }
             | Surface3::Cone { axis, .. }
             | Surface3::Sphere { axis, .. }
-            | Surface3::Torus { axis, .. } => axis,
+            | Surface3::Torus { axis, .. } => Some(axis),
+            Surface3::Nurbs(_) => None,
         }
     }
 
     /// Radial unit direction at angle `u` about the frame axis, plus its
     /// derivative with respect to `u` (the tangential direction).
+    ///
+    /// Only meaningful for the variants parameterized by an angle about an
+    /// axis, which are the only callers.
     fn radial_frame(&self, u: f64) -> (Vector3, Vector3) {
-        let (e_u, e_v) = plane_basis(self.frame_axis());
+        let axis = self
+            .frame_axis()
+            .expect("radial_frame is only called from the axis-parameterized arms");
+        let (e_u, e_v) = plane_basis(axis);
         let radial = e_u * u.cos() + e_v * u.sin();
         let tangential = e_v * u.cos() - e_u * u.sin();
         (radial, tangential)
@@ -348,6 +379,7 @@ impl SurfaceEval for Surface3 {
                     + radial * (major_radius + minor_radius * v.cos())
                     + axis * (minor_radius * v.sin())
             }
+            Surface3::Nurbs(nurbs) => nurbs.point(u, v),
         }
     }
 
@@ -376,6 +408,7 @@ impl SurfaceEval for Surface3 {
                 let (_, tangential) = self.radial_frame(u);
                 tangential * (major_radius + minor_radius * v.cos())
             }
+            Surface3::Nurbs(nurbs) => nurbs.du(u, v),
         }
     }
 
@@ -399,6 +432,7 @@ impl SurfaceEval for Surface3 {
                 let (radial, _) = self.radial_frame(u);
                 (axis * v.cos() - radial * v.sin()) * *minor_radius
             }
+            Surface3::Nurbs(nurbs) => nurbs.dv(u, v),
         }
     }
 
@@ -424,13 +458,22 @@ impl SurfaceEval for Surface3 {
                 let (radial, _) = self.radial_frame(u);
                 Some(radial * v.cos() + axis * v.sin())
             }
+            // `None` at a collapsed control row: unlike a sphere pole,
+            // nothing constrains the neighborhood, so there is no limit
+            // normal to return.
+            Surface3::Nurbs(nurbs) => nurbs.normal(u, v),
         }
     }
 
     fn domain_u(&self) -> (f64, f64) {
         match self {
             Surface3::Plane { .. } => (f64::NEG_INFINITY, f64::INFINITY),
-            _ => (0.0, TWO_PI),
+            // The finite knot rectangle, unlike any analytic variant.
+            Surface3::Nurbs(nurbs) => nurbs.domain_u(),
+            Surface3::Cylinder { .. }
+            | Surface3::Cone { .. }
+            | Surface3::Sphere { .. }
+            | Surface3::Torus { .. } => (0.0, TWO_PI),
         }
     }
 
@@ -441,11 +484,21 @@ impl SurfaceEval for Surface3 {
             }
             Surface3::Sphere { .. } => (-std::f64::consts::FRAC_PI_2, std::f64::consts::FRAC_PI_2),
             Surface3::Torus { .. } => (0.0, TWO_PI),
+            Surface3::Nurbs(nurbs) => nurbs.domain_v(),
         }
     }
 
+    /// Clamped NURBS is never periodic: a geometrically closed spline body
+    /// is built as a clamped patch meeting itself at a real seam **edge**
+    /// in the topology, which is where the pipeline already handles wrap.
     fn is_periodic_u(&self) -> bool {
-        !matches!(self, Surface3::Plane { .. })
+        match self {
+            Surface3::Plane { .. } | Surface3::Nurbs(_) => false,
+            Surface3::Cylinder { .. }
+            | Surface3::Cone { .. }
+            | Surface3::Sphere { .. }
+            | Surface3::Torus { .. } => true,
+        }
     }
 
     fn is_periodic_v(&self) -> bool {
@@ -468,9 +521,12 @@ impl SurfaceEval for Surface3 {
         }
     }
 
-    fn is_singular(&self, _u: f64, v: f64) -> bool {
+    fn is_singular(&self, u: f64, v: f64) -> bool {
         match self {
             Surface3::Plane { .. } | Surface3::Cylinder { .. } | Surface3::Torus { .. } => false,
+            // Collapsed control row (the lofted-to-a-point tip). Detected
+            // by the same |S_u × S_v| test as `normal`.
+            Surface3::Nurbs(nurbs) => nurbs.is_singular(u, v),
             // Apex: the u-circle collapses to a point.
             Surface3::Cone {
                 half_angle, radius, ..

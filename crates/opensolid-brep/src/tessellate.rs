@@ -227,6 +227,13 @@ fn tessellate_face_into(
             );
             Ok(())
         }
+        // The grid path prices its lattice off an angular pitch about an
+        // axis, which a freeform patch has none of; a curvature-derived
+        // pitch is of-37i.6 (phase 4). Erroring here routes NURBS bodies to
+        // the F-Rep fallback, which meshes them correctly today.
+        Surface3::Nurbs(_) => Err(CoreError::NotImplemented {
+            feature: "tessellating NURBS faces (of-37i.6: curvature-derived lattice pitch)",
+        }),
     }
 }
 

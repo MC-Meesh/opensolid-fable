@@ -80,6 +80,21 @@ pub trait CurveProject {
 pub trait SurfaceProject {
     /// Closest point on the surface to `point`.
     fn project_point(&self, point: &Point3) -> SurfaceProjection;
+
+    /// Closest point on the surface to `point`, with the Newton iteration
+    /// started from `seed` instead of the implementation's own seeding.
+    ///
+    /// Use this wherever a good seed is already known (the previous point
+    /// of a walk, say). Beyond being cheaper than a blind search, it picks
+    /// the **branch**: a surface that approaches itself has several local
+    /// minima, and unseeded projection can converge onto the wrong sheet.
+    ///
+    /// The default implementation ignores the seed, which is correct for
+    /// surfaces whose own seeding is already a global closed-form answer.
+    fn project_point_seeded(&self, point: &Point3, seed: (f64, f64)) -> SurfaceProjection {
+        let _ = seed;
+        self.project_point(point)
+    }
 }
 
 /// One parameter direction's domain restriction: wrap by the period if
@@ -379,6 +394,9 @@ impl NewtonSurface for Surface3 {
     fn jet(&self, u: f64, v: f64) -> SurfaceJet {
         let zero = Vector3::zeros();
         let (suu, suv, svv) = match self {
+            // No closed-form second derivatives to fold into the shared
+            // tail below; take the whole jet from the patch instead.
+            Surface3::Nurbs(nurbs) => return nurbs.jet(u, v),
             Surface3::Plane { .. } => (zero, zero, zero),
             Surface3::Cylinder { axis, radius, .. } => {
                 let (radial, _) = radial_tangential(axis, u);
@@ -430,6 +448,9 @@ impl NewtonSurface for Surface3 {
 impl SurfaceProject for Surface3 {
     fn project_point(&self, point: &Point3) -> SurfaceProjection {
         let (seed_u, seed_v) = match self {
+            // No closed-form seed: fall through to the patch's own
+            // per-knot-span search.
+            Surface3::Nurbs(nurbs) => return nurbs.project_point(point),
             Surface3::Plane { origin, normal } => {
                 let (e_u, e_v) = plane_basis(normal);
                 let d = point - origin;
@@ -490,6 +511,19 @@ impl SurfaceProject for Surface3 {
         };
         newton_surface(self, point, seed_u, seed_v)
     }
+
+    fn project_point_seeded(&self, point: &Point3, seed: (f64, f64)) -> SurfaceProjection {
+        match self {
+            Surface3::Nurbs(nurbs) => nurbs.project_point_seeded(point, seed),
+            // Every analytic seed above is already a closed-form global
+            // answer, so a caller's seed can only make it worse.
+            Surface3::Plane { .. }
+            | Surface3::Cylinder { .. }
+            | Surface3::Cone { .. }
+            | Surface3::Sphere { .. }
+            | Surface3::Torus { .. } => self.project_point(point),
+        }
+    }
 }
 
 impl NewtonSurface for NurbsSurface {
@@ -521,6 +555,12 @@ impl SurfaceProject for NurbsSurface {
                 }
             }
         }
+        newton_surface(self, point, seed.0, seed.1)
+    }
+
+    /// Newton straight from `seed`, skipping the per-span search. The seed
+    /// is clamped to the knot domains by [`newton_surface`]'s bounds.
+    fn project_point_seeded(&self, point: &Point3, seed: (f64, f64)) -> SurfaceProjection {
         newton_surface(self, point, seed.0, seed.1)
     }
 }

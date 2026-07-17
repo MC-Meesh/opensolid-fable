@@ -18,7 +18,7 @@ use crate::nurbs::curve::{KnotVector, NurbsError, binomial};
 use crate::surface::SurfaceEval;
 use nalgebra::Vector4;
 use opensolid_core::SYSTEM_RESOLUTION;
-use opensolid_core::types::{Point3, Vector3};
+use opensolid_core::types::{BoundingBox3, Point3, Vector3};
 
 /// Non-uniform rational B-spline surface in 3D.
 ///
@@ -119,6 +119,70 @@ impl NurbsSurface {
 
     pub fn degree_v(&self) -> usize {
         self.knots_v.degree()
+    }
+
+    /// Number of control-point rows (`u` direction) and columns (`v`).
+    pub fn grid_size(&self) -> (usize, usize) {
+        (self.knots_u.control_count(), self.knots_v.control_count())
+    }
+
+    /// Map every control point through `f`, leaving weights and knots
+    /// untouched.
+    ///
+    /// For an **affine** `f` this transforms the surface exactly:
+    /// evaluation is a weighted average of control points whose basis
+    /// weights sum to one, and affine maps commute with such averages. It
+    /// is *not* valid for a projective or otherwise non-affine `f`, which
+    /// would have to move the weights too.
+    pub fn map_control_points(&mut self, f: impl Fn(Point3) -> Point3) {
+        for p in &mut self.control_points {
+            *p = f(*p);
+        }
+    }
+
+    /// Axis-aligned box of the control hull.
+    ///
+    /// By the convex hull property of (rational, positive-weight) NURBS the
+    /// patch lies inside the convex hull of its control points, so this box
+    /// contains the whole surface. It is a *bound*, not the tight box of
+    /// the geometry, which is exactly what broad-phase culling needs: never
+    /// too tight. `None` only for an empty grid, which the constructors
+    /// reject.
+    pub fn control_hull_box(&self) -> Option<BoundingBox3> {
+        let mut points = self.control_points.iter();
+        let first = *points.next()?;
+        let (mut lo, mut hi) = (first, first);
+        for p in points {
+            lo = Point3::new(lo.x.min(p.x), lo.y.min(p.y), lo.z.min(p.z));
+            hi = Point3::new(hi.x.max(p.x), hi.y.max(p.y), hi.z.max(p.z));
+        }
+        Some(BoundingBox3::new(lo, hi))
+    }
+
+    /// Whether any point of the patch is a parameterization singularity — a
+    /// collapsed control row/column (the classic lofted-to-a-point tip),
+    /// where `|S_u × S_v|` vanishes and no limit normal exists.
+    ///
+    /// Tested at the four domain corners and the midpoint of each domain
+    /// edge, which is where a collapsed boundary row shows up. The chart
+    /// rejects such patches (they have no pole machinery analogue), so this
+    /// is a conservative gate, not a geometric classification.
+    pub fn has_degenerate_edge(&self) -> bool {
+        let (u0, u1) = self.knots_u.domain();
+        let (v0, v1) = self.knots_v.domain();
+        let (um, vm) = (0.5 * (u0 + u1), 0.5 * (v0 + v1));
+        [
+            (u0, v0),
+            (u0, vm),
+            (u0, v1),
+            (um, v0),
+            (um, v1),
+            (u1, v0),
+            (u1, vm),
+            (u1, v1),
+        ]
+        .into_iter()
+        .any(|(u, v)| self.is_singular(u, v))
     }
 
     /// Homogeneous control point `(w·P, w)` at grid position `(i, j)`.

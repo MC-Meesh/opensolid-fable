@@ -133,6 +133,11 @@ pub fn transform_body(
                 *center = transform * *center;
                 *axis = rotation * *axis;
             }
+            // A rigid transform is affine, so moving the control points
+            // moves the patch exactly; knots and weights are unaffected,
+            // leaving the parameterization (and every uv in the topology)
+            // intact.
+            Surface3::Nurbs(nurbs) => nurbs.map_control_points(|p| transform * p),
         }
     }
     Ok(())
