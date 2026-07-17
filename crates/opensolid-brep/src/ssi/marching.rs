@@ -32,8 +32,8 @@
 //! return an empty curve set, not an error.
 
 use crate::curve::{TWO_PI, plane_basis};
-use crate::nurbs::NurbsSurface;
-use crate::project::SurfaceProject;
+use crate::nurbs::{KnotVector, NurbsSurface};
+use crate::project::{SurfaceProject, span_samples};
 use crate::surface::{Surface3, SurfaceEval};
 use nalgebra::{Matrix3, Matrix4, Vector4};
 use opensolid_core::error::{CoreError, CoreResult};
@@ -68,6 +68,47 @@ trait MarchSurface: SurfaceEval + SurfaceProject {
     fn eval1(&self, u: f64, v: f64) -> (Point3, Vector3, Vector3) {
         (self.point(u, v), self.du(u, v), self.dv(u, v))
     }
+
+    /// Ascending seed-grid sample parameters spanning `[lo, hi]` along
+    /// direction `dir` (0 = `u`, 1 = `v`), always including both bounds.
+    ///
+    /// The default is [`GRID_DIVISIONS`] uniform steps, which is adequate
+    /// for a primitive: its curvature is bounded by one radius over the
+    /// whole domain, so a curve crossing the domain cannot hide between
+    /// nodes. A NURBS patch has no such bound — see the override on
+    /// [`NurbsSurface`].
+    fn seed_samples(&self, _dir: usize, bounds: (f64, f64)) -> Vec<f64> {
+        uniform_seed_samples(bounds)
+    }
+}
+
+/// [`GRID_DIVISIONS`] uniform samples across `[lo, hi]`, inclusive of both.
+fn uniform_seed_samples((lo, hi): (f64, f64)) -> Vec<f64> {
+    let n = GRID_DIVISIONS;
+    (0..=n)
+        .map(|k| lo + (hi - lo) * k as f64 / n as f64)
+        .collect()
+}
+
+/// Per-knot-span seeding for a NURBS patch, matching
+/// [`NurbsSurface::project_point`]'s sampling (`degree + 2` per span).
+///
+/// A uniform grid is not safe here. Knot spacing is arbitrary, so a patch
+/// can carry an entire intersection branch inside a span narrower than a
+/// uniform cell; the grid then samples no sign change and the branch is
+/// silently dropped. Unlike a missed *face* pair, nothing downstream
+/// catches this — the boolean is just quietly wrong. Sampling per span
+/// scales the grid with the patch's own knot structure, which is where its
+/// curvature actually lives.
+fn nurbs_seed_samples(knots: &KnotVector, degree: usize, (lo, hi): (f64, f64)) -> Vec<f64> {
+    let mut samples = vec![lo];
+    samples.extend(
+        span_samples(knots, degree + 2)
+            .into_iter()
+            .filter(|t| *t > lo && *t < hi),
+    );
+    samples.push(hi);
+    samples
 }
 
 impl MarchSurface for NurbsSurface {
@@ -76,9 +117,37 @@ impl MarchSurface for NurbsSurface {
         let d = self.derivatives(u, v, 1);
         (Point3::origin() + d[0][0], d[1][0], d[0][1])
     }
+
+    fn seed_samples(&self, dir: usize, bounds: (f64, f64)) -> Vec<f64> {
+        let (knots, degree) = if dir == 0 {
+            (self.knot_vector_u(), self.degree_u())
+        } else {
+            (self.knot_vector_v(), self.degree_v())
+        };
+        nurbs_seed_samples(knots, degree, bounds)
+    }
 }
 
-impl MarchSurface for Surface3 {}
+impl MarchSurface for Surface3 {
+    fn eval1(&self, u: f64, v: f64) -> (Point3, Vector3, Vector3) {
+        match self {
+            Surface3::Nurbs(nurbs) => nurbs.eval1(u, v),
+            _ => (self.point(u, v), self.du(u, v), self.dv(u, v)),
+        }
+    }
+
+    /// Delegates to the inner patch for [`Surface3::Nurbs`]. Without this
+    /// the per-span grid would apply only to a bare [`NurbsSurface`] and
+    /// every patch arriving through the `Surface3` dispatch — which is all
+    /// of them, from the boolean pipeline — would silently fall back to the
+    /// uniform grid this override exists to avoid.
+    fn seed_samples(&self, dir: usize, bounds: (f64, f64)) -> Vec<f64> {
+        match self {
+            Surface3::Nurbs(nurbs) => nurbs.seed_samples(dir, bounds),
+            _ => uniform_seed_samples(bounds),
+        }
+    }
+}
 
 /// One intersection curve traced by marching, as a dense polyline with
 /// the parameter preimages on both surfaces.
@@ -488,17 +557,37 @@ fn march_boxed<A: MarchSurface, B: MarchSurface>(
 ) -> CoreResult<Vec<MarchedCurve>> {
     let gap_tol = tol.linear.max(opensolid_core::SYSTEM_RESOLUTION);
 
+    // An infinite bound would make every grid parameter below infinite and
+    // every seed NaN, which then surfaces as an empty or garbage curve set
+    // rather than a failure. Callers clip unbounded primitive directions to
+    // a region of interest precisely so this cannot happen; if one did not,
+    // say so instead of marching nonsense.
+    if !domains
+        .iter()
+        .all(|(lo, hi)| lo.is_finite() && hi.is_finite())
+    {
+        return Err(CoreError::Degenerate {
+            context: "ssi::marching",
+            reason: format!(
+                "marching needs finite parameter boxes on both surfaces, got \
+                 {domains:?}; an unbounded direction must be clipped to a \
+                 region of interest first (see intersect_marched_bounded)"
+            ),
+        });
+    }
+
     // Oriented-distance samples of A's parameter grid against B. Nodes
     // where the projection fails (rare: ambiguous/singular feet) are
     // excluded from seeding.
-    let n = GRID_DIVISIONS;
-    let grid_param = |k: usize, (lo, hi): (f64, f64)| lo + (hi - lo) * k as f64 / n as f64;
-    let mut nodes = vec![None; (n + 1) * (n + 1)];
+    let us = a.seed_samples(0, domains[0]);
+    let vs = a.seed_samples(1, domains[1]);
+    let (nu, nv) = (us.len(), vs.len());
+    let mut nodes = vec![None; nu * nv];
     let mut lo = Point3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY);
     let mut hi = Point3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
-    for i in 0..=n {
-        for j in 0..=n {
-            let (u, v) = (grid_param(i, domains[0]), grid_param(j, domains[1]));
+    for i in 0..nu {
+        for j in 0..nv {
+            let (u, v) = (us[i], vs[j]);
             let pa = a.point(u, v);
             lo = Point3::new(lo.x.min(pa.x), lo.y.min(pa.y), lo.z.min(pa.z));
             hi = Point3::new(hi.x.max(pa.x), hi.y.max(pa.y), hi.z.max(pa.z));
@@ -510,7 +599,7 @@ fn march_boxed<A: MarchSurface, B: MarchSurface>(
                 continue;
             };
             let signed = (pa - proj.point).dot(&nb);
-            nodes[i * (n + 1) + j] = Some((u, v, signed, proj.u, proj.v));
+            nodes[i * nv + j] = Some((u, v, signed, proj.u, proj.v));
         }
     }
     let diameter = (hi - lo).norm();
@@ -530,9 +619,9 @@ fn march_boxed<A: MarchSurface, B: MarchSurface>(
     // Seed candidates: grid nodes already on the intersection, plus the
     // linear zero crossing of every sign-changing grid edge.
     let mut candidates: Vec<MarchState> = Vec::new();
-    let node = |i: usize, j: usize| nodes[i * (n + 1) + j];
-    for i in 0..=n {
-        for j in 0..=n {
+    let node = |i: usize, j: usize| nodes[i * nv + j];
+    for i in 0..nu {
+        for j in 0..nv {
             let Some((u, v, d0, bu, bv)) = node(i, j) else {
                 continue;
             };
@@ -541,7 +630,7 @@ fn march_boxed<A: MarchSurface, B: MarchSurface>(
                 continue;
             }
             for (i2, j2) in [(i + 1, j), (i, j + 1)] {
-                if i2 > n || j2 > n {
+                if i2 >= nu || j2 >= nv {
                     continue;
                 }
                 let Some((u2, v2, d1, bu2, bv2)) = node(i2, j2) else {
@@ -764,8 +853,8 @@ pub fn intersect_marched(
             feature: "marched SSI for this surface pair (plane/sphere/cylinder \
                       combinations have closed forms in ssi::intersect; the \
                       unbounded cone pairs — plane-cone, cylinder-cone, \
-                      cone-cone — march through ssi::intersect_marched_bounded, \
-                      not here)",
+                      cone-cone — and every NURBS pair march through \
+                      ssi::intersect_marched_bounded, not here)",
         }),
     }
 }
@@ -820,10 +909,29 @@ pub fn intersect_marched_bounded(
         // this branch). Both cones are clipped to the region sphere and one
         // is gridded against the other.
         (Cone { .. }, Cone { .. }) => march_bounded_pair(a, b, bounds, tol),
+        // Every pair involving a NURBS patch — against a primitive or
+        // against another patch. A patch has no implicit form and no closed
+        // form against anything, so marching is the only route (of-37i.4).
+        //
+        // These come here rather than to `intersect_marched` even when they
+        // look compact. A patch is always finite (its knot domain), so a
+        // NURBS-plane pair reads as "one side bounds the grid" — but the
+        // plane is still infinite, and `intersect_marched` would hand
+        // `march_boxed` that infinite side's natural domain, yielding
+        // infinite grid parameters and NaN seeds. Routing through the
+        // bounded entry clips the partner to the region of interest; a
+        // patch's own natural domain survives `clipped_domains` unchanged.
+        //
+        // Grid over the patch: its domain is finite without clipping, and
+        // its knot structure drives the per-span seeding (`seed_samples`)
+        // that a primitive partner's uniform grid would not provide.
+        (Nurbs(_), _) => march_bounded_pair(a, b, bounds, tol),
+        (_, Nurbs(_)) => Ok(swap_params(intersect_marched_bounded(b, a, bounds, tol)?)),
         _ => Err(CoreError::NotImplemented {
             feature: "bounded marched SSI for this surface pair (only the \
-                      unbounded plane-cone and cone-cone sections are marched \
-                      with an explicit region; every other pair is closed-form \
+                      unbounded plane-cone and cone-cone sections, and any \
+                      pair involving a NURBS patch, are marched with an \
+                      explicit region; every other pair is closed-form \
                       in ssi::intersect or compact-bounded in \
                       intersect_marched)",
         }),
@@ -1307,8 +1415,10 @@ mod tests {
                 let rho = (d - axis * v).norm();
                 ((rho - (radius + v * half_angle.tan())) * half_angle.cos()).abs()
             }
-            // As `analytic.rs`: no closed-form locus to measure against,
-            // and no test here builds a NURBS operand.
+            // As `analytic.rs`: no closed-form locus to measure against.
+            // The NURBS dispatch tests check their operands through
+            // `assert_marched_on_both_params` instead, which needs no
+            // implicit form.
             Surface3::Nurbs(_) => panic!("residual has no closed form for a NURBS patch"),
         }
     }
@@ -1840,5 +1950,309 @@ mod tests {
         // Exactly on the cylinder's u = ub ruling line.
         let ruling = cylinder.point(ub, p.z);
         assert!((p - ruling).norm() < 1e-14);
+    }
+
+    // -----------------------------------------------------------------
+    // NURBS dispatch (of-37i.4)
+    // -----------------------------------------------------------------
+
+    /// Acceptance for a marched pair with no implicit form on either side:
+    /// both parameter preimages reproduce every vertex, so the vertex lies
+    /// on both surfaces by construction.
+    fn assert_marched_on_both_params(curves: &[MarchedCurve], a: &Surface3, b: &Surface3) {
+        assert!(!curves.is_empty(), "expected intersection curves");
+        for (ci, curve) in curves.iter().enumerate() {
+            for (k, p) in curve.points.iter().enumerate() {
+                let (ua, va) = curve.params_a[k];
+                let (ub, vb) = curve.params_b[k];
+                assert!(
+                    (a.point(ua, va) - p).norm() <= MARCH_RESID,
+                    "curve {ci} vertex {k}: params_a do not reproduce the vertex"
+                );
+                assert!(
+                    (b.point(ub, vb) - p).norm() <= MARCH_RESID,
+                    "curve {ci} vertex {k}: params_b do not reproduce the vertex"
+                );
+            }
+        }
+    }
+
+    /// A region of interest comfortably containing the test patches.
+    fn patch_bounds() -> (Point3, f64) {
+        (Point3::new(0.0, 0.0, 1.0), 6.0)
+    }
+
+    /// GATE, checked first: an unsupported pair must name NURBS. A
+    /// fallthrough arm looks exactly like a pass — before phase 2 these
+    /// pairs reported a *cone* problem, which is why this is tested
+    /// explicitly rather than inferred from a successful march.
+    #[test]
+    fn analytic_ssi_rejects_nurbs_pairs_by_name() {
+        let tol = default_tol();
+        let patch = Surface3::nurbs(plane_patch(1.0, 0.3));
+        let plane = Surface3::Plane {
+            origin: Point3::origin(),
+            normal: Vector3::z(),
+        };
+        let cylinder = Surface3::Cylinder {
+            origin: Point3::origin(),
+            axis: Vector3::z(),
+            radius: 1.0,
+        };
+        let other = Surface3::nurbs(cylinder_patch());
+        for (a, b) in [
+            (&patch, &plane),
+            (&plane, &patch),
+            (&patch, &cylinder),
+            (&patch, &other),
+        ] {
+            let err = crate::ssi::intersect(a, b, &tol).unwrap_err();
+            let CoreError::NotImplemented { feature } = err else {
+                panic!("expected NotImplemented, got {err:?}");
+            };
+            assert!(
+                feature.contains("NURBS"),
+                "analytic SSI rejected a NURBS pair without naming NURBS: {feature}"
+            );
+            assert!(
+                !feature.contains("cone"),
+                "a NURBS pair reported a cone problem: {feature}"
+            );
+        }
+    }
+
+    /// A NURBS pair must not reach the compact-partner entry point: its
+    /// grid would be seeded over an unbounded partner's natural domain.
+    #[test]
+    fn unbounded_marched_entry_rejects_nurbs_pairs_by_name() {
+        let patch = Surface3::nurbs(cylinder_patch());
+        let plane = Surface3::Plane {
+            origin: Point3::origin(),
+            normal: Vector3::z(),
+        };
+        let err = intersect_marched(&patch, &plane, &default_tol()).unwrap_err();
+        let CoreError::NotImplemented { feature } = err else {
+            panic!("expected NotImplemented, got {err:?}");
+        };
+        assert!(feature.contains("NURBS"), "{feature}");
+    }
+
+    /// An infinite parameter box must be an honest error, not NaN seeds and
+    /// a silently empty curve set. Unreachable through the public entry
+    /// points (they clip first) — this pins the guard that makes that so.
+    #[test]
+    fn marching_rejects_an_infinite_parameter_box() {
+        let patch = cylinder_patch();
+        let err = march_boxed(
+            &patch,
+            &patch,
+            [
+                (0.0, 1.0),
+                (0.0, 1.0),
+                (f64::NEG_INFINITY, f64::INFINITY),
+                (0.0, 1.0),
+            ],
+            &default_tol(),
+        )
+        .unwrap_err();
+        let CoreError::Degenerate { reason, .. } = err else {
+            panic!("expected Degenerate, got {err:?}");
+        };
+        assert!(reason.contains("finite"), "{reason}");
+    }
+
+    /// GATE: NURBS-plane through the dispatch matches the analytic section
+    /// to `tol.linear`. The patch is an exact unit cylinder and the partner
+    /// an *infinite* analytic plane — the pair that looks compact (the patch
+    /// bounds one side) but is not.
+    #[test]
+    fn nurbs_plane_bounded_matches_analytic_ellipse() {
+        let tol = default_tol();
+        let patch = Surface3::nurbs(cylinder_patch());
+        // z = 1 + 0.3x through the cylinder: the ellipse x² + y² = 1.
+        let plane = Surface3::Plane {
+            origin: Point3::new(0.0, 0.0, 1.0),
+            normal: Vector3::new(-0.3, 0.0, 1.0).normalize(),
+        };
+        let curves = intersect_marched_bounded(&patch, &plane, patch_bounds(), &tol).unwrap();
+        assert_marched_on_both_params(&curves, &patch, &plane);
+        for curve in &curves {
+            for p in &curve.points {
+                assert!(
+                    (p.x.hypot(p.y) - 1.0).abs() <= tol.linear,
+                    "vertex {p:?} off the analytic cylinder section"
+                );
+                assert!(
+                    (p.z - (1.0 + 0.3 * p.x)).abs() <= tol.linear,
+                    "vertex {p:?} off the analytic plane section"
+                );
+            }
+        }
+        // The seam cuts the ellipse into fragments; together they must cover
+        // the full revolution.
+        let spread = curves
+            .iter()
+            .flat_map(|c| c.points.iter())
+            .map(|p| p.y.atan2(p.x))
+            .fold((f64::MAX, f64::MIN), |(lo, hi), t| (lo.min(t), hi.max(t)));
+        assert!(
+            spread.1 - spread.0 > 1.9 * std::f64::consts::PI,
+            "section does not cover the revolution: {spread:?}"
+        );
+    }
+
+    /// Both argument orders agree (the swap arm returns the preimages to
+    /// their own surfaces).
+    #[test]
+    fn nurbs_plane_bounded_is_symmetric() {
+        let tol = default_tol();
+        let patch = Surface3::nurbs(cylinder_patch());
+        let plane = Surface3::Plane {
+            origin: Point3::new(0.0, 0.0, 1.0),
+            normal: Vector3::new(-0.3, 0.0, 1.0).normalize(),
+        };
+        let forward = intersect_marched_bounded(&patch, &plane, patch_bounds(), &tol).unwrap();
+        let swapped = intersect_marched_bounded(&plane, &patch, patch_bounds(), &tol).unwrap();
+        assert_eq!(forward.len(), swapped.len());
+        assert_marched_on_both_params(&swapped, &plane, &patch);
+        for c in &swapped {
+            for (k, p) in c.points.iter().enumerate() {
+                // params_a must index the plane, params_b the patch.
+                let (ub, vb) = c.params_b[k];
+                assert!((patch.point(ub, vb) - p).norm() <= MARCH_RESID);
+            }
+        }
+    }
+
+    /// GATE: a transversal NURBS-NURBS pair yields one continuous branch
+    /// running boundary to boundary.
+    #[test]
+    fn nurbs_nurbs_bounded_single_branch_boundary_to_boundary() {
+        let tol = default_tol();
+        // Two bicubic graphs over the same [0, 3]² footprint: a flat sheet
+        // at z = 0.5, and a ramp z = x through it (the Bernstein basis has
+        // linear precision, so control heights 0..3 at x = 0..3 give exactly
+        // z = x). They cross along the single line x = 0.5 — transversal
+        // everywhere.
+        let flat = bicubic_graph([[0.5; 4]; 4]);
+        let tilt = bicubic_graph([[0.0; 4], [1.0; 4], [2.0; 4], [3.0; 4]]);
+        let a = Surface3::nurbs(flat);
+        let b = Surface3::nurbs(tilt);
+        let curves = intersect_marched_bounded(&a, &b, patch_bounds(), &tol).unwrap();
+        assert_eq!(curves.len(), 1, "expected a single branch");
+        let curve = &curves[0];
+        assert!(!curve.closed, "a boundary-to-boundary branch is open");
+        assert_marched_on_both_params(&curves, &a, &b);
+        for p in &curve.points {
+            assert!((p.x - 0.5).abs() <= tol.linear, "vertex {p:?} off x = 0.5");
+            assert!((p.z - 0.5).abs() <= tol.linear, "vertex {p:?} off z = 0.5");
+        }
+        // Boundary to boundary: the branch spans the full y footprint.
+        let (lo, hi) = curve
+            .points
+            .iter()
+            .map(|p| p.y)
+            .fold((f64::MAX, f64::MIN), |(lo, hi), y| (lo.min(y), hi.max(y)));
+        assert!(lo <= tol.linear, "branch starts short of y = 0: {lo}");
+        assert!(hi >= 3.0 - tol.linear, "branch ends short of y = 3: {hi}");
+    }
+
+    /// A degree-1 patch over `[0, 1]²` whose height dips to `-1` at a single
+    /// interior knot, `u = 0.53`, and is `+1` at `u ≤ 0.52` and `u ≥ 0.54`.
+    ///
+    /// The knots are deliberately decoupled from the control-point spacing:
+    /// the dip occupies 0.02 of the *parameter* domain but 0.6 of the patch
+    /// in `x`. That is the configuration this regression is about — the grid
+    /// samples parameters, so a feature is hidden or found by its knot
+    /// extent, not its size in space. It also keeps the two flanks 0.3 apart
+    /// in `x`, well clear of the tracer's own branch-merge distance (`2·h0`,
+    /// about 0.05 here); a dip narrow in `x` too would put both flanks
+    /// inside one merge radius and the second branch would be dropped as a
+    /// duplicate of the first — a real limit of the step size, but not the
+    /// seeding bug under test.
+    fn narrow_dip_patch() -> NurbsSurface {
+        let xs = [0.0, 0.2, 0.5, 0.8, 1.0];
+        let zs = [1.0, 1.0, -1.0, 1.0, 1.0];
+        let control_points: Vec<Vec<Point3>> = xs
+            .iter()
+            .zip(zs)
+            .map(|(&x, z)| vec![Point3::new(x, 0.0, z), Point3::new(x, 1.0, z)])
+            .collect();
+        let knots_u = KnotVector::new(1, vec![0.0, 0.0, 0.52, 0.53, 0.54, 1.0, 1.0]).unwrap();
+        let knots_v = KnotVector::clamped_uniform(1, 2).unwrap();
+        NurbsSurface::bspline(control_points, knots_u, knots_v).unwrap()
+    }
+
+    /// GATE — MISSED-BRANCH REGRESSION: an intersection branch narrower than
+    /// a uniform grid cell must still be found.
+    ///
+    /// The dip spans `u ∈ (0.52, 0.54)`, which is 0.02 wide — under a third
+    /// of a `GRID_DIVISIONS` cell (1/16 = 0.0625) — and falls strictly
+    /// between the uniform nodes at 0.5 and 0.5625, where the patch is `+1`
+    /// on both sides. A uniform grid therefore samples no sign change and
+    /// drops both branches silently: not an error, just a wrong boolean with
+    /// nothing downstream to catch it. Per-knot-span seeding samples inside
+    /// the dip's own spans and finds them.
+    #[test]
+    fn narrow_knot_span_branch_is_not_missed() {
+        let tol = default_tol();
+        let patch = Surface3::nurbs(narrow_dip_patch());
+        let plane = Surface3::Plane {
+            origin: Point3::origin(),
+            normal: Vector3::z(),
+        };
+
+        // The premise: the dip really does hide between uniform nodes.
+        for k in 0..=GRID_DIVISIONS {
+            let u = k as f64 / GRID_DIVISIONS as f64;
+            assert!(
+                patch.point(u, 0.5).z > 0.0,
+                "uniform node u = {u} already samples the dip — the test no \
+                 longer exercises a missed branch"
+            );
+        }
+
+        let curves = intersect_marched_bounded(&patch, &plane, patch_bounds(), &tol).unwrap();
+        assert_marched_on_both_params(&curves, &patch, &plane);
+        // z crosses zero on each flank of the V: at u = 0.525 and u = 0.535,
+        // which the control spacing places at x = 0.35 and x = 0.65.
+        let mut crossings: Vec<f64> = curves
+            .iter()
+            .map(|c| c.points.iter().map(|p| p.x).sum::<f64>() / c.points.len() as f64)
+            .collect();
+        crossings.sort_by(f64::total_cmp);
+        assert_eq!(crossings.len(), 2, "expected both flanks of the dip");
+        assert!(
+            (crossings[0] - 0.35).abs() <= tol.linear,
+            "first flank at {}, want 0.35",
+            crossings[0]
+        );
+        assert!(
+            (crossings[1] - 0.65).abs() <= tol.linear,
+            "second flank at {}, want 0.65",
+            crossings[1]
+        );
+    }
+
+    /// Per-span seeding must survive the `Surface3` wrapper: the boolean
+    /// pipeline never hands the marcher a bare `NurbsSurface`, so a
+    /// `Surface3::Nurbs` that fell back to the uniform grid would undo the
+    /// regression above everywhere it actually matters.
+    #[test]
+    fn surface3_nurbs_delegates_per_span_seeding() {
+        let patch = narrow_dip_patch();
+        let wrapped = Surface3::nurbs(patch.clone());
+        for dir in 0..2 {
+            assert_eq!(
+                wrapped.seed_samples(dir, (0.0, 1.0)),
+                patch.seed_samples(dir, (0.0, 1.0)),
+                "Surface3::Nurbs seeding diverges from the patch on dir {dir}"
+            );
+        }
+        // And it is genuinely not the uniform grid.
+        assert_ne!(
+            wrapped.seed_samples(0, (0.0, 1.0)),
+            uniform_seed_samples((0.0, 1.0))
+        );
     }
 }

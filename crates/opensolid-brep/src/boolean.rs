@@ -1457,18 +1457,24 @@ fn broad_phase_face_box(
     }
 }
 
-/// Signed implicit residual of `p` against a primitive's locus: zero on
-/// the surface, smooth nearby. Used to polish marched clip endpoints onto
-/// exact face-boundary junctions.
+/// Signed residual of `p` against a surface's locus: zero on the surface,
+/// smooth nearby. Used to polish marched clip endpoints onto exact
+/// face-boundary junctions.
 ///
-/// `None` for a NURBS patch, which has no implicit form. Unlike
-/// [`ray_surface_hits`], `None` is safe here: the caller reads it as "no
-/// polish available" and keeps the unpolished endpoint, costing accuracy
-/// rather than correctness. Phase 2 replaces this for NURBS with the
-/// marcher's two-surface Newton corrector.
+/// Closed-form for the primitives. A NURBS patch has no implicit form, so
+/// it uses the same signed projection distance the marcher seeds its grid
+/// with — `(p − foot) · n̂(foot)` — which is the exact signed distance to
+/// the patch wherever the foot is unique, and whose zero set is the patch
+/// itself. `None` when the projection does not converge (or the foot is
+/// singular): the caller reads it as "no polish available" and keeps the
+/// unpolished endpoint, costing accuracy rather than correctness.
 fn surface_residual(s: &Surface3, p: &Point3) -> Option<f64> {
     match *s {
-        Surface3::Nurbs(_) => None,
+        Surface3::Nurbs(_) => {
+            let proj = s.project_point(p);
+            let n = proj.converged.then(|| s.normal(proj.u, proj.v))??;
+            Some((p - proj.point).dot(&n))
+        }
         Surface3::Plane { origin, normal } => Some(normal.dot(&(p - origin))),
         Surface3::Sphere { center, radius, .. } => Some((p - center).norm() - radius),
         Surface3::Cylinder {
@@ -1510,15 +1516,22 @@ fn surface_residual(s: &Surface3, p: &Point3) -> Option<f64> {
 
 /// Spatial gradient of [`surface_residual`] at `p` (the unit normal of the
 /// residual's level set). `None` on the residual's singular sets (axis,
-/// center, tube centerline) and for NURBS (no implicit form), where the
+/// center, tube centerline) and where a NURBS projection fails, so the
 /// polish gives up.
+///
+/// For NURBS this is the patch's unit normal at the foot: the gradient of a
+/// signed distance function is the unit normal of the level set through the
+/// foot, which is exactly the surface normal there.
 fn surface_residual_gradient(s: &Surface3, p: &Point3) -> Option<Vector3> {
     let unit = |v: Vector3| {
         let n = v.norm();
         (n > f64::MIN_POSITIVE).then(|| v / n)
     };
     match *s {
-        Surface3::Nurbs(_) => None,
+        Surface3::Nurbs(_) => {
+            let proj = s.project_point(p);
+            proj.converged.then(|| s.normal(proj.u, proj.v))?
+        }
         Surface3::Plane { normal, .. } => Some(normal),
         Surface3::Sphere { center, .. } => unit(p - center),
         Surface3::Cylinder { origin, axis, .. } => {
@@ -1582,18 +1595,29 @@ fn marched_ssi_supported(a: &Surface3, b: &Surface3) -> bool {
 }
 
 /// Whether the pair is marched through [`intersect_marched_bounded`] with an
-/// explicit region: plane-cone (either order) or cone-cone. Both involve an
-/// unbounded section with no [`Curve3`] closed form — the plane-cone
-/// parabola/hyperbola/generator branch and the general-position cone-cone
-/// quartic. Their closed-form configurations (plane-cone circle, ellipse,
-/// generator lines, apex-only contact; coaxial cone-cone circle) are exact in
-/// [`ssi_intersect`], so this arm is reached only for the not-yet-representable
-/// branch.
+/// explicit region: plane-cone (either order), cone-cone, or any pair
+/// involving a NURBS patch. The cone pairs involve an unbounded section with
+/// no [`Curve3`] closed form — the plane-cone parabola/hyperbola/generator
+/// branch and the general-position cone-cone quartic. Their closed-form
+/// configurations (plane-cone circle, ellipse, generator lines, apex-only
+/// contact; coaxial cone-cone circle) are exact in [`ssi_intersect`], so those
+/// arms are reached only for the not-yet-representable branch.
+///
+/// A NURBS pair has no closed form at all, so it always lands here (of-37i.4).
+/// Note this is deliberately the *bounded* route even for a patch against a
+/// compact primitive: the patch's partner may still be unbounded, and
+/// [`marched_ssi_supported`] must keep reporting `false` for NURBS so the
+/// pipeline does not send it to [`intersect_marched`] first — that path would
+/// grid an infinite domain.
 fn is_bounded_marched(a: &Surface3, b: &Surface3) -> bool {
     use Surface3::*;
     matches!(
         (a, b),
-        (Plane { .. }, Cone { .. }) | (Cone { .. }, Plane { .. }) | (Cone { .. }, Cone { .. })
+        (Plane { .. }, Cone { .. })
+            | (Cone { .. }, Plane { .. })
+            | (Cone { .. }, Cone { .. })
+            | (Nurbs(_), _)
+            | (_, Nurbs(_))
     )
 }
 

@@ -360,7 +360,7 @@ impl CurveProject for Curve3 {
 /// Sample parameters covering every non-empty knot span inside the domain:
 /// `per_span` evenly spaced values from each span start (inclusive), plus
 /// the domain end.
-fn span_samples(knots: &KnotVector, per_span: usize) -> Vec<f64> {
+pub(crate) fn span_samples(knots: &KnotVector, per_span: usize) -> Vec<f64> {
     let (t0, t1) = knots.domain();
     let mut samples = Vec::new();
     for window in knots.knots().windows(2) {

@@ -26,6 +26,11 @@
 //! The sphere/torus pairs' general positions march instead: see
 //! [`super::intersect_marched`].
 //!
+//! Coverage here is *analytic* by definition, so a [`Surface3::Nurbs`] pair
+//! is never in it: a patch has no implicit form and no closed-form section
+//! against anything. Those pairs are rejected by name and march through
+//! [`super::intersect_marched_bounded`].
+//!
 //! All classification comparisons (parallelism, tangency, coincidence) go
 //! through the caller's [`ToleranceContext`], per the kernel tolerance
 //! model.
@@ -122,6 +127,18 @@ pub fn intersect(
         (Torus { .. }, Cylinder { .. }) => cylinder_torus(b, a, tol),
         (Torus { .. }, Torus { .. }) => torus_torus(a, b, tol),
         (Cone { .. }, Cone { .. }) => cone_cone(a, b, tol),
+        // A NURBS patch has no implicit form and its intersection with
+        // anything — including a plane — is not expressible with the
+        // current `Curve3` variants, so there is no analytic arm to write:
+        // every NURBS pair marches through
+        // [`super::intersect_marched_bounded`]. This arm exists to say so;
+        // without it these pairs fall through to the cone message below and
+        // report a cone problem for a surface that is not a cone.
+        (Nurbs(_), _) | (_, Nurbs(_)) => Err(CoreError::NotImplemented {
+            feature: "analytic SSI against a NURBS patch (no closed form; \
+                      NURBS pairs are marched through \
+                      ssi::intersect_marched_bounded)",
+        }),
         _ => Err(CoreError::NotImplemented {
             feature: "analytic SSI for cone pairs other than plane-cone \
                       and coaxial cone-cone",
