@@ -52,7 +52,7 @@ use opensolid_core::mesh::TriangleMesh;
 use opensolid_core::tolerance::ToleranceContext;
 use opensolid_core::types::{BoundingBox3, Point3, Vector3};
 use opensolid_kernel::{MeshOptions, MeshSdf, mass_properties, mesh_sdf_indexed};
-use std::f64::consts::{FRAC_PI_2, PI};
+use std::f64::consts::{FRAC_PI_2, FRAC_PI_4, PI};
 
 fn tol() -> ToleranceContext {
     ToleranceContext::default()
@@ -2581,4 +2581,85 @@ fn no_panics_on_cone_configurations() {
             }
         }
     }
+}
+
+// =====================================================================
+// (10) Coincident surfaces carrying disjoint trims (of-bxl.2)
+// =====================================================================
+
+/// Two unit blocks set corner to corner, `gap` apart in y. Their `x = 1`
+/// planes are coincident, as are their `z = 0` and `z = 1` planes, but on
+/// every one of those planes the two trimmed regions miss each other — so
+/// the union is ordinary transversal work (here, two disjoint cubes).
+///
+/// SSI decides coincidence from the *infinite* surfaces and never consults
+/// the trims, so before of-bxl.2 each of those pairs was rejected outright.
+///
+/// `tilt` rotates both operands 45° about z. That is the load-bearing
+/// variant: axis-aligned coplanar faces this far apart never even reach SSI,
+/// because their bounding boxes are tight and the broad phase separates
+/// them. Tilting fattens each face's axis-aligned box (a planar face is
+/// boxed from its boundary samples and dilated by a fraction of its extent,
+/// see `broad_phase_face_box`), so the boxes overlap, the pair reaches SSI,
+/// and only the trim test can tell the configuration apart.
+fn coplanar_disjoint_blocks(gap: f64, tilt: bool, context: &str) {
+    let mut scene = Scene::new();
+    let a = scene.block([0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
+    let b = scene.block([1.0, 1.0 + gap, 0.0], [2.0, 2.0 + gap, 1.0]);
+    if tilt {
+        let rot = Rotation3::from_axis_angle(&Unit::new_normalize(Vector3::z()), FRAC_PI_4);
+        scene.rotate(a, &rot, &Point3::origin());
+        scene.rotate(b, &rot, &Point3::origin());
+    }
+    let out = scene
+        .unite(a, b)
+        .unwrap_or_else(|e| panic!("{context}: unite rejected a transversal pair: {e:?}"));
+    // Two unit cubes that touch nowhere: the union keeps both whole.
+    assert_close(volume(&out, context), 2.0, PLANAR_VOLUME_RTOL, context);
+}
+
+#[test]
+fn coplanar_disjoint_faces_unite_near_miss() {
+    coplanar_disjoint_blocks(0.05, false, "coplanar faces 0.05 apart");
+}
+
+#[test]
+fn coplanar_disjoint_faces_unite_clear_miss() {
+    coplanar_disjoint_blocks(0.2, false, "coplanar faces 0.2 apart");
+}
+
+#[test]
+fn coplanar_disjoint_faces_unite_near_miss_tilted() {
+    coplanar_disjoint_blocks(0.05, true, "coplanar faces 0.05 apart, tilted 45°");
+}
+
+#[test]
+fn coplanar_disjoint_faces_unite_clear_miss_tilted() {
+    coplanar_disjoint_blocks(0.2, true, "coplanar faces 0.2 apart, tilted 45°");
+}
+
+/// The same pair pushed together until the two blocks touch along exactly
+/// one vertical edge. The `x = 1` planes are still coincident, and their
+/// trims now meet — but in a line, i.e. zero area — so there is still
+/// nothing to imprint and the target must come through whole.
+///
+/// Only `subtract` is asserted here, and deliberately so:
+/// - `unite` of this pair is legitimately NON-MANIFOLD (the cubes stay two
+///   shells joined at the shared edge's two endpoints, which `check`
+///   reports as `VertexSharedBetweenShells`). That it returns `Ok` with an
+///   unusable body rather than rejecting is of-n5g — the edge-contact
+///   degeneracy, not this gate's business.
+/// - `intersect` is empty, which the kernel reports as `SolidWithoutShells`
+///   for *any* disjoint pair (verified against fully separated blocks),
+///   coincident faces or not.
+#[test]
+fn edge_adjacent_blocks_subtract_leaves_target_whole() {
+    let context = "blocks touching along one edge, subtract";
+    let mut scene = Scene::new();
+    let a = scene.block([0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
+    let b = scene.block([1.0, 1.0, 0.0], [2.0, 2.0, 1.0]);
+    let out = scene
+        .subtract(a, b)
+        .unwrap_or_else(|e| panic!("{context}: rejected a zero-area contact: {e:?}"));
+    assert_close(volume(&out, context), 1.0, PLANAR_VOLUME_RTOL, context);
 }
