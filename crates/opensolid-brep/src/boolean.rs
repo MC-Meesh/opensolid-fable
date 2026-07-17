@@ -899,8 +899,8 @@ const POLE_REL_EPS: f64 = 1e-9;
 ///
 /// This is the one chart inverse that can fail, and it must be allowed to.
 /// `p` is *assumed* to lie on the patch, so a converged projection lands on
-/// it to within float noise; a residual above `linear_tol` means the
-/// assumption was false. Both that and non-convergence return an error
+/// it to within float noise; a residual beyond `tol` means the assumption
+/// was false. Both that and non-convergence return an error
 /// rather than a best guess, because the caller cannot tell a wrong uv from
 /// a right one — it just embeds it in a region polygon and produces a solid
 /// with silently wrong parity.
@@ -1106,13 +1106,19 @@ fn crosses_upward(a: (f64, f64), b: (f64, f64), p: (f64, f64)) -> bool {
 }
 
 /// Map a 3D polyline into a face's parameter space with angle unwrapping.
-fn map_polyline(chart: &Chart, points: &[Point3]) -> Vec<(f64, f64)> {
+///
+/// Each point is inverted with the previous one as its hint, which unwraps
+/// angles on the analytic charts and seeds Newton on a NURBS one.
+///
+/// # Errors
+/// Propagates [`Chart::param`]'s failure to invert a point (NURBS only).
+fn map_polyline(chart: &Chart, points: &[Point3]) -> CoreResult<Vec<(f64, f64)>> {
     let mut out: Vec<(f64, f64)> = Vec::with_capacity(points.len());
     for p in points {
         let hint = out.last().copied();
-        out.push(chart.param(p, hint));
+        out.push(chart.param(p, hint)?);
     }
-    out
+    Ok(out)
 }
 
 /// Angular slack under which a walk's departure meridian from a sphere
@@ -1170,25 +1176,33 @@ impl<'c> CoverEmbedder<'c> {
     /// Embed the walk's next point, appending one cover point — or two
     /// when this point leaves a pole (the departure end of the pole row,
     /// carrying the pole's 3D point, precedes it).
-    fn push(&mut self, p: Point3, out: &mut Vec<CoverPoint>) {
+    ///
+    /// # Errors
+    /// Propagates [`Chart::param`]'s failure to invert `p` (NURBS only).
+    fn push(&mut self, p: Point3, out: &mut Vec<CoverPoint>) -> CoreResult<()> {
         if let Some(vp) = self.chart.pole_v(&p) {
             let u = self.last_uv.map_or(0.0, |(u, _)| u);
             out.push(((u, vp), p));
             self.last_uv = Some((u, vp));
             self.at_pole = Some((vp, p));
-            return;
+            return Ok(());
         }
         let uv = if let Some((vp, pole_pt)) = self.at_pole.take() {
             let (u_in, _) = self.last_uv.expect("standing on a pole implies a uv");
-            let (raw_u, v) = self.chart.param(&p, None);
+            // No hint: leaving a pole, the previous uv's longitude is the
+            // arrival meridian, which is precisely what must not bias the
+            // departure meridian being recovered here. Only pole-bearing
+            // charts reach this branch, and none of them are NURBS.
+            let (raw_u, v) = self.chart.param(&p, None)?;
             let u_out = self.pole_row_u_out(u_in, raw_u, vp);
             out.push(((u_out, vp), pole_pt));
             (u_out, v)
         } else {
-            self.chart.param(&p, self.last_uv)
+            self.chart.param(&p, self.last_uv)?
         };
         out.push((uv, p));
         self.last_uv = Some(uv);
+        Ok(())
     }
 
     /// The `u` of a pole row's departure end: sweep from the arrival
@@ -1253,6 +1267,11 @@ impl<'c> CoverEmbedder<'c> {
 
 /// Which solid an entity belongs to.
 type SolidTag = usize; // 0 = A, 1 = B
+
+/// One sample's parameters on both hosts of an imprint: `(uv_on_a,
+/// uv_on_b)`. Carried from sample to sample through [`clip_imprint`] as
+/// the next inversion's hint.
+type HostUv = ((f64, f64), (f64, f64));
 
 /// A curve in the global split network: an original edge of one solid or
 /// an imprint shared by one face of each solid.
@@ -1591,7 +1610,7 @@ fn boolean(
     let solid_b = extract_solid(store, geo, b, "b")?;
     let mut pipe = Pipeline::new(&solid_a, &solid_b, tol)?;
     pipe.find_imprints()?;
-    pipe.collect_splits();
+    pipe.collect_splits()?;
     let (atoms, atoms_by_source) = pipe.build_atoms();
     pipe.reconstruct(op, atoms, atoms_by_source)
 }
@@ -1615,7 +1634,7 @@ impl<'a> Pipeline<'a> {
         let mut face_polys: [Vec<FaceRegionPoly>; 2] = [Vec::new(), Vec::new()];
         for s in 0..2 {
             for face in &solids[s].faces {
-                let chart = Chart::build(&face.surface)?;
+                let chart = Chart::build(&face.surface, tol)?;
                 let mut loops = Vec::new();
                 for lp in &face.loops {
                     let mut pts3: Vec<Point3> = Vec::new();
@@ -1630,7 +1649,7 @@ impl<'a> Pipeline<'a> {
                     let mut emb = CoverEmbedder::new(&chart, face.outward_along_normal);
                     let mut cover: Vec<CoverPoint> = Vec::with_capacity(pts3.len());
                     for p in pts3 {
-                        emb.push(p, &mut cover);
+                        emb.push(p, &mut cover)?;
                     }
                     loops.push(cover);
                 }
@@ -1699,7 +1718,7 @@ impl<'a> Pipeline<'a> {
                                           intersection curves (transversal MVP)",
                             });
                         }
-                        self.clip_imprint(&ic.curve, fa, fb, box_a, box_b);
+                        self.clip_imprint(&ic.curve, fa, fb, box_a, box_b)?;
                     }
                 }
                 // Analytic SSI classifies the special configurations of the
@@ -1711,7 +1730,7 @@ impl<'a> Pipeline<'a> {
                 Err(CoreError::NotImplemented { .. }) if marched_ssi_supported(sa, sb) => {
                     for mc in intersect_marched(sa, sb, &self.tol)? {
                         for curve in self.marched_polylines(mc, sa, sb) {
-                            self.clip_imprint(&curve, fa, fb, box_a, box_b);
+                            self.clip_imprint(&curve, fa, fb, box_a, box_b)?;
                         }
                     }
                 }
@@ -1727,7 +1746,7 @@ impl<'a> Pipeline<'a> {
                     let bounds = (joint.center(), 0.5 * joint.extents().norm());
                     for mc in intersect_marched_bounded(sa, sb, bounds, &self.tol)? {
                         for curve in self.marched_polylines(mc, sa, sb) {
-                            self.clip_imprint(&curve, fa, fb, box_a, box_b);
+                            self.clip_imprint(&curve, fa, fb, box_a, box_b)?;
                         }
                     }
                 }
@@ -1854,6 +1873,12 @@ impl<'a> Pipeline<'a> {
 
     /// Clip one SSI curve to both face regions; store surviving pieces as
     /// imprints.
+    ///
+    /// # Errors
+    /// Propagates [`Chart::param`]'s failure to invert a sample onto either
+    /// host face (NURBS hosts only), which aborts the boolean to the F-Rep
+    /// fallback rather than clipping against a wrongly-parameterized
+    /// region.
     fn clip_imprint(
         &mut self,
         curve: &Curve3,
@@ -1861,7 +1886,7 @@ impl<'a> Pipeline<'a> {
         fb: usize,
         box_a: &BoundingBox3,
         box_b: &BoundingBox3,
-    ) {
+    ) -> CoreResult<()> {
         // Sampling stations: the full period for closed conics, a bbox
         // slab clip for lines, the vertices for (marched) polylines. For
         // closed curves the stations cover one period without repeating
@@ -1870,7 +1895,7 @@ impl<'a> Pipeline<'a> {
             Curve3::Line { origin, dir } => {
                 let joint = box_a.intersection(box_b);
                 let Some((t_lo, t_hi)) = clip_line_to_box(origin, dir, &joint) else {
-                    return;
+                    return Ok(());
                 };
                 let n = IMPRINT_LINE_SAMPLES;
                 let ts = (0..=n)
@@ -1898,14 +1923,33 @@ impl<'a> Pipeline<'a> {
                 (ts, true, TWO_PI)
             }
         };
-        let inside = |t: f64| -> bool {
+        // Seeded by the previous station's parameters, and returning this
+        // station's so the caller can chain them. The seed is not an
+        // optimization: on a NURBS host an unseeded projection of a patch
+        // that approaches itself can converge onto the wrong sheet, and a
+        // wrong uv here clips the imprint against the wrong region.
+        let inside = |t: f64, hint: Option<HostUv>| -> CoreResult<(bool, HostUv)> {
             let p = curve.point(t);
-            let pa = self.face_polys[0][fa].chart.param(&p, None);
-            let pb = self.face_polys[1][fb].chart.param(&p, None);
-            self.face_polys[0][fa].contains_for_clip(pa, self.snap)
-                && self.face_polys[1][fb].contains_for_clip(pb, self.snap)
+            let (hint_a, hint_b) = match hint {
+                Some((a, b)) => (Some(a), Some(b)),
+                None => (None, None),
+            };
+            let pa = self.face_polys[0][fa].chart.param(&p, hint_a)?;
+            let pb = self.face_polys[1][fb].chart.param(&p, hint_b)?;
+            let is_inside = self.face_polys[0][fa].contains_for_clip(pa, self.snap)
+                && self.face_polys[1][fb].contains_for_clip(pb, self.snap);
+            Ok((is_inside, (pa, pb)))
         };
-        let flags: Vec<bool> = ts.iter().map(|&t| inside(t)).collect();
+        // Walked in station order so each inversion seeds the next.
+        let mut flags: Vec<bool> = Vec::with_capacity(ts.len());
+        let mut station_uv: Vec<HostUv> = Vec::with_capacity(ts.len());
+        let mut hint = None;
+        for &t in &ts {
+            let (is_inside, uv) = inside(t, hint)?;
+            flags.push(is_inside);
+            station_uv.push(uv);
+            hint = Some(uv);
+        }
 
         if closed_curve && flags.iter().all(|&f| f) {
             // Entire ring inside both regions.
@@ -1918,7 +1962,7 @@ impl<'a> Pipeline<'a> {
                     closed: true,
                 },
             });
-            return;
+            return Ok(());
         }
 
         // Extract maximal inside runs; refine both ends by bisection.
@@ -1972,7 +2016,10 @@ impl<'a> Pipeline<'a> {
                 if closed_curve && t_out > t_in {
                     t_out -= period;
                 }
-                let p = curve.point(refine_crossing(&inside, t_out, t_in));
+                // Seed from the run's first station: it is inside, so its
+                // parameters are on the sheet the crossing belongs to.
+                let t = refine_clip_crossing(&inside, t_out, t_in, Some(station_uv[first_idx]))?;
+                let p = curve.point(t);
                 pts.push(if marched {
                     self.polish_clip_endpoint(p, fa, fb)
                 } else {
@@ -1989,7 +2036,8 @@ impl<'a> Pipeline<'a> {
                 if closed_curve && t_out < t_in {
                     t_out += period;
                 }
-                let p = curve.point(refine_crossing(&inside, t_out, t_in));
+                let t = refine_clip_crossing(&inside, t_out, t_in, Some(station_uv[last_idx]))?;
+                let p = curve.point(t);
                 pts.push(if marched {
                     self.polish_clip_endpoint(p, fa, fb)
                 } else {
@@ -2034,6 +2082,7 @@ impl<'a> Pipeline<'a> {
                 });
             }
         }
+        Ok(())
     }
 
     /// Polish a marched imprint's clip endpoint onto the exact junction it
@@ -2125,7 +2174,11 @@ impl<'a> Pipeline<'a> {
     /// that wraps the axis crosses once (plus backtracking pairs); a
     /// winding-0 ring straddling the seam crosses an even number of times
     /// and becomes that many chords (of-43n).
-    fn collect_splits(&mut self) {
+    /// # Errors
+    /// Propagates [`Chart::param`]'s failure to invert an imprint sample
+    /// while scanning for seam crossings (NURBS hosts only — and a NURBS
+    /// chart has no seam, so it is not scanned at all).
+    fn collect_splits(&mut self) -> CoreResult<()> {
         self.snap_imprint_endpoints_to_poles();
         let mut events: Vec<(CurveSource, Point3)> = Vec::new();
         let mut barriers: Vec<((SolidTag, usize), Point3)> = Vec::new();
@@ -2200,7 +2253,7 @@ impl<'a> Pipeline<'a> {
                     if period.is_none() {
                         continue;
                     }
-                    for seam_point in seam_crossings(fp, &imp.curve, &imp.sampled.points, axis) {
+                    for seam_point in seam_crossings(fp, &imp.curve, &imp.sampled.points, axis)? {
                         events.push((CurveSource::Imprint { index: ii }, seam_point));
                         // Exact-curve edge matching: sphere/torus seam edges
                         // are circular arcs whose sampled polylines sag far
@@ -2219,6 +2272,7 @@ impl<'a> Pipeline<'a> {
         for (key, p) in barriers {
             self.seam_barriers.entry(key).or_default().push(p);
         }
+        Ok(())
     }
 
     /// Canonicalize open imprints that terminate at a sphere pole of a
@@ -2473,7 +2527,7 @@ impl<'a> Pipeline<'a> {
                     if flip {
                         darts = reverse_chain(&darts);
                     }
-                    cycles.push(embed_cycle(face_poly, &atoms, darts));
+                    cycles.push(embed_cycle(face_poly, &atoms, darts)?);
                 }
                 let mut regions = vec![Region { cycles }];
 
@@ -2568,21 +2622,28 @@ impl<'a> Pipeline<'a> {
                     if t <= ambiguous {
                         // Would mean the sample point lies on this surface;
                         // only ambiguous if it is actually on the face.
-                        let uv = fp.localize(fp.chart.param(p, None));
+                        let uv = fp.localize(fp.chart.param(p, None)?);
                         if fp.contains(uv) {
                             continue 'dirs;
                         }
                         continue;
                     }
                     let hit = p + dir * t;
+                    // No hint exists here, and none is invented: ray hits
+                    // arrive independently, with no walk to inherit a
+                    // previous uv from. That costs nothing today because
+                    // `ray_surface_hits` rejects NURBS above, so this is
+                    // reached only on analytic charts, whose inverses are
+                    // closed-form and ignore the hint anyway. of-37i.5
+                    // classifies NURBS operands by the F-Rep sign test
+                    // instead of reaching here at all.
+                    let (nu, nv) = fp.chart.param(&hit, None)?;
                     // Grazing incidence: retry with another direction.
-                    let (nu, nv) = fp.chart.param(&hit, None);
                     let n = fp.chart.normal(nu, nv);
                     if n.dot(&dir).abs() < 1e-6 {
                         continue 'dirs;
                     }
-                    let uv = fp.localize(fp.chart.param(&hit, None));
-                    if !fp.contains(uv) {
+                    if !fp.contains(fp.localize((nu, nv))) {
                         continue;
                     }
                     // Near a region boundary: retry.
@@ -2745,6 +2806,34 @@ fn refine_crossing(inside: &dyn Fn(f64) -> bool, mut t_out: f64, mut t_in: f64) 
         }
     }
     0.5 * (t_out + t_in)
+}
+
+/// [`refine_crossing`] for the imprint clip, whose predicate inverts each
+/// sample onto both host charts and so can both fail and want a seed.
+///
+/// `hint` seeds the first sample; each sample then seeds the next, which is
+/// a good seed by construction since the bisection converges.
+///
+/// # Errors
+/// Propagates `inside`'s failure to invert a sample (NURBS hosts only).
+fn refine_clip_crossing(
+    inside: &dyn Fn(f64, Option<HostUv>) -> CoreResult<(bool, HostUv)>,
+    mut t_out: f64,
+    mut t_in: f64,
+    hint: Option<HostUv>,
+) -> CoreResult<f64> {
+    let mut hint = hint;
+    for _ in 0..CLIP_REFINE_ITERATIONS {
+        let mid = 0.5 * (t_out + t_in);
+        let (is_inside, uv) = inside(mid, hint)?;
+        hint = Some(uv);
+        if is_inside {
+            t_in = mid;
+        } else {
+            t_out = mid;
+        }
+    }
+    Ok(0.5 * (t_out + t_in))
 }
 
 /// Distance from `p` to a polyline (closed if `closed`).
@@ -2935,13 +3024,18 @@ impl SeamAxis {
 /// edge. A sample landing exactly on a level registers its crossing from
 /// both adjacent segments; `split_sampled`'s snap merge deduplicates the
 /// repeat downstream.
+/// # Errors
+/// Propagates [`Chart::param`]'s failure to invert a sample. A NURBS chart
+/// has no seam to cross, so it yields an empty set rather than an error:
+/// both its periods are `None`, and the caller only scans axes that have
+/// one.
 fn seam_crossings(
     face_poly: &FaceRegionPoly,
     curve: &Curve3,
     points: &[Point3],
     axis: SeamAxis,
-) -> Vec<Point3> {
-    let uv = map_polyline(&face_poly.chart, points);
+) -> CoreResult<Vec<Point3>> {
+    let uv = map_polyline(&face_poly.chart, points)?;
     // Closing segment: unwrap the first point relative to the last.
     let close_w = {
         let mut w = axis.coord(uv[0]);
@@ -2997,12 +3091,12 @@ fn seam_crossings(
                     level,
                     (uv[i], w1),
                     (&p0, &p1),
-                ));
+                )?);
             }
         }
         level += TWO_PI;
     }
-    crossings
+    Ok(crossings)
 }
 
 /// Refine a seam crossing bracketed by consecutive imprint samples
@@ -3010,6 +3104,10 @@ fn seam_crossings(
 /// coordinate at `p1`, straddling `level`) to a point on the exact
 /// `curve` at axis coordinate `level`, by bisecting `w(t) = level` over
 /// the curve-parameter bracket recovered by closest-point projection.
+///
+/// # Errors
+/// Propagates [`Chart::param`]'s failure to invert a bracket sample. Only
+/// reachable on a chart with a seam, so never on a NURBS one.
 fn refine_seam_point(
     chart: &Chart,
     curve: &Curve3,
@@ -3017,7 +3115,7 @@ fn refine_seam_point(
     level: f64,
     (hint_uv, w1): ((f64, f64), f64),
     (p0, p1): (&Point3, &Point3),
-) -> Point3 {
+) -> CoreResult<Point3> {
     let w0 = axis.coord(hint_uv);
     let t0 = curve.project_point(p0).t;
     let mut t1 = curve.project_point(p1).t;
@@ -3030,25 +3128,27 @@ fn refine_seam_point(
     }
     // Angles along the bracket stay within a sample step of `hint_uv`,
     // far inside the ±π unwrap window of the hint.
-    let residual = |t: f64| axis.coord(chart.param(&curve.point(t), Some(hint_uv))) - level;
+    let residual = |t: f64| -> CoreResult<f64> {
+        Ok(axis.coord(chart.param(&curve.point(t), Some(hint_uv))?) - level)
+    };
     let (mut fa, fb) = (w0 - level, w1 - level);
     if fa == 0.0 {
-        return curve.point(t0);
+        return Ok(curve.point(t0));
     }
     if fb == 0.0 {
-        return curve.point(t1);
+        return Ok(curve.point(t1));
     }
     if fa * fb > 0.0 || t1 <= t0 {
         // Projection disagrees with the polyline bracketing (degenerate
         // segment); fall back to the chord point.
-        return *p0 + (*p1 - *p0) * ((level - w0) / (w1 - w0));
+        return Ok(*p0 + (*p1 - *p0) * ((level - w0) / (w1 - w0)));
     }
     let (mut ta, mut tb) = (t0, t1);
     for _ in 0..CLIP_REFINE_ITERATIONS {
         let tm = 0.5 * (ta + tb);
-        let fm = residual(tm);
+        let fm = residual(tm)?;
         if fm == 0.0 {
-            return curve.point(tm);
+            return Ok(curve.point(tm));
         }
         if (fm > 0.0) == (fa > 0.0) {
             ta = tm;
@@ -3057,7 +3157,7 @@ fn refine_seam_point(
             tb = tm;
         }
     }
-    curve.point(0.5 * (ta + tb))
+    Ok(curve.point(0.5 * (ta + tb)))
 }
 
 // ---------------------------------------------------------------------
@@ -3116,12 +3216,15 @@ fn dart_endpoints(atom: &Atom, forward: bool) -> (Point3, Point3) {
 /// unwrapping along the walk, ring atoms rotated to start where the walk
 /// stands, and the finished polyline shifted whole periods so every cycle
 /// of a face shares one cover window.
+/// # Errors
+/// Propagates [`Chart::param`]'s failure to invert a walk point (NURBS
+/// hosts only).
 fn embed_walk(
     face_poly: &FaceRegionPoly,
     atoms: &[Atom],
     darts: &[(usize, bool)],
     keep_final: bool,
-) -> (Vec<CoverPoint>, Vec<usize>) {
+) -> CoreResult<(Vec<CoverPoint>, Vec<usize>)> {
     let mut poly: Vec<((f64, f64), Point3)> = Vec::new();
     let mut offsets = Vec::with_capacity(darts.len());
     let mut walk_pos: Option<Point3> = None;
@@ -3163,7 +3266,7 @@ fn embed_walk(
             if first {
                 initial_pole = face_poly.chart.pole_v(p);
             }
-            emb.push(*p, &mut poly);
+            emb.push(*p, &mut poly)?;
             if j == 0 {
                 // The dart's vertex is the point itself — when it leaves a
                 // pole, the departure end of the pole row is emitted just
@@ -3278,7 +3381,7 @@ fn embed_walk(
             }
         }
     }
-    (poly, offsets)
+    Ok((poly, offsets))
 }
 
 fn shoelace(poly: &[((f64, f64), Point3)]) -> f64 {
@@ -3292,15 +3395,17 @@ fn shoelace(poly: &[((f64, f64), Point3)]) -> f64 {
         .sum::<f64>()
 }
 
-fn embed_cycle(face_poly: &FaceRegionPoly, atoms: &[Atom], darts: DartChain) -> Cycle {
-    let (poly, dart_offsets) = embed_walk(face_poly, atoms, &darts, false);
+/// # Errors
+/// Propagates [`embed_walk`]'s failure to invert a cycle point.
+fn embed_cycle(face_poly: &FaceRegionPoly, atoms: &[Atom], darts: DartChain) -> CoreResult<Cycle> {
+    let (poly, dart_offsets) = embed_walk(face_poly, atoms, &darts, false)?;
     let area = shoelace(&poly);
-    Cycle {
+    Ok(Cycle {
         darts,
         poly,
         area,
         dart_offsets,
-    }
+    })
 }
 
 fn reverse_chain(darts: &[(usize, bool)]) -> DartChain {
@@ -3553,17 +3658,22 @@ fn apply_chain(
     chain: DartChain,
     snap: f64,
 ) -> CoreResult<()> {
-    let (chain_poly, _) = embed_walk(face_poly, atoms, &chain, true);
+    let (chain_poly, _) = embed_walk(face_poly, atoms, &chain, true)?;
     let period = (face_poly.chart.period_u(), face_poly.chart.period_v());
-    // Arc-length metric evaluated at the chain's mean minor angle / latitude
-    // — the axis scales only vary with `v` on sphere/torus charts, and this
-    // band is narrow enough for a representative `v` to hold.
-    let rep_v = if chain_poly.is_empty() {
-        0.0
+    // Arc-length metric evaluated at the chain's mean parameters — the
+    // axis scales vary only with `v` on sphere/torus charts, and with both
+    // axes on a NURBS one, but this band is narrow enough for a
+    // representative point to hold either way.
+    let rep_uv = if chain_poly.is_empty() {
+        (0.0, 0.0)
     } else {
-        chain_poly.iter().map(|((_, v), _)| v).sum::<f64>() / chain_poly.len() as f64
+        let n = chain_poly.len() as f64;
+        let (su, sv) = chain_poly
+            .iter()
+            .fold((0.0, 0.0), |(su, sv), ((u, v), _)| (su + u, sv + v));
+        (su / n, sv / n)
     };
-    let scale = face_poly.chart.uv_scale(rep_v);
+    let scale = face_poly.chart.uv_scale(rep_uv);
     // Locate the host region and split vertices. Endpoint proximity alone
     // cannot decide either — a seam chord's endpoints coincide in 3D with
     // vertex copies on EVERY region bordering the seam at those points,
@@ -3576,7 +3686,7 @@ fn apply_chain(
     // slices a boundary complement instead and winds one piece CW. Falls
     // back to the best-scoring match if no split is both-CCW (preserving
     // the pre-of-43n behavior).
-    let split_at = |ri: usize, (vi, vj): (usize, usize)| {
+    let split_at = |ri: usize, (vi, vj): (usize, usize)| -> CoreResult<(Cycle, Cycle)> {
         let outer = &regions[ri].cycles[0];
         if vi == vj {
             // The chain is a closed loop anchored at a single boundary
@@ -3586,26 +3696,26 @@ fn apply_chain(
             // shared vertex — one pinched cycle, NOT an outer + hole
             // pair, whose vertex-touching ring would over-count R and
             // break the shell's Euler characteristic.
-            let as_given = embed_cycle(face_poly, atoms, chain.clone());
+            let as_given = embed_cycle(face_poly, atoms, chain.clone())?;
             let (loop_darts, loop_cycle) = if as_given.area >= 0.0 {
                 (chain.clone(), as_given)
             } else {
                 let rev = reverse_chain(&chain);
-                let cy = embed_cycle(face_poly, atoms, rev.clone());
+                let cy = embed_cycle(face_poly, atoms, rev.clone())?;
                 (rev, cy)
             };
             let mut pinched = reverse_chain(&loop_darts);
             pinched.extend(cyclic_slice(&outer.darts, vi, vi));
-            return (loop_cycle, embed_cycle(face_poly, atoms, pinched));
+            return Ok((loop_cycle, embed_cycle(face_poly, atoms, pinched)?));
         }
         let mut darts_one = chain.clone();
         darts_one.extend(cyclic_slice(&outer.darts, vj, vi));
         let mut darts_two = reverse_chain(&chain);
         darts_two.extend(cyclic_slice(&outer.darts, vi, vj));
-        (
-            embed_cycle(face_poly, atoms, darts_one),
-            embed_cycle(face_poly, atoms, darts_two),
-        )
+        Ok((
+            embed_cycle(face_poly, atoms, darts_one)?,
+            embed_cycle(face_poly, atoms, darts_two)?,
+        ))
     };
     let mut fallback: Option<(usize, (usize, usize))> = None;
     let mut chosen: Option<(usize, Cycle, Cycle)> = None;
@@ -3622,7 +3732,7 @@ fn apply_chain(
                 });
             }
             for &pair in &candidates {
-                let (one, two) = split_at(ri, pair);
+                let (one, two) = split_at(ri, pair)?;
                 if one.area > 0.0 && two.area > 0.0 {
                     chosen = Some((ri, one, two));
                     break 'regions;
@@ -3635,7 +3745,7 @@ fn apply_chain(
     }
     if chosen.is_none() {
         if let Some((ri, pair)) = fallback {
-            let (one, two) = split_at(ri, pair);
+            let (one, two) = split_at(ri, pair)?;
             chosen = Some((ri, one, two));
         }
     }
@@ -3691,7 +3801,7 @@ fn apply_chain(
                 .into(),
         });
     }
-    let ring = embed_cycle(face_poly, atoms, chain);
+    let ring = embed_cycle(face_poly, atoms, chain)?;
     let probe = ring.poly[0].0;
     let host = regions
         .iter()
@@ -3702,10 +3812,10 @@ fn apply_chain(
         })?;
     let shift = localize_to_window(&regions[host].cycles[0].poly, probe, period).0 - probe.0;
     let (disk, mut hole) = if ring.area >= 0.0 {
-        let hole = embed_cycle(face_poly, atoms, reverse_chain(&ring.darts));
+        let hole = embed_cycle(face_poly, atoms, reverse_chain(&ring.darts))?;
         (ring, hole)
     } else {
-        let disk = embed_cycle(face_poly, atoms, reverse_chain(&ring.darts));
+        let disk = embed_cycle(face_poly, atoms, reverse_chain(&ring.darts))?;
         (disk, ring)
     };
     // The hole joins the host's cycle set: move it into the host's cover
@@ -3842,6 +3952,7 @@ fn chart_point(chart: &Chart, uv: (f64, f64)) -> Point3 {
             let rho = radius + uv.1 * half_angle.tan();
             origin + radial * rho + axis * uv.1
         }
+        Chart::Nurbs { surface, .. } => surface.point(uv.0, uv.1),
     }
 }
 
@@ -4581,6 +4692,13 @@ fn triangulate_mesh_face(mf: &MeshFace, weld_eps: f64) -> CoreResult<(Vec<Triang
             (r > 0.0).then_some((r * pitch, (r, 1.0)))
         }
         Chart::Plane { .. } => None,
+        // A freeform patch has no u-circle to price an angular pitch off,
+        // and its curvature varies across the domain; the curvature-derived
+        // pitch is of-37i.6 (phase 4). `None` leaves the region on the
+        // ear-clip seed, which the mesh deviation gate then diverts to the
+        // F-Rep fallback — quality-only, exactly as for the cone estimate
+        // above, and never a correctness risk.
+        Chart::Nurbs { .. } => None,
     };
     // Curved charts: replace the ear-clip seed with a constrained Delaunay
     // triangulation of the ring vertices before laying the interior lattice.
@@ -5951,8 +6069,14 @@ mod tests {
         Vector3::new(1.0, 2.0, 3.0).normalize()
     }
 
+    /// [`Chart::build`] at the default tolerance. Only the NURBS chart
+    /// reads the tolerance at all (to bound its iterative inverse).
+    fn build_chart(surface: &Surface3) -> CoreResult<Chart> {
+        Chart::build(surface, &ToleranceContext::default())
+    }
+
     fn sphere_chart(center: Point3, radius: f64) -> Chart {
-        Chart::build(&Surface3::sphere(center, tilted_axis(), radius).unwrap()).unwrap()
+        build_chart(&Surface3::sphere(center, tilted_axis(), radius).unwrap()).unwrap()
     }
 
     /// A chart without poles, for tests exercising the plain uv metric.
@@ -5966,7 +6090,7 @@ mod tests {
     }
 
     fn torus_chart(center: Point3, major: f64, minor: f64) -> Chart {
-        Chart::build(&Surface3::torus(center, tilted_axis(), major, minor).unwrap()).unwrap()
+        build_chart(&Surface3::torus(center, tilted_axis(), major, minor).unwrap()).unwrap()
     }
 
     #[test]
@@ -5977,9 +6101,9 @@ mod tests {
         let sphere = Surface3::sphere(Point3::origin(), Vector3::z(), 2.0).unwrap();
         let torus = Surface3::torus(Point3::origin(), Vector3::z(), 3.0, 1.0).unwrap();
         let cone = Surface3::cone(Point3::origin(), Vector3::z(), 0.5, 1.0).unwrap();
-        assert!(matches!(Chart::build(&sphere), Ok(Chart::Sphere { .. })));
-        assert!(matches!(Chart::build(&torus), Ok(Chart::Torus { .. })));
-        assert!(matches!(Chart::build(&cone), Ok(Chart::Cone { .. })));
+        assert!(matches!(build_chart(&sphere), Ok(Chart::Sphere { .. })));
+        assert!(matches!(build_chart(&torus), Ok(Chart::Torus { .. })));
+        assert!(matches!(build_chart(&cone), Ok(Chart::Cone { .. })));
     }
 
     // -----------------------------------------------------------------
@@ -6070,10 +6194,9 @@ mod tests {
 
     #[test]
     fn chart_period_helpers_match_surface_topology() {
-        let plane =
-            Chart::build(&Surface3::plane(Point3::origin(), Vector3::z()).unwrap()).unwrap();
-        let cyl = Chart::build(&Surface3::cylinder(Point3::origin(), Vector3::z(), 1.0).unwrap())
-            .unwrap();
+        let plane = build_chart(&Surface3::plane(Point3::origin(), Vector3::z()).unwrap()).unwrap();
+        let cyl =
+            build_chart(&Surface3::cylinder(Point3::origin(), Vector3::z(), 1.0).unwrap()).unwrap();
         let sph = sphere_chart(Point3::origin(), 2.0);
         let tor = torus_chart(Point3::origin(), 4.0, 1.0);
         assert_eq!((plane.period_u(), plane.period_v()), (None, None));
@@ -6096,7 +6219,7 @@ mod tests {
                 // Lands on the sphere.
                 assert!(((p - center).norm() - radius).abs() < 1e-9);
                 // Round-trips to the same parameters given a nearby hint.
-                let (u2, v2) = chart.param(&p, Some((u, v)));
+                let (u2, v2) = chart.param(&p, Some((u, v))).unwrap();
                 assert!((u2 - u).abs() < 1e-9, "u {u} -> {u2}");
                 assert!((v2 - v).abs() < 1e-9, "v {v} -> {v2}");
             }
@@ -6109,7 +6232,7 @@ mod tests {
         // A point just past the seam (u ≈ 0.1) reported near a hint at
         // u ≈ 2π stays on the hint's branch, not wrapped back to ~0.1.
         let p = chart_point(&chart, (0.1, 0.3));
-        let (u, _) = chart.param(&p, Some((TWO_PI, 0.3)));
+        let (u, _) = chart.param(&p, Some((TWO_PI, 0.3))).unwrap();
         assert!(
             (u - (TWO_PI + 0.1)).abs() < 1e-9,
             "expected ~2π+0.1, got {u}"
@@ -6125,16 +6248,16 @@ mod tests {
         let south = chart_point(&chart, (0.0, -FRAC_PI_2));
         // At a pole the longitude is undefined; it inherits the hint...
         for &hint_u in &[0.0, 1.3, PI, 5.0] {
-            let (u, v) = chart.param(&north, Some((hint_u, 0.0)));
+            let (u, v) = chart.param(&north, Some((hint_u, 0.0))).unwrap();
             assert!((u - hint_u).abs() < 1e-12, "north kept hint u");
             assert!((v - FRAC_PI_2).abs() < 1e-9);
-            let (u, v) = chart.param(&south, Some((hint_u, 0.0)));
+            let (u, v) = chart.param(&south, Some((hint_u, 0.0))).unwrap();
             assert!((u - hint_u).abs() < 1e-12, "south kept hint u");
             assert!((v + FRAC_PI_2).abs() < 1e-9);
         }
         // ...and defaults to 0 with no hint (still a well-defined param, so
         // an imprint through the pole never spawns a zero-width UV wedge).
-        let (u, _) = chart.param(&north, None);
+        let (u, _) = chart.param(&north, None).unwrap();
         assert_eq!(u, 0.0);
     }
 
@@ -6163,7 +6286,7 @@ mod tests {
         let mut hint: Option<(f64, f64)> = None;
         let mut us = Vec::new();
         for p in &samples {
-            let (u, v) = chart.param(p, hint);
+            let (u, v) = chart.param(p, hint).unwrap();
             us.push(u);
             hint = Some((u, v));
         }
@@ -6177,15 +6300,15 @@ mod tests {
         let radius = 3.0;
         let chart = sphere_chart(Point3::origin(), radius);
         // Equator: longitude arc uses the full radius; latitude too.
-        let (us, vs) = chart.uv_scale(0.0);
+        let (us, vs) = chart.uv_scale((0.0, 0.0));
         assert!((us - radius).abs() < 1e-12);
         assert!((vs - radius).abs() < 1e-12);
         // Mid-latitude: longitude scale is radius·cos(v).
-        let (us, vs) = chart.uv_scale(PI / 3.0);
+        let (us, vs) = chart.uv_scale((0.0, PI / 3.0));
         assert!((us - radius * 0.5).abs() < 1e-12);
         assert!((vs - radius).abs() < 1e-12);
         // Near the pole the longitude circle collapses.
-        let (us, _) = chart.uv_scale(FRAC_PI_2);
+        let (us, _) = chart.uv_scale((0.0, FRAC_PI_2));
         assert!(us.abs() < 1e-9);
     }
 
@@ -6211,7 +6334,7 @@ mod tests {
         for &u in &[0.0, 1.1, PI, 4.0, TWO_PI - 0.2] {
             for &v in &[0.0, 0.8, PI, 4.7, TWO_PI - 0.1] {
                 let p = chart_point(&chart, (u, v));
-                let (u2, v2) = chart.param(&p, Some((u, v)));
+                let (u2, v2) = chart.param(&p, Some((u, v))).unwrap();
                 assert!((u2 - u).abs() < 1e-9, "u {u} -> {u2}");
                 assert!((v2 - v).abs() < 1e-9, "v {v} -> {v2}");
             }
@@ -6224,7 +6347,7 @@ mod tests {
         // A point just past both seams reported near a hint one full period
         // out on each axis stays on the hint's cover copy.
         let p = chart_point(&chart, (0.15, 0.25));
-        let (u, v) = chart.param(&p, Some((TWO_PI, TWO_PI)));
+        let (u, v) = chart.param(&p, Some((TWO_PI, TWO_PI))).unwrap();
         assert!(
             (u - (TWO_PI + 0.15)).abs() < 1e-9,
             "major angle unwrapped: {u}"
@@ -6240,14 +6363,14 @@ mod tests {
         let (major, minor) = (6.0, 2.0);
         let chart = torus_chart(Point3::origin(), major, minor);
         // Outer equator (v = 0): major circle radius is major + minor.
-        let (us, vs) = chart.uv_scale(0.0);
+        let (us, vs) = chart.uv_scale((0.0, 0.0));
         assert!((us - (major + minor)).abs() < 1e-12);
         assert!((vs - minor).abs() < 1e-12);
         // Inner equator (v = π): major + minor·cos(π) = major - minor.
-        let (us, _) = chart.uv_scale(PI);
+        let (us, _) = chart.uv_scale((0.0, PI));
         assert!((us - (major - minor)).abs() < 1e-12);
         // Top of the tube (v = π/2): back to the bare major radius.
-        let (us, _) = chart.uv_scale(FRAC_PI_2);
+        let (us, _) = chart.uv_scale((0.0, FRAC_PI_2));
         assert!((us - major).abs() < 1e-12);
     }
 
@@ -6277,7 +6400,7 @@ mod tests {
     // -----------------------------------------------------------------
 
     fn cone_chart(origin: Point3, half_angle: f64, radius: f64) -> Chart {
-        Chart::build(&Surface3::cone(origin, tilted_axis(), half_angle, radius).unwrap()).unwrap()
+        build_chart(&Surface3::cone(origin, tilted_axis(), half_angle, radius).unwrap()).unwrap()
     }
 
     #[test]
@@ -6317,7 +6440,7 @@ mod tests {
         let mut emb = CoverEmbedder::new(&chart, true);
         let mut cover = Vec::new();
         for p in &walk {
-            emb.push(*p, &mut cover);
+            emb.push(*p, &mut cover).unwrap();
         }
         emb.close_at_pole(cover[0].0.0, &mut cover);
         // Both apex-row endpoints (arrival + departure) are present and
@@ -6343,7 +6466,7 @@ mod tests {
         for &u in &[0.0, 0.7, 2.0, PI, 4.5, TWO_PI - 0.3] {
             for &v in &[-0.4, 0.0, 0.8, 2.5] {
                 let p = chart_point(&chart, (u, v));
-                let (u2, v2) = chart.param(&p, Some((u, v)));
+                let (u2, v2) = chart.param(&p, Some((u, v))).unwrap();
                 assert!((u2 - u).abs() < 1e-9, "u {u} -> {u2}");
                 assert!((v2 - v).abs() < 1e-9, "v {v} -> {v2}");
             }
@@ -6355,7 +6478,7 @@ mod tests {
         let origin = Point3::new(-2.0, 1.0, 0.0);
         let (half_angle, radius) = (0.5, 0.8);
         let surface = Surface3::cone(origin, tilted_axis(), half_angle, radius).unwrap();
-        let chart = Chart::build(&surface).unwrap();
+        let chart = build_chart(&surface).unwrap();
         for &(u, v) in &[(0.3, 0.2), (2.5, 1.1), (5.0, -0.3), (PI, 3.0)] {
             let cp = chart_point(&chart, (u, v));
             let sp = surface.point(u, v);
@@ -6367,7 +6490,7 @@ mod tests {
     fn cone_longitude_unwraps_toward_hint() {
         let chart = cone_chart(Point3::origin(), 0.4, 1.0);
         let p = chart_point(&chart, (0.1, 0.5));
-        let (u, _) = chart.param(&p, Some((TWO_PI, 0.5)));
+        let (u, _) = chart.param(&p, Some((TWO_PI, 0.5))).unwrap();
         assert!(
             (u - (TWO_PI + 0.1)).abs() < 1e-9,
             "expected ~2π+0.1, got {u}"
@@ -6381,11 +6504,11 @@ mod tests {
         let chart = cone_chart(Point3::origin(), 0.4, 0.0);
         let apex = chart_point(&chart, (0.0, 0.0));
         for &hint_u in &[0.0, 1.3, PI, 5.0] {
-            let (u, _) = chart.param(&apex, Some((hint_u, 0.0)));
+            let (u, _) = chart.param(&apex, Some((hint_u, 0.0))).unwrap();
             assert!((u - hint_u).abs() < 1e-12, "apex kept hint u, got {u}");
         }
         // No hint defaults to 0 — a well-defined param, no zero-width wedge.
-        let (u, _) = chart.param(&apex, None);
+        let (u, _) = chart.param(&apex, None).unwrap();
         assert_eq!(u, 0.0);
     }
 
@@ -6395,7 +6518,7 @@ mod tests {
         let chart = cone_chart(Point3::origin(), half_angle, radius);
         let tan_a = half_angle.tan();
         for &v in &[-0.5, 0.0, 1.0, 3.0] {
-            let (us, vs) = chart.uv_scale(v);
+            let (us, vs) = chart.uv_scale((0.0, v));
             assert!(
                 (us - (radius + v * tan_a)).abs() < 1e-12,
                 "u scale = rho(v)"
@@ -6412,7 +6535,7 @@ mod tests {
         let origin = Point3::new(0.5, -2.0, 1.0);
         let (half_angle, radius) = (0.45, 1.1);
         let surface = Surface3::cone(origin, tilted_axis(), half_angle, radius).unwrap();
-        let chart = Chart::build(&surface).unwrap();
+        let chart = build_chart(&surface).unwrap();
         // Stay on the near nappe (v so that rho > 0).
         for &(u, v) in &[(0.3, 0.5), (2.5, 1.4), (5.0, 3.0)] {
             let n = chart.normal(u, v);
@@ -6439,7 +6562,7 @@ mod tests {
         // (mirror nappe). The single-nappe filter keeps only z = +1.
         let surface = Surface3::cone(Point3::origin(), Vector3::z(), FRAC_PI_4_CONST, 0.0).unwrap();
         let start = Point3::new(1.0, 0.0, -10.0);
-        let hits = ray_surface_hits(&surface, &start, &Vector3::z());
+        let hits = ray_surface_hits(&surface, &start, &Vector3::z()).unwrap();
         assert_eq!(hits.len(), 1, "single-nappe: {hits:?}");
         // z = +1 is reached at t = 11; the z = −1 hit (t = 9) is filtered.
         assert!(
@@ -6457,7 +6580,7 @@ mod tests {
         let surface = Surface3::cone(Point3::origin(), axis, FRAC_PI_4_CONST, 2.0).unwrap();
         // At z = 0 the radius is 2; a ray along +x from x = -5 at z = 0.
         let start = Point3::new(-5.0, 0.0, 0.0);
-        let mut hits = ray_surface_hits(&surface, &start, &Vector3::x());
+        let mut hits = ray_surface_hits(&surface, &start, &Vector3::x()).unwrap();
         hits.sort_by(|a, b| a.partial_cmp(b).unwrap());
         assert_eq!(hits.len(), 2, "two nappe crossings: {hits:?}");
         // Entry at x = -2 (t = 3), exit at x = +2 (t = 7).
@@ -7212,7 +7335,7 @@ mod tests {
             minor_radius: r,
         };
         let points = ring_samples(&curve);
-        let crossings = seam_crossings(&fp, &curve, &points, SeamAxis::U);
+        let crossings = seam_crossings(&fp, &curve, &points, SeamAxis::U).unwrap();
         assert_eq!(crossings.len(), 1, "wrap-once ring crosses the seam once");
         let p = crossings[0];
         // Seam angle u = π on this ring is curve parameter t = π - phase.
@@ -7242,7 +7365,7 @@ mod tests {
             minor_radius: r,
         };
         let points = ring_samples(&curve);
-        let crossings = seam_crossings(&fp, &curve, &points, SeamAxis::U);
+        let crossings = seam_crossings(&fp, &curve, &points, SeamAxis::U).unwrap();
         assert_eq!(crossings.len(), 1, "wrap-once ring crosses the seam once");
         let p = crossings[0];
         // This section satisfies u(t) = t, so the seam angle is hit at
@@ -7260,7 +7383,7 @@ mod tests {
     // -----------------------------------------------------------------
 
     fn unit_sphere_chart() -> Chart {
-        Chart::build(&Surface3::sphere(Point3::origin(), Vector3::z(), 1.0).expect("valid"))
+        build_chart(&Surface3::sphere(Point3::origin(), Vector3::z(), 1.0).expect("valid"))
             .expect("sphere charts build")
     }
 
@@ -7280,7 +7403,7 @@ mod tests {
         let mut emb = CoverEmbedder::new(chart, ccw);
         let mut out = Vec::new();
         for p in points {
-            emb.push(*p, &mut out);
+            emb.push(*p, &mut out).unwrap();
         }
         out
     }
@@ -7436,7 +7559,8 @@ mod tests {
             &fp,
             &atoms,
             vec![(0, true), (1, true), (1, false), (0, false)],
-        );
+        )
+        .unwrap();
         assert!(
             (cycle.area - TWO_PI * PI).abs() < 1e-6,
             "split seam cycle still covers the rectangle, got {}",
@@ -7498,8 +7622,8 @@ mod tests {
                 closed: false,
             },
         ];
-        let cycle = embed_cycle(&fp, &atoms, vec![(0, true), (0, false)]);
-        let (chain_poly, _) = embed_walk(&fp, &atoms, &[(1, true)], true);
+        let cycle = embed_cycle(&fp, &atoms, vec![(0, true), (0, false)]).unwrap();
+        let (chain_poly, _) = embed_walk(&fp, &atoms, &[(1, true)], true).unwrap();
         let got = match_chain_to_cycle(
             &cycle,
             &chain_poly,
@@ -7534,8 +7658,8 @@ mod tests {
                 closed: false,
             },
         ];
-        let cycle = embed_cycle(&fp, &atoms, vec![(0, true), (0, false)]);
-        let (chain_poly, _) = embed_walk(&fp, &atoms, &[(1, true)], true);
+        let cycle = embed_cycle(&fp, &atoms, vec![(0, true), (0, false)]).unwrap();
+        let (chain_poly, _) = embed_walk(&fp, &atoms, &[(1, true)], true).unwrap();
         let got = match_chain_to_cycle(
             &cycle,
             &chain_poly,
@@ -7628,7 +7752,7 @@ mod tests {
                 closed: false,
             },
         ];
-        let cycle = embed_cycle(&fp, &atoms, vec![(0, true), (1, true)]);
+        let cycle = embed_cycle(&fp, &atoms, vec![(0, true), (1, true)]).unwrap();
         assert!(
             (cycle.area - PI * PI).abs() < 1e-6,
             "band area must be π·π, got {}",
@@ -7669,7 +7793,7 @@ mod tests {
         let curve = Curve3::circle(Point3::new(0.0, 0.0, v0.sin()), Vector3::z(), v0.cos())
             .expect("valid cap circle");
         let points = ring_samples(&curve);
-        let crossings = seam_crossings(&fp, &curve, &points, SeamAxis::U);
+        let crossings = seam_crossings(&fp, &curve, &points, SeamAxis::U).unwrap();
         assert_eq!(crossings.len(), 1, "cap ring wraps the period once");
         let p = crossings[0];
         assert!(
@@ -7718,7 +7842,7 @@ mod tests {
             minor_radius: 2.4,
         };
         let points = ring_samples(&curve);
-        let crossings = seam_crossings(&fp, &curve, &points, SeamAxis::U);
+        let crossings = seam_crossings(&fp, &curve, &points, SeamAxis::U).unwrap();
         assert_eq!(crossings.len(), 1, "latitude ring wraps u once");
         let p = crossings[0];
         let expected = Point3::new(2.4, 0.0, 0.3);
@@ -7728,7 +7852,9 @@ mod tests {
             (p - expected).norm()
         );
         assert!(
-            seam_crossings(&fp, &curve, &points, SeamAxis::V).is_empty(),
+            seam_crossings(&fp, &curve, &points, SeamAxis::V)
+                .unwrap()
+                .is_empty(),
             "constant-v ring must not report a v-seam crossing"
         );
     }
@@ -7743,7 +7869,7 @@ mod tests {
         let curve = Curve3::circle(Point3::new(0.0, 2.0, 0.0), Vector3::x(), 0.5)
             .expect("valid tube circle");
         let points = ring_samples(&curve);
-        let crossings = seam_crossings(&fp, &curve, &points, SeamAxis::V);
+        let crossings = seam_crossings(&fp, &curve, &points, SeamAxis::V).unwrap();
         assert_eq!(crossings.len(), 1, "tube ring wraps v once");
         let p = crossings[0];
         let expected = Point3::new(0.0, 2.5, 0.0);
@@ -7753,7 +7879,9 @@ mod tests {
             (p - expected).norm()
         );
         assert!(
-            seam_crossings(&fp, &curve, &points, SeamAxis::U).is_empty(),
+            seam_crossings(&fp, &curve, &points, SeamAxis::U)
+                .unwrap()
+                .is_empty(),
             "constant-u ring must not report a u-seam crossing"
         );
     }
@@ -7801,7 +7929,7 @@ mod tests {
         )
         .expect("valid cap circle");
         let points = ring_samples(&curve);
-        let mut crossings = seam_crossings(&fp, &curve, &points, SeamAxis::U);
+        let mut crossings = seam_crossings(&fp, &curve, &points, SeamAxis::U).unwrap();
         assert_eq!(
             crossings.len(),
             2,
@@ -7832,7 +7960,9 @@ mod tests {
         .expect("valid cap circle");
         let points = ring_samples(&curve);
         assert!(
-            seam_crossings(&fp, &curve, &points, SeamAxis::U).is_empty(),
+            seam_crossings(&fp, &curve, &points, SeamAxis::U)
+                .unwrap()
+                .is_empty(),
             "cap away from the seam must not report a crossing"
         );
     }
@@ -8391,6 +8521,293 @@ mod tests {
             let context = format!("sweep step {i} (dx = {dx:e})");
             assert_valid(&out, &context);
             assert_geometry_bound(&out, &context);
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // NURBS chart (of-37i.3, freeform phase 1)
+    // -----------------------------------------------------------------
+
+    use crate::nurbs::curve::KnotVector;
+
+    /// Deterministic splitmix64, mirroring `tests/boolean_stress.rs` — the
+    /// corpus must be reproducible from its seed when a case fails.
+    struct Rng(u64);
+
+    impl Rng {
+        fn new(seed: u64) -> Self {
+            Rng(seed)
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+
+        fn unit(&mut self) -> f64 {
+            (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
+        }
+
+        fn range(&mut self, lo: f64, hi: f64) -> f64 {
+            lo + (hi - lo) * self.unit()
+        }
+    }
+
+    /// A clamped knot vector over `[origin, origin + span]` — the same
+    /// uniform layout as [`KnotVector::clamped_uniform`], which is fixed to
+    /// `[0, 1]`, but on an arbitrary domain. The chart must not care which.
+    fn scaled_knots(degree: usize, control_count: usize, origin: f64, span: f64) -> KnotVector {
+        let interior = control_count - degree - 1;
+        let mut knots = vec![origin; degree + 1];
+        for i in 1..=interior {
+            knots.push(origin + span * i as f64 / (interior + 1) as f64);
+        }
+        knots.extend(std::iter::repeat_n(origin + span, degree + 1));
+        KnotVector::new(degree, knots).expect("valid clamped knot vector")
+    }
+
+    /// A bicubic patch that bulges off its control grid's base plane, with
+    /// `height` scaling the bulge. Regular everywhere (no collapsed row),
+    /// so `Chart::build` admits it.
+    fn wavy_patch(
+        rng: &mut Rng,
+        (u_origin, u_span): (f64, f64),
+        (v_origin, v_span): (f64, f64),
+        height: f64,
+    ) -> NurbsSurface {
+        let n = 4;
+        let mut grid = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut row = Vec::with_capacity(n);
+            for j in 0..n {
+                // A monotone x/y lattice keeps the patch a graph over the
+                // base plane, so the closest point is unique and the
+                // round-trip has one right answer to find.
+                row.push(Point3::new(
+                    i as f64 + rng.range(-0.15, 0.15),
+                    j as f64 + rng.range(-0.15, 0.15),
+                    height * rng.range(-1.0, 1.0),
+                ));
+            }
+            grid.push(row);
+        }
+        NurbsSurface::bspline(
+            grid,
+            scaled_knots(3, n, u_origin, u_span),
+            scaled_knots(3, n, v_origin, v_span),
+        )
+        .expect("valid bicubic patch")
+    }
+
+    #[test]
+    fn nurbs_chart_is_aperiodic_with_a_finite_knot_domain() {
+        // The whole seam/pole apparatus keys off these. A clamped patch has
+        // no seam and no pole, so every seam mechanism must degenerate to
+        // the plane path rather than inventing a 2*pi period.
+        let mut rng = Rng::new(0x0371);
+        let patch = wavy_patch(&mut rng, (-2.0, 5.0), (10.0, 0.25), 0.4);
+        let surface = Surface3::nurbs(patch);
+        assert_eq!(surface.domain_u(), (-2.0, 3.0));
+        assert_eq!(surface.domain_v(), (10.0, 10.25));
+        assert!(!surface.is_periodic_u(), "clamped NURBS never wraps u");
+        assert!(!surface.is_periodic_v(), "clamped NURBS never wraps v");
+
+        let chart = build_chart(&surface).expect("regular patch is admitted");
+        assert!(matches!(chart, Chart::Nurbs { .. }));
+        assert_eq!(chart.period_u(), None);
+        assert_eq!(chart.period_v(), None);
+        assert_eq!(chart.pole_v(&Point3::origin()), None);
+        assert_eq!(chart.apex(), None);
+        assert!(chart.pole_points().is_empty());
+    }
+
+    /// The phase-1 gate: `chart_point` and `param` invert each other across
+    /// a randomized corpus, over randomized **knot scalings**.
+    ///
+    /// The scaling axis is the point. `tol.parametric` is documented
+    /// relative to a unit-scale domain while a knot domain is arbitrary, so
+    /// a uv residual is only meaningful normalized by the domain span —
+    /// without that, the very same patch passes or fails on its knot
+    /// scaling alone.
+    #[test]
+    fn nurbs_param_round_trips_over_randomized_knot_scalings() {
+        let tol = tol();
+        let mut rng = Rng::new(0x00F3_EEF0);
+        for case in 0..24 {
+            // Spans from a thousandth to a thousand: a chart that only
+            // works near unit scale is not a chart.
+            let u_span = 10f64.powf(rng.range(-3.0, 3.0));
+            let v_span = 10f64.powf(rng.range(-3.0, 3.0));
+            let u_origin = rng.range(-50.0, 50.0);
+            let v_origin = rng.range(-50.0, 50.0);
+            let patch = wavy_patch(&mut rng, (u_origin, u_span), (v_origin, v_span), 0.5);
+            let surface = Surface3::nurbs(patch);
+            let chart = build_chart(&surface).expect("regular patch is admitted");
+
+            for i in 1..5 {
+                for j in 1..5 {
+                    // Interior samples: the corners are where a Newton step
+                    // pins against the domain clamp, which is its own
+                    // (phase 2) boundary-termination story.
+                    let u = u_origin + u_span * i as f64 / 5.0;
+                    let v = v_origin + v_span * j as f64 / 5.0;
+                    let p = chart_point(&chart, (u, v));
+
+                    let (u2, v2) = chart
+                        .param(&p, Some((u, v)))
+                        .expect("a point taken from the patch inverts");
+                    // Normalize by the domain span before comparing, per
+                    // `tol.parametric`'s unit-domain contract.
+                    assert!(
+                        tol.params_approx_eq((u2 - u) / u_span, 0.0)
+                            && tol.params_approx_eq((v2 - v) / v_span, 0.0),
+                        "case {case}: uv round-trip drift at ({u}, {v}) -> ({u2}, {v2}), \
+                         spans ({u_span}, {v_span})"
+                    );
+                    // The gate that actually matters downstream: the
+                    // inverted parameters reproduce the point in 3D.
+                    assert!(
+                        tol.points_approx_eq(&chart_point(&chart, (u2, v2)), &p),
+                        "case {case}: point round-trip drift at ({u}, {v})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Unseeded inversion must work too — `map_polyline` seeds from the
+    /// previous point, but the first point of every walk has no hint.
+    #[test]
+    fn nurbs_param_inverts_without_a_hint() {
+        let tol = tol();
+        let mut rng = Rng::new(0xB0_07);
+        let patch = wavy_patch(&mut rng, (0.0, 1.0), (0.0, 1.0), 0.5);
+        let chart = build_chart(&Surface3::nurbs(patch)).expect("regular patch");
+        for i in 1..5 {
+            let (u, v) = (0.2 * i as f64, 0.17 * i as f64);
+            let p = chart_point(&chart, (u, v));
+            let (u2, v2) = chart.param(&p, None).expect("inverts unseeded");
+            assert!(tol.points_approx_eq(&chart_point(&chart, (u2, v2)), &p));
+        }
+    }
+
+    /// A point off the patch has no inverse, and `param` must say so rather
+    /// than return the nearest uv. A guessed uv does not fail loudly — it
+    /// corrupts region parity and yields a plausible solid with the wrong
+    /// volume (the of-ipt.4 failure mode).
+    #[test]
+    fn nurbs_param_errors_for_a_point_off_the_patch() {
+        let mut rng = Rng::new(0x0FF);
+        let patch = wavy_patch(&mut rng, (0.0, 1.0), (0.0, 1.0), 0.3);
+        let chart = build_chart(&Surface3::nurbs(patch)).expect("regular patch");
+        let on = chart_point(&chart, (0.5, 0.5));
+        let normal = chart.normal(0.5, 0.5);
+        let off = on + normal * 0.25;
+        let err = chart
+            .param(&off, Some((0.5, 0.5)))
+            .expect_err("a point a quarter unit off the patch has no inverse");
+        assert!(
+            matches!(err, CoreError::Degenerate { context, .. } if context.contains("Nurbs")),
+            "expected a Degenerate naming the NURBS inverse, got {err:?}"
+        );
+    }
+
+    /// Degenerate-edge patches are rejected at chart-build time and fall to
+    /// F-Rep: the pole machinery needs a known pole location and a limit
+    /// normal, and a collapsed control row supplies neither.
+    #[test]
+    fn chart_build_rejects_a_nurbs_patch_with_a_collapsed_edge() {
+        // A lofted-to-a-point tip: the whole v = 0 row sits on one point.
+        let apex = Point3::new(0.5, 0.5, 1.0);
+        let grid = vec![
+            vec![apex, Point3::new(0.0, 0.0, 0.0), Point3::new(0.0, 1.0, 0.0)],
+            vec![apex, Point3::new(0.5, 0.0, 0.0), Point3::new(0.5, 1.0, 0.0)],
+            vec![apex, Point3::new(1.0, 0.0, 0.0), Point3::new(1.0, 1.0, 0.0)],
+        ];
+        let knots = KnotVector::clamped_uniform(2, 3).expect("valid");
+        let patch = NurbsSurface::bspline(grid, knots.clone(), knots).expect("valid patch");
+        assert!(patch.has_degenerate_edge(), "the v=0 row is collapsed");
+
+        let err = build_chart(&Surface3::nurbs(patch))
+            .expect_err("a collapsed-row patch has no chart in phase 1");
+        assert!(
+            matches!(err, CoreError::NotImplemented { feature } if feature.contains("degenerate")),
+            "expected a NotImplemented naming the degeneracy, got {err:?}"
+        );
+    }
+
+    /// The control hull bounds the patch by the convex hull property. A
+    /// face box that is too tight silently drops a face pair, which is a
+    /// wrong boolean rather than an error — so this must never shrink to
+    /// the boundary samples' box.
+    #[test]
+    fn nurbs_bounding_box_contains_the_patch_and_is_not_boundary_tight() {
+        let mut rng = Rng::new(0xB0_C5);
+        // A tall bulge whose interior escapes its own trim boundary box.
+        let patch = wavy_patch(&mut rng, (0.0, 1.0), (0.0, 1.0), 3.0);
+        let surface = Surface3::nurbs(patch);
+        let bb = surface
+            .bounding_box()
+            .expect("a NURBS patch always has a control hull");
+        for i in 0..=8 {
+            for j in 0..=8 {
+                let p = surface.point(i as f64 / 8.0, j as f64 / 8.0);
+                assert!(
+                    bb.contains(&p),
+                    "control hull box must contain the patch; {p:?} escaped"
+                );
+            }
+        }
+    }
+
+    /// `uv_scale` is the first fundamental form's diagonal. It became
+    /// point-valued for this arm, so check it against a finite difference
+    /// of the surface itself rather than a closed form.
+    #[test]
+    fn nurbs_uv_scale_matches_the_measured_arc_length_metric() {
+        let mut rng = Rng::new(0x5CA1E);
+        let patch = wavy_patch(&mut rng, (0.0, 2.0), (0.0, 2.0), 0.6);
+        let chart = build_chart(&Surface3::nurbs(patch)).expect("regular patch");
+        let h = 1e-6;
+        for &(u, v) in &[(0.5, 0.5), (1.0, 0.7), (1.5, 1.3)] {
+            let (su, sv) = chart.uv_scale((u, v));
+            let du = (chart_point(&chart, (u + h, v)) - chart_point(&chart, (u - h, v))).norm()
+                / (2.0 * h);
+            let dv = (chart_point(&chart, (u, v + h)) - chart_point(&chart, (u, v - h))).norm()
+                / (2.0 * h);
+            assert!(
+                (su - du).abs() < 1e-4 && (sv - dv).abs() < 1e-4,
+                "uv_scale ({su}, {sv}) disagrees with the measured metric ({du}, {dv}) at ({u}, {v})"
+            );
+        }
+    }
+
+    /// A rigid transform of a patch is exact through its control points,
+    /// and must leave the parameterization alone — every uv already stored
+    /// in the topology has to keep meaning the same point.
+    #[test]
+    fn nurbs_transform_preserves_the_parameterization() {
+        let mut rng = Rng::new(0x0071_3A45);
+        let patch = wavy_patch(&mut rng, (0.0, 1.0), (0.0, 1.0), 0.5);
+        let before = Surface3::nurbs(patch.clone());
+        let mut moved = patch;
+        let shift = Vector3::new(3.0, -1.0, 2.0);
+        moved.map_control_points(|p| p + shift);
+        let after = Surface3::nurbs(moved);
+
+        assert_eq!(after.domain_u(), before.domain_u(), "knots must not move");
+        for i in 0..=4 {
+            for j in 0..=4 {
+                let (u, v) = (i as f64 / 4.0, j as f64 / 4.0);
+                let expected = before.point(u, v) + shift;
+                assert!(
+                    (after.point(u, v) - expected).norm() < 1e-12,
+                    "translation is exact through the control points"
+                );
+            }
         }
     }
 }

@@ -1673,6 +1673,8 @@ impl FallbackMesher<'_> {
                 (0.0, period, true, angular_segments(period, self.options))
             }
             Surface3::Plane { .. } => unreachable!("caller dispatched planes elsewhere"),
+            // `RawSurface::Nurbs` never reaches the analytic path.
+            Surface3::Nurbs(_) => unreachable!("caller dispatched NURBS elsewhere"),
         };
         grid_quadric(
             mesh,

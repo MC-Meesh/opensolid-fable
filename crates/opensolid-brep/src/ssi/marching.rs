@@ -1307,6 +1307,9 @@ mod tests {
                 let rho = (d - axis * v).norm();
                 ((rho - (radius + v * half_angle.tan())) * half_angle.cos()).abs()
             }
+            // As `analytic.rs`: no closed-form locus to measure against,
+            // and no test here builds a NURBS operand.
+            Surface3::Nurbs(_) => panic!("residual has no closed form for a NURBS patch"),
         }
     }
 

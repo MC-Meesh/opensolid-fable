@@ -634,6 +634,16 @@ impl Emitter<'_> {
                     fmt_real(minor_radius)
                 ))
             }
+            // AP203 spells this B_SPLINE_SURFACE_WITH_KNOTS, which needs
+            // the control grid, both knot vectors with multiplicities, and
+            // the rational weight grid emitted; that is the of-37i STEP
+            // round-trip phase, not this one.
+            Surface3::Nurbs(_) => {
+                return Err(StepWriteError::Unsupported(
+                    "NURBS surface (B_SPLINE_SURFACE_WITH_KNOTS emission is a later of-37i phase)"
+                        .into(),
+                ));
+            }
         };
         self.surfaces.insert(surface, id);
         Ok(id)

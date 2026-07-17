@@ -1056,6 +1056,9 @@ mod tests {
                 let rho = (d - axis * h).norm();
                 ((rho - major_radius).hypot(h) - minor_radius).abs()
             }
+            // These helpers measure a point against a closed-form implicit
+            // locus; a NURBS patch has none, and no test here builds one.
+            Surface3::Nurbs(_) => panic!("residual has no closed form for a NURBS patch"),
         }
     }
 

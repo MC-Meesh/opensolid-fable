@@ -575,6 +575,7 @@ mod tests {
                         Surface3::Cone { .. } => "cone",
                         Surface3::Sphere { .. } => "sphere",
                         Surface3::Torus { .. } => "torus",
+                        Surface3::Nurbs(_) => "nurbs",
                     }
                 })
                 .collect()
