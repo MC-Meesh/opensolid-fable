@@ -239,10 +239,13 @@ mod tests {
     /// cell, which then terminated as a single flat sheet and pinched the
     /// plate face against the bore wall, failing to close. Whether a corner
     /// landed inside the bore depended only on where the tracked bounding
-    /// box put the octree grid, so geometrically identical spellings of the
-    /// same part disagreed: `.rotate(0, 1, 0, 360)` — an identity that only
-    /// loosens the tracked box — used to be the difference between a clean
-    /// export and a hard error.
+    /// box put the octree grid, so genuinely identical spellings of the same
+    /// part disagreed: a full 2π-radian turn (`TAU`, a true identity that
+    /// leaves the geometry untouched and only loosens the tracked box) used
+    /// to be the difference between a clean export and a hard error. NB: the
+    /// angle here is radians — `.rotate(0, 1, 0, 360)` in the JS API is 360
+    /// *radians* ≈ 106.5°, a real rotation, not the identity it was once
+    /// mistaken for (of-03f).
     #[test]
     fn plate_with_through_hole_exports_however_it_is_spelled() {
         // 60x40x5 plate, one d5 bore through the thickness.
