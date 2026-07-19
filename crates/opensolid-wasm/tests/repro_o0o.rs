@@ -21,11 +21,16 @@ fn repro() {
     for r in [1.2, 1.4, 1.6, 1.8, 2.0, 2.5, 3.0, 3.5] {
         let part = leaf(r);
         let mesh = part.mesh_adaptive(f64::NAN, None);
+        let d = mesh.manifold_defects();
         println!(
-            "r={r} tris={} pinched={} manifold={}",
+            "r={r} tris={} pinched={} manifold={} defects: boundary={} misoriented={} pinched3plus={} degen={}",
             mesh.indices.len(),
             pinched_edge_count(&mesh),
-            mesh.is_closed_manifold()
+            mesh.is_closed_manifold(),
+            d.boundary_edges,
+            d.misoriented_edges,
+            d.pinched_edges,
+            d.degenerate_triangles,
         );
     }
 }
