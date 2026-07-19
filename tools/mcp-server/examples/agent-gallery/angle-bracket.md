@@ -31,8 +31,8 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 >   "name": "angle-bracket",
 >   "exact": false,
 >   "mesh": {
->     "triangles": 19366,
->     "vertices": 9681
+>     "triangles": 24188,
+>     "vertices": 12088
 >   },
 >   "boundingBox": {
 >     "min": [
@@ -51,54 +51,54 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 >       44
 >     ]
 >   },
->   "volume": 18585.712471707368,
+>   "volume": 18736.52541076776,
 >   "valid": true,
 >   "issues": []
 > }
 > ```
 
-**Agent:** `create_model` returns immediately with `valid: true` and volume 18586 mm³ — the four holes and the boolean union all resolved into one closed solid. Let me eyeball it before exporting.
+**Agent:** `create_model` returns immediately with `valid: true` and volume 18737 mm³ — the four holes and the boolean union all resolved into one closed solid. Let me eyeball it before exporting.
 
 > 🔧 **`get_screenshot`** `{ "model_id": "model-1", "view": "iso", "width": 720, "height": 540 }`
 >
 > ![angle-bracket — iso view](../output/angle-bracket-iso.png)
 >
-> *(real 720×540 render, 19 KB PNG)*
+> *(real 720×540 render, 17 KB PNG)*
 
 **Agent:** That looks right — but a render cannot tell me a hole went in sideways, and neither can `valid: true`. The only check that can is the volume, against a number I work out by hand: two 60×40×4 plates meeting at a corner is `60*40*4 + 60*4*40 = 19200 mm³`, less four Ø6 holes through 4 mm of base (`4 * π * 3² * 4 = 452.4`) — **18747.6 mm³**.
 
 > 🔧 **`measure`** `{ "model_id": "model-1", "query": "mass" }`
 > ```json
 > {
->   "volume": 18585.712471707368,
->   "surfaceArea": 10645.158889048333,
+>   "volume": 18736.52541076776,
+>   "surfaceArea": 10723.762830207674,
 >   "centroid": [
->     -0.0017141130990889618,
->     -9.142890079673267,
->     11.236832123975795
+>     -0.000020571797553580846,
+>     -9.146998505174698,
+>     11.26306284369305
 >   ],
 >   "inertia": [
 >     [
->       6275395.541823169,
->       -306.3689073331263,
->       1445.8172902536046
+>       6345533.795163175,
+>       1.9971831435529674,
+>       -10.602795309747968
 >     ],
 >     [
->       -306.3689073331263,
->       9002296.533018937,
->       1851641.4006252699
+>       1.9971831435529674,
+>       9125871.747594982,
+>       1868205.04889089
 >     ],
 >     [
->       1445.8172902536046,
->       1851641.4006252699,
->       8271231.722990537
+>       -10.602795309747968,
+>       1868205.04889089,
+>       8360144.591583632
 >     ]
 >   ],
 >   "exact": false
 > }
 > ```
 
-**Agent:** Volume 18586 mm³ against 18747.6 predicted — -0.9%, which is the SDF mesher reading a hair under true volume at this accuracy, not a modelling error. (Had I left the holes on the default +Y axis they would have bored lengthwise through the plate and landed near 18032 — a 4% miss that looks fine in every render.) So: 18.6 cm³, and in 6061 aluminium (2.70 g/cm³) about **50 g**. Now the files — STL first:
+**Agent:** Volume 18737 mm³ against 18747.6 predicted — -0.1%, which is the SDF mesher reading a hair under true volume at this accuracy, not a modelling error. (Had I left the holes on the default +Y axis they would have bored lengthwise through the plate and landed near 18032 — a 4% miss that looks fine in every render.) So: 18.7 cm³, and in 6061 aluminium (2.70 g/cm³) about **51 g**. Now the files — STL first:
 
 > 🔧 **`export`** `{ "model_id": "model-1", "format": "stl", "path": "angle-bracket.stl" }`
 > ```json
@@ -106,7 +106,7 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 >   "model_id": "model-1",
 >   "format": "stl",
 >   "path": "output/angle-bracket.stl",
->   "bytes": 968384
+>   "bytes": 1209484
 > }
 > ```
 
@@ -115,11 +115,13 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 > 🔧 **`export`** `{ "model_id": "model-1", "format": "step", "path": "angle-bracket.step" }`
 > ```json
 > {
->   "isError": true,
->   "text": "Error: export failed: STEP export failed: degenerate geometry in sdf_to_brep: adaptive meshing did not produce a closed manifold: 2 pinched edge(s) joining 3+ triangles — two surface sheets fused through one cell, typically at a near-tangent CSG feature; this is a mesher defect (of-o0o), and a finer accuracy does not reliably clear it"
+>   "model_id": "model-1",
+>   "format": "step",
+>   "path": "output/angle-bracket.step",
+>   "bytes": 8476931
 > }
 > ```
 
-**Agent:** STEP declines on this one, and that is worth showing rather than hiding. The shape has no exact B-Rep companion, so STEP goes through the faceted SDF→B-Rep path, which needs a closed manifold — and the mesher hands it one with two *pinched* edges, where two surface sheets fuse through a single cell. The tempting read is that four Ø6 holes in a 4 mm plate are simply too fine for an accuracy derived from the part’s full 44 mm height, but that is not what is happening: a pinch is a mesher defect (of-o0o) and a finer accuracy does not clear it. The tool reports `isError: true` naming the real defect instead of writing a corrupt file. The STL is unaffected (different code path) and is print-ready.
+**Agent:** Both files wrote. This shape has no exact B-Rep companion, so STEP goes through the faceted SDF→B-Rep path: the exporter meshes the solid to a closed manifold and emits that as a B-rep body. That path needs a watertight mesh, and it used to not get one here — the mesher fused two surface sheets through a single cell into a *pinched* edge (the defect tracked as of-o0o) and STEP declined rather than write a corrupt file. A later mesher fix (of-obv) cleared the pinch for this geometry, so the closed mesh now survives the conversion and STEP exports. The STL takes a separate, mesh-direct path and was never affected either way.
 
-**Agent:** To get an analytic STEP of a bracket like this, model the L-section as an extruded `Profile` so it carries an exact B-Rep — that is exactly what the [right-angle bracket](bracket-right-angle.md) transcript does, and its STEP export succeeds. Same part, different construction, different export path.
+**Agent:** One thing to carry forward: this is a *faceted* STEP — the round hole walls arrive as many small planar facets, not analytic cylinders, which is why the file is large. When an exact B-Rep matters (crisp analytic faces, a smaller file), model the L-section as an extruded `Profile` instead, the way the [right-angle bracket](bracket-right-angle.md) transcript builds it. Same part, different construction, different export path.

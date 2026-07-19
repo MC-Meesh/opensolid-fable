@@ -14,7 +14,7 @@
 //
 //   cd tools/mcp-server && npm run build && node examples/agent-gallery/build-gallery.mjs
 //
-import { writeFileSync } from 'node:fs';
+import { writeFileSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve, basename } from 'node:path';
 import { createTools } from '../../src/tools.js';
@@ -313,22 +313,23 @@ return bracket;
     t.say('And STEP:');
     t.export(m.model_id, 'step', 'angle-bracket.step');
     t.say(
-      'STEP declines on this one, and that is worth showing rather than hiding. The ' +
-        'shape has no exact B-Rep companion, so STEP goes through the faceted ' +
-        'SDF→B-Rep path, which needs a closed manifold — and the mesher hands it one ' +
-        'with two *pinched* edges, where two surface sheets fuse through a single ' +
-        'cell. The tempting read is that four Ø6 holes in a 4 mm plate are simply too ' +
-        'fine for an accuracy derived from the part’s full 44 mm height, but that is ' +
-        'not what is happening: a pinch is a mesher defect (of-o0o) and a finer ' +
-        'accuracy does not clear it. The tool reports `isError: true` naming the real ' +
-        'defect instead of writing a corrupt file. The STL is unaffected (different ' +
-        'code path) and is print-ready.',
+      'Both files wrote. This shape has no exact B-Rep companion, so STEP goes ' +
+        'through the faceted SDF→B-Rep path: the exporter meshes the solid to a ' +
+        'closed manifold and emits that as a B-rep body. That path needs a watertight ' +
+        'mesh, and it used to not get one here — the mesher fused two surface sheets ' +
+        'through a single cell into a *pinched* edge (the defect tracked as of-o0o) ' +
+        'and STEP declined rather than write a corrupt file. A later mesher fix ' +
+        '(of-obv) cleared the pinch for this geometry, so the closed mesh now survives ' +
+        'the conversion and STEP exports. The STL takes a separate, mesh-direct path ' +
+        'and was never affected either way.',
     );
     t.say(
-      'To get an analytic STEP of a bracket like this, model the L-section as an ' +
-        'extruded `Profile` so it carries an exact B-Rep — that is exactly what the ' +
-        '[right-angle bracket](bracket-right-angle.md) transcript does, and its STEP ' +
-        'export succeeds. Same part, different construction, different export path.',
+      'One thing to carry forward: this is a *faceted* STEP — the round hole walls ' +
+        'arrive as many small planar facets, not analytic cylinders, which is why the ' +
+        'file is large. When an exact B-Rep matters (crisp analytic faces, a smaller ' +
+        'file), model the L-section as an extruded `Profile` instead, the way the ' +
+        '[right-angle bracket](bracket-right-angle.md) transcript builds it. Same ' +
+        'part, different construction, different export path.',
     );
   },
 );
@@ -805,40 +806,59 @@ return base.union(wall);
 );
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Run everything and write outputs.
+// Orchestration — pure helpers (exported for tests) + the run entry point.
 // ═══════════════════════════════════════════════════════════════════════════
-const tools = createTools({ outputDir });
-const manifest = [];
-const indexRows = [];
 
-// `GALLERY_ONLY=<slug>` regenerates a single transcript and its outputs, and
-// leaves manifest.json / README.md (the whole-gallery index) untouched. Useful
-// for iterating on one example without rewriting — and churning — every other
-// example's committed renders and exports.
-const only = process.env.GALLERY_ONLY;
-
-for (const { spec, drive } of examples) {
-  if (only && spec.slug !== only) continue;
-  console.error(`\n=== ${spec.slug} ===`);
-  const t = new Transcript(tools, spec);
-  drive(t);
-  writeFileSync(resolve(galleryDir, `${spec.slug}.md`), t.render(), 'utf8');
-  manifest.push(t.manifestEntry());
-  indexRows.push(`| [${spec.title}](${spec.slug}.md) | ${spec.slug} |`);
+// Run each selected example through `renderOne`, isolating failures so one
+// throwing example does not strand the rest. A drive() can throw for real
+// reasons — most often the kernel handing back a null volume at a mesher pinch
+// (of-o0o) and the narration then calling `.toFixed` on it — and without
+// isolation that single failure aborts the whole loop, leaving manifest.json
+// and every not-yet-reached transcript stale. `renderOne(spec, drive)` does the
+// side effects (drive the tools, write the transcript) and returns the manifest
+// entry + index row; if it throws, the example is recorded as a failure and
+// skipped. Pure w.r.t. its inputs — `renderOne`/`log` carry all the IO.
+export function driveExamples(examples, { only, renderOne, log = () => {} }) {
+  const manifest = [];
+  const indexRows = [];
+  const failures = [];
+  for (const { spec, drive } of examples) {
+    if (only && spec.slug !== only) continue;
+    log(`\n=== ${spec.slug} ===`);
+    try {
+      const { manifestEntry, indexRow } = renderOne(spec, drive);
+      manifest.push(manifestEntry);
+      indexRows.push(indexRow);
+    } catch (err) {
+      failures.push({ slug: spec.slug, message: err?.message ?? String(err) });
+      log(`  FAIL ${spec.slug}: ${err?.message ?? err}`);
+      log('  (skipping this example; its committed transcript is left untouched)');
+    }
+  }
+  return { manifest, indexRows, failures };
 }
 
-if (only) {
-  if (manifest.length === 0) throw new Error(`GALLERY_ONLY=${only}: no example with that slug`);
-  console.error(`\nGALLERY_ONLY=${only}: wrote the transcript; left index + manifest untouched.`);
-  process.exit(0);
+// Merge regenerated manifest entries into an existing manifest by slug: replace
+// a matching entry in place, append a new one. Used by the GALLERY_ONLY path so
+// a single-example regen keeps manifest.json consistent with the transcript it
+// just wrote without churning — or dropping — the other examples' entries.
+export function mergeManifest(existing, entries) {
+  const out = Array.isArray(existing) ? existing.slice() : [];
+  for (const entry of entries) {
+    const i = out.findIndex((e) => e.slug === entry.slug);
+    if (i >= 0) out[i] = entry;
+    else out.push(entry);
+  }
+  return out;
 }
 
-writeFileSync(resolve(outputDir, 'manifest.json'), JSON.stringify(manifest, null, 2), 'utf8');
-
-const COUNT_WORDS = ['zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight'];
-const countWord = COUNT_WORDS[examples.length] ?? String(examples.length);
-
-const index = `# Agent gallery
+function renderIndex(indexRows) {
+  // Count the examples that actually rendered — a skipped failure must not be
+  // claimed in the index prose or the row list.
+  const written = indexRows.length;
+  const COUNT_WORDS = ['zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight'];
+  const countWord = COUNT_WORDS[written] ?? String(written);
+  return `# Agent gallery
 
 ${countWord[0].toUpperCase() + countWord.slice(1)} worked examples of an MCP-capable agent operating the OpenSolid CAD kernel
 end to end — prompt in, manufacturable part out — with **no GUI**. Each
@@ -871,6 +891,70 @@ stdio transport and gated by
 it cost to build — and the kernel bugs it surfaced — is written up in the
 [friction log](../../../../docs/dogfood-bracket-friction-log.md).
 `;
-writeFileSync(resolve(galleryDir, 'README.md'), index, 'utf8');
+}
 
-console.error(`\nWrote ${examples.length} transcripts + manifest.json to examples/.`);
+function main() {
+  const tools = createTools({ outputDir });
+  // `GALLERY_ONLY=<slug>` regenerates a single transcript and its outputs, and
+  // leaves README.md (the whole-gallery index) untouched while merging just its
+  // own entry into manifest.json. Useful for iterating on one example without
+  // churning every other example's committed renders and exports.
+  const only = process.env.GALLERY_ONLY;
+
+  const { manifest, indexRows, failures } = driveExamples(examples, {
+    only,
+    log: (m) => console.error(m),
+    renderOne: (spec, drive) => {
+      const t = new Transcript(tools, spec);
+      drive(t);
+      writeFileSync(resolve(galleryDir, `${spec.slug}.md`), t.render(), 'utf8');
+      return {
+        manifestEntry: t.manifestEntry(),
+        indexRow: `| [${spec.title}](${spec.slug}.md) | ${spec.slug} |`,
+      };
+    },
+  });
+
+  if (only) {
+    if (manifest.length === 0 && failures.length === 0) {
+      throw new Error(`GALLERY_ONLY=${only}: no example with that slug`);
+    }
+    if (manifest.length) {
+      const manifestPath = resolve(outputDir, 'manifest.json');
+      let existing = [];
+      try {
+        existing = JSON.parse(readFileSync(manifestPath, 'utf8'));
+      } catch {
+        existing = [];
+      }
+      writeFileSync(manifestPath, JSON.stringify(mergeManifest(existing, manifest), null, 2), 'utf8');
+      console.error(
+        `\nGALLERY_ONLY=${only}: wrote the transcript and merged its manifest.json ` +
+          'entry; left the index and the other examples untouched.',
+      );
+    }
+    if (failures.length) {
+      console.error(`GALLERY_ONLY=${only}: FAILED — ${failures.map((f) => f.slug).join(', ')}`);
+      process.exit(1);
+    }
+    process.exit(0);
+  }
+
+  writeFileSync(resolve(outputDir, 'manifest.json'), JSON.stringify(manifest, null, 2), 'utf8');
+  writeFileSync(resolve(galleryDir, 'README.md'), renderIndex(indexRows), 'utf8');
+  console.error(`\nWrote ${indexRows.length} transcripts + manifest.json to examples/.`);
+
+  if (failures.length) {
+    console.error(
+      `\n${failures.length} example(s) FAILED and were skipped: ` +
+        `${failures.map((f) => f.slug).join(', ')}. The rest regenerated normally.`,
+    );
+    for (const f of failures) console.error(`  - ${f.slug}: ${f.message}`);
+    process.exit(1);
+  }
+}
+
+// Run only when invoked directly (node build-gallery.mjs), not when imported by
+// a test that exercises the pure helpers above.
+const isMain = process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+if (isMain) main();
