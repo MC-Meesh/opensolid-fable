@@ -66,6 +66,7 @@
 //! layer of cells are not stitched and would leave holes.
 
 use std::collections::HashMap;
+use std::sync::Mutex;
 
 use crate::mesh::{CELL_EDGES, NO_COMP, classify_components, corner};
 use crate::primitives::Sdf;
@@ -576,11 +577,71 @@ fn as_leaf(node: &Node) -> Option<&Leaf> {
     }
 }
 
+/// Concurrent memo of field values at integer finest-lattice coordinates.
+///
+/// The graded octree evaluates a cell corner or interior-probe point at
+/// `g.point_at(key)` many times over: sibling cells share the faces between
+/// them, neighbouring cells at the same depth share the edges between them,
+/// and the interior-feature probe ([`GradedBuilder::model_holds_inside`])
+/// resamples exactly the points the next refinement level would take. Keyed by
+/// the absolute finest-lattice integer coordinate — bit-identical across depths
+/// and cells for the same physical point — the memo evaluates each point at
+/// most once over the whole tree, recovering for the sparse graded descent the
+/// single-global-grid economy the uniform mesher gets for free (of-9gw). This
+/// is what pays back the probe's ~19-evals-per-terminating-leaf cost: the
+/// shared face and edge points among those 19 (all but the cell centre) are
+/// evaluated once and reused by every cell that touches them.
+///
+/// Sharded by a hash of the key so the parallel subtrees above
+/// [`GRADED_PAR_DEPTH`] rarely contend: neighbouring subtrees touch mostly
+/// disjoint regions, and even a shared boundary point lands in one shard while
+/// unrelated inserts proceed in the others. The SDF is evaluated *outside* the
+/// lock, so two threads racing the same fresh point compute it twice (the SDF
+/// is pure, so the result is identical and the map converges on one stored
+/// value) rather than serializing every field evaluation behind the lock.
+struct LatticeMemo {
+    shards: Vec<Mutex<HashMap<[u32; 3], f64>>>,
+}
+
+impl LatticeMemo {
+    /// One shard per ~4 potential worker threads (minimum 16), so the handful
+    /// of parallel subtrees seldom hash to the same lock. Empty maps do not
+    /// allocate, so an ample shard count costs nothing on small meshes.
+    fn new() -> Self {
+        let shard_count = (rayon::current_num_threads() * 4).max(16);
+        Self {
+            shards: (0..shard_count)
+                .map(|_| Mutex::new(HashMap::new()))
+                .collect(),
+        }
+    }
+
+    fn shard(&self, key: [u32; 3]) -> &Mutex<HashMap<[u32; 3], f64>> {
+        let h = key[0].wrapping_mul(0x9E37_79B1)
+            ^ key[1].wrapping_mul(0x85EB_CA77)
+            ^ key[2].wrapping_mul(0xC2B2_AE3D);
+        &self.shards[h as usize % self.shards.len()]
+    }
+
+    /// Field value at `key`, computing it (outside the lock) only on the first
+    /// request across the whole tree. Racing computes converge: `or_insert`
+    /// keeps whichever value landed first, and all are bit-identical.
+    fn eval_or(&self, key: [u32; 3], compute: impl FnOnce() -> f64) -> f64 {
+        let shard = self.shard(key);
+        if let Some(&v) = shard.lock().unwrap().get(&key) {
+            return v;
+        }
+        let v = compute();
+        *shard.lock().unwrap().entry(key).or_insert(v)
+    }
+}
+
 struct GradedBuilder<'a> {
     sdf: &'a dyn Sdf,
     g: OctGrid,
     max_depth: u32,
     accuracy: f64,
+    memo: LatticeMemo,
 }
 
 fn mesh_graded(sdf: &dyn Sdf, opts: &AdaptiveMeshOptions, accuracy: f64) -> TriangleMesh {
@@ -593,10 +654,10 @@ fn mesh_graded(sdf: &dyn Sdf, opts: &AdaptiveMeshOptions, accuracy: f64) -> Tria
         g: OctGrid::new(opts),
         max_depth: opts.max_depth,
         accuracy,
+        memo: LatticeMemo::new(),
     };
-    let root_corners: [f64; 8] = std::array::from_fn(|c| {
-        sdf.eval(&builder.g.point_at(corner_key([0, 0, 0], opts.max_depth, c)))
-    });
+    let root_corners: [f64; 8] =
+        std::array::from_fn(|c| builder.eval_key(corner_key([0, 0, 0], opts.max_depth, c)));
     let mut root = builder.build(0, [0, 0, 0], root_corners);
 
     number_leaves(&mut root, &mut mesh.positions);
@@ -671,9 +732,19 @@ impl GradedBuilder<'_> {
         self.subdivide(depth, coords, lattice)
     }
 
+    /// Field value at the finest-lattice point `key`, evaluated once per
+    /// point across the whole tree and reused by every cell that shares it
+    /// ([`LatticeMemo`]).
+    fn eval_key(&self, key: [u32; 3]) -> f64 {
+        self.memo
+            .eval_or(key, || self.sdf.eval(&self.g.point_at(key)))
+    }
+
     /// Field value at child-corner lattice point `(i, j, k)` (each in
-    /// `0..=2`) of the cell at `coords`/`depth`, evaluating it only on the
-    /// first request.
+    /// `0..=2`) of the cell at `coords`/`depth`. The per-cell `lattice` is an
+    /// L1 cache in front of the global [`LatticeMemo`], so points a cell reads
+    /// more than once (the probe then subdivision) cost one array lookup, not
+    /// a repeated shard lock.
     fn lattice_at(
         &self,
         lattice: &mut SubLattice,
@@ -685,11 +756,11 @@ impl GradedBuilder<'_> {
         let base = [coords[0] << 1, coords[1] << 1, coords[2] << 1];
         let slot = &mut lattice.vals[(i * 3 + j) * 3 + k];
         *slot.get_or_insert_with(|| {
-            self.sdf.eval(&self.g.point_at([
+            self.eval_key([
                 (base[0] + i as u32) << child_shift,
                 (base[1] + j as u32) << child_shift,
                 (base[2] + k as u32) << child_shift,
-            ]))
+            ])
         })
     }
 
@@ -881,9 +952,10 @@ impl GradedBuilder<'_> {
         let base = [coords[0] << 1, coords[1] << 1, coords[2] << 1];
 
         let children: [Node; 8] = if depth < GRADED_PAR_DEPTH {
-            // Shallow cells are few: build subtrees in parallel and let each
-            // child evaluate its own corners (the handful of duplicated
-            // sibling evaluations is noise at this level).
+            // Shallow cells are few: build subtrees in parallel. Sibling
+            // corners are shared through the global memo, so a face or edge
+            // point one child evaluates is reused by the next rather than
+            // recomputed.
             let mut built: Vec<Node> = (0..8usize)
                 .into_par_iter()
                 .map(|c| {
@@ -900,10 +972,8 @@ impl GradedBuilder<'_> {
                     {
                         return Node::Empty;
                     }
-                    let child_corners: [f64; 8] = std::array::from_fn(|k| {
-                        self.sdf
-                            .eval(&self.g.point_at(corner_key(cc, child_shift, k)))
-                    });
+                    let child_corners: [f64; 8] =
+                        std::array::from_fn(|k| self.eval_key(corner_key(cc, child_shift, k)));
                     self.build(depth + 1, cc, child_corners)
                 })
                 .collect();
@@ -1704,26 +1774,25 @@ mod tests {
     }
 
     /// Flat-dominated scenes must pay off: grading collapses the flat
-    /// regions into a fraction of the triangles, and must not blow up the
-    /// field-evaluation count doing it.
+    /// regions into a fraction of the triangles *and* into a fraction of the
+    /// field evaluations.
     ///
-    /// This asserted >2x *eval* savings at this depth until the of-obv
-    /// interior-feature probe ([`GradedBuilder::model_holds_inside`]) landed.
-    /// The probe costs ~19 evals on a *terminating* leaf — the one case with
-    /// no skipped subtree to amortize them against — which pushed the eval
-    /// break-even a level deeper. Measured on this shape: evals 2.5x worse
-    /// than uniform at depth 6, parity at depth 8 (222k vs 232k), and 2.2x
-    /// better at depth 9 (425k vs 930k), while triangles improve from 2.1x
-    /// to 8.0x to 20.3x fewer. Depth 9 is where the old claim still holds,
-    /// but meshing a ~930k-triangle uniform reference there takes ~74s —
-    /// too slow to gate on.
+    /// The of-obv interior-feature probe ([`GradedBuilder::model_holds_inside`])
+    /// costs ~19 evals on a *terminating* leaf — the one case with no skipped
+    /// subtree to amortize them against — and once erased the eval win here
+    /// entirely (parity at depth 8: 222k vs 232k). But those 19 points are all
+    /// shared with sibling and neighbour cells except the cell centre, so the
+    /// global lattice memo (of-9gw, [`LatticeMemo`]) evaluates each once and
+    /// hands it back for free to every cell that touches it. Measured on this
+    /// shape at depth 8: evals drop from 222k to 148k, a 1.57x win over the
+    /// 232k uniform reference, with no change to the mesh (28,988 triangles,
+    /// 8.0x fewer than uniform's 232k).
     ///
     /// The probe is not optional: without it the mesher pinches two surface
-    /// sheets onto one vertex and faceted STEP export fails outright. So
-    /// this guards what survives at a depth cheap enough to run — triangle
-    /// count, which is what a STEP body actually pays for — plus a ceiling
-    /// that still catches an eval blowup. of-9gw tracks winning the evals
-    /// back via global lattice memoization.
+    /// sheets onto one vertex and faceted STEP export fails outright. This test
+    /// guards both payoffs at a depth cheap enough to run — triangle count,
+    /// which is what a STEP body actually pays for, and the restored eval
+    /// savings.
     #[test]
     fn graded_box_union_collapses_flat_regions_without_eval_blowup() {
         let make = || Union {
@@ -1766,12 +1835,12 @@ mod tests {
         );
         let g = graded.evals.load(Ordering::Relaxed);
         let u = uniform.evals.load(Ordering::Relaxed);
-        // Deliberately NOT a savings claim at this depth (measured 1.04x —
-        // too thin a margin to gate on). A ceiling: the probe, or anything
-        // that follows it, must not make grading pathologically eval-hungry.
+        // Measured 1.57x fewer (148k vs 232k) once the lattice memo recovered
+        // the probe's shared points; assert only >1.25x so drift in the
+        // grading heuristics or a few racing double-computes never trip it.
         assert!(
-            g * 2 < u * 3,
-            "graded sampled {g} points, uniform depth sampled {u}: expected under 1.5x"
+            5 * g < 4 * u,
+            "graded sampled {g} points, uniform depth sampled {u}: expected >1.25x fewer"
         );
     }
 
