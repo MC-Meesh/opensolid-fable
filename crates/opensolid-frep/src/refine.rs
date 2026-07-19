@@ -85,6 +85,12 @@ const SNAP_TRUST: f64 = 0.4;
 /// Edges shorter than this fraction of a cell are slivers to collapse.
 const COLLAPSE_FRACTION: f64 = 0.2;
 
+/// Boundary vertices closer than this fraction of a cell are welded together
+/// when [`repair_fold_flaps`] seals the holes it opens. The flaps it cuts are
+/// sub-cell, so their boundary loops close within a fraction of a cell; a
+/// margin below one cell avoids bridging genuinely separate defect regions.
+const FLAP_SEAL_FRACTION: f64 = 0.75;
+
 /// Vertex classification from the active field branches at the vertex.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -133,6 +139,11 @@ pub fn refine_mesh(sdf: &dyn Sdf, mesh: &mut TriangleMesh, opts: &RefineOptions)
             }
         }
     }
+
+    // Final cleanup of residual single-sheet folds at near-tangent silhouettes
+    // that the two-sheet split above cannot separate (of-o0o). Runs last, on
+    // the settled topology, and is a no-op unless such a fold survives.
+    repair_fold_flaps(mesh, FLAP_SEAL_FRACTION * cell);
 
     mesh.normals = mesh
         .positions
@@ -309,6 +320,161 @@ fn repair_pinched_edges(mesh: &mut TriangleMesh) -> usize {
     }
     mesh.indices = new_tris;
     pinched
+}
+
+/// Repair the residual non-manifold edges [`repair_pinched_edges`] cannot
+/// split: single-sheet folds at near-tangent silhouettes (of-o0o). Where a
+/// CSG surface grazes a cell face tangentially, the two "sheets" the dual
+/// contour sees are one smooth surface doubled back on itself, so their
+/// crossing normals are (anti-)parallel and refinement never separates them —
+/// the per-component split has no distinct components to place vertices for,
+/// and emits a thin flap: two extra near-degenerate triangles (one facing the
+/// wrong way) sharing the pinched edge with the two real surface triangles.
+///
+/// Such an edge carries more than two triangles but is not a clean two-sheet
+/// pinch, so it is cut structurally rather than split: at every over-incident
+/// edge the two largest-area triangles (the true surface) are kept and the
+/// rest (the flap) removed. Cutting opens a small boundary loop where the flap
+/// tips met the mesh; welding boundary vertices within `seal_tol` closes it.
+/// Cut and seal are iterated because a seal can re-expose a flap, and repeated
+/// to convergence (bounded).
+///
+/// Both steps are no-ops on a closed manifold: no edge has more than two
+/// triangles to cut, and no vertex lies on a boundary edge to weld. The pass
+/// therefore only touches meshes that are already non-manifold, and cannot
+/// perturb the well-formed gallery.
+fn repair_fold_flaps(mesh: &mut TriangleMesh, seal_tol: f64) {
+    let mut changed = false;
+    for _ in 0..8 {
+        let cut = cut_over_incident_edges(mesh);
+        let sealed = seal_boundary(mesh, seal_tol);
+        if cut == 0 && sealed == 0 {
+            break;
+        }
+        changed = true;
+    }
+    if changed {
+        compact_unreferenced(mesh);
+    }
+}
+
+/// At every edge shared by more than two triangles, keep the two largest by
+/// area and drop the rest. Returns the number of triangles removed.
+fn cut_over_incident_edges(mesh: &mut TriangleMesh) -> usize {
+    let mut incident: HashMap<(usize, usize), Vec<usize>> = HashMap::new();
+    for (t, tri) in mesh.indices.iter().enumerate() {
+        for e in 0..3 {
+            let (a, b) = (tri[e], tri[(e + 1) % 3]);
+            incident.entry((a.min(b), a.max(b))).or_default().push(t);
+        }
+    }
+    let area = |t: usize| {
+        let [a, b, c] = mesh.indices[t].map(|i| mesh.positions[i]);
+        (b - a).cross(&(c - a)).norm()
+    };
+    let mut kill = vec![false; mesh.indices.len()];
+    for tris in incident.values().filter(|v| v.len() > 2) {
+        let mut by_area = tris.clone();
+        by_area.sort_by(|&x, &y| {
+            area(y)
+                .partial_cmp(&area(x))
+                .expect("finite triangle areas")
+        });
+        for &t in &by_area[2..] {
+            kill[t] = true;
+        }
+    }
+    let cut = kill.iter().filter(|&&k| k).count();
+    if cut > 0 {
+        let mut i = 0;
+        mesh.indices.retain(|_| {
+            let keep = !kill[i];
+            i += 1;
+            keep
+        });
+    }
+    cut
+}
+
+/// Weld together vertices that lie on a boundary edge (an edge used by exactly
+/// one triangle) and fall within `tol` of each other, sealing the small holes
+/// [`cut_over_incident_edges`] opens. Restricting welds to boundary vertices
+/// keeps interior sheets — never bordering a boundary edge on a valid mesh —
+/// untouched. Returns the number of vertices merged away.
+fn seal_boundary(mesh: &mut TriangleMesh, tol: f64) -> usize {
+    let mut edge_count: HashMap<(usize, usize), usize> = HashMap::new();
+    for tri in &mesh.indices {
+        for e in 0..3 {
+            let (a, b) = (tri[e], tri[(e + 1) % 3]);
+            *edge_count.entry((a.min(b), a.max(b))).or_default() += 1;
+        }
+    }
+    let mut on_boundary = vec![false; mesh.positions.len()];
+    for (&(a, b), &c) in &edge_count {
+        if c == 1 {
+            on_boundary[a] = true;
+            on_boundary[b] = true;
+        }
+    }
+    let boundary: Vec<usize> = (0..mesh.positions.len())
+        .filter(|&v| on_boundary[v])
+        .collect();
+    if boundary.is_empty() {
+        return 0;
+    }
+    let mut remap: Vec<usize> = (0..mesh.positions.len()).collect();
+    for i in 0..boundary.len() {
+        let vi = boundary[i];
+        if remap[vi] != vi {
+            continue; // already merged into an earlier representative
+        }
+        for &vj in &boundary[i + 1..] {
+            if remap[vj] == vj && (mesh.positions[vi] - mesh.positions[vj]).norm() <= tol {
+                remap[vj] = vi;
+            }
+        }
+    }
+    let mut merged = 0;
+    for (v, &r) in remap.iter().enumerate() {
+        if r != v {
+            merged += 1;
+        }
+    }
+    if merged > 0 {
+        for tri in &mut mesh.indices {
+            for v in tri.iter_mut() {
+                *v = remap[*v];
+            }
+        }
+        mesh.indices
+            .retain(|t| t[0] != t[1] && t[1] != t[2] && t[0] != t[2]);
+    }
+    merged
+}
+
+/// Drop vertices no triangle references, remapping indices in place. Unlike
+/// [`compact`] this carries no `kinds` (it runs before classification), and
+/// preserves `normals` only when present.
+fn compact_unreferenced(mesh: &mut TriangleMesh) {
+    let mut new_index: Vec<Option<usize>> = vec![None; mesh.positions.len()];
+    let mut positions = Vec::new();
+    let mut normals = Vec::new();
+    let has_normals = !mesh.normals.is_empty();
+    for tri in &mut mesh.indices {
+        for v in tri.iter_mut() {
+            *v = *new_index[*v].get_or_insert_with(|| {
+                positions.push(mesh.positions[*v]);
+                if has_normals {
+                    normals.push(mesh.normals[*v]);
+                }
+                positions.len() - 1
+            });
+        }
+    }
+    mesh.positions = positions;
+    if has_normals {
+        mesh.normals = normals;
+    }
 }
 
 /// Active branch surfaces near `p`, deduplicated by normal direction:
