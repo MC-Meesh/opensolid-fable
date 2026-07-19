@@ -39,12 +39,12 @@
 //! `NotImplemented` F-Rep fallback.
 
 use nalgebra::{Rotation3, Unit};
-use opensolid_brep::boolean::{intersect, subtract, unite};
+use opensolid_brep::boolean::{InsideTest, boolean_with_inside_tests, intersect, subtract, unite};
 use opensolid_brep::curve::plane_basis;
 use opensolid_brep::{
-    Body, BodyType, BooleanOutput, CheckFailure, Curve3, FaceSense, FinSense, GeometryStore,
-    LoopType, SYSTEM_RESOLUTION, ShellOrientation, Surface3, TopologyStore, primitives,
-    rotate_body, translate_body,
+    Body, BodyType, BooleanOp, BooleanOutput, CheckFailure, Curve3, FaceSense, FinSense,
+    GeometryStore, KnotVector, LoopType, NurbsSurface, SYSTEM_RESOLUTION, ShellOrientation,
+    Surface3, TopologyStore, primitives, rotate_body, translate_body,
 };
 use opensolid_core::EntityId;
 use opensolid_core::error::{CoreError, CoreResult};
@@ -521,6 +521,130 @@ impl Scene {
                 (e_minor, FinSense::Reversed),
             ],
         );
+        body
+    }
+
+    /// Axis-aligned box spanning `min`..`max`, but with all six faces bound
+    /// to **bilinear NURBS patches** (`Surface3::Nurbs`) instead of analytic
+    /// planes. A flat degree-1×1 patch with a 2×2 control grid reproduces a
+    /// rectangle exactly — its four boundary isocurves are straight lines —
+    /// so the geometry is identical to [`Scene::block`] down to floating
+    /// point; only the surface *kind* differs. That difference is the whole
+    /// point (of-xka): this is the only operand in the suite whose faces
+    /// drive the boolean through the NURBS chart, SSI, and
+    /// classify/reconstruct path end to end, rather than the analytic-plane
+    /// path. Every prior NURBS gate stopped at the marched curve (of-37i.4)
+    /// or the imprint (of-4is); none reached a NURBS-hosted *solid*.
+    ///
+    /// Because [`ray_surface_hits`] has no NURBS arm (of-3oj), a body built
+    /// here cannot be classified by ray parity and MUST be booleaned via
+    /// [`boolean_with_inside_tests`] with a [`box_inside_test`] in its slot
+    /// — see the tests below.
+    ///
+    /// Control points are ordered so each patch's `du × dv` points out of
+    /// the solid, matching `FaceSense::Positive` + `ShellOrientation::Outward`:
+    /// with `(u,v)=(0,0)→cycle[0]`, `(1,0)→cycle[1]`, `(1,1)→cycle[2]`,
+    /// `(0,1)→cycle[3]`, the normal at `(0,0)` is `(c1−c0)×(c3−c0)`, which
+    /// points outward exactly when `c0→c1→c2→c3` is CCW seen from outside —
+    /// the same winding as `primitives::block`'s `face_specs` (verified
+    /// against the bottom face: `(0,2hy,0)×(2hx,0,0) = −Z`).
+    fn nurbs_block(&mut self, min: [f64; 3], max: [f64; 3]) -> EntityId<Body> {
+        let corners: [Point3; 8] = [
+            Point3::new(min[0], min[1], min[2]),
+            Point3::new(max[0], min[1], min[2]),
+            Point3::new(max[0], max[1], min[2]),
+            Point3::new(min[0], max[1], min[2]),
+            Point3::new(min[0], min[1], max[2]),
+            Point3::new(max[0], min[1], max[2]),
+            Point3::new(max[0], max[1], max[2]),
+            Point3::new(min[0], max[1], max[2]),
+        ];
+
+        /// Undirected edges as (low, high) corner-index pairs: bottom ring,
+        /// top ring, verticals (identical to `primitives::block`).
+        const EDGE_PAIRS: [(usize, usize); 12] = [
+            (0, 1),
+            (1, 2),
+            (2, 3),
+            (3, 0),
+            (4, 5),
+            (5, 6),
+            (6, 7),
+            (7, 4),
+            (0, 4),
+            (1, 5),
+            (2, 6),
+            (3, 7),
+        ];
+
+        // Vertex cycles counterclockwise viewed from outside — identical to
+        // `primitives::block`'s `face_specs`; the outward normal each cycle
+        // implies is reproduced by the control ordering documented above.
+        let face_cycles: [[usize; 4]; 6] = [
+            [0, 3, 2, 1], // bottom (−Z)
+            [4, 5, 6, 7], // top (+Z)
+            [0, 1, 5, 4], // front (−Y)
+            [1, 2, 6, 5], // right (+X)
+            [2, 3, 7, 6], // back (+Y)
+            [3, 0, 4, 7], // left (−X)
+        ];
+
+        let store = &mut self.store;
+        let geo = &mut self.geo;
+        let body = store.create_body(BodyType::Solid);
+        let shell = store.create_shell(body, true, ShellOrientation::Outward);
+        let vertices = corners.map(|p| store.create_vertex(p, SYSTEM_RESOLUTION));
+
+        let edges: Vec<_> = EDGE_PAIRS
+            .iter()
+            .map(|&(a, b)| {
+                let line =
+                    Curve3::line(corners[a], corners[b] - corners[a]).expect("distinct corners");
+                let length = (corners[b] - corners[a]).norm();
+                let curve = geo.add_curve(line);
+                store.create_edge_with_curve(
+                    vertices[a],
+                    vertices[b],
+                    SYSTEM_RESOLUTION,
+                    curve,
+                    0.0,
+                    length,
+                )
+            })
+            .collect();
+
+        let directed_edge = |from: usize, to: usize| -> (EntityId<_>, FinSense) {
+            let (index, &(a, _)) = EDGE_PAIRS
+                .iter()
+                .enumerate()
+                .find(|&(_, &(a, b))| (a, b) == (from, to) || (a, b) == (to, from))
+                .expect("face cycles only use listed edges");
+            let sense = if a == from {
+                FinSense::Forward
+            } else {
+                FinSense::Reversed
+            };
+            (edges[index], sense)
+        };
+
+        let knots = KnotVector::clamped_uniform(1, 2).expect("degree-1 knots for 2 control points");
+        for cycle in face_cycles {
+            // Row-major grid `[i][j]` with `i↔u`, `j↔v`: row u=0 is
+            // (v=0, v=1) = (c0, c3); row u=1 is (c1, c2).
+            let grid = vec![
+                vec![corners[cycle[0]], corners[cycle[3]]],
+                vec![corners[cycle[1]], corners[cycle[2]]],
+            ];
+            let patch = NurbsSurface::bspline(grid, knots.clone(), knots.clone())
+                .expect("rectangular 2×2 bilinear grid");
+            let surface = geo.add_surface(Surface3::nurbs(patch));
+            let face = store.create_face(shell, FaceSense::Positive);
+            store.faces.get_mut(face).expect("just created").surface = Some(surface);
+            let loop_edges: Vec<_> = (0..4)
+                .map(|i| directed_edge(cycle[i], cycle[(i + 1) % 4]))
+                .collect();
+            store.create_loop(face, LoopType::Outer, &loop_edges);
+        }
         body
     }
 
@@ -2998,4 +3122,173 @@ fn corner_touching_blocks_unite_is_not_implemented() {
         matches!(err, CoreError::NotImplemented { .. }),
         "{context}: expected NotImplemented, got {err:?}"
     );
+}
+
+// =====================================================================
+// (13) NURBS-hosted solids: the classify/reconstruct path end to end
+//      (of-xka)
+// =====================================================================
+//
+// Every prior NURBS gate stopped short of a solid boolean: phase 2
+// (of-37i.4) gated the marched intersection curve, of-4is gated the imprint
+// (reached directly via `clip_imprint`), and `boolean_stress` itself
+// contained ZERO NURBS operands — so the suite being green never exercised
+// classify/reconstruct on a NURBS host at all. These cases close that gap:
+// a box whose six faces are bilinear NURBS patches (built by
+// `Scene::nurbs_block`) is analytically a cube, so the exact answers are the
+// same planar volumes as the analytic campaigns — but the pipeline now runs
+// the NURBS chart, NURBS SSI, region tracing on a NURBS-hosted face, atom
+// building, shell reconstruction, and the volume-identity check. The
+// inclusion–exclusion identity `vol(A)+vol(B) = vol(A∪B)+vol(A∩B)` is the
+// invariant that catches the of-ipt.4 wrong-uv failure mode on a NURBS host.
+//
+// The overlap is a clean transversal half-overlap: the tool strictly exceeds
+// the box in two axes and overlaps its `+x` half in the third, so the tool's
+// `−x` face is the only cut. It splits each of the box's four `x`-spanning
+// NURBS faces into two SIMPLE (hole-free) regions, the box's `+x` face lies
+// wholly inside the tool, and no face pair is coincident (coincident NURBS
+// faces are a separate, still-`NotImplemented` tangential-SSI path). A tool
+// that instead *bores* the box — protruding both ends — leaves an annular
+// (holed) region on the NURBS caps, which currently fails classification
+// (of-l69); that case is the `#[ignore]`d repro at the end of this section.
+//
+// Booleans on a NURBS body go through `boolean_with_inside_tests` because
+// `ray_surface_hits` has no NURBS arm (of-3oj): the injected test replaces
+// ray parity for the NURBS operand. A box has an exact interior predicate,
+// so `box_inside_test` never abstains — the classification stays exact (not
+// `MeshSdf`-approximate), which makes the volume identity a *tight* gate.
+
+/// Exact strict point-in-box predicate for a NURBS box built by
+/// [`Scene::nurbs_block`], to inject via [`boolean_with_inside_tests`].
+/// `Some(true)` strictly inside, `Some(false)` strictly outside; it never
+/// returns `None` — a box's interior is an exact predicate, so there is no
+/// reason to abstain and fall through to the (NURBS-erroring) ray path.
+fn box_inside_test(min: [f64; 3], max: [f64; 3]) -> impl Fn(&Point3) -> Option<bool> {
+    move |p: &Point3| Some((0..3).all(|i| p[i] > min[i] && p[i] < max[i]))
+}
+
+/// Run all three ops for a NURBS-hosted pair and assert the transversal
+/// half-overlap answers: `A−B` and `A∩B` are the overlapped half, and the
+/// inclusion–exclusion identity holds. `a` is always the NURBS box of volume
+/// `vol_a` with inside test `inside_a`; `b` (volume `vol_b`) overlaps exactly
+/// half of `a`, so `A−B = A∩B = vol_a / 2`.
+fn assert_half_overlap_identity(
+    context: &str,
+    scene: &Scene,
+    a: EntityId<Body>,
+    b: EntityId<Body>,
+    tests: [Option<InsideTest>; 2],
+    vol_a: f64,
+    vol_b: f64,
+) {
+    let half = vol_a / 2.0;
+    let run = |op, label: &str| {
+        boolean_with_inside_tests(op, &scene.store, &scene.geo, a, b, &tol(), tests)
+            .unwrap_or_else(|e| panic!("{context}: exact pipeline rejected the {label}: {e:?}"))
+    };
+    let subtracted = run(BooleanOp::Subtract, "subtract");
+    assert_close(
+        volume(&subtracted, context),
+        half,
+        PLANAR_VOLUME_RTOL,
+        context,
+    );
+    let intersected = run(BooleanOp::Intersect, "intersect");
+    assert_close(
+        volume(&intersected, context),
+        half,
+        PLANAR_VOLUME_RTOL,
+        context,
+    );
+    let united = run(BooleanOp::Unite, "unite");
+    let sum = volume(&united, context) + volume(&intersected, context);
+    assert_close(sum, vol_a + vol_b, PLANAR_VOLUME_RTOL, context);
+}
+
+/// NURBS box half-overlapped by an **analytic** block. Only operand A is
+/// NURBS, so only slot 0 carries an inside test; B classifies by exact ray
+/// parity. First end-to-end proof (of-xka) that a NURBS-hosted solid
+/// survives classify → reconstruct → tessellate → volume.
+#[test]
+fn nurbs_box_half_overlapped_by_analytic_block() {
+    let context = "NURBS box half-overlapped by analytic block";
+    let mut scene = Scene::new();
+    let a_box = ([0.0, 0.0, 0.0], [2.0, 2.0, 2.0]);
+    let a = scene.nurbs_block(a_box.0, a_box.1);
+    let b = scene.block([1.0, -1.0, -1.0], [3.0, 3.0, 3.0]);
+    let inside_a = box_inside_test(a_box.0, a_box.1);
+    // vol(A) = 2³ = 8; vol(B) = 2·4·4 = 32; overlap = A's +x half = 4.
+    assert_half_overlap_identity(context, &scene, a, b, [Some(&inside_a), None], 8.0, 32.0);
+}
+
+/// The same half-overlap, but the tool is itself a **NURBS** box — the
+/// genuine NURBS↔NURBS solid boolean the whole gap (of-xka) was about. Both
+/// operands carry an inside test; every cut is a NURBS patch meeting a NURBS
+/// patch, driving NURBS↔NURBS SSI and NURBS-on-NURBS region tracing that no
+/// analytic operand can reach.
+#[test]
+fn nurbs_box_half_overlapped_by_nurbs_box() {
+    let context = "NURBS box half-overlapped by NURBS box";
+    let mut scene = Scene::new();
+    let a_box = ([0.0, 0.0, 0.0], [2.0, 2.0, 2.0]);
+    let b_box = ([1.0, -1.0, -1.0], [3.0, 3.0, 3.0]);
+    let a = scene.nurbs_block(a_box.0, a_box.1);
+    let b = scene.nurbs_block(b_box.0, b_box.1);
+    let inside_a = box_inside_test(a_box.0, a_box.1);
+    let inside_b = box_inside_test(b_box.0, b_box.1);
+    assert_half_overlap_identity(
+        context,
+        &scene,
+        a,
+        b,
+        [Some(&inside_a), Some(&inside_b)],
+        8.0,
+        32.0,
+    );
+}
+
+/// NURBS box bored transversally by an analytic bar protruding both ends,
+/// which leaves an annular (holed) region on the box's top and bottom NURBS
+/// caps. Region tracing on a holed NURBS face currently fails classification
+/// with `boolean::classify: could not find an interior sample point for a
+/// face region` (of-l69) — the same bore on analytic planar caps works, and
+/// the hole-free half-overlaps above work, so the defect is specific to
+/// holed regions on a NURBS host.
+///
+/// Kept as an executable repro of the expected-correct behavior: box `2³ =
+/// 8`, bar `1×1×3 = 3`, overlap `2`, so `A−B = 6`, `A∩B = 2`, and the
+/// identity `9 + 2 = 8 + 3` should hold once of-l69 is fixed. Run with
+/// `cargo test --test boolean_stress -- --ignored`.
+#[test]
+#[ignore = "of-l69: region_interior_point fails on holed NURBS-hosted faces"]
+fn nurbs_box_bored_by_analytic_bar() {
+    let context = "NURBS box bored by analytic bar";
+    let mut scene = Scene::new();
+    let a_box = ([0.0, 0.0, 0.0], [2.0, 2.0, 2.0]);
+    let a = scene.nurbs_block(a_box.0, a_box.1);
+    let b = scene.block([0.5, 0.5, -0.5], [1.5, 1.5, 2.5]);
+    let inside_a = box_inside_test(a_box.0, a_box.1);
+    let tests: [Option<InsideTest>; 2] = [Some(&inside_a), None];
+
+    let run = |op, label: &str| {
+        boolean_with_inside_tests(op, &scene.store, &scene.geo, a, b, &tol(), tests)
+            .unwrap_or_else(|e| panic!("{context}: exact pipeline rejected the {label}: {e:?}"))
+    };
+    let subtracted = run(BooleanOp::Subtract, "subtract");
+    assert_close(
+        volume(&subtracted, context),
+        6.0,
+        PLANAR_VOLUME_RTOL,
+        context,
+    );
+    let intersected = run(BooleanOp::Intersect, "intersect");
+    assert_close(
+        volume(&intersected, context),
+        2.0,
+        PLANAR_VOLUME_RTOL,
+        context,
+    );
+    let united = run(BooleanOp::Unite, "unite");
+    let sum = volume(&united, context) + volume(&intersected, context);
+    assert_close(sum, 8.0 + 3.0, PLANAR_VOLUME_RTOL, context);
 }
