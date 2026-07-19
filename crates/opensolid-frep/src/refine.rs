@@ -1416,4 +1416,118 @@ mod tests {
             );
         }
     }
+
+    /// A closed regular octahedron: eight outward-wound triangles, every edge
+    /// shared by exactly two.
+    fn octahedron() -> TriangleMesh {
+        let positions = vec![
+            Point3::new(1.0, 0.0, 0.0),  // 0 +x
+            Point3::new(-1.0, 0.0, 0.0), // 1 -x
+            Point3::new(0.0, 1.0, 0.0),  // 2 +y
+            Point3::new(0.0, -1.0, 0.0), // 3 -y
+            Point3::new(0.0, 0.0, 1.0),  // 4 +z
+            Point3::new(0.0, 0.0, -1.0), // 5 -z
+        ];
+        let indices = vec![
+            [4, 0, 2],
+            [4, 2, 1],
+            [4, 1, 3],
+            [4, 3, 0],
+            [5, 2, 0],
+            [5, 1, 2],
+            [5, 3, 1],
+            [5, 0, 3],
+        ];
+        TriangleMesh {
+            normals: positions.iter().map(|_| Vector3::z()).collect(),
+            positions,
+            indices,
+        }
+    }
+
+    /// The residual fold `repair_pinched_edges` cannot split: a single sheet
+    /// (two large triangles on the shared edge) with a thin flap doubled back
+    /// onto it (two small triangles on the same edge, tips just off the
+    /// surface). `cut_over_incident_edges` keeps the two largest triangles.
+    #[test]
+    fn cut_over_incident_edges_keeps_two_largest() {
+        let positions = vec![
+            Point3::new(0.0, 0.0, 0.0),   // 0 shared edge start
+            Point3::new(0.0, 1.0, 0.0),   // 1 shared edge end
+            Point3::new(-1.0, 0.5, 0.0),  // 2 real sheet, left
+            Point3::new(1.0, 0.5, 0.0),   // 3 real sheet, right
+            Point3::new(0.0, 0.5, 0.02),  // 4 flap tip (small area)
+            Point3::new(0.0, 0.5, 0.021), // 5 flap tip (small area)
+        ];
+        let indices = vec![
+            [0, 1, 2], // real, large
+            [1, 0, 3], // real, large
+            [0, 1, 4], // flap, small
+            [1, 0, 5], // flap, small
+        ];
+        let mut mesh = TriangleMesh {
+            normals: positions.iter().map(|_| Vector3::z()).collect(),
+            positions,
+            indices,
+        };
+        let cut = cut_over_incident_edges(&mut mesh);
+        assert_eq!(cut, 2, "must cut the two small flap triangles");
+        assert_eq!(mesh.triangle_count(), 2);
+        let kept: std::collections::HashSet<_> = mesh.indices.iter().cloned().collect();
+        assert!(kept.contains(&[0, 1, 2]) && kept.contains(&[1, 0, 3]));
+    }
+
+    #[test]
+    fn seal_boundary_welds_coincident_boundary_vertices() {
+        // Vertex 3 duplicates vertex 0; both lie on a boundary edge.
+        let positions = vec![
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(1.0, 0.0, 0.0),
+            Point3::new(0.0, 1.0, 0.0),
+            Point3::new(0.0, 0.0, 1e-6), // ~coincident with vertex 0
+            Point3::new(1.0, 0.0, 1.0),
+            Point3::new(0.0, 1.0, 1.0),
+        ];
+        let mut mesh = TriangleMesh {
+            normals: positions.iter().map(|_| Vector3::z()).collect(),
+            positions,
+            indices: vec![[0, 1, 2], [3, 4, 5]],
+        };
+        let merged = seal_boundary(&mut mesh, 0.1);
+        assert_eq!(merged, 1, "the coincident boundary pair welds");
+        assert_eq!(mesh.indices[1], [0, 4, 5], "vertex 3 remapped onto 0");
+    }
+
+    #[test]
+    fn repair_fold_flaps_is_noop_on_closed_manifold() {
+        let mut mesh = octahedron();
+        assert!(mesh.is_closed_manifold());
+        repair_fold_flaps(&mut mesh, 0.5);
+        assert_eq!(mesh.triangle_count(), 8, "no triangle touched");
+        assert_eq!(mesh.vertex_count(), 6, "no vertex touched");
+        assert!(mesh.is_closed_manifold());
+    }
+
+    /// End to end: an octahedron with a thin flap grafted onto one edge is
+    /// restored to the clean closed octahedron.
+    #[test]
+    fn repair_fold_flaps_removes_grafted_fold() {
+        let mut mesh = octahedron();
+        // Two small triangles doubled onto edge (0, 2), tips just off surface.
+        let p = mesh.positions.len();
+        mesh.positions.push(Point3::new(0.5, 0.5, 0.02));
+        mesh.positions.push(Point3::new(0.5, 0.5, 0.021));
+        mesh.normals.push(Vector3::z());
+        mesh.normals.push(Vector3::z());
+        mesh.indices.push([0, 2, p]);
+        mesh.indices.push([2, 0, p + 1]);
+        assert!(
+            !mesh.is_closed_manifold(),
+            "graft makes edge (0,2) four-way"
+        );
+        repair_fold_flaps(&mut mesh, 0.5);
+        assert_eq!(mesh.triangle_count(), 8);
+        assert_eq!(mesh.vertex_count(), 6, "flap tips compacted away");
+        assert!(mesh.is_closed_manifold());
+    }
 }
