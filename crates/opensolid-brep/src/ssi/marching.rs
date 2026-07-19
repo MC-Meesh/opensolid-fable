@@ -543,19 +543,41 @@ pub fn intersect_nurbs(
         b,
         [a.domain_u(), a.domain_v(), b.domain_u(), b.domain_v()],
         tol,
+        None,
     )
 }
 
 /// Shared marching driver: grid-seed over `domains[0..2]` of `a`, refine
 /// against `b`, and trace within the given parameter boxes (which must be
 /// finite — unbounded primitive directions are clipped by the callers).
+///
+/// `roi` is the region of interest as a bounding sphere `(center, radius)`.
+/// When set, only seeds whose refined point lies inside it (padded to the
+/// same `reach` [`clipped_domains`] clips a partner to) start a trace. This
+/// is not an optimization: `a`'s natural parameter domain can extend well
+/// past the region where it actually meets `b` — a plane clipped to the
+/// ROI intersects a full-domain NURBS patch only across the ROI, so the
+/// patch's grid seeds *outside* the ROI would each trace a fragment that
+/// dead-ends at the clipped partner's domain wall. Those fragments overlap
+/// (the tracer covers past the seed on the ROI side before stalling), and
+/// the seed-on-existing-curve guard below only skips a seed sitting on an
+/// already-traced curve, not one beyond a fragment's stalled end. Two
+/// overlapping fragments of one curve then reach the boolean arrangement as
+/// duplicate imprints, which collapse a holed region into a zero-area loop
+/// (of-l69). Seeding only inside the ROI leaves one trace to cover the whole
+/// in-region crossing. Callers with no clipped partner (compact primitives,
+/// full-domain NURBS) pass `None`.
 fn march_boxed<A: MarchSurface, B: MarchSurface>(
     a: &A,
     b: &B,
     domains: [(f64, f64); 4],
     tol: &ToleranceContext,
+    roi: Option<(Point3, f64)>,
 ) -> CoreResult<Vec<MarchedCurve>> {
     let gap_tol = tol.linear.max(opensolid_core::SYSTEM_RESOLUTION);
+    // Same padded reach `clipped_domains` uses to clip a partner to the ROI,
+    // so a seed the clipped partner still covers is never filtered out.
+    let roi_reach = roi.map(|(center, radius)| (center, 1.05 * radius + tol.linear));
 
     // An infinite bound would make every grid parameter below infinite and
     // every seed NaN, which then surfaces as an empty or garbage curve set
@@ -656,6 +678,14 @@ fn march_boxed<A: MarchSurface, B: MarchSurface>(
         let Some(seed) = marcher.refine_seed(candidate)? else {
             continue;
         };
+        // Skip seeds outside the region of interest: `a`'s grid can cover
+        // more of `a` than `b` reaches once clipped, and an out-of-region
+        // seed only re-traces a fragment of an in-region crossing (of-l69).
+        if let Some((center, reach)) = roi_reach {
+            if (seed.1.pa - center).norm() > reach {
+                continue;
+            }
+        }
         // Skip seeds landing on an already-traced curve.
         let on_existing = curves.iter().any(|curve| {
             curve
@@ -769,7 +799,9 @@ fn march_primitives(
     let bounds = bounding_sphere(a).expect("marched SSI grids over a compact primitive");
     let [bu, bv] = clipped_domains(b, bounds, tol);
     let domains = [a.domain_u(), a.domain_v(), bu, bv];
-    match march_boxed(a, b, domains, tol) {
+    // `a` is the compact primitive whose own finite domain bounds the grid,
+    // so its every seed is already in range — no ROI filter is needed.
+    match march_boxed(a, b, domains, tol, None) {
         Err(CoreError::Degenerate { .. }) => Err(CoreError::NotImplemented {
             feature: "marched primitive SSI across a tangential contact or \
                       parameterization singularity (transversal MVP)",
@@ -949,7 +981,11 @@ fn march_bounded_pair(
 ) -> CoreResult<Vec<MarchedCurve>> {
     let [au, av] = clipped_domains(a, bounds, tol);
     let [bu, bv] = clipped_domains(b, bounds, tol);
-    match march_boxed(a, b, [au, av, bu, bv], tol) {
+    // A NURBS `a` keeps its full natural domain through `clipped_domains`
+    // (only unbounded primitives clip in parameter space), so its grid can
+    // seed traces outside `bounds`. Pass the ROI so those seeds are dropped
+    // (of-l69); an already-clipped primitive `a` is unaffected.
+    match march_boxed(a, b, [au, av, bu, bv], tol, Some(bounds)) {
         Err(CoreError::Degenerate { .. }) => Err(CoreError::NotImplemented {
             feature: "marched bounded SSI across a tangential contact \
                       (transversal MVP)",
@@ -2123,6 +2159,7 @@ mod tests {
                 (0.0, 1.0),
             ],
             &default_tol(),
+            None,
         )
         .unwrap_err();
         let CoreError::Degenerate { reason, .. } = err else {

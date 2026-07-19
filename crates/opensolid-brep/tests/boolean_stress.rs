@@ -3249,18 +3249,23 @@ fn nurbs_box_half_overlapped_by_nurbs_box() {
 
 /// NURBS box bored transversally by an analytic bar protruding both ends,
 /// which leaves an annular (holed) region on the box's top and bottom NURBS
-/// caps. Region tracing on a holed NURBS face currently fails classification
-/// with `boolean::classify: could not find an interior sample point for a
-/// face region` (of-l69) — the same bore on analytic planar caps works, and
-/// the hole-free half-overlaps above work, so the defect is specific to
-/// holed regions on a NURBS host.
+/// caps. This once failed classification with `boolean::classify: could not
+/// find an interior sample point for a face region` (of-l69): the bar's side
+/// planes are infinite surfaces clipped to the box-overlap region, but the
+/// NURBS cap kept its full natural domain, so `march_boxed` grid-seeded the
+/// cap *outside* that region and each out-of-region seed traced an
+/// overlapping fragment of the same hole edge. The two fragments reached the
+/// arrangement as duplicate imprints, which `merge_imprint_chains` walked
+/// into a zero-area loop with no interior point. Seeding only inside the
+/// region of interest (of-l69) leaves one trace per edge, so the annulus is
+/// built correctly. The same bore on analytic planar caps always worked
+/// (their SSI is closed-form, not marched), and the hole-free half-overlaps
+/// above work, which had localized the defect to holed regions on a NURBS
+/// host.
 ///
-/// Kept as an executable repro of the expected-correct behavior: box `2³ =
-/// 8`, bar `1×1×3 = 3`, overlap `2`, so `A−B = 6`, `A∩B = 2`, and the
-/// identity `9 + 2 = 8 + 3` should hold once of-l69 is fixed. Run with
-/// `cargo test --test boolean_stress -- --ignored`.
+/// Volumes: box `2³ = 8`, bar `1×1×3 = 3`, overlap `2`, so `A−B = 6`,
+/// `A∩B = 2`, and the inclusion-exclusion identity `9 + 2 = 8 + 3` holds.
 #[test]
-#[ignore = "of-l69: region_interior_point fails on holed NURBS-hosted faces"]
 fn nurbs_box_bored_by_analytic_bar() {
     let context = "NURBS box bored by analytic bar";
     let mut scene = Scene::new();
