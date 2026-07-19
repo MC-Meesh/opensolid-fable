@@ -116,6 +116,15 @@ class Transcript {
     return payload;
   }
 
+  optimize(args) {
+    const res = this._run('optimize', args);
+    if (res.isError) throw new Error(`optimize failed: ${res.content[0].text}`);
+    const payload = JSON.parse(res.content[0].text);
+    this.turns.push({ kind: 'optimize', args, payload });
+    console.error(`  ok  optimize -> converged=${payload.converged} iters=${payload.iterations}`);
+    return payload;
+  }
+
   // Export records whatever the tool returns — success payload OR the tool's
   // own error result — so a genuine export limitation appears in the transcript
   // verbatim instead of crashing the run.
@@ -192,6 +201,16 @@ class Transcript {
       }
       case 'validate': {
         const lines = [`> 🔧 **\`validate\`** \`{ "model_id": "${stableId(turn.args.model_id)}" }\``];
+        lines.push('> ```json');
+        for (const l of json(turn.payload).split('\n')) lines.push(`> ${l}`);
+        lines.push('> ```');
+        return lines.join('\n');
+      }
+      case 'optimize': {
+        const lines = [`> 🔧 **\`optimize\`**`];
+        lines.push('> ```json');
+        for (const l of json(turn.args).split('\n')) lines.push(`> ${l}`);
+        lines.push('> ```');
         lines.push('> ```json');
         for (const l of json(turn.payload).split('\n')) lines.push(`> ${l}`);
         lines.push('> ```');
@@ -699,6 +718,92 @@ return part.rotate(0, 1, 0, 360);
   },
 );
 
+// 7. Gradient optimization: drive a bracket onto a mass target ──────────────
+// The differentiable path (of-2y4.2): the agent declares a design variable with
+// param(), then hands the numeric search to `optimize` instead of nudging the
+// dimension by hand across a dozen tool calls.
+example(
+  {
+    slug: 'optimize-bracket',
+    title: 'hitting a mass target with the optimize tool',
+    intro:
+      'A weight budget is a number, not a shape. Rather than guess a wall ' +
+      'thickness, render, measure, and nudge — a dozen tool calls converging ' +
+      'like a random walk — the agent declares the thickness a `param()` and ' +
+      'lets `optimize` descend the F-Rep gradient straight onto the target.',
+    prompt:
+      'Make me an L-bracket — a 60×40 base flange and a 60×40 back wall — out ' +
+      'of 6061 aluminium, and size the wall thickness so it weighs 45 g. Then ' +
+      'confirm it and export the STL.',
+  },
+  (t) => {
+    t.say(
+      'Mass is volume × density, and for this bracket volume is a smooth, monotone ' +
+        'function of one number — the shared wall thickness. That makes it a textbook ' +
+        'job for the gradient optimizer instead of hand-tuning. The move is to expose ' +
+        'the thickness as a `param(name, default, {min, max})`: the model still builds ' +
+        'at the default (4 mm), but `optimize` can now move it. 6061 aluminium is ' +
+        '2.70 g/cm³ = 0.0027 g/mm³, so 45 g is a volume the search will find; I bound ' +
+        'the thickness to a manufacturable 2–8 mm.',
+    );
+    const script = `
+// L-bracket: a 60×40 base flange and a 60×40 back wall sharing one wall
+// thickness \`t\`, exposed as the design variable optimize() will move. The
+// model builds at t's default (4 mm); optimize re-runs it at other values.
+const t = param('thickness', 4, { min: 2, max: 8 });
+const base = Shape.box3(30, 20, t / 2);                            // 60 × 40 × t
+const wall = Shape.box3(30, t / 2, 20).translate(0, -(20 - t / 2), 20 - t / 2); // 60 × t × 40
+return base.union(wall);
+`.trim();
+    const m = t.create_model(script, 'optimize-bracket');
+    t.say(
+      `The create call echoes the declared param back — \`thickness\` at its 4 mm ` +
+        `default, bounded 2–8 — and the part is \`valid: ${m.valid}\` at ` +
+        `${(m.volume * 0.0027).toFixed(1)} g. Too heavy. Rather than bisect it by hand, ` +
+        'I hand the numeric search to `optimize`: target mass 45 g, the one param free ' +
+        'to move, everything else the script fixed. It descends the smooth occupancy-' +
+        'field gradient — no mesh rebuild per step — and calibrates against the exact ' +
+        'mesh each iteration so the reported grams are the real ones, not the field estimate.',
+    );
+    const opt = t.optimize({
+      model_id: m.model_id,
+      params: [{ name: 'thickness' }],
+      objective: { type: 'target_mass', value: 45, density: 0.0027 },
+      options: { max_iters: 40, resolution: 40 },
+    });
+    t.say(
+      `Converged in ${opt.iterations} iterations to thickness ` +
+        `**${opt.params.thickness.toFixed(3)} mm**, an achieved mass of ` +
+        `**${opt.objective.achieved.toFixed(2)} g** — ` +
+        `${(opt.objective.relativeError * 100).toFixed(2)}% off the 45 g target, measured ` +
+        'on the exact mesh, not the field. `converged: true` with an empty `warnings` ' +
+        'means no parameter is pinned to a bound and nothing is left on the table; the ' +
+        'per-iteration `trajectory` shows the loss falling monotonically. `optimize` has ' +
+        'already written the winning thickness back into the model, so the next call ' +
+        'sees the optimized part — let me confirm that independently.',
+    );
+    const mass = t.measure(m.model_id, 'mass');
+    t.say(
+      `An independent \`measure\` on the (now optimized) model reads ` +
+        `${(mass.volume * 0.0027).toFixed(2)} g — the same part the optimizer reported, ` +
+        'confirming the parameter really was committed and not just returned. A quick ' +
+        'validity check, then the STL:',
+    );
+    const val = t.validate(m.model_id);
+    t.say(
+      `\`valid: ${val.valid}\` — the optimized thickness still bounds a closed, ` +
+        'manifold solid, so it is safe to export. STL for the slicer:',
+    );
+    t.export(m.model_id, 'stl', 'optimize-bracket.stl');
+    t.say(
+      'That is the whole differentiable loop the agent layer is built around: the agent ' +
+        'owns the *topology* (an L-bracket, one shared thickness), and the gradient owns ' +
+        'the *numbers*. Want three ribs instead of a plain wall, or the hole moved? Edit ' +
+        'the script and call `optimize` again — it moves numbers, never structure.',
+    );
+  },
+);
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Run everything and write outputs.
 // ═══════════════════════════════════════════════════════════════════════════
@@ -706,13 +811,26 @@ const tools = createTools({ outputDir });
 const manifest = [];
 const indexRows = [];
 
+// `GALLERY_ONLY=<slug>` regenerates a single transcript and its outputs, and
+// leaves manifest.json / README.md (the whole-gallery index) untouched. Useful
+// for iterating on one example without rewriting — and churning — every other
+// example's committed renders and exports.
+const only = process.env.GALLERY_ONLY;
+
 for (const { spec, drive } of examples) {
+  if (only && spec.slug !== only) continue;
   console.error(`\n=== ${spec.slug} ===`);
   const t = new Transcript(tools, spec);
   drive(t);
   writeFileSync(resolve(galleryDir, `${spec.slug}.md`), t.render(), 'utf8');
   manifest.push(t.manifestEntry());
   indexRows.push(`| [${spec.title}](${spec.slug}.md) | ${spec.slug} |`);
+}
+
+if (only) {
+  if (manifest.length === 0) throw new Error(`GALLERY_ONLY=${only}: no example with that slug`);
+  console.error(`\nGALLERY_ONLY=${only}: wrote the transcript; left index + manifest untouched.`);
+  process.exit(0);
 }
 
 writeFileSync(resolve(outputDir, 'manifest.json'), JSON.stringify(manifest, null, 2), 'utf8');

@@ -8,6 +8,7 @@ import { resolve, isAbsolute, join } from 'node:path';
 import { ModelStore } from './kernel.js';
 import { getMesh, buildBinaryStl, buildObj } from './mesh.js';
 import { renderPng, VIEW_NAMES } from './render.js';
+import { optimize } from './optimize.js';
 
 const EXPORT_FORMATS = ['step', 'stl', 'obj'];
 const MEASURE_QUERIES = ['all', 'volume', 'surface_area', 'bbox', 'centroid', 'mass'];
@@ -80,16 +81,21 @@ export function createTools(config = {}) {
         name: 'create_model',
         description:
           'Build a CAD model from a playground JS script and register it under a ' +
-          'model_id. The script has `Shape` and `Profile` in scope and must `return` ' +
-          'a Shape (identical semantics to the browser playground). Returns the ' +
-          'model_id plus mesh statistics and a validation summary.',
+          'model_id. The script has `Shape`, `Profile`, and `param` in scope and must ' +
+          '`return` a Shape (identical semantics to the browser playground). Declare a ' +
+          "design variable with `param(name, default, {min, max})` — e.g. " +
+          "`const t = param('thickness', 4, {min: 2, max: 12});` — to make it " +
+          'optimizable by the `optimize` tool; the call returns the value to use and ' +
+          'the model builds at the default. Returns the model_id, mesh statistics, a ' +
+          'validation summary, and any declared params.',
         inputSchema: {
           type: 'object',
           properties: {
             script: {
               type: 'string',
               description:
-                'JS body that returns a Shape, e.g. `return Shape.sphere(1).subtract(Shape.box3(1,1,1));`',
+                'JS body that returns a Shape, e.g. `return Shape.sphere(1).subtract(Shape.box3(1,1,1));`. ' +
+                "Wrap tunable dimensions in `param('name', default, {min, max})` to expose them to `optimize`.",
             },
             name: { type: 'string', description: 'Optional friendly name for the model.' },
             exact: {
@@ -126,6 +132,19 @@ export function createTools(config = {}) {
               volume: measure.volume,
               valid: validation.valid,
               issues: validation.issues,
+              // The design variables the script declared via param(). Present so
+              // an agent sees, from the create call alone, exactly what `optimize`
+              // may move and within what bounds. Omitted when the script declares none.
+              ...(model.params.length
+                ? {
+                    params: model.params.map((p) => ({
+                      name: p.name,
+                      value: p.value,
+                      ...(p.min !== undefined ? { min: p.min } : {}),
+                      ...(p.max !== undefined ? { max: p.max } : {}),
+                    })),
+                  }
+                : {}),
             },
             measure,
           ),
@@ -325,6 +344,110 @@ export function createTools(config = {}) {
       },
       handler() {
         return text({ models: store.list() });
+      },
+    },
+
+    optimize: {
+      definition: {
+        name: 'optimize',
+        description:
+          "Drive a model's `param()` design variables onto an objective under keep-out / " +
+          'mass / volume constraints, using gradient descent on the smooth F-Rep field ' +
+          '(the active counterpart to `measure`: measure reports, optimize *moves*). The ' +
+          'named params must have been declared in the model\'s script with ' +
+          "`param(name, default, {min, max})`. Writes the converged values back into the " +
+          'model, so a subsequent get_screenshot/export/measure shows the optimized part. ' +
+          'Returns the converged params, the achieved objective and constraint values ' +
+          'measured on the EXACT mesh, whether it converged or hit a bound/iteration/time ' +
+          'cap, per-iteration loss history, and warnings (pinned or no-effect params). ' +
+          'Topology is yours to choose: optimize only moves numbers — to change structure, ' +
+          'edit the script and optimize again. Every op is supported, including rotate.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            model_id: { type: 'string' },
+            params: {
+              type: 'array',
+              description:
+                'Which declared params may move, and their bounds. Bounds are required ' +
+                '(a wall thickness of −3 mm is not a design); they may be omitted here only ' +
+                'if the param() declaration already carries them.',
+              items: {
+                type: 'object',
+                properties: {
+                  name: { type: 'string' },
+                  min: { type: 'number' },
+                  max: { type: 'number' },
+                  start: { type: 'number', description: 'Optional starting value (default: the param\'s current value).' },
+                },
+                required: ['name'],
+              },
+            },
+            objective: {
+              type: 'object',
+              description:
+                'What to minimize toward. target_mass/target_volume drive a scalar to `value`; ' +
+                'centroid_at drives the centre of mass to a point. target_mass needs a `density` ' +
+                '(mass per model unit³, e.g. 0.0027 g/mm³ for aluminium 6061).',
+              properties: {
+                type: { type: 'string', enum: ['target_mass', 'target_volume', 'centroid_at'] },
+                value: {
+                  description: 'Target: a positive number for mass/volume, or [x,y,z] (null to skip an axis) for centroid_at.',
+                },
+                density: { type: 'number', description: 'Mass per model unit³, required for target_mass.' },
+              },
+              required: ['type', 'value'],
+            },
+            constraints: {
+              type: 'array',
+              description:
+                'Optional penalties. clearance: solid stays `min` away from keep-out `probes` ' +
+                '(point keep-outs — [[x,y,z],…] or flat [x,y,z,…]). mass/volume: hold the ' +
+                'measured quantity within [min,max] (mass needs a density).',
+              items: {
+                type: 'object',
+                properties: {
+                  type: { type: 'string', enum: ['clearance', 'mass', 'volume'] },
+                  probes: { description: 'Keep-out points for clearance: [[x,y,z],…] or a flat [x,y,z,…] array.' },
+                  min: { type: 'number' },
+                  max: { type: 'number' },
+                  softness: { type: 'number', description: 'Clearance softmin blend (model units, default 0.02).' },
+                  density: { type: 'number', description: 'For a mass bound; inherits the objective density if omitted.' },
+                },
+                required: ['type'],
+              },
+            },
+            options: {
+              type: 'object',
+              description: 'Guardrails and tuning.',
+              properties: {
+                max_iters: { type: 'number', description: `Iteration cap (default 60, max ${300}).` },
+                time_budget_ms: { type: 'number', description: 'Wall-clock cap in ms (default 30000, max 120000).' },
+                resolution: { type: 'number', description: 'Field quadrature samples per axis (default 32, max 64; cost ~res³).' },
+                penalty_weight: { type: 'number', description: 'Constraint penalty weight relative to the objective (default 10).' },
+              },
+            },
+          },
+          required: ['model_id', 'params', 'objective'],
+        },
+      },
+      handler(args) {
+        let model;
+        try {
+          model = store.get(args.model_id);
+        } catch (err) {
+          return fail(err.message);
+        }
+        let result;
+        try {
+          result = optimize(model, args);
+        } catch (err) {
+          return fail(`optimize failed: ${errMessage(err)}`);
+        }
+        // Commit the winning point back into the model so the next
+        // measure/export/get_screenshot reflects the optimized part.
+        store.applyOptimized(model.id, result.shape, result.overrides);
+        return text({ model_id: model.id, ...result.report });
       },
     },
   };

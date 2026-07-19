@@ -23,3 +23,10 @@ CLAUDE.local.md
 __pycache__/
 state.json
 CLAUDE.md
+
+# Stray mesh/BREP exports produced by running examples from the repo root.
+# Real gallery artifacts live under tools/mcp-server/examples/output/ and are
+# committed there; these root-level ones are throwaway (of-2y4.2).
+/*.stl
+/*.step
+/*.obj

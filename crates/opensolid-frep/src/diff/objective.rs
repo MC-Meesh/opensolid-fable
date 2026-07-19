@@ -30,6 +30,7 @@ use super::dual::Dual;
 use super::param::ParamSdf;
 use super::scalar::Scalar;
 use super::vec::Vec3;
+use crate::primitives::Sdf;
 use opensolid_core::types::{BoundingBox3, Point3};
 
 /// Band width, in grid cells, used by [`Occupancy::for_domain`].
@@ -300,6 +301,84 @@ pub fn clearance<S: ParamSdf<N> + ?Sized, const N: usize>(
         .expect("non-empty");
     let out = m - s * sum.ln();
     (out.v, out.d)
+}
+
+/// The smooth-field measures of a plain [`Sdf`] — the *value* of the same
+/// occupancy integrals [`volume`] and [`centroid`] compute, with no parameter
+/// gradient attached.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FieldMeasure {
+    /// Occupancy-integral volume — smooth in the shape, biased high by the
+    /// smeared band (see the module's *Accuracy* note). Steer with this;
+    /// report with the exact mesh-based `mass_properties`.
+    pub volume: f64,
+    /// Occupancy-weighted centre of mass. The origin when the field is empty
+    /// (`volume == 0`), where a centroid is undefined.
+    pub centroid: [f64; 3],
+}
+
+/// Volume and centroid of an arbitrary [`Sdf`] from one occupancy-integral
+/// pass — the `f64`-only counterpart to [`volume`]/[`centroid`].
+///
+/// [`volume`] and friends take a [`ParamSdf`] and seed duals to get
+/// `∂/∂θ` for free, which needs the field written in the [`field`](super::field)
+/// tower at compile time. That is the exact, fast path — but it cannot see a
+/// shape built at runtime from a playground script, whose field is an
+/// `Arc<dyn Sdf>` and not a generic tower expression. This function reads the
+/// same smooth objective off *any* [`Sdf`], so an optimiser can steer a
+/// script-built part by finite-differencing it (re-evaluating the script at
+/// perturbed parameters). It is smooth for the same reason [`volume`] is —
+/// it integrates the field, not a mesh (§5) — so a finite-difference gradient
+/// of it is well-behaved, where a finite difference of the mesh volume is not.
+///
+/// The two paths are pinned together by
+/// [`field_measure_matches_param_volume`](self): a [`Frozen`](super::Frozen)
+/// [`ParamSdf`] measured here must return the same volume and centroid the
+/// dual path reports, so they cannot drift.
+pub fn measure_field(sdf: &dyn Sdf, domain: &BoundingBox3, occ: &Occupancy) -> FieldMeasure {
+    let dv = cell_volume(domain, occ.resolution);
+    let mut occupancy = 0.0;
+    let mut moment = [0.0; 3];
+    for p in grid_points(domain, occ.resolution) {
+        let o = occupancy_ramp(sdf.eval(&p), occ.band);
+        occupancy += o;
+        moment[0] += o * p.x;
+        moment[1] += o * p.y;
+        moment[2] += o * p.z;
+    }
+    let centroid = if occupancy > 0.0 {
+        [
+            moment[0] / occupancy,
+            moment[1] / occupancy,
+            moment[2] / occupancy,
+        ]
+    } else {
+        [0.0; 3]
+    };
+    FieldMeasure {
+        volume: occupancy * dv,
+        centroid,
+    }
+}
+
+/// Softmin clearance of an arbitrary [`Sdf`] over `probes` — the `f64`-only
+/// counterpart to [`clearance`], for a shape built from a script.
+///
+/// Same log-sum-exp softmin, same `m`-shift for overflow safety; see
+/// [`clearance`] for the why. Returns the signed distance from the solid to
+/// the nearest probe: positive clears every probe.
+///
+/// # Panics
+///
+/// If `probes` is empty or `softness <= 0`.
+pub fn clearance_field(sdf: &dyn Sdf, probes: &[Point3], softness: f64) -> f64 {
+    assert!(!probes.is_empty(), "clearance needs at least one probe");
+    assert!(softness > 0.0, "softness must be positive");
+
+    let ds: Vec<f64> = probes.iter().map(|p| sdf.eval(p)).collect();
+    let m = ds.iter().copied().fold(f64::INFINITY, f64::min);
+    let sum: f64 = ds.iter().map(|&d| ((m - d) / softness).exp()).sum();
+    m - softness * sum.ln()
 }
 
 #[cfg(test)]
@@ -596,6 +675,67 @@ mod tests {
     #[should_panic(expected = "at least one probe")]
     fn clearance_rejects_empty_probes() {
         let _ = clearance(&Ball, &[1.0], &[], 0.1);
+    }
+
+    /// The plain-[`Sdf`] path must read exactly the same volume and centroid
+    /// as the dual [`ParamSdf`] path — they share the quadrature, and a
+    /// [`Frozen`](super::super::Frozen) shape is an ordinary [`Sdf`]. If they
+    /// ever diverge, one of the two occupancy loops has drifted.
+    #[test]
+    fn field_measure_matches_param_volume() {
+        let d = domain(2.0);
+        let occ = Occupancy::for_domain(48, &d);
+        // A translated ball, so the centroid is not trivially the origin.
+        struct Sliding;
+        impl ParamSdf<1> for Sliding {
+            fn field<T: Scalar>(&self, p: Vec3<T>, params: &[T; 1]) -> T {
+                field::sphere(p, Vec3::new(params[0], T::zero(), T::zero()), T::cst(1.0))
+            }
+        }
+        let params = [0.4];
+        let frozen = Sliding.freeze(params);
+
+        let m = measure_field(&frozen, &d, &occ);
+        let (v, _) = volume(&Sliding, &params, &d, &occ);
+        let c = centroid(&Sliding, &params, &d, &occ);
+
+        assert!((m.volume - v).abs() < 1e-9, "{} vs {v}", m.volume);
+        for (a, (mc, cc)) in m.centroid.iter().zip(c.iter()).enumerate() {
+            assert!((mc - cc.0).abs() < 1e-9, "axis {a}: {mc} vs {}", cc.0);
+        }
+    }
+
+    #[test]
+    fn field_clearance_matches_param_clearance() {
+        let frozen = Ball.freeze([1.0]);
+        let probes = [Point3::new(3.0, 0.0, 0.0), Point3::new(0.0, 3.4, 0.0)];
+        let got = clearance_field(&frozen, &probes, 0.2);
+        let (want, _) = clearance(&Ball, &[1.0], &probes, 0.2);
+        assert!((got - want).abs() < 1e-9, "{got} vs {want}");
+    }
+
+    #[test]
+    fn field_measure_centroid_is_origin_for_a_centred_ball() {
+        let d = domain(2.0);
+        let m = measure_field(&Ball.freeze([1.0]), &d, &Occupancy::for_domain(48, &d));
+        for (a, c) in m.centroid.iter().enumerate() {
+            assert!(c.abs() < 1e-6, "axis {a} centroid {c}");
+        }
+    }
+
+    #[test]
+    fn field_measure_empty_field_has_origin_centroid() {
+        // A ball of radius zero occupies nothing inside the band: volume ~0
+        // and the centroid must not divide by zero.
+        let d = domain(2.0);
+        let m = measure_field(&Ball.freeze([0.0]), &d, &Occupancy::new(8, 0.05));
+        assert_eq!(m.centroid, [0.0; 3]);
+    }
+
+    #[test]
+    #[should_panic(expected = "at least one probe")]
+    fn field_clearance_rejects_empty_probes() {
+        let _ = clearance_field(&Ball.freeze([1.0]), &[], 0.1);
     }
 
     #[test]

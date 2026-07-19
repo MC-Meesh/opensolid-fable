@@ -78,6 +78,7 @@ persistence. Exports and screenshots are written to `OPENSOLID_MCP_OUTPUT_DIR`.
 | `get_screenshot` | **`model_id`**, `view`, `width`, `height`          | inline PNG image |
 | `export`         | **`model_id`**, **`format`**, `path`, `accuracy`   | file path + byte size |
 | `measure`        | **`model_id`**, `query`, `accuracy`                | mass properties |
+| `optimize`       | **`model_id`**, **`params`**, **`objective`**, `constraints`, `options` | converged params + achieved objective + trajectory |
 | `validate`       | **`model_id`**, `accuracy`                          | structural report |
 | `list_models`    | —                                                  | models registered this session |
 
@@ -160,6 +161,47 @@ Volume and centroid are the agent's cheapest correctness oracles — a volume
 *delta* confirms a cut actually removed material; a centroid confirms a feature
 landed where intended.
 
+### `optimize`
+
+`measure` reports; `optimize` **moves**. It drives a model's `param()` design
+variables (see §3) onto a target under constraints, using gradient descent on
+the smooth F-Rep field, and writes the converged values back into the model — so
+the next `measure`/`export`/`get_screenshot` shows the optimized part.
+
+```jsonc
+{
+  "model_id": "bracket-1",
+  "params": [ { "name": "thickness", "min": 2, "max": 8 } ], // what may move; bounds required*
+  "objective": { "type": "target_mass", "value": 45, "density": 0.0027 }, // grams, g/mm³
+  "constraints": [ { "type": "clearance", "probes": [[20, 0, 0]], "min": 1.5 } ],
+  "options": { "max_iters": 60, "resolution": 40 }
+}
+```
+
+- **Objectives:** `target_mass` (needs `density`, mass per model unit³),
+  `target_volume`, `centroid_at` (`value` is `[x,y,z]`; use `null` for an axis
+  you don't constrain).
+- **Constraints:** `clearance` (the solid stays `min` away from keep-out
+  `probes` — points, `[[x,y,z],…]` or flat), and `mass`/`volume` bounds
+  (`min`/`max`). Constraints are soft quadratic penalties.
+- **\*Bounds are required** — a param with no `min`/`max` in the request *or* its
+  `param()` declaration is rejected. A negative wall thickness is not a design.
+- **Guardrails:** `max_iters` (default 60), `time_budget_ms` (default 30 s),
+  `resolution` (field quadrature, default 32; higher is more accurate but ~res³
+  slower), `penalty_weight` (constraint stiffness, default 50).
+
+The result reports the achieved objective from the **exact mesh** (the field
+that steered the search is biased high; the reported number is the real one),
+`converged` and `feasible` flags, any parameters `pinned` to a bound, a
+per-iteration `trajectory`, and `warnings`. Read them honestly: `converged:
+false` or `feasible: false` means the reported point is a starting place, not an
+answer — a pinned parameter usually means the design wants to go past a bound you
+set, and an unsatisfiable constraint (`feasible: false`) means the objective and
+the constraint genuinely conflict. Every op is supported, `rotate` included.
+Topology is yours: `optimize` moves numbers — to change structure, edit the
+script and optimize again. Worked example:
+[`optimize-bracket`](../tools/mcp-server/examples/agent-gallery/optimize-bracket.md).
+
 ### `validate`
 
 Checks whether the mesh is a closed, consistently-oriented manifold enclosing a
@@ -190,10 +232,10 @@ registered this session.
 ## 3. Script API crash course
 
 `create_model` takes a **JavaScript function body** (not a module) that must
-`return` a `Shape`. It runs in strict mode with exactly two bindings in scope —
-`Shape` and `Profile` — identical to the playground's **Code** tab. No imports,
-no `require`, no filesystem or network. Because it's real JavaScript, patterns
-(loops, arrays, math) are just code:
+`return` a `Shape`. It runs in strict mode with three bindings in scope —
+`Shape`, `Profile`, and `param` — the first two identical to the playground's
+**Code** tab. No imports, no `require`, no filesystem or network. Because it's
+real JavaScript, patterns (loops, arrays, math) are just code:
 
 ```js
 // A bolt boss with a hole, then four holes on a rectangular pattern.
@@ -208,6 +250,25 @@ return part;
 
 Dimensions are model units. Box/cylinder/torus arguments are **half-extents /
 half-heights** — the shape is centered on the origin.
+
+> ### `param()` — declare a design variable for `optimize`
+>
+> `param(name, default, { min, max })` marks a number as a tunable design
+> variable and returns the value to use. The model builds at the `default`, so a
+> script with `param()` calls still runs normally in `create_model` — but the
+> `optimize` tool can now *move* those numbers to hit a target:
+>
+> ```js
+> const t = param('thickness', 4, { min: 2, max: 8 });  // builds at 4 mm
+> const base = Shape.box3(30, 20, t / 2);
+> return base.union(Shape.box3(30, t / 2, 20).translate(0, -(20 - t / 2), 20 - t / 2));
+> ```
+>
+> Only wrap the dimensions you want a search to own — most numbers are intent (a
+> bolt circle that must stay a bolt circle), and declaring them all optimizes the
+> wrong thing. Bounds are optional at declaration but then **must** be supplied
+> in the `optimize` call; a design variable with no bound anywhere is an error.
+> `create_model` echoes the declared params back so you can see what is tunable.
 
 > ### ⚠️ The axis convention: `cylinder` and `extrude` are **+Y**
 >

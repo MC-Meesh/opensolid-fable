@@ -1,6 +1,6 @@
 # Agent gallery
 
-Six worked examples of an MCP-capable agent operating the OpenSolid CAD kernel
+Seven worked examples of an MCP-capable agent operating the OpenSolid CAD kernel
 end to end — prompt in, manufacturable part out — with **no GUI**. Each
 transcript is real, unedited output from the [OpenSolid MCP server](../../README.md),
 captured by [`build-gallery.mjs`](build-gallery.mjs): the agent writes a script,
@@ -23,6 +23,7 @@ node examples/agent-gallery/build-gallery.mjs
 | [a toothed disk from a circular pattern](gear-disk.md) | gear-disk |
 | [a bottle from a revolved, shelled profile](bottle.md) | bottle |
 | [a right-angle bracket with a gusset and filleted corner](bracket-right-angle.md) | bracket-right-angle |
+| [hitting a mass target with the optimize tool](optimize-bracket.md) | optimize-bracket |
 
 Exported files (STEP/STL/OBJ) and PNG renders land in
 [`../output/`](../output/); [`manifest.json`](../output/manifest.json) is the

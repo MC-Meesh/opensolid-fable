@@ -405,10 +405,11 @@ a space small enough to actually cover.
 
 The MCP server exposes `create_model`, `measure`, `export`, `validate`,
 `get_screenshot`, `list_models` (`tools/mcp-server/src/tools.js`). `optimize`
-slots in as the tool that closes the loop: it is `measure`'s active
-counterpart — `measure` reports, `optimize` *moves*.
+(`tools/mcp-server/src/optimize.js`, `of-2y4.2`) is the tool that closes the
+loop: it is `measure`'s active counterpart — `measure` reports, `optimize`
+*moves*. It is now shipped; the sketch below is the shape it took.
 
-**Sketch (not implemented):**
+**Sketch:**
 
 ```jsonc
 {
@@ -453,6 +454,56 @@ Design constraints that fall out of §1–§9:
 - **Topology is the caller's job** (§9). `optimize` moves numbers. An agent
   wanting a different structure edits the model and calls `optimize` again.
 
+### As shipped
+
+The compile-time AD path of §2 cannot see an agent's model: a playground
+script builds an `Arc<dyn Sdf>` at runtime, not a `ParamSdf<N>` tower, so there
+is no `θ` for a dual to flow through (§7 is exactly this gap). The tool bridges
+it the way §7 anticipates deferring — **finite differences over the smooth
+field**:
+
+- **`param()` in the script.** `create_model` runs the script with a
+  `param(name, default, {min, max})` helper in scope; it returns the value to
+  use and records the declaration. The model builds at the defaults, and
+  `optimize` re-runs the *same script* with substituted values. This is the
+  named-and-bounded declaration §7 calls for, at the script level.
+- **FD gradient of the field, not the mesh (§5).** Each step re-evaluates the
+  script through WASM at perturbed parameters and central-differences
+  `fieldMeasure` / `fieldClearance` — the occupancy integral, which is smooth
+  in `θ`, so its finite difference is well-behaved where a finite difference of
+  the jumpy mesh volume is noise. The cost is one script re-evaluation per
+  probe, and the payoff is that **every op works, `rotate` included** — the AD
+  tower's missing ops (§7, `of-37i.2`) are simply not a constraint here.
+- **A fixed integration domain.** The quadrature grid is pinned for the whole
+  run (unioned over the parameter-range corners, then padded) so it does not
+  drift as parameters move and inject non-smoothness into the objective.
+- **Exact-mesh calibration.** The field volume is biased a few percent high
+  (tens of percent for thin walls, where the smeared band rivals the wall
+  thickness). So at each accepted iterate the tool measures the *exact* mesh and
+  corrects the field estimate by the gap: steer on the smooth field, but drive
+  the *exact* quantity to the target. On the sphere and box tests the reported
+  exact volume lands within a fraction of a percent of target.
+- **Honest status.** `converged` is never true with a violated constraint;
+  `feasible` is a separate field; pinned parameters and no-effect (zero-gradient)
+  parameters are named in `warnings`; the objective is reported from the exact
+  `mass_properties`, and a per-iteration `trajectory` (in exact units) is
+  returned so the agent can see the loss fall.
+
+The descent itself is the JS port of `optimize::descend` — projected gradient,
+heavy-ball momentum, Armijo backtracking — run in a normalized `[0,1]^N` box so
+one step size fits parameters of very different physical scale. It inherits
+`descend`'s weak spot (§6): a soft quadratic penalty does not *enforce* a
+constraint, so a hard conflict is reported `feasible: false` rather than solved.
+The worked example is `tools/mcp-server/examples/agent-gallery/optimize-bracket.md`
+(bracket → 45 g mass target → re-validate → export STL).
+
+The one part of the sketch not shipped is **annealing the blend temperature**:
+the field objective already reads the model's own booleans, and no example
+needed a temperature schedule, so it is left for when a blended part does. Plane
+and body-to-body clearance are also future work — the shipped clearance
+constraint is against explicit keep-out *points*, which is what the
+differentiable clearance field supports.
+
 ## 11. What ships now
 
 In `opensolid-frep::diff`:
@@ -463,12 +514,25 @@ In `opensolid-frep::diff`:
   translate/scale), written once over `T: Scalar`, pinned against the existing
   `Sdf` impls so they cannot drift.
 - `ParamSdf<N>` — exact `∂f/∂θ` in one pass; `freeze` bridges back to `Sdf`.
-- `objective` — differentiable volume, mass, centroid, softmin clearance.
+- `objective` — differentiable volume, mass, centroid, softmin clearance, plus
+  the `f64`-only `measure_field` / `clearance_field` that read the same
+  occupancy integrals off an arbitrary `&dyn Sdf` (what the MCP tool
+  finite-differences).
 - `optimize` — projected gradient descent with an Armijo line search.
 - `crates/opensolid-kernel/examples/optimize_bracket.rs` — a right-angle
   bracket driven onto a mass target under a clearance constraint, meshed and
   exported.
 
+In `opensolid-wasm` and the MCP server:
+
+- `WasmShape::fieldMeasure` / `fieldClearance` — the field objectives exposed to
+  JS over a fixed integration domain.
+- The `optimize` MCP tool (§10, `of-2y4.2`): script `param()` declarations,
+  finite-difference descent over the field with exact-mesh calibration, and the
+  `optimize-bracket` gallery example.
+
 Not covered: profiles/sweeps/patterns in the tower (`of-37i.2`), script-level
-parameter extraction (§7), B-Rep sensitivities (§8, `of-37i.3`), inertia
-tensors (§5, mechanical), the `optimize` MCP tool (§10).
+parameter *extraction* from the operation graph (§7 — the tool relies on
+explicit `param()` calls instead), B-Rep sensitivities (§8, `of-37i.3`),
+inertia tensors (§5, mechanical), and plane/body clearance and blend annealing
+in `optimize` (§10).

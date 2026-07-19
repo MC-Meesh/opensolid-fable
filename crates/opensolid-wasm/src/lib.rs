@@ -17,7 +17,8 @@ pub mod step;
 use bounded::{BoundedShape, flatten_mesh};
 use exact::{ExactPrim, ExactRep, ExactSpec};
 use opensolid_core::mesh::TriangleMesh;
-use opensolid_core::types::{Point3, Vector3};
+use opensolid_core::types::{BoundingBox3, Point3, Vector3};
+use opensolid_frep::diff::objective::{Occupancy, clearance_field, measure_field};
 use opensolid_frep::{OpenPath2D, Profile2D, RibSide};
 use opensolid_kernel::brep::BooleanOp;
 use opensolid_kernel::mass_properties;
@@ -562,6 +563,20 @@ fn mesh_bbox_json(mesh: &TriangleMesh) -> String {
 /// quote only — kernel error messages contain no control characters).
 fn json_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// The integration domain for a field measure: the shape's tracked box grown
+/// by `margin` of its own maximum extent on every side.
+///
+/// The tracked box is a conservative *enclosure* of the solid, which is exactly
+/// what a field integral wants — anything outside simply reads occupancy zero.
+/// The margin keeps the smoothing band around the surface off the domain wall,
+/// where a clipped ramp would bias the volume.
+fn padded_domain(b: &BoundingBox3, margin: f64) -> BoundingBox3 {
+    let size = b.max - b.min;
+    let pad = size.x.max(size.y).max(size.z) * margin.max(0.0);
+    let d = Vector3::new(pad, pad, pad);
+    BoundingBox3::new(b.min - d, b.max + d)
 }
 
 #[wasm_bindgen]
@@ -1157,6 +1172,83 @@ impl WasmShape {
         })
     }
 
+    /// Smooth-field volume and centroid of the shape, as a JSON object string:
+    /// `{ "volume", "centroid":[x,y,z], "domain":{"min":[…],"max":[…]} }`.
+    ///
+    /// Where [`measure`](Self::measure) integrates the *mesh* — exact, but a
+    /// non-differentiable function of the design, since mesh connectivity jumps
+    /// as parameters move — this integrates the *field* over a smooth occupancy
+    /// ramp (`opensolid_frep::diff::objective`). The volume is biased a percent
+    /// or so high by the smeared band, but it is **smooth** in the shape, so a
+    /// finite-difference gradient of it steers an optimiser where a gradient of
+    /// the mesh volume would be noise. This is the objective the `optimize` MCP
+    /// tool descends on; report final numbers with [`measure`](Self::measure).
+    ///
+    /// `resolution` is samples per axis (cost ~`resolution³`). `margin` pads the
+    /// integration domain beyond the shape's tracked box by that fraction of the
+    /// box's maximum extent (default `0.1`), keeping the occupancy band off the
+    /// domain wall.
+    ///
+    /// `domain` optionally pins the integration box to an explicit
+    /// `[min_x,min_y,min_z, max_x,max_y,max_z]` (any other length, including
+    /// empty, derives it from the tracked box as above). An optimiser passes a
+    /// **fixed** domain across all iterations so the quadrature grid does not
+    /// shift as parameters move — a shifting grid would inject small
+    /// non-smoothness into an otherwise smooth objective and corrupt its
+    /// finite-difference gradient.
+    #[wasm_bindgen(js_name = fieldMeasure)]
+    pub fn field_measure(&self, resolution: u32, margin: Option<f64>, domain: &[f64]) -> String {
+        let domain = if domain.len() == 6 {
+            BoundingBox3::new(
+                Point3::new(domain[0], domain[1], domain[2]),
+                Point3::new(domain[3], domain[4], domain[5]),
+            )
+        } else {
+            padded_domain(&self.inner.bounds, margin.unwrap_or(0.1))
+        };
+        let occ = Occupancy::for_domain(resolution.max(1) as usize, &domain);
+        let m = measure_field(&self.inner.shape, &domain, &occ);
+        format!(
+            "{{\"volume\":{},\"centroid\":[{},{},{}],\
+             \"domain\":{{\"min\":[{},{},{}],\"max\":[{},{},{}]}}}}",
+            json_num(m.volume),
+            json_num(m.centroid[0]),
+            json_num(m.centroid[1]),
+            json_num(m.centroid[2]),
+            json_num(domain.min.x),
+            json_num(domain.min.y),
+            json_num(domain.min.z),
+            json_num(domain.max.x),
+            json_num(domain.max.y),
+            json_num(domain.max.z),
+        )
+    }
+
+    /// Softmin clearance of the shape from a set of keep-out probe points, in
+    /// model units — positive when the solid clears every probe, negative when
+    /// it overlaps the nearest. `probes` is a flat `[x0,y0,z0, x1,y1,z1, …]`
+    /// buffer; `softness` blends the near-active probes (smaller ≈ a hard
+    /// `min`). The differentiable constraint the `optimize` tool holds a part
+    /// against a keep-out region with.
+    ///
+    /// Throws when `probes` is empty or not a multiple of three, or `softness`
+    /// is not positive.
+    #[wasm_bindgen(js_name = fieldClearance)]
+    pub fn field_clearance(&self, probes: &[f64], softness: f64) -> Result<f64, String> {
+        if probes.is_empty() || probes.len() % 3 != 0 {
+            return Err("probes must be a non-empty flat [x,y,z,…] buffer".to_string());
+        }
+        // Rejects zero, negatives, and NaN (a NaN softness would poison the softmin).
+        if softness <= 0.0 || softness.is_nan() {
+            return Err("softness must be positive".to_string());
+        }
+        let pts: Vec<Point3> = probes
+            .chunks_exact(3)
+            .map(|c| Point3::new(c[0], c[1], c[2]))
+            .collect();
+        Ok(clearance_field(&self.inner.shape, &pts, softness))
+    }
+
     /// A structural check report for the shape's measured mesh, as a JSON
     /// object string: `{ valid, closedManifold, triangles, vertices, volume,
     /// exact, issues:[…] }`. `valid` is true exactly when the mesh is
@@ -1222,6 +1314,62 @@ mod tests {
         assert!(data.indices.iter().all(|&i| i < vertex_count));
         // Feature edges are two 3D points per segment: a multiple of 6 floats.
         assert_eq!(data.feature_edges.len() % 6, 0);
+    }
+
+    #[test]
+    fn field_measure_reports_volume_and_centroid() {
+        // A unit-radius sphere: field volume near 4π/3 (biased a touch high by
+        // the band), centroid at the origin, domain enclosing the shape.
+        let json = WasmShape::sphere(1.0).field_measure(48, None, &[]);
+        let volume = json_field(&json, "volume").expect("volume");
+        let exact = 4.0 / 3.0 * std::f64::consts::PI;
+        assert!((volume - exact).abs() < 0.1, "field volume {volume}");
+        let centroid = json_triple(&json, "centroid").expect("centroid");
+        assert!(centroid.iter().all(|c| c.abs() < 1e-6), "{centroid:?}");
+        assert!(json.contains("\"domain\""), "domain reported: {json}");
+    }
+
+    #[test]
+    fn field_measure_centroid_tracks_a_translated_shape() {
+        // Move a box +3 in x; the field centroid must follow it.
+        let json = WasmShape::box3(1.0, 1.0, 1.0)
+            .translate(3.0, 0.0, 0.0)
+            .field_measure(40, None, &[]);
+        let c = json_triple(&json, "centroid").expect("centroid");
+        assert!((c[0] - 3.0).abs() < 0.05, "x centroid {}", c[0]);
+        assert!(c[1].abs() < 0.05 && c[2].abs() < 0.05, "{c:?}");
+    }
+
+    #[test]
+    fn field_clearance_is_positive_when_the_probe_is_clear() {
+        // A radius-1 sphere against a probe 3 units out: clearance ≈ 2.
+        let clr = WasmShape::sphere(1.0)
+            .field_clearance(&[3.0, 0.0, 0.0], 1e-3)
+            .expect("clearance");
+        assert!((clr - 2.0).abs() < 1e-2, "clearance {clr}");
+    }
+
+    #[test]
+    fn field_clearance_is_negative_inside_the_solid() {
+        // A probe at the centre of a radius-1 sphere is 1 unit *inside*.
+        let clr = WasmShape::sphere(1.0)
+            .field_clearance(&[0.0, 0.0, 0.0], 1e-3)
+            .expect("clearance");
+        assert!((clr + 1.0).abs() < 1e-2, "clearance {clr}");
+    }
+
+    #[test]
+    fn field_clearance_rejects_malformed_probes() {
+        let s = WasmShape::sphere(1.0);
+        assert!(s.field_clearance(&[], 1.0).is_err(), "empty");
+        assert!(
+            s.field_clearance(&[1.0, 2.0], 1.0).is_err(),
+            "not xyz-aligned"
+        );
+        assert!(
+            s.field_clearance(&[1.0, 2.0, 3.0], 0.0).is_err(),
+            "softness"
+        );
     }
 
     #[test]
