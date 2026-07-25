@@ -37,6 +37,11 @@
 //! The no-panic guard `no_panics_on_cone_configurations` stays live across
 //! the promotion — it accepts both a valid exact solid and the structured
 //! `NotImplemented` F-Rep fallback.
+//!
+//! Section (14) is the FREEFORM §9 NURBS promotion-gate campaign
+//! (of-37i.5), written stress-suite-first per the same policy: until it is
+//! green, the hybrid kernel keeps routing NURBS operands to the F-Rep
+//! fallback.
 
 use nalgebra::{Rotation3, Unit};
 use opensolid_brep::boolean::{InsideTest, boolean_with_inside_tests, intersect, subtract, unite};
@@ -52,7 +57,7 @@ use opensolid_core::mesh::TriangleMesh;
 use opensolid_core::tolerance::ToleranceContext;
 use opensolid_core::types::{BoundingBox3, Point3, Vector3};
 use opensolid_kernel::{MeshOptions, MeshSdf, mass_properties, mesh_sdf_indexed};
-use std::f64::consts::{FRAC_PI_2, FRAC_PI_4, PI};
+use std::f64::consts::{FRAC_1_SQRT_2, FRAC_PI_2, FRAC_PI_4, PI};
 
 fn tol() -> ToleranceContext {
     ToleranceContext::default()
@@ -539,7 +544,21 @@ impl Scene {
     /// Because [`ray_surface_hits`] has no NURBS arm (of-3oj), a body built
     /// here cannot be classified by ray parity and MUST be booleaned via
     /// [`boolean_with_inside_tests`] with a [`box_inside_test`] in its slot
-    /// — see the tests below.
+    /// — see the tests below. Winding and control ordering are documented
+    /// on [`Scene::nurbs_hexahedron`], which this delegates to.
+    fn nurbs_block(&mut self, min: [f64; 3], max: [f64; 3]) -> EntityId<Body> {
+        self.nurbs_hexahedron(box_corners(min, max), [[(0.0, 1.0); 2]; 6], 1)
+    }
+
+    /// General hexahedral NURBS solid: six degree-1 B-spline patches over
+    /// the bilinear blend of the 8 `corners` (in `primitives::block` corner
+    /// order — see [`box_corners`]), each face carrying its own `(u, v)`
+    /// knot **domain** and `spans` knot spans per direction (`spans + 1`
+    /// control points; interior knots evenly spaced). For planar
+    /// quadrilateral faces every choice of domain and span count produces
+    /// the *identical* point set, which is exactly what the knot-scaling
+    /// and multi-span promotion-gate tests need: any behavioral difference
+    /// is a parameterization bug, never geometry.
     ///
     /// Control points are ordered so each patch's `du × dv` points out of
     /// the solid, matching `FaceSense::Positive` + `ShellOrientation::Outward`:
@@ -548,18 +567,12 @@ impl Scene {
     /// points outward exactly when `c0→c1→c2→c3` is CCW seen from outside —
     /// the same winding as `primitives::block`'s `face_specs` (verified
     /// against the bottom face: `(0,2hy,0)×(2hx,0,0) = −Z`).
-    fn nurbs_block(&mut self, min: [f64; 3], max: [f64; 3]) -> EntityId<Body> {
-        let corners: [Point3; 8] = [
-            Point3::new(min[0], min[1], min[2]),
-            Point3::new(max[0], min[1], min[2]),
-            Point3::new(max[0], max[1], min[2]),
-            Point3::new(min[0], max[1], min[2]),
-            Point3::new(min[0], min[1], max[2]),
-            Point3::new(max[0], min[1], max[2]),
-            Point3::new(max[0], max[1], max[2]),
-            Point3::new(min[0], max[1], max[2]),
-        ];
-
+    fn nurbs_hexahedron(
+        &mut self,
+        corners: [Point3; 8],
+        face_domains: [[(f64, f64); 2]; 6],
+        spans: usize,
+    ) -> EntityId<Body> {
         /// Undirected edges as (low, high) corner-index pairs: bottom ring,
         /// top ring, verticals (identical to `primitives::block`).
         const EDGE_PAIRS: [(usize, usize); 12] = [
@@ -627,16 +640,33 @@ impl Scene {
             (edges[index], sense)
         };
 
-        let knots = KnotVector::clamped_uniform(1, 2).expect("degree-1 knots for 2 control points");
-        for cycle in face_cycles {
-            // Row-major grid `[i][j]` with `i↔u`, `j↔v`: row u=0 is
-            // (v=0, v=1) = (c0, c3); row u=1 is (c1, c2).
-            let grid = vec![
-                vec![corners[cycle[0]], corners[cycle[3]]],
-                vec![corners[cycle[1]], corners[cycle[2]]],
-            ];
-            let patch = NurbsSurface::bspline(grid, knots.clone(), knots.clone())
-                .expect("rectangular 2×2 bilinear grid");
+        for (cycle, domains) in face_cycles.into_iter().zip(face_domains) {
+            // Row-major grid `[i][j]` with `i↔u`, `j↔v`: the bilinear blend
+            // of the cycle's corners sampled uniformly, so for `spans = 1`
+            // row u=0 is (v=0, v=1) = (c0, c3) and row u=1 is (c1, c2),
+            // reproducing the original 2×2 layout.
+            let n = spans + 1;
+            let grid: Vec<Vec<Point3>> = (0..n)
+                .map(|i| {
+                    let u = i as f64 / spans as f64;
+                    (0..n)
+                        .map(|j| {
+                            let v = j as f64 / spans as f64;
+                            bilerp(
+                                corners[cycle[0]],
+                                corners[cycle[1]],
+                                corners[cycle[2]],
+                                corners[cycle[3]],
+                                u,
+                                v,
+                            )
+                        })
+                        .collect()
+                })
+                .collect();
+            let patch =
+                NurbsSurface::bspline(grid, deg1_knots(n, domains[0]), deg1_knots(n, domains[1]))
+                    .expect("rectangular bilinear grid");
             let surface = geo.add_surface(Surface3::nurbs(patch));
             let face = store.create_face(shell, FaceSense::Positive);
             store.faces.get_mut(face).expect("just created").surface = Some(surface);
@@ -644,6 +674,154 @@ impl Scene {
                 .map(|i| directed_edge(cycle[i], cycle[(i + 1) % 4]))
                 .collect();
             store.create_loop(face, LoopType::Outer, &loop_edges);
+        }
+        body
+    }
+
+    /// Solid cylinder about `+Z` whose wall is four **exact** rational
+    /// quadratic NURBS quarter patches — the of-pb7.3 construction (90°
+    /// arcs with middle control point at the tangent intersection, weight
+    /// `1/√2`) swept linearly in `v` — with planar caps. Radius `r`, axis
+    /// through `(cx, cy)`, `z ∈ [z0, z0 + h]`. Geometrically identical to
+    /// [`Scene::cylinder`] to ~1e-10, but every wall surface the pipeline
+    /// sees is a NURBS patch: this is the "NURBS patch of exact analytic
+    /// form" the FREEFORM §9 promotion gate checks against the analytic
+    /// cylinder's known-good boolean. Quarter patches (rather than one
+    /// periodic patch with a seam) keep every chart domain open, matching
+    /// how `Chart` treats NURBS domains as non-periodic.
+    ///
+    /// Topology mirrors `primitives::cylinder` stretched to four wall
+    /// faces: ring vertices at angles `0, π/2, π, 3π/2` (the `Curve3::circle`
+    /// parameter origin is `plane_basis(+Z).0 = +X`, so arc `k` spans
+    /// `t ∈ [kπ/2, (k+1)π/2]` exactly), four axial seam edges, and caps
+    /// bounded by the four arcs. Wall patch `u` runs along increasing
+    /// angle and `v` up the axis, so `du × dv` points radially outward.
+    fn nurbs_cylinder(&mut self, cx: f64, cy: f64, r: f64, z0: f64, h: f64) -> EntityId<Body> {
+        let z1 = z0 + h;
+        let axis = Vector3::z();
+        let dirs: [Vector3; 4] = [
+            Vector3::new(1.0, 0.0, 0.0),
+            Vector3::new(0.0, 1.0, 0.0),
+            Vector3::new(-1.0, 0.0, 0.0),
+            Vector3::new(0.0, -1.0, 0.0),
+        ];
+        let bottom_center = Point3::new(cx, cy, z0);
+        let top_center = Point3::new(cx, cy, z1);
+
+        let store = &mut self.store;
+        let geo = &mut self.geo;
+        let body = store.create_body(BodyType::Solid);
+        let shell = store.create_shell(body, true, ShellOrientation::Outward);
+
+        let v_bot: Vec<_> = dirs
+            .iter()
+            .map(|d| store.create_vertex(bottom_center + d * r, SYSTEM_RESOLUTION))
+            .collect();
+        let v_top: Vec<_> = dirs
+            .iter()
+            .map(|d| store.create_vertex(top_center + d * r, SYSTEM_RESOLUTION))
+            .collect();
+
+        // Quarter-circle arc edges on the two cap circles, each on its own
+        // copy of the circle curve, plus four axial seams.
+        let arc = |store: &mut TopologyStore,
+                   geo: &mut GeometryStore,
+                   center: Point3,
+                   verts: &[EntityId<_>],
+                   k: usize| {
+            let circle = Curve3::circle(center, axis, r).expect("valid circle");
+            let curve = geo.add_curve(circle);
+            store.create_edge_with_curve(
+                verts[k],
+                verts[(k + 1) % 4],
+                SYSTEM_RESOLUTION,
+                curve,
+                k as f64 * FRAC_PI_2,
+                (k + 1) as f64 * FRAC_PI_2,
+            )
+        };
+        let e_bot: Vec<_> = (0..4)
+            .map(|k| arc(store, geo, bottom_center, &v_bot, k))
+            .collect();
+        let e_top: Vec<_> = (0..4)
+            .map(|k| arc(store, geo, top_center, &v_top, k))
+            .collect();
+        let e_seam: Vec<_> = (0..4)
+            .map(|k| {
+                let line = Curve3::line(bottom_center + dirs[k] * r, axis).expect("valid seam");
+                let curve = geo.add_curve(line);
+                store.create_edge_with_curve(v_bot[k], v_top[k], SYSTEM_RESOLUTION, curve, 0.0, h)
+            })
+            .collect();
+
+        // Bottom cap looks along -Z: counterclockwise about -Z is against
+        // the circles' natural (+Z) direction, so the arcs run reversed in
+        // reversed order.
+        let f_bottom = store.create_face(shell, FaceSense::Positive);
+        store.faces.get_mut(f_bottom).expect("just created").surface =
+            Some(geo.add_surface(Surface3::plane(bottom_center, -axis).expect("valid plane")));
+        store.create_loop(
+            f_bottom,
+            LoopType::Outer,
+            &[
+                (e_bot[3], FinSense::Reversed),
+                (e_bot[2], FinSense::Reversed),
+                (e_bot[1], FinSense::Reversed),
+                (e_bot[0], FinSense::Reversed),
+            ],
+        );
+
+        let f_top = store.create_face(shell, FaceSense::Positive);
+        store.faces.get_mut(f_top).expect("just created").surface =
+            Some(geo.add_surface(Surface3::plane(top_center, axis).expect("valid plane")));
+        store.create_loop(
+            f_top,
+            LoopType::Outer,
+            &[
+                (e_top[0], FinSense::Forward),
+                (e_top[1], FinSense::Forward),
+                (e_top[2], FinSense::Forward),
+                (e_top[3], FinSense::Forward),
+            ],
+        );
+
+        // Four wall patches. Quarter `k` spans angles `[kπ/2, (k+1)π/2]`:
+        // arc control points [d_k, d_k + d_{k+1}, d_{k+1}] (the middle one
+        // is the tangent intersection at radius r·√2) with weights
+        // [1, 1/√2, 1] trace the exact circular arc; sweeping each along
+        // `+Z` (2 linear control points in v) gives the exact quarter
+        // cylinder. Boundary: bottom arc forward, up the far seam, top arc
+        // reversed, down the near seam — outward radial normal.
+        let knots_u = KnotVector::clamped_uniform(2, 3).expect("degree-2 knots, 3 controls");
+        let knots_v = KnotVector::clamped_uniform(1, 2).expect("degree-1 knots, 2 controls");
+        for k in 0..4 {
+            let d0 = dirs[k];
+            let d1 = dirs[(k + 1) % 4];
+            let ring = [d0, d0 + d1, d1];
+            let control_points: Vec<Vec<Point3>> = ring
+                .iter()
+                .map(|d| vec![bottom_center + d * r, top_center + d * r])
+                .collect();
+            let weights: Vec<Vec<f64>> = [1.0, FRAC_1_SQRT_2, 1.0]
+                .iter()
+                .map(|&w| vec![w, w])
+                .collect();
+            let patch =
+                NurbsSurface::new(control_points, weights, knots_u.clone(), knots_v.clone())
+                    .expect("valid rational quarter-cylinder patch");
+            let face = store.create_face(shell, FaceSense::Positive);
+            store.faces.get_mut(face).expect("just created").surface =
+                Some(geo.add_surface(Surface3::nurbs(patch)));
+            store.create_loop(
+                face,
+                LoopType::Outer,
+                &[
+                    (e_bot[k], FinSense::Forward),
+                    (e_seam[(k + 1) % 4], FinSense::Forward),
+                    (e_top[k], FinSense::Reversed),
+                    (e_seam[k], FinSense::Reversed),
+                ],
+            );
         }
         body
     }
@@ -720,6 +898,43 @@ impl Scene {
     fn intersect(&self, a: EntityId<Body>, b: EntityId<Body>) -> CoreResult<BooleanOutput> {
         intersect(&self.store, &self.geo, a, b, &tol())
     }
+}
+
+/// The 8 corners of the axis-aligned box `min..max` in `primitives::block`
+/// corner order: bottom ring `(z = min)` counterclockwise from `(min, min)`,
+/// then the top ring above it.
+fn box_corners(min: [f64; 3], max: [f64; 3]) -> [Point3; 8] {
+    [
+        Point3::new(min[0], min[1], min[2]),
+        Point3::new(max[0], min[1], min[2]),
+        Point3::new(max[0], max[1], min[2]),
+        Point3::new(min[0], max[1], min[2]),
+        Point3::new(min[0], min[1], max[2]),
+        Point3::new(max[0], min[1], max[2]),
+        Point3::new(max[0], max[1], max[2]),
+        Point3::new(min[0], max[1], max[2]),
+    ]
+}
+
+/// Bilinear blend of a quadrilateral `c0→c1→c2→c3` at `(u, v)`: `u` runs
+/// along `c0→c1`, `v` along `c0→c3` (so `(1,1)` lands on `c2`).
+fn bilerp(c0: Point3, c1: Point3, c2: Point3, c3: Point3, u: f64, v: f64) -> Point3 {
+    let bottom = c0 + (c1 - c0) * u;
+    let top = c3 + (c2 - c3) * u;
+    bottom + (top - bottom) * v
+}
+
+/// Clamped degree-1 knot vector for `control_count` control points over the
+/// domain `[a, b]`, interior knots evenly spaced — `clamped_uniform`
+/// generalized to an arbitrary domain, which is what the knot-scaling
+/// invariance tests vary.
+fn deg1_knots(control_count: usize, (a, b): (f64, f64)) -> KnotVector {
+    let mut knots = vec![a];
+    for i in 0..control_count {
+        knots.push(a + (b - a) * i as f64 / (control_count - 1) as f64);
+    }
+    knots.push(b);
+    KnotVector::new(1, knots).expect("valid clamped degree-1 knots")
 }
 
 // =====================================================================
@@ -3278,11 +3493,109 @@ fn box_inside_test(min: [f64; 3], max: [f64; 3]) -> impl Fn(&Point3) -> Option<b
     move |p: &Point3| Some((0..3).all(|i| p[i] > min[i] && p[i] < max[i]))
 }
 
-/// Run all three ops for a NURBS-hosted pair and assert the transversal
-/// half-overlap answers: `A−B` and `A∩B` are the overlapped half, and the
-/// inclusion–exclusion identity holds. `a` is always the NURBS box of volume
-/// `vol_a` with inside test `inside_a`; `b` (volume `vol_b`) overlaps exactly
-/// half of `a`, so `A−B = A∩B = vol_a / 2`.
+/// Connected components and total genus of a closed manifold triangle
+/// mesh, as [`assert_valid`] establishes: every undirected index edge is
+/// shared by exactly two consistently-oriented triangles, so per component
+/// `χ = V − E + F = 2 − 2g` and `Σg = c − χ/2`, counted over referenced
+/// vertices. This is the §9 "genus on every output" check: a boolean that
+/// silently gains or loses a handle (the classic wrong-region failure)
+/// changes `χ` even when volume and manifoldness survive.
+fn components_and_genus(mesh: &TriangleMesh) -> (usize, usize) {
+    fn find(parent: &mut [usize], mut x: usize) -> usize {
+        while parent[x] != x {
+            parent[x] = parent[parent[x]];
+            x = parent[x];
+        }
+        x
+    }
+    let n = mesh.vertex_count();
+    let mut parent: Vec<usize> = (0..n).collect();
+    let mut referenced = vec![false; n];
+    let mut edges: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+    for tri in &mesh.indices {
+        for e in 0..3 {
+            let a = tri[e];
+            let b = tri[(e + 1) % 3];
+            referenced[a] = true;
+            edges.insert((a.min(b), a.max(b)));
+            let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
+            if ra != rb {
+                parent[ra] = rb;
+            }
+        }
+    }
+    let v = referenced.iter().filter(|&&r| r).count() as i64;
+    let e = edges.len() as i64;
+    let f = mesh.triangle_count() as i64;
+    let roots: std::collections::HashSet<usize> = (0..n)
+        .filter(|&i| referenced[i])
+        .map(|i| find(&mut parent, i))
+        .collect();
+    let c = roots.len() as i64;
+    let chi = v - e + f;
+    let genus_doubled = 2 * c - chi;
+    assert!(
+        genus_doubled >= 0 && genus_doubled % 2 == 0,
+        "Euler characteristic {chi} is inconsistent with {c} closed orientable component(s)"
+    );
+    (c as usize, (genus_doubled / 2) as usize)
+}
+
+/// [`volume`] plus the topology half of the §9 gate: assert the output is
+/// valid (check() clean, closed manifold), has exactly the expected
+/// connected `components` and total `genus`, and return its mesh volume.
+fn volume_checked(out: &BooleanOutput, components: usize, genus: usize, context: &str) -> f64 {
+    let mesh = assert_valid(out, context);
+    let (c, g) = components_and_genus(&mesh);
+    assert!(
+        (c, g) == (components, genus),
+        "{context}: expected {components} component(s) of total genus {genus}, \
+         got {c} component(s) of total genus {g}"
+    );
+    mass_properties(&mesh)
+        .unwrap_or_else(|e| panic!("{context}: mass_properties failed: {e}"))
+        .volume
+}
+
+/// Run all three ops for a NURBS-hosted transversal pair and assert the
+/// full §9 identity set at planar accuracy: `A−B = vol_a − overlap`,
+/// `A∩B = overlap`, inclusion–exclusion
+/// `vol(A∪B) + vol(A∩B) = vol(A) + vol(B)`, and every output a valid
+/// single-component genus-0 closed manifold. `vols` is
+/// `(vol_a, vol_b, overlap)`.
+fn assert_overlap_identity(
+    context: &str,
+    scene: &Scene,
+    a: EntityId<Body>,
+    b: EntityId<Body>,
+    tests: [Option<InsideTest>; 2],
+    (vol_a, vol_b, overlap): (f64, f64, f64),
+) {
+    let run = |op, label: &str| {
+        boolean_with_inside_tests(op, &scene.store, &scene.geo, a, b, &tol(), tests)
+            .unwrap_or_else(|e| panic!("{context}: exact pipeline rejected the {label}: {e:?}"))
+    };
+    let subtracted = run(BooleanOp::Subtract, "subtract");
+    assert_close(
+        volume_checked(&subtracted, 1, 0, context),
+        vol_a - overlap,
+        PLANAR_VOLUME_RTOL,
+        context,
+    );
+    let intersected = run(BooleanOp::Intersect, "intersect");
+    assert_close(
+        volume_checked(&intersected, 1, 0, context),
+        overlap,
+        PLANAR_VOLUME_RTOL,
+        context,
+    );
+    let united = run(BooleanOp::Unite, "unite");
+    let sum = volume_checked(&united, 1, 0, context) + volume_checked(&intersected, 1, 0, context);
+    assert_close(sum, vol_a + vol_b, PLANAR_VOLUME_RTOL, context);
+}
+
+/// [`assert_overlap_identity`] for the common half-overlap fixture: `b`
+/// overlaps exactly half of `a`, so `A−B = A∩B = vol_a / 2`.
 fn assert_half_overlap_identity(
     context: &str,
     scene: &Scene,
@@ -3292,28 +3605,7 @@ fn assert_half_overlap_identity(
     vol_a: f64,
     vol_b: f64,
 ) {
-    let half = vol_a / 2.0;
-    let run = |op, label: &str| {
-        boolean_with_inside_tests(op, &scene.store, &scene.geo, a, b, &tol(), tests)
-            .unwrap_or_else(|e| panic!("{context}: exact pipeline rejected the {label}: {e:?}"))
-    };
-    let subtracted = run(BooleanOp::Subtract, "subtract");
-    assert_close(
-        volume(&subtracted, context),
-        half,
-        PLANAR_VOLUME_RTOL,
-        context,
-    );
-    let intersected = run(BooleanOp::Intersect, "intersect");
-    assert_close(
-        volume(&intersected, context),
-        half,
-        PLANAR_VOLUME_RTOL,
-        context,
-    );
-    let united = run(BooleanOp::Unite, "unite");
-    let sum = volume(&united, context) + volume(&intersected, context);
-    assert_close(sum, vol_a + vol_b, PLANAR_VOLUME_RTOL, context);
+    assert_overlap_identity(context, scene, a, b, tests, (vol_a, vol_b, vol_a / 2.0));
 }
 
 /// NURBS box half-overlapped by an **analytic** block. Only operand A is
@@ -3390,21 +3682,576 @@ fn nurbs_box_bored_by_analytic_bar() {
         boolean_with_inside_tests(op, &scene.store, &scene.geo, a, b, &tol(), tests)
             .unwrap_or_else(|e| panic!("{context}: exact pipeline rejected the {label}: {e:?}"))
     };
+    // The bore makes the difference a genus-1 solid (one handle) — the
+    // sharpest topology assertion in the section: a wrong-region result
+    // that happens to keep the right volume still changes χ.
     let subtracted = run(BooleanOp::Subtract, "subtract");
     assert_close(
-        volume(&subtracted, context),
+        volume_checked(&subtracted, 1, 1, context),
         6.0,
         PLANAR_VOLUME_RTOL,
         context,
     );
     let intersected = run(BooleanOp::Intersect, "intersect");
     assert_close(
-        volume(&intersected, context),
+        volume_checked(&intersected, 1, 0, context),
         2.0,
         PLANAR_VOLUME_RTOL,
         context,
     );
     let united = run(BooleanOp::Unite, "unite");
-    let sum = volume(&united, context) + volume(&intersected, context);
+    let sum = volume_checked(&united, 1, 0, context) + volume_checked(&intersected, 1, 0, context);
     assert_close(sum, 8.0 + 3.0, PLANAR_VOLUME_RTOL, context);
+}
+
+// =====================================================================
+// (14) NURBS promotion gate: the FREEFORM §9 stress campaign (of-37i.5)
+// =====================================================================
+//
+// The README's stress-suite-first policy: a surface class does not enter
+// the exact pipeline until its randomized stress suite is green, and the
+// suite is written BEFORE the exact path is promoted — this section IS
+// that suite for NURBS. Section (13) proved a NURBS-hosted solid survives
+// the pipeline at all; this section is the §9 checklist that gates
+// promotion:
+//
+//   - a NURBS operand of EXACT analytic form (the of-pb7.3 rational
+//     quarter-cylinder patches) booleaned against a block must match the
+//     analytic cylinder's boolean — every result vertex on the closed-form
+//     boundary to `tol.linear`, the strongest check in the suite, because
+//     it validates the exact path against a known-good answer rather than
+//     against itself;
+//   - the inclusion–exclusion volume identity to 1e-9 relative over
+//     seeded randomized transversal NURBS pairs (planar patch geometry,
+//     so mesh volumes are exact and 1e-9 is meaningful);
+//   - rigid-rotation invariance (control points rotate exactly; a
+//     bilinear patch of rotated corners is the rotated patch);
+//   - knot-scaling invariance — identical geometry under wildly scaled,
+//     offset, and anisotropic knot domains, which catches any
+//     `tol.parametric` normalization bug (§6): a parameter tolerance
+//     applied to an unnormalized domain changes behavior between domain
+//     [0,1] and domain [3,13] even though the surfaces are pointwise
+//     identical;
+//   - multi-span patches with the imprint landing exactly ON an interior
+//     knot line, and landing mid-span;
+//   - trim regions abutting (and consuming) the knot-domain boundary;
+//   - closed manifold + `check()` + components + genus on every output
+//     (`volume_checked`).
+//
+// All operands go through `boolean_with_inside_tests` with exact
+// predicates in the NURBS slots (of-3oj), so classification never
+// abstains and any failure is the pipeline's, not the crutch's.
+//
+// GATE STATUS: RED. The deterministic checks (knot scaling, multi-span,
+// domain-boundary slivers) are green and live; the campaigns that put
+// NURBS in general position found two pipeline defects on first contact
+// and are `#[ignore]`d referencing them:
+//   - of-hqb — the curved-operand bore aborts in `Chart::param(Nurbs)`
+//     on an interpolated (uncarried) marched station that sits a chord
+//     sagitta off the exact patch;
+//   - of-bd3 — randomized planar-NURBS pairs (both NURBS↔analytic and
+//     NURBS↔NURBS) tessellate non-manifold in configurations the
+//     analytic campaigns handle.
+// Until both land and the ignores lift, the hybrid kernel's F-Rep
+// fallback for NURBS operands stays the correct route.
+
+/// Exact strict interior predicate for the finite solid cylinder (axis
+/// `+Z` through `(cx, cy)`, radius `r`, `z ∈ (z0, z1)`), to inject via
+/// [`boolean_with_inside_tests`] for a [`Scene::nurbs_cylinder`] operand.
+/// Like [`box_inside_test`] it never abstains.
+fn cylinder_inside_test(
+    cx: f64,
+    cy: f64,
+    r: f64,
+    z0: f64,
+    z1: f64,
+) -> impl Fn(&Point3) -> Option<bool> {
+    move |p: &Point3| Some((p.x - cx).powi(2) + (p.y - cy).powi(2) < r * r && p.z > z0 && p.z < z1)
+}
+
+/// [`box_inside_test`] for a box rigidly rotated by `rot` about `center`:
+/// the query point is pulled back into the box's own frame, so the
+/// predicate stays exact under the rotation.
+fn rotated_box_inside_test(
+    min: [f64; 3],
+    max: [f64; 3],
+    rot: Rotation3<f64>,
+    center: Point3,
+) -> impl Fn(&Point3) -> Option<bool> {
+    let inv = rot.inverse();
+    move |p: &Point3| {
+        let q = center + inv * (p - center);
+        Some((0..3).all(|i| q[i] > min[i] && q[i] < max[i]))
+    }
+}
+
+/// [`box_corners`] rigidly rotated by `rot` about `center` — the operand
+/// for building an exactly-rotated NURBS hexahedron (rotation is affine,
+/// so the bilinear patch of rotated corners IS the rotated patch).
+fn rotated_box_corners(
+    min: [f64; 3],
+    max: [f64; 3],
+    rot: &Rotation3<f64>,
+    center: &Point3,
+) -> [Point3; 8] {
+    box_corners(min, max).map(|c| center + rot * (c - center))
+}
+
+/// Exact signed distance to the axis-aligned box `min..max` (negative
+/// inside) — one half of the closed-form answer the §9 highest-value test
+/// checks the exact path against.
+fn box_sdf(min: [f64; 3], max: [f64; 3], p: &Point3) -> f64 {
+    let q = [
+        (min[0] - p.x).max(p.x - max[0]),
+        (min[1] - p.y).max(p.y - max[1]),
+        (min[2] - p.z).max(p.z - max[2]),
+    ];
+    let outside = (q[0].max(0.0).powi(2) + q[1].max(0.0).powi(2) + q[2].max(0.0).powi(2)).sqrt();
+    outside + q[0].max(q[1]).max(q[2]).min(0.0)
+}
+
+/// Exact signed distance to the finite solid cylinder (axis `+Z` through
+/// `(cx, cy)`, radius `r`, `z ∈ [z0, z1]`; negative inside) — the other
+/// half of the closed-form answer.
+fn cylinder_sdf(cx: f64, cy: f64, r: f64, z0: f64, z1: f64, p: &Point3) -> f64 {
+    let dr = ((p.x - cx).powi(2) + (p.y - cy).powi(2)).sqrt() - r;
+    let dz = (z0 - p.z).max(p.z - z1);
+    let outside = (dr.max(0.0).powi(2) + dz.max(0.0).powi(2)).sqrt();
+    outside + dr.max(dz).min(0.0)
+}
+
+/// Assert every referenced vertex of a result mesh lies within
+/// `tol.linear` of the analytic result boundary described by `residual`
+/// (a signed field whose zero set is that boundary). Mesh vertices are
+/// evaluated points of the result's faces, so this is a direct
+/// `tol.linear` comparison of the exact path's geometry against the
+/// closed form — tessellation *density* never enters, only the surfaces
+/// the pipeline actually produced.
+fn assert_vertices_on_boundary(
+    mesh: &TriangleMesh,
+    residual: &dyn Fn(&Point3) -> f64,
+    context: &str,
+) {
+    let lin = tol().linear;
+    let mut referenced = vec![false; mesh.vertex_count()];
+    for tri in &mesh.indices {
+        for &i in tri {
+            referenced[i] = true;
+        }
+    }
+    for (i, p) in mesh.positions.iter().enumerate() {
+        if !referenced[i] {
+            continue;
+        }
+        let r = residual(p).abs();
+        assert!(
+            r <= lin,
+            "{context}: mesh vertex {i} at ({}, {}, {}) sits {r:.3e} off the \
+             analytic result boundary (allowed {lin:.1e})",
+            p.x,
+            p.y,
+            p.z,
+        );
+    }
+}
+
+/// §9's HIGHEST-VALUE TEST: a NURBS operand of exact analytic form — the
+/// rational quarter-cylinder patches of [`Scene::nurbs_cylinder`], exact
+/// to ~1e-10 — bored through a block, checked against the closed-form
+/// answer three ways:
+///
+/// 1. every vertex of every result mesh lies on the analytic boolean's
+///    boundary (`max`/`min` of the two exact SDFs) to `tol.linear`;
+/// 2. volumes match the closed form (`8 − π/2`, `π/2`, `8 + π/2`) at the
+///    curved-tessellation tolerance;
+/// 3. the same boolean built from `Scene::cylinder` (the analytic
+///    surface) agrees, so the NURBS and analytic paths corroborate each
+///    other on identical geometry.
+///
+/// The bore pierces both caps, so the difference is genus 1 — the
+/// topology check rules out a wrong-region result that happens to keep
+/// the right volume. Every wall-crossing imprint runs across all four
+/// quarter patches and their seam edges, exercising marched Plane↔NURBS
+/// SSI junction welding (of-9ia) on curved geometry.
+#[test]
+#[ignore = "of-hqb: Chart::param(Nurbs) hard-rejects an interpolated marched \
+            station 4.1e-4 off the rational cylinder patch (chord sagitta), \
+            aborting the boolean — first curved NURBS operand in the suite"]
+fn block_bored_by_exact_nurbs_cylinder_matches_analytic() {
+    let (cx, cy, r) = (1.0, 1.0, 0.5);
+    let (z0, h) = (-1.0, 4.0);
+    let bore = PI * r * r * 2.0; // clipped to the block's z ∈ [0, 2]
+    let vol_b = PI * r * r * h;
+    let d_box = |p: &Point3| box_sdf([0.0; 3], [2.0; 3], p);
+    let d_cyl = |p: &Point3| cylinder_sdf(cx, cy, r, z0, z0 + h, p);
+
+    let mut scene = Scene::new();
+    let a = scene.block([0.0; 3], [2.0; 3]);
+    let b = scene.nurbs_cylinder(cx, cy, r, z0, h);
+    let inside_b = cylinder_inside_test(cx, cy, r, z0, z0 + h);
+    let tests: [Option<InsideTest>; 2] = [None, Some(&inside_b)];
+    let run = |op, label: &str| {
+        boolean_with_inside_tests(op, &scene.store, &scene.geo, a, b, &tol(), tests)
+            .unwrap_or_else(|e| panic!("{label}: exact pipeline rejected the boolean: {e:?}"))
+    };
+
+    let ctx_sub = "block − exact NURBS cylinder (through-bore)";
+    let subtracted = run(BooleanOp::Subtract, ctx_sub);
+    let v_sub = volume_checked(&subtracted, 1, 1, ctx_sub);
+    assert_close(v_sub, 8.0 - bore, CYL_VOLUME_RTOL, ctx_sub);
+    assert_vertices_on_boundary(
+        &assert_valid(&subtracted, ctx_sub),
+        &|p| d_box(p).max(-d_cyl(p)),
+        ctx_sub,
+    );
+
+    let ctx_int = "block ∩ exact NURBS cylinder";
+    let intersected = run(BooleanOp::Intersect, ctx_int);
+    let v_int = volume_checked(&intersected, 1, 0, ctx_int);
+    assert_close(v_int, bore, CYL_VOLUME_RTOL, ctx_int);
+    assert_vertices_on_boundary(
+        &assert_valid(&intersected, ctx_int),
+        &|p| d_box(p).max(d_cyl(p)),
+        ctx_int,
+    );
+
+    let ctx_uni = "block ∪ exact NURBS cylinder";
+    let united = run(BooleanOp::Unite, ctx_uni);
+    let v_uni = volume_checked(&united, 1, 0, ctx_uni);
+    assert_close(v_uni, 8.0 + vol_b - bore, CYL_VOLUME_RTOL, ctx_uni);
+    assert_vertices_on_boundary(
+        &assert_valid(&united, ctx_uni),
+        &|p| d_box(p).min(d_cyl(p)),
+        ctx_uni,
+    );
+    assert_close(
+        v_uni + v_int,
+        8.0 + vol_b,
+        CYL_VOLUME_RTOL,
+        "NURBS cylinder inclusion–exclusion identity",
+    );
+
+    // The analytic twin: identical geometry through `Surface3::Cylinder`
+    // and ray-parity classification. Its agreement pins the NURBS result
+    // to the known-good path, not just to the closed form.
+    let mut analytic = Scene::new();
+    let a2 = analytic.block([0.0; 3], [2.0; 3]);
+    let b2 = analytic.cylinder(Point3::new(cx, cy, z0), Vector3::z(), r, h);
+    let ctx_ana = "block − analytic cylinder (NURBS twin cross-check)";
+    let sub2 = analytic
+        .subtract(a2, b2)
+        .unwrap_or_else(|e| panic!("{ctx_ana}: subtract failed: {e:?}"));
+    let v_sub2 = volume_checked(&sub2, 1, 1, ctx_ana);
+    assert_close(v_sub2, 8.0 - bore, CYL_VOLUME_RTOL, ctx_ana);
+    assert_close(
+        v_sub,
+        v_sub2,
+        CYL_VOLUME_RTOL,
+        "NURBS vs analytic cylinder bore volumes",
+    );
+}
+
+/// Expected `(components, total genus)` of `A − B`'s boundary for a
+/// [`BlockPair`]: piercing one axis while strictly interior on the other
+/// two bores a handle (genus 1); piercing two with one interior axis cuts
+/// `A` clean in half; anything else notches a topological ball. Panics if
+/// the seed produced a non-transversal pair (`B ⊇ A`, or `B` a strict
+/// interior void) — pick a different seed rather than weakening the test.
+fn expected_subtract_topology(pair: &BlockPair, repro: &str) -> (usize, usize) {
+    let pierced = (0..3)
+        .filter(|&k| pair.b_min[k] < 0.0 && pair.b_max[k] > pair.a_max[k])
+        .count();
+    let interior = (0..3)
+        .filter(|&k| pair.b_min[k] > 0.0 && pair.b_max[k] < pair.a_max[k])
+        .count();
+    assert!(
+        pierced < 3 && interior < 3,
+        "{repro}: seed produced a non-transversal pair; choose a different seed"
+    );
+    match (pierced, interior) {
+        (1, 2) => (1, 1),
+        (2, 1) => (2, 0),
+        _ => (1, 0),
+    }
+}
+
+/// §9's randomized identity campaign on NURBS-hosted operands: the same
+/// seeded transversal `BlockPair` protocol as
+/// `random_transversal_block_pairs_volume_identity`, but operand `A` is
+/// always a NURBS box and `B` alternates analytic/NURBS — so half the
+/// cases drive NURBS↔plane SSI and half NURBS↔NURBS. Volumes stay exact
+/// (planar patches), so the inclusion–exclusion identity holds to 1e-9
+/// relative, and every output's component count and genus is predicted
+/// from the pair's overlap structure — through-bores are *expected* to
+/// come out genus 1, full slabs to split `A` in two.
+#[test]
+#[ignore = "of-bd3: general-position NURBS booleans tessellate non-manifold \
+            (seed 0xACE5 case 0: NURBS ∪ analytic corner notch, 618 triangles) \
+            — deterministic fixtures pass, randomized configurations do not"]
+fn random_transversal_nurbs_block_pairs_volume_identity() {
+    // Seed chosen (see of-37i.5) so all 12 pairs are transversal AND the
+    // expected subtract topologies are diverse: two through-bores
+    // (genus 1), two clean splits (2 components), and eight notches.
+    let mut rng = Rng::new(0xACE5);
+    for case in 0..12 {
+        let pair = BlockPair::random(&mut rng);
+        let nurbs_tool = case % 2 == 1;
+        let repro = format!(
+            "{} (A as NURBS{})",
+            pair.repro(case),
+            if nurbs_tool { ", B as NURBS" } else { "" }
+        );
+        let mut scene = Scene::new();
+        let a = scene.nurbs_block([0.0; 3], pair.a_max);
+        let b = if nurbs_tool {
+            scene.nurbs_block(pair.b_min, pair.b_max)
+        } else {
+            scene.block(pair.b_min, pair.b_max)
+        };
+        let inside_a = box_inside_test([0.0; 3], pair.a_max);
+        let inside_b = box_inside_test(pair.b_min, pair.b_max);
+        let tests: [Option<InsideTest>; 2] = [
+            Some(&inside_a),
+            if nurbs_tool { Some(&inside_b) } else { None },
+        ];
+        let (sub_components, sub_genus) = expected_subtract_topology(&pair, &repro);
+
+        let run = |op, label: &str| {
+            boolean_with_inside_tests(op, &scene.store, &scene.geo, a, b, &tol(), tests)
+                .unwrap_or_else(|e| panic!("{repro}: {label} failed: {e:?}"))
+        };
+        let united = run(BooleanOp::Unite, "unite");
+        let intersected = run(BooleanOp::Intersect, "intersect");
+        let subtracted = run(BooleanOp::Subtract, "subtract");
+
+        let vol_union = volume_checked(&united, 1, 0, &format!("{repro}: union"));
+        let vol_inter = volume_checked(&intersected, 1, 0, &format!("{repro}: intersection"));
+        let vol_diff = volume_checked(
+            &subtracted,
+            sub_components,
+            sub_genus,
+            &format!("{repro}: difference"),
+        );
+
+        assert_close(
+            vol_inter,
+            pair.vol_overlap(),
+            PLANAR_VOLUME_RTOL,
+            &format!("{repro}: intersection vs analytic overlap"),
+        );
+        assert_close(
+            vol_union + vol_inter,
+            pair.vol_a() + pair.vol_b(),
+            PLANAR_VOLUME_RTOL,
+            &format!("{repro}: inclusion–exclusion identity"),
+        );
+        assert_close(
+            vol_diff,
+            pair.vol_a() - pair.vol_overlap(),
+            PLANAR_VOLUME_RTOL,
+            &format!("{repro}: difference identity"),
+        );
+    }
+}
+
+/// §9 rotation invariance on NURBS operands: each seeded pair is
+/// booleaned axis-aligned and again after a rigid rotation of both
+/// operands — control points rotated exactly (affine map of a bilinear
+/// patch), inside tests pulled back through the inverse rotation — and
+/// the intersection volume must be invariant to 1e-9. The analytic twin
+/// campaign is `random_block_pairs_rotation_invariance`; this one drives
+/// the same invariant through NURBS↔NURBS SSI and NURBS charts, where a
+/// frame-dependent seed or normalization would show up as volume drift.
+#[test]
+#[ignore = "of-bd3: general-position NURBS booleans tessellate non-manifold \
+            (seed 0x0F37_501A case 3: axis-aligned NURBS ∩ NURBS thin slab, \
+            470 triangles — fails before any rotation is applied)"]
+fn random_nurbs_block_pairs_rotation_invariance() {
+    let mut rng = Rng::new(0x0F37_501A);
+    for case in 0..4 {
+        let pair = BlockPair::random(&mut rng);
+        let repro = pair.repro(case);
+        let mut scene = Scene::new();
+        let a = scene.nurbs_block([0.0; 3], pair.a_max);
+        let b = scene.nurbs_block(pair.b_min, pair.b_max);
+        let inside_a = box_inside_test([0.0; 3], pair.a_max);
+        let inside_b = box_inside_test(pair.b_min, pair.b_max);
+        let inter = boolean_with_inside_tests(
+            BooleanOp::Intersect,
+            &scene.store,
+            &scene.geo,
+            a,
+            b,
+            &tol(),
+            [Some(&inside_a), Some(&inside_b)],
+        )
+        .unwrap_or_else(|e| panic!("{repro}: NURBS intersect failed: {e:?}"));
+        let v = volume_checked(&inter, 1, 0, &format!("{repro}: NURBS intersection"));
+        assert_close(
+            v,
+            pair.vol_overlap(),
+            PLANAR_VOLUME_RTOL,
+            &format!("{repro}: NURBS intersection vs analytic overlap"),
+        );
+
+        let axis = Unit::new_normalize(Vector3::new(
+            rng.range(-1.0, 1.0),
+            rng.range(-1.0, 1.0),
+            rng.range(-1.0, 1.0),
+        ));
+        let angle = rng.range(0.2, 1.3);
+        let rot = Rotation3::from_axis_angle(&axis, angle);
+        let center = Point3::new(1.0, 1.0, 1.0);
+        let mut scene_rot = Scene::new();
+        let ar = scene_rot.nurbs_hexahedron(
+            rotated_box_corners([0.0; 3], pair.a_max, &rot, &center),
+            [[(0.0, 1.0); 2]; 6],
+            1,
+        );
+        let br = scene_rot.nurbs_hexahedron(
+            rotated_box_corners(pair.b_min, pair.b_max, &rot, &center),
+            [[(0.0, 1.0); 2]; 6],
+            1,
+        );
+        let inside_ar = rotated_box_inside_test([0.0; 3], pair.a_max, rot, center);
+        let inside_br = rotated_box_inside_test(pair.b_min, pair.b_max, rot, center);
+        let inter_rot = boolean_with_inside_tests(
+            BooleanOp::Intersect,
+            &scene_rot.store,
+            &scene_rot.geo,
+            ar,
+            br,
+            &tol(),
+            [Some(&inside_ar), Some(&inside_br)],
+        )
+        .unwrap_or_else(|e| {
+            panic!("{repro} rotated by {angle} rad about {axis:?}: NURBS intersect failed: {e:?}")
+        });
+        let v_rot = volume_checked(
+            &inter_rot,
+            1,
+            0,
+            &format!("{repro}: rotated NURBS intersection"),
+        );
+        assert_close(
+            v_rot,
+            v,
+            1e-9,
+            &format!("{repro}: NURBS intersection volume under rotation ({angle} rad, {axis:?})"),
+        );
+    }
+}
+
+/// §9 knot-scaling invariance — the test that catches the
+/// `tol.parametric` normalization bug. Same fixture as
+/// `nurbs_box_half_overlapped_by_nurbs_box`, but every patch's knot
+/// domain is offset far from `[0, 1]`, scaled 10× in `u` and 1/32× in
+/// `v` (a 320× per-face anisotropy), and distinct per face — while the
+/// point sets are bitwise-identical bilinear rectangles. Any behavioral
+/// difference from the unscaled twin (which passes at 1e-9) is a
+/// parameterization bug by construction: a parametric tolerance or seed
+/// step applied to an unnormalized domain, a `[0,1]` assumption, or a
+/// domain-relative epsilon.
+#[test]
+fn nurbs_box_knot_scaling_invariance() {
+    let context = "knot-scaled NURBS box half-overlapped by knot-scaled NURBS box";
+    let dom_a = |i: usize| -> [(f64, f64); 2] {
+        let k = i as f64;
+        [
+            (10.0 * k + 3.0, 10.0 * k + 13.0),
+            (-5.0 * k - 7.0, -5.0 * k - 7.0 + 0.03125),
+        ]
+    };
+    // B's domains invert the anisotropy (tiny u, wide v) and sit on other
+    // offsets, so no two patches in the boolean share a parameter scale.
+    let dom_b = |i: usize| -> [(f64, f64); 2] {
+        let k = i as f64;
+        [
+            (100.0 * k + 41.0, 100.0 * k + 41.0 + 0.0625),
+            (7.0 * k - 2.0, 7.0 * k + 3.0),
+        ]
+    };
+    let mut scene = Scene::new();
+    let a_box = ([0.0, 0.0, 0.0], [2.0, 2.0, 2.0]);
+    let b_box = ([1.0, -1.0, -1.0], [3.0, 3.0, 3.0]);
+    let a = scene.nurbs_hexahedron(
+        box_corners(a_box.0, a_box.1),
+        [dom_a(0), dom_a(1), dom_a(2), dom_a(3), dom_a(4), dom_a(5)],
+        1,
+    );
+    let b = scene.nurbs_hexahedron(
+        box_corners(b_box.0, b_box.1),
+        [dom_b(0), dom_b(1), dom_b(2), dom_b(3), dom_b(4), dom_b(5)],
+        1,
+    );
+    let inside_a = box_inside_test(a_box.0, a_box.1);
+    let inside_b = box_inside_test(b_box.0, b_box.1);
+    assert_half_overlap_identity(
+        context,
+        &scene,
+        a,
+        b,
+        [Some(&inside_a), Some(&inside_b)],
+        8.0,
+        32.0,
+    );
+}
+
+/// §9 multi-span coverage: NURBS boxes whose patches carry interior
+/// knots, half-overlapped by an analytic block. With 2 spans the interior
+/// knot line `u = 1/2` maps exactly onto the cut plane `x = 1` — the
+/// imprint runs ALONG a knot line, where span-boundary continuity bugs in
+/// evaluation, projection seeding, or marching live. With 3 spans the
+/// same cut lands mid-span, with knot lines at `1/3` and `2/3` crossing
+/// the trim regions instead.
+#[test]
+fn nurbs_box_multispan_imprints_on_and_off_knot_lines() {
+    for (spans, where_cut) in [(2usize, "on the u = 1/2 knot line"), (3, "mid-span")] {
+        let context = format!("{spans}-span NURBS box half-overlap, cut {where_cut}");
+        let mut scene = Scene::new();
+        let a_box = ([0.0, 0.0, 0.0], [2.0, 2.0, 2.0]);
+        let a = scene.nurbs_hexahedron(box_corners(a_box.0, a_box.1), [[(0.0, 1.0); 2]; 6], spans);
+        let b = scene.block([1.0, -1.0, -1.0], [3.0, 3.0, 3.0]);
+        let inside_a = box_inside_test(a_box.0, a_box.1);
+        assert_half_overlap_identity(&context, &scene, a, b, [Some(&inside_a), None], 8.0, 32.0);
+    }
+}
+
+/// §9 trim regions abutting the knot-domain boundary: sliver cuts whose
+/// surviving regions run hard against the edge of the patch domain.
+/// Case (a) shaves a 0.05-thick sliver off `+x`: on each x-spanning face
+/// the trim boundary sits at `u = 0.975`, 2.5% of the domain from the
+/// `u = 1` edge, and the `+x` face is consumed whole. Case (b) is a
+/// 0.02-thick slab across the top — 1% of the domain from the `v = 1`
+/// edge on four faces at once. Both must keep the 1e-9 identity: a
+/// domain-boundary clamp or an epsilon that swallows the sliver shows up
+/// as a volume error five orders of magnitude above the tolerance.
+#[test]
+fn nurbs_box_sliver_trims_abut_knot_domain_boundary() {
+    let a_box = ([0.0, 0.0, 0.0], [2.0, 2.0, 2.0]);
+    let inside_a = box_inside_test(a_box.0, a_box.1);
+
+    let mut scene = Scene::new();
+    let a = scene.nurbs_block(a_box.0, a_box.1);
+    let b = scene.block([1.95, -1.0, -1.0], [3.95, 3.0, 3.0]);
+    assert_overlap_identity(
+        "0.05 sliver at +x of a NURBS box",
+        &scene,
+        a,
+        b,
+        [Some(&inside_a), None],
+        (8.0, 2.0 * 4.0 * 4.0, 0.05 * 2.0 * 2.0),
+    );
+
+    let mut scene = Scene::new();
+    let a = scene.nurbs_block(a_box.0, a_box.1);
+    let b = scene.block([-1.0, -1.0, 1.98], [3.0, 3.0, 3.5]);
+    assert_overlap_identity(
+        "0.02 slab across the top of a NURBS box",
+        &scene,
+        a,
+        b,
+        [Some(&inside_a), None],
+        (8.0, 4.0 * 4.0 * 1.52, 2.0 * 2.0 * 0.02),
+    );
 }
