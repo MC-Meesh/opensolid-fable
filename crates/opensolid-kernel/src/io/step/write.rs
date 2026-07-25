@@ -43,10 +43,13 @@
 //! faces all carry analytic surfaces and whose edges all carry analytic
 //! curves. Anything else — sheet/wire bodies, voids (multiple shells),
 //! vertex loops, missing geometry — fails with [`StepWriteError`] rather
-//! than emitting an unreadable file. NURBS geometry cannot occur: the
-//! geometry store's [`Curve3`] / [`Surface3`] enums have no NURBS variants
-//! yet (see the [reader docs](super::read) for the import-side mirror of
-//! this limitation).
+//! than emitting an unreadable file. NURBS geometry *can* occur — both
+//! [`Curve3`] and [`Surface3`] carry a freeform variant — but it is
+//! refused rather than approximated: emitting
+//! `B_SPLINE_CURVE_WITH_KNOTS` / `B_SPLINE_SURFACE_WITH_KNOTS` is
+//! of-3qy.7, and sampling a freeform into the analytic forms above would
+//! export different geometry under a name that reads exact. See the
+//! [reader docs](super::read) for the import-side mirror.
 //!
 //! # External tool compatibility
 //!
@@ -568,6 +571,19 @@ impl Emitter<'_> {
                     knots.join(",")
                 ))
             }
+            // A real B_SPLINE_CURVE_WITH_KNOTS needs the control points,
+            // the knot vector collapsed to distinct-knots-plus-
+            // multiplicities, and — for a rational curve — the
+            // `RATIONAL_B_SPLINE_CURVE` complex-instance form carrying the
+            // weights. That is of-3qy.7, not this phase; the degree-1
+            // polyline emission above is deliberately not reused, because
+            // sampling a freeform curve into one would silently downgrade
+            // exact geometry.
+            Curve3::Nurbs(_) => {
+                return Err(StepWriteError::Unsupported(
+                    "NURBS curve (B_SPLINE_CURVE_WITH_KNOTS emission is the of-3qy.7 phase)".into(),
+                ));
+            }
         };
         self.curves.insert(curve, id);
         Ok(id)
@@ -670,8 +686,8 @@ mod tests {
 
     use opensolid_brep::primitives::{block, cylinder, sphere, torus};
     use opensolid_brep::{
-        FinSense, LoopType, SYSTEM_RESOLUTION, ShellOrientation, TessellationOptions,
-        tessellate_body,
+        FinSense, KnotVector, LoopType, NurbsCurve, SYSTEM_RESOLUTION, ShellOrientation,
+        TessellationOptions, tessellate_body,
     };
 
     use crate::io::step::read::{SolidOutcome, StepReadOptions, read_step};
@@ -1236,6 +1252,44 @@ mod tests {
             emitter.data
         );
         assert!(emitter.data.contains("DIRECTION('',(1.0,0.0,0.0))"));
+    }
+
+    /// A NURBS curve must be refused outright, not quietly sampled into
+    /// the degree-1 polyline form sitting right next to it in
+    /// `emit_curve` — that would export a *different* curve under a name
+    /// that reads exact (of-3qy.7 emits the real thing).
+    #[test]
+    fn rejects_nurbs_curves_rather_than_downgrading_them() {
+        let store = TopologyStore::new();
+        let mut geo = GeometryStore::new();
+        let curve_id = geo.add_curve(Curve3::nurbs(
+            NurbsCurve::bspline(
+                vec![
+                    Point3::origin(),
+                    Point3::new(1.0, 2.0, 0.0),
+                    Point3::new(3.0, 0.0, 1.0),
+                ],
+                KnotVector::new(2, vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0]).expect("knots"),
+            )
+            .expect("b-spline"),
+        ));
+        let mut emitter = Emitter {
+            store: &store,
+            geo: &geo,
+            data: String::new(),
+            next_id: 1,
+            vertices: HashMap::new(),
+            edges: HashMap::new(),
+            curves: HashMap::new(),
+            surfaces: HashMap::new(),
+        };
+        let err = emitter.emit_curve(curve_id).unwrap_err();
+        assert!(matches!(err, StepWriteError::Unsupported(_)), "{err}");
+        assert!(
+            !emitter.data.contains("B_SPLINE_CURVE_WITH_KNOTS"),
+            "nothing may be emitted for a refused curve:\n{}",
+            emitter.data
+        );
     }
 
     // ------------------------------------------------------------------

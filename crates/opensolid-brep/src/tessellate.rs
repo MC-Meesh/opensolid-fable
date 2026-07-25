@@ -69,7 +69,7 @@
 
 use crate::curve::{Curve3, CurveEval, plane_basis};
 use crate::geometry::GeometryStore;
-use crate::nurbs::NurbsSurface;
+use crate::nurbs::{NurbsCurve, NurbsSurface};
 use crate::project::SurfaceProject;
 use crate::surface::{Surface3, SurfaceEval};
 use crate::topology::{Body, Edge, Face, FaceSense, Fin, FinSense, Loop, TopologyStore};
@@ -124,6 +124,60 @@ impl TessellationOptions {
 fn angular_segments(sweep: f64, options: &TessellationOptions) -> usize {
     let raw = sweep.abs() / options.angular_step;
     ((raw - 1e-9).ceil() as usize).max(3)
+}
+
+/// Segment count for sweeping a freeform curve from `t_from` to `t_to`.
+///
+/// A NURBS curve has no angular parameter to price a pitch off, so — as
+/// [`span_samples`] does for a patch — the count is derived from how far the
+/// *tangent turns* over the swept range: `ceil(turn / angular_step)`. The
+/// turn is the summed angle between tangents at `2·degree + 1` probes per
+/// covered knot span, enough to resolve a polynomial piece of that degree;
+/// zero-length tangents (a collapsed control run) contribute nothing rather
+/// than a guessed angle.
+///
+/// The result is floored at the number of knot spans the range covers, so a
+/// curve that is nearly straight but has interior knots — where a repeated
+/// knot may hide a tangent discontinuity that turns *between* probes — still
+/// gets a vertex per piece. Sampling stays uniform in `t`, matching every
+/// other variant here, so interior knots are bracketed rather than hit
+/// exactly; that costs chord accuracy, never correctness.
+fn nurbs_curve_segments(
+    nurbs: &NurbsCurve,
+    t_from: f64,
+    t_to: f64,
+    options: &TessellationOptions,
+) -> usize {
+    let (lo, hi) = (t_from.min(t_to), t_from.max(t_to));
+    // Distinct knots strictly inside the swept range split it into spans.
+    let interior = nurbs
+        .knot_vector()
+        .knots()
+        .windows(2)
+        .filter(|w| w[1] > w[0] && w[1] > lo && w[1] < hi)
+        .count();
+    let spans = interior + 1;
+
+    let probes = spans * (2 * nurbs.degree() + 1);
+    let mut turn = 0.0;
+    let mut previous: Option<Vector3> = None;
+    for i in 0..=probes {
+        let t = t_from + (t_to - t_from) * i as f64 / probes as f64;
+        let tangent = nurbs.derivative(t);
+        if tangent.norm() == 0.0 {
+            continue;
+        }
+        if let Some(p) = previous {
+            turn += p.angle(&tangent);
+        }
+        previous = Some(tangent);
+    }
+    // Snapped exactly as `angular_segments` snaps, and for the same
+    // reason: a turn within float noise of a whole number of steps — a
+    // half or full revolution, say — must land on that count rather than
+    // one more, or two faces recovering the same shared arc disagree on
+    // where its samples go and their rim vertices fail to weld.
+    (((turn / options.angular_step) - 1e-9).ceil() as usize).max(spans)
 }
 
 /// Tessellate every face of `body` into one welded mesh.
@@ -358,6 +412,7 @@ fn sample_loop(
             // One parameter unit per chord: sampling at the vertices
             // reproduces the polyline exactly.
             Curve3::Polyline { .. } => ((t_to - t_from).abs().ceil() as usize).max(1),
+            Curve3::Nurbs(nurbs) => nurbs_curve_segments(nurbs, t_from, t_to, options),
         };
         for k in 0..segments {
             let t = t_from + (t_to - t_from) * k as f64 / segments as f64;
@@ -868,8 +923,101 @@ fn grid_normal(surface: &Surface3, u: f64, v: f64, v_lo: f64, v_hi: f64) -> Vect
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::nurbs::KnotVector;
     use crate::primitives;
-    use std::f64::consts::{PI, TAU};
+    use std::f64::consts::{FRAC_1_SQRT_2, PI, TAU};
+
+    /// Exact unit circle as a rational quadratic: four knot spans, one per
+    /// 90° arc (Piegl & Tiller §7.5).
+    fn nurbs_unit_circle() -> NurbsCurve {
+        let s = FRAC_1_SQRT_2;
+        NurbsCurve::new(
+            vec![
+                Point3::new(1.0, 0.0, 0.0),
+                Point3::new(1.0, 1.0, 0.0),
+                Point3::new(0.0, 1.0, 0.0),
+                Point3::new(-1.0, 1.0, 0.0),
+                Point3::new(-1.0, 0.0, 0.0),
+                Point3::new(-1.0, -1.0, 0.0),
+                Point3::new(0.0, -1.0, 0.0),
+                Point3::new(1.0, -1.0, 0.0),
+                Point3::new(1.0, 0.0, 0.0),
+            ],
+            vec![1.0, s, 1.0, s, 1.0, s, 1.0, s, 1.0],
+            KnotVector::new(
+                2,
+                vec![
+                    0.0, 0.0, 0.0, 0.25, 0.25, 0.5, 0.5, 0.75, 0.75, 1.0, 1.0, 1.0,
+                ],
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// A NURBS circle must be segmented like [`Curve3::Circle`] is: the
+    /// tangent turns a full 2π, so the tangent-turn measure has to land on
+    /// the same count `angular_segments` gives that sweep.
+    #[test]
+    fn nurbs_curve_segments_match_a_conic_of_the_same_turn() {
+        let options = TessellationOptions::default();
+        let circle = nurbs_unit_circle();
+        assert_eq!(
+            nurbs_curve_segments(&circle, 0.0, 1.0, &options),
+            angular_segments(TAU, &options),
+            "a full NURBS circle must segment like a full analytic circle"
+        );
+        // Half the domain is half the turn.
+        assert_eq!(
+            nurbs_curve_segments(&circle, 0.0, 0.5, &options),
+            angular_segments(PI, &options)
+        );
+    }
+
+    /// A straight curve turns nowhere, so the count falls back to the
+    /// per-knot-span floor rather than collapsing to zero segments.
+    #[test]
+    fn nurbs_curve_segments_floor_at_one_per_knot_span() {
+        let options = TessellationOptions::default();
+        let line = NurbsCurve::bspline(
+            vec![Point3::origin(), Point3::new(10.0, 0.0, 0.0)],
+            KnotVector::new(1, vec![0.0, 0.0, 3.0, 3.0]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(nurbs_curve_segments(&line, 0.0, 3.0, &options), 1);
+
+        // Three collinear spans: still straight, but each polynomial piece
+        // gets its own segment, because a repeated knot could hide a kink.
+        let kinked = NurbsCurve::bspline(
+            vec![
+                Point3::origin(),
+                Point3::new(1.0, 0.0, 0.0),
+                Point3::new(2.0, 0.0, 0.0),
+                Point3::new(3.0, 0.0, 0.0),
+            ],
+            KnotVector::new(1, vec![0.0, 0.0, 1.0, 2.0, 3.0, 3.0]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(nurbs_curve_segments(&kinked, 0.0, 3.0, &options), 3);
+        // Restricting to one span drops the floor with it.
+        assert_eq!(nurbs_curve_segments(&kinked, 0.0, 1.0, &options), 1);
+    }
+
+    /// A finer `angular_step` must buy more segments on the same curve.
+    #[test]
+    fn nurbs_curve_segments_respect_the_angular_step() {
+        let circle = nurbs_unit_circle();
+        let coarse = nurbs_curve_segments(&circle, 0.0, 1.0, &TessellationOptions::default());
+        let fine = nurbs_curve_segments(
+            &circle,
+            0.0,
+            1.0,
+            &TessellationOptions {
+                angular_step: TAU / 128.0,
+            },
+        );
+        assert!(fine > coarse, "finer step must refine: {fine} vs {coarse}");
+    }
 
     fn build(
         make: impl FnOnce(&mut TopologyStore, &mut GeometryStore) -> CoreResult<EntityId<Body>>,

@@ -6,7 +6,12 @@
 //! - `Circle` / `Ellipse`: parameterized by angle in radians over `[0, 2π)`,
 //!   counterclockwise when viewed from the tip of `axis` (right-hand rule).
 //!   `t = 0` lies along the reference x-direction of the curve's frame.
+//! - `Nurbs`: parameterized by its own knot vector over the finite domain
+//!   `[knots[p], knots[n − p]]`, which is whatever the curve was built with
+//!   — not normalized to `[0, 1]`. Evaluation outside it clamps, so a
+//!   closed NURBS curve is not periodic.
 
+use crate::nurbs::NurbsCurve;
 use opensolid_core::error::{CoreError, CoreResult};
 use opensolid_core::types::{Point3, Vector3};
 
@@ -76,6 +81,16 @@ pub enum Curve3 {
         major_radius: f64,
         minor_radius: f64,
     },
+    /// Freeform clamped NURBS curve. Unlike every analytic variant, its
+    /// parameter domain is the finite knot interval and evaluation outside
+    /// it clamps rather than extrapolating or wrapping — so a NURBS curve
+    /// whose endpoints coincide is [`is_closed`](CurveEval::is_closed) but
+    /// never periodic (see [`CurveEval::is_periodic`] below).
+    ///
+    /// Boxed for the same reason [`crate::surface::Surface3::Nurbs`] is:
+    /// [`NurbsCurve`] owns two `Vec`s plus a knot vector, and inlining them
+    /// would grow every `Curve3` — the analytic variants are the hot ones.
+    Nurbs(Box<NurbsCurve>),
 }
 
 /// Deterministic orthonormal basis `(u, v)` spanning the plane normal to
@@ -235,11 +250,21 @@ impl Curve3 {
         Ok(Curve3::Polyline { points, closed })
     }
 
+    /// Freeform clamped NURBS curve over its knot interval.
+    ///
+    /// Accepts any curve [`NurbsCurve`] itself accepts — its constructors
+    /// already enforce the invariants (matching control/weight/knot counts,
+    /// positive weights, non-empty domain) that evaluation relies on, so
+    /// there is nothing left for this wrapper to reject.
+    pub fn nurbs(curve: NurbsCurve) -> Self {
+        Curve3::Nurbs(Box::new(curve))
+    }
+
     /// In-plane frame `(u, v)` for conic evaluation: `u` at t = 0, `v` at
     /// t = π/2.
     fn conic_frame(&self) -> Option<(Vector3, Vector3)> {
         match self {
-            Curve3::Line { .. } | Curve3::Polyline { .. } => None,
+            Curve3::Line { .. } | Curve3::Polyline { .. } | Curve3::Nurbs(_) => None,
             Curve3::Circle { axis, .. } => Some(plane_basis(axis)),
             Curve3::Ellipse {
                 axis, major_dir, ..
@@ -284,6 +309,7 @@ impl CurveEval for Curve3 {
                 let (u, v) = self.conic_frame().unwrap();
                 center + u * (major_radius * t.cos()) + v * (minor_radius * t.sin())
             }
+            Curve3::Nurbs(nurbs) => nurbs.point(t),
         }
     }
 
@@ -308,6 +334,7 @@ impl CurveEval for Curve3 {
                 let (u, v) = self.conic_frame().unwrap();
                 v * (minor_radius * t.cos()) - u * (major_radius * t.sin())
             }
+            Curve3::Nurbs(nurbs) => nurbs.derivative(t),
         }
     }
 
@@ -326,6 +353,7 @@ impl CurveEval for Curve3 {
                 let (u, v) = self.conic_frame().unwrap();
                 -(u * (major_radius * t.cos()) + v * (minor_radius * t.sin()))
             }
+            Curve3::Nurbs(nurbs) => nurbs.second_derivative(t),
         }
     }
 
@@ -334,6 +362,7 @@ impl CurveEval for Curve3 {
             Curve3::Line { .. } => (f64::NEG_INFINITY, f64::INFINITY),
             Curve3::Circle { .. } | Curve3::Ellipse { .. } => (0.0, TWO_PI),
             Curve3::Polyline { points, .. } => (0.0, (points.len() - 1) as f64),
+            Curve3::Nurbs(nurbs) => nurbs.domain(),
         }
     }
 
@@ -342,11 +371,22 @@ impl CurveEval for Curve3 {
             Curve3::Line { .. } => false,
             Curve3::Circle { .. } | Curve3::Ellipse { .. } => true,
             Curve3::Polyline { closed, .. } => *closed,
+            // Geometric, not declared: the patch reports whether its two
+            // domain ends actually meet.
+            Curve3::Nurbs(nurbs) => nurbs.is_closed(),
         }
     }
 
+    /// Closed *and* wrapping. Every variant but the freeform one repeats
+    /// with its period once closed; a clamped NURBS curve does not, because
+    /// evaluation outside the knot interval clamps to the ends instead of
+    /// wrapping — a closed one traces its locus exactly once. Callers that
+    /// mean "start meets end" want [`is_closed`](CurveEval::is_closed).
     fn is_periodic(&self) -> bool {
-        self.is_closed()
+        match self {
+            Curve3::Nurbs(nurbs) => nurbs.is_periodic(),
+            _ => self.is_closed(),
+        }
     }
 
     fn period(&self) -> Option<f64> {
@@ -364,6 +404,7 @@ impl CurveEval for Curve3 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::nurbs::KnotVector;
     use std::f64::consts::{FRAC_PI_2, PI};
 
     const EPS: f64 = 1e-10;
@@ -761,6 +802,135 @@ mod tests {
         assert_point_eq(&c.point(4.25), &c.point(0.25));
         assert_point_eq(&c.point(-0.5), &c.point(3.5));
         assert_vec_eq(&c.derivative(4.5), &c.derivative(0.5));
+    }
+
+    /// Exact unit circle in the XY plane as a rational quadratic (Piegl &
+    /// Tiller §7.5): closed, and rational, so it exercises the weighted
+    /// evaluation path rather than a plain B-spline.
+    fn nurbs_unit_circle() -> Curve3 {
+        let s = std::f64::consts::FRAC_1_SQRT_2;
+        let curve = NurbsCurve::new(
+            vec![
+                Point3::new(1.0, 0.0, 0.0),
+                Point3::new(1.0, 1.0, 0.0),
+                Point3::new(0.0, 1.0, 0.0),
+                Point3::new(-1.0, 1.0, 0.0),
+                Point3::new(-1.0, 0.0, 0.0),
+                Point3::new(-1.0, -1.0, 0.0),
+                Point3::new(0.0, -1.0, 0.0),
+                Point3::new(1.0, -1.0, 0.0),
+                Point3::new(1.0, 0.0, 0.0),
+            ],
+            vec![1.0, s, 1.0, s, 1.0, s, 1.0, s, 1.0],
+            KnotVector::new(
+                2,
+                vec![
+                    0.0, 0.0, 0.0, 0.25, 0.25, 0.5, 0.5, 0.75, 0.75, 1.0, 1.0, 1.0,
+                ],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        Curve3::nurbs(curve)
+    }
+
+    /// Open cubic B-spline over the domain `[0, 2]`, so the tests cannot
+    /// pass by accident on a curve whose domain happens to be `[0, 1]`.
+    fn nurbs_open_cubic() -> Curve3 {
+        let curve = NurbsCurve::bspline(
+            vec![
+                Point3::new(0.0, 0.0, 0.0),
+                Point3::new(1.0, 2.0, 0.5),
+                Point3::new(3.0, 2.5, -1.0),
+                Point3::new(4.0, 0.0, 2.0),
+                Point3::new(6.0, -1.0, 1.0),
+            ],
+            KnotVector::new(3, vec![0.0, 0.0, 0.0, 0.0, 1.0, 2.0, 2.0, 2.0, 2.0]).unwrap(),
+        )
+        .unwrap();
+        Curve3::nurbs(curve)
+    }
+
+    #[test]
+    fn nurbs_evaluation_matches_the_inner_curve() {
+        let inner = match &nurbs_unit_circle() {
+            Curve3::Nurbs(n) => (**n).clone(),
+            _ => unreachable!(),
+        };
+        let wrapped = nurbs_unit_circle();
+        for i in 0..=20 {
+            let t = i as f64 / 20.0;
+            assert_point_eq(&wrapped.point(t), &inner.point(t));
+            assert_vec_eq(&wrapped.derivative(t), &inner.derivative(t));
+            assert_vec_eq(&wrapped.second_derivative(t), &inner.second_derivative(t));
+        }
+    }
+
+    #[test]
+    fn nurbs_circle_is_geometrically_exact() {
+        let c = nurbs_unit_circle();
+        for i in 0..=40 {
+            let t = i as f64 / 40.0;
+            let r = c.point(t) - Point3::origin();
+            assert!(
+                (r.norm() - 1.0).abs() < 1e-12,
+                "off the unit circle at t={t}"
+            );
+            assert!(r.z.abs() < 1e-12, "left the XY plane at t={t}");
+        }
+    }
+
+    #[test]
+    fn nurbs_derivatives_agree_with_finite_differences() {
+        // Away from the C1-reducing repeated knots at 0.25/0.5/0.75, where
+        // the one-sided derivatives of the circle representation differ and
+        // a central difference straddles both.
+        let c = nurbs_unit_circle();
+        for t in [0.1, 0.35, 0.6, 0.9] {
+            check_derivatives_numerically(&c, t);
+        }
+        let open = nurbs_open_cubic();
+        for t in [0.3, 0.7, 1.4, 1.8] {
+            check_derivatives_numerically(&open, t);
+        }
+    }
+
+    #[test]
+    fn nurbs_domain_comes_from_the_knot_vector() {
+        assert_eq!(nurbs_unit_circle().domain(), (0.0, 1.0));
+        assert_eq!(nurbs_open_cubic().domain(), (0.0, 2.0));
+    }
+
+    #[test]
+    fn nurbs_evaluation_clamps_outside_the_domain() {
+        // Clamped curves do not extrapolate: past either end the curve
+        // pins to the endpoint rather than continuing.
+        let c = nurbs_open_cubic();
+        let (t0, t1) = c.domain();
+        assert_point_eq(&c.point(t0 - 5.0), &c.point(t0));
+        assert_point_eq(&c.point(t1 + 5.0), &c.point(t1));
+    }
+
+    #[test]
+    fn nurbs_is_closed_but_never_periodic() {
+        let circle = nurbs_unit_circle();
+        assert!(circle.is_closed(), "the circle's ends meet");
+        // The distinction the analytic variants do not need: a clamped
+        // NURBS traces its locus once, so nothing wraps.
+        assert!(!circle.is_periodic());
+        assert_eq!(circle.period(), None);
+
+        let open = nurbs_open_cubic();
+        assert!(!open.is_closed());
+        assert!(!open.is_periodic());
+        assert_eq!(open.period(), None);
+    }
+
+    #[test]
+    fn nurbs_has_no_conic_frame() {
+        // `conic_frame` is the guard the Circle/Ellipse arms unwrap; a
+        // freeform curve must never claim one.
+        assert!(nurbs_unit_circle().conic_frame().is_none());
     }
 
     #[test]

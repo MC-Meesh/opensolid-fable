@@ -32,11 +32,14 @@
 //! # Mesh fallback
 //!
 //! `b_spline_curve_with_knots` / `b_spline_surface_with_knots` parse into
-//! [`NurbsCurve`] / [`NurbsSurface`] for evaluation, but the geometry
-//! store's [`Curve3`] / [`Surface3`] enums have no NURBS variants yet, so
-//! exact NURBS import is unsupported — as are `parabola` / `hyperbola`
-//! edges (no conic variant), `composite_curve` edges, and swept surfaces
-//! with no quadric reduction. Solids containing any of those (or any
+//! [`NurbsCurve`] / [`NurbsSurface`] for evaluation. The geometry store
+//! now has freeform variants to hold them ([`Curve3::Nurbs`],
+//! [`Surface3::Nurbs`]) and every consumer — evaluation, projection,
+//! tessellation, transform — handles them, but this mapper does not yet
+//! build them: retiring the mesh fallback for B-splines is of-3qy.8.
+//! Until then it is unsupported, as are `parabola` / `hyperbola` edges
+//! (no conic variant), `composite_curve` edges, and swept surfaces with
+//! no quadric reduction. Solids containing any of those (or any
 //! other unmappable entity), and solids whose mapped topology fails
 //! `check`, fall back to a **tessellated import**: each face is
 //! triangulated straight from the STEP graph (planar faces ear-clipped
@@ -117,10 +120,10 @@ use std::collections::HashMap;
 use opensolid_brep::curve::plane_basis;
 use opensolid_brep::triangulate::{ear_clip_rings, signed_area2};
 use opensolid_brep::{
-    Body, BodyType, Curve3, CurveEval, Edge, Face, FaceSense, Fin, FinSense, GeometryStore,
-    KnotVector, Loop, LoopType, NurbsCurve, NurbsError, NurbsSurface, SYSTEM_RESOLUTION, Shell,
-    ShellOrientation, Surface3, SurfaceEval, SurfaceProject, TessellationOptions, TopologyStore,
-    Vertex,
+    Body, BodyType, Curve3, CurveEval, CurveProject, Edge, Face, FaceSense, Fin, FinSense,
+    GeometryStore, KnotVector, Loop, LoopType, NurbsCurve, NurbsError, NurbsSurface,
+    SYSTEM_RESOLUTION, Shell, ShellOrientation, Surface3, SurfaceEval, SurfaceProject,
+    TessellationOptions, TopologyStore, Vertex,
 };
 use opensolid_core::error::CoreError;
 use opensolid_core::mesh::TriangleMesh;
@@ -1566,20 +1569,23 @@ fn reverse_curve(curve: &Curve3) -> Curve3 {
             major_radius: *major_radius,
             minor_radius: *minor_radius,
         },
-        // Not produced by the reader (B-splines parse as NURBS), but the
+        // Not produced by the reader (marched SSI geometry only), but the
         // reversal is well-defined: walk the vertices backwards.
         Curve3::Polyline { points, closed } => Curve3::Polyline {
             points: points.iter().rev().copied().collect(),
             closed: *closed,
         },
+        // Control points, weights and knots all reflect about the domain
+        // midpoint, so the locus and the domain are both preserved.
+        Curve3::Nurbs(nurbs) => Curve3::nurbs(nurbs.reversed()),
     }
 }
 
 /// Angle parameter of `p` on a conic, in the curve's own frame, wrapped to
-/// `[0, 2π)`. `None` for lines.
+/// `[0, 2π)`. `None` for every variant not parameterized by an angle.
 fn conic_angle(curve: &Curve3, p: &Point3) -> Option<f64> {
     match curve {
-        Curve3::Line { .. } | Curve3::Polyline { .. } => None,
+        Curve3::Line { .. } | Curve3::Polyline { .. } | Curve3::Nurbs(_) => None,
         Curve3::Circle { center, axis, .. } => {
             let (u, v) = plane_basis(axis);
             let r = p - center;
@@ -1633,8 +1639,38 @@ fn trim_curve(
             }
             (t0, t1)
         }
+        // A freeform curve has no closed form to invert, so the vertices
+        // are located by projection; `verify_trim` below then confirms the
+        // recovered parameters really do land on them, which is what
+        // catches a vertex that is off the curve entirely. A closed edge
+        // takes the whole knot interval — a clamped B-spline traces its
+        // locus exactly once, so there is no period to add.
+        Curve3::Nurbs(nurbs) => {
+            if closed {
+                nurbs.knot_vector().domain()
+            } else {
+                let t0 = nurbs.project_point(&start).t;
+                let t1 = nurbs.project_point(&end).t;
+                if (t1 - t0).partial_cmp(&SYSTEM_RESOLUTION) != Some(std::cmp::Ordering::Greater) {
+                    return Err(invalid(
+                        entity,
+                        "edge endpoints do not advance along its B-spline (check same_sense)",
+                    ));
+                }
+                (t0, t1)
+            }
+        }
         conic => {
-            let t0 = conic_angle(conic, &start).expect("conic");
+            // Only the angle-parameterized variants are left. `Polyline`
+            // reaches here only if some future caller hands one in — the
+            // reader never builds one — so refuse rather than panic on
+            // input of unknown provenance.
+            let Some(t0) = conic_angle(conic, &start) else {
+                return Err(invalid(
+                    entity,
+                    "edge geometry has no angular parameterization to trim by",
+                ));
+            };
             if closed {
                 (t0, t0 + TAU)
             } else {
@@ -1821,8 +1857,11 @@ impl SolidBuilder<'_> {
             RawSurface::Nurbs(_) => {
                 return Err(unsupported(
                     surface_ref,
-                    "exact NURBS surface import (geometry store has no NURBS variant); \
-                     falling back to tessellation",
+                    // `Surface3::Nurbs` has existed since of-ew7; what is
+                    // missing is this mapping, which is of-3qy.8 alongside
+                    // the curve side.
+                    "exact NURBS surface import (of-3qy.8 wires B_SPLINE_SURFACE_WITH_KNOTS \
+                     onto Surface3::Nurbs); falling back to tessellation",
                 ));
             }
             RawSurface::Extruded { .. } | RawSurface::Revolved { .. } => {
@@ -1968,8 +2007,13 @@ impl SolidBuilder<'_> {
             Some(curve) => curve.clone(),
             None => {
                 let what = match raw {
+                    // `Curve3::Nurbs` exists and every consumer handles it
+                    // (of-3qy.6); what is still missing is this mapping —
+                    // building the edge's `Curve3::Nurbs` and trimming it
+                    // by the vertices, which is of-3qy.8.
                     RawCurve::Nurbs(_) | RawCurve::Trimmed { .. } => {
-                        "exact NURBS curve import (geometry store has no NURBS variant)"
+                        "exact NURBS curve import (of-3qy.8 wires B_SPLINE_CURVE_WITH_KNOTS \
+                         onto Curve3::Nurbs)"
                     }
                     RawCurve::Conic(_) => {
                         "exact PARABOLA/HYPERBOLA import (geometry store has no conic variant)"
@@ -4328,6 +4372,104 @@ mod tests {
             matches!(err, MapError::Invalid { entity: 7, .. }),
             "{err:?}"
         );
+    }
+
+    /// Open cubic B-spline over `[0, 2]`, so a trim recovering `(0, 1)`
+    /// would be visibly wrong rather than coincidentally right.
+    fn bspline_arc() -> Curve3 {
+        Curve3::nurbs(
+            NurbsCurve::bspline(
+                vec![
+                    Point3::new(0.0, 0.0, 0.0),
+                    Point3::new(1.0, 2.0, 0.0),
+                    Point3::new(3.0, 2.0, 1.0),
+                    Point3::new(4.0, 0.0, 0.0),
+                ],
+                KnotVector::new(3, vec![0.0, 0.0, 0.0, 0.0, 2.0, 2.0, 2.0, 2.0]).unwrap(),
+            )
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn trims_a_bspline_by_projecting_its_vertices() {
+        let curve = bspline_arc();
+        let (t0, t1) = curve.domain();
+        let (start, end) = (curve.point(t0), curve.point(t1));
+        let trimmed = trim_curve(&curve, true, start, end, false, 1).unwrap();
+        assert!((trimmed.t_start - t0).abs() < 1e-9);
+        assert!((trimmed.t_end - t1).abs() < 1e-9);
+        // An interior vertex trims to an interior parameter, not the end.
+        let mid = curve.point(1.25);
+        let partial = trim_curve(&curve, true, start, mid, false, 1).unwrap();
+        assert!((partial.t_end - 1.25).abs() < 1e-6, "got {}", partial.t_end);
+    }
+
+    #[test]
+    fn same_sense_false_reverses_a_bspline() {
+        let curve = bspline_arc();
+        let (t0, t1) = curve.domain();
+        // The edge runs against the curve: end vertex first.
+        let (start, end) = (curve.point(t1), curve.point(t0));
+        let trimmed = trim_curve(&curve, false, start, end, false, 1).unwrap();
+        assert!(trimmed.t_start < trimmed.t_end, "normalized trim direction");
+        assert!(matches!(trimmed.curve, Curve3::Nurbs(_)), "stays exact");
+        // The reversed curve interpolates the edge's vertices in order.
+        assert!((trimmed.curve.point(trimmed.t_start) - start).norm() < 1e-9);
+        assert!((trimmed.curve.point(trimmed.t_end) - end).norm() < 1e-9);
+    }
+
+    #[test]
+    fn closed_bspline_edge_spans_the_whole_knot_interval() {
+        // Control net returning to its start: the two domain ends meet, so
+        // the edge takes the full interval rather than adding a period a
+        // clamped B-spline does not have.
+        let curve = Curve3::nurbs(
+            NurbsCurve::bspline(
+                vec![
+                    Point3::new(1.0, 0.0, 0.0),
+                    Point3::new(0.0, 1.5, 0.0),
+                    Point3::new(-1.5, 0.0, 0.0),
+                    Point3::new(0.0, -1.5, 0.0),
+                    Point3::new(1.0, 0.0, 0.0),
+                ],
+                KnotVector::new(2, vec![0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 3.0, 3.0]).unwrap(),
+            )
+            .unwrap(),
+        );
+        let vertex = curve.point(0.0);
+        let trimmed = trim_curve(&curve, true, vertex, vertex, true, 1).unwrap();
+        assert_eq!((trimmed.t_start, trimmed.t_end), (0.0, 3.0));
+    }
+
+    #[test]
+    fn trim_rejects_bspline_vertices_off_the_curve() {
+        let curve = bspline_arc();
+        let start = curve.point(0.0);
+        let err =
+            trim_curve(&curve, true, start, Point3::new(0.0, 9.0, 9.0), false, 7).unwrap_err();
+        assert!(
+            matches!(err, MapError::Invalid { entity: 7, .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn reverse_curve_mirrors_a_bspline() {
+        let curve = bspline_arc();
+        let (t0, t1) = curve.domain();
+        let back = reverse_curve(&curve);
+        assert_eq!(back.domain(), (t0, t1));
+        for i in 0..=10 {
+            let t = t0 + (t1 - t0) * i as f64 / 10.0;
+            assert!((back.point(t) - curve.point(t0 + t1 - t)).norm() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn bspline_has_no_conic_angle() {
+        let curve = bspline_arc();
+        assert_eq!(conic_angle(&curve, &curve.point(1.0)), None);
     }
 
     #[test]

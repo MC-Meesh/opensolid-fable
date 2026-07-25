@@ -13,7 +13,7 @@
 
 use crate::curve::CurveEval;
 use nalgebra::Vector4;
-use opensolid_core::types::{Point3, Vector3};
+use opensolid_core::types::{BoundingBox3, Point3, Vector3};
 use thiserror::Error;
 
 /// Errors from NURBS construction and editing.
@@ -360,6 +360,68 @@ impl NurbsCurve {
             ders.push(v / homo[0].w);
         }
         ders
+    }
+
+    /// Map every control point through `f`, leaving weights and knots
+    /// untouched.
+    ///
+    /// For an **affine** `f` this transforms the curve exactly: evaluation
+    /// is a weighted average of control points whose basis weights sum to
+    /// one, and affine maps commute with such averages. It is *not* valid
+    /// for a projective or otherwise non-affine `f`, which would have to
+    /// move the weights too.
+    pub fn map_control_points(&mut self, f: impl Fn(Point3) -> Point3) {
+        for p in &mut self.control_points {
+            *p = f(*p);
+        }
+    }
+
+    /// The same locus traced in the opposite direction, over the same
+    /// parameter domain.
+    ///
+    /// Control points and weights are reversed, and knot `k` is reflected
+    /// to `t0 + t1 − k` (then re-reversed so the vector is non-decreasing
+    /// again). The reflection is an affine change of parameter, so
+    /// `reversed().point(t) == point(t0 + t1 − t)` exactly up to the
+    /// floating-point cost of the reflection itself; multiplicities — and
+    /// hence the clamping — are carried along with the knots they belong
+    /// to.
+    ///
+    /// The reflected interior knots are new float values: `t0 + t1 − k` is
+    /// generally not the decimal one would write down for the mirrored
+    /// position, so query [`KnotVector::multiplicity`] with a value read
+    /// back out of `knot_vector().knots()`, never with a literal.
+    pub fn reversed(&self) -> NurbsCurve {
+        let (t0, t1) = self.knots.domain();
+        let sum = t0 + t1;
+        let knots: Vec<f64> = self.knots.knots().iter().rev().map(|&k| sum - k).collect();
+        let degree = self.degree();
+        NurbsCurve {
+            control_points: self.control_points.iter().rev().copied().collect(),
+            weights: self.weights.iter().rev().copied().collect(),
+            // Reflecting a valid knot vector yields a valid knot vector of
+            // the same degree and length, so this cannot fail.
+            knots: KnotVector::new(degree, knots)
+                .expect("reflecting a valid knot vector keeps it valid"),
+        }
+    }
+
+    /// Axis-aligned box of the control polygon.
+    ///
+    /// By the convex hull property of (rational, positive-weight) NURBS the
+    /// curve lies inside the convex hull of its control points, so this box
+    /// contains the whole curve. It is a *bound*, not the tight box of the
+    /// geometry — the same contract [`crate::nurbs::NurbsSurface::control_hull_box`]
+    /// offers, and what broad-phase culling needs: never too tight.
+    pub fn control_hull_box(&self) -> Option<BoundingBox3> {
+        let mut points = self.control_points.iter();
+        let first = *points.next()?;
+        let (mut lo, mut hi) = (first, first);
+        for p in points {
+            lo = Point3::new(lo.x.min(p.x), lo.y.min(p.y), lo.z.min(p.z));
+            hi = Point3::new(hi.x.max(p.x), hi.y.max(p.y), hi.z.max(p.z));
+        }
+        Some(BoundingBox3::new(lo, hi))
     }
 
     /// Insert `u` once into the knot vector (Boehm's algorithm, A5.1),
@@ -826,6 +888,91 @@ mod tests {
                     end: 1.0
                 })
             );
+        }
+    }
+
+    // --- control-point editing ---
+
+    #[test]
+    fn map_control_points_applies_an_affine_map_exactly() {
+        let curve = generic_rational_cubic();
+        // Rigid-ish affine map: rotate 90° about +Z, then translate.
+        let map = |p: Point3| Point3::new(-p.y + 2.0, p.x - 1.0, p.z + 0.5);
+        let mut moved = curve.clone();
+        moved.map_control_points(map);
+
+        // Weights and knots are untouched, so the parameterization — and
+        // any edge parameter range pinned to it — survives.
+        assert_eq!(moved.weights(), curve.weights());
+        assert_eq!(moved.knot_vector(), curve.knot_vector());
+        for t in sample_params(50) {
+            assert!(
+                (moved.point(t) - map(curve.point(t))).norm() < TIGHT,
+                "affine map must commute with evaluation at t={t}"
+            );
+        }
+    }
+
+    #[test]
+    fn reversed_traces_the_same_locus_backwards() {
+        let curve = generic_rational_cubic();
+        let back = curve.reversed();
+        let (t0, t1) = curve.knot_vector().domain();
+        assert_eq!(back.knot_vector().domain(), (t0, t1));
+        assert_eq!(back.degree(), curve.degree());
+        for t in sample_params(50) {
+            let mirrored = t0 + t1 - t;
+            assert!(
+                (back.point(t) - curve.point(mirrored)).norm() < TIGHT,
+                "reversed point mismatch at t={t}"
+            );
+            // Chain rule through dt ↦ −dt: the tangent flips sign.
+            assert!(
+                (back.derivative(t) + curve.derivative(mirrored)).norm() < 1e-9,
+                "reversed tangent must oppose the original at t={t}"
+            );
+        }
+        // Reversing twice is the identity.
+        let forward = back.reversed();
+        for t in sample_params(50) {
+            assert!((forward.point(t) - curve.point(t)).norm() < TIGHT);
+        }
+    }
+
+    #[test]
+    fn reversed_preserves_interior_knot_multiplicity() {
+        // Non-symmetric interior knots: reflecting must carry each knot's
+        // multiplicity to its mirrored position, not merely reverse the
+        // list of distinct values.
+        let curve = generic_rational_cubic().insert_knot(0.4).unwrap();
+        let back = curve.reversed();
+        assert_eq!(curve.knot_vector().multiplicity(0.4), 2);
+        assert_eq!(back.knot_vector().multiplicity(0.6), 2);
+        // Element-wise reflection, not merely the same distinct values in
+        // the other order: `1.0 - 0.7` is not the literal `0.3`, so each
+        // mirrored knot is compared against the reflection itself.
+        let (t0, t1) = curve.knot_vector().domain();
+        let expected: Vec<f64> = curve
+            .knot_vector()
+            .knots()
+            .iter()
+            .rev()
+            .map(|&k| t0 + t1 - k)
+            .collect();
+        assert_eq!(back.knot_vector().knots(), expected.as_slice());
+    }
+
+    #[test]
+    fn control_hull_box_contains_the_curve() {
+        for curve in [unit_circle(), generic_rational_cubic()] {
+            let bbox = curve.control_hull_box().expect("non-empty control net");
+            for t in sample_params(200) {
+                let p = curve.point(t);
+                assert!(
+                    bbox.contains(&p),
+                    "convex hull property violated at t={t}: {p:?} outside {bbox:?}"
+                );
+            }
         }
     }
 

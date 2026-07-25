@@ -106,6 +106,12 @@ pub fn transform_body(
                     *p = transform * *p;
                 }
             }
+            // As for a NURBS patch: a rigid transform is affine, so moving
+            // the control points moves the curve exactly, and knots and
+            // weights are untouched — the parameterization (and every edge
+            // parameter range in the topology) survives intact, so no
+            // parameter shift is queued the way a rotated circle's is.
+            Curve3::Nurbs(nurbs) => nurbs.map_control_points(|p| transform * p),
         }
     }
 
@@ -300,6 +306,7 @@ mod tests {
     use super::*;
     use crate::boolean;
     use crate::curve::CurveEval;
+    use crate::nurbs::{KnotVector, NurbsCurve};
     use crate::primitives;
     use crate::project::SurfaceProject;
     use crate::tessellate::{TessellationOptions, tessellate_body};
@@ -369,6 +376,79 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Swap one of `body`'s straight edges for an exactly equivalent
+    /// degree-1 NURBS curve: two control points at the edge's vertices,
+    /// clamped over the edge's own parameter range, so evaluation — and
+    /// therefore the whole body — is unchanged. Returns the curve id and
+    /// the edge's endpoints.
+    fn nurbs_ify_one_edge(
+        store: &TopologyStore,
+        geo: &mut GeometryStore,
+        body: EntityId<Body>,
+    ) -> (EntityId<Curve3>, Point3, Point3) {
+        for face in store.faces_of_body(body) {
+            for edge_id in store.edges_of_face(face) {
+                let edge = store.edge(edge_id).unwrap();
+                let curve_id = edge.curve.expect("bound curve");
+                if !matches!(geo.curve(curve_id), Some(Curve3::Line { .. })) {
+                    continue;
+                }
+                let start = store.vertex(edge.start_vertex).unwrap().point;
+                let end = store.vertex(edge.end_vertex).unwrap().point;
+                let knots =
+                    KnotVector::new(1, vec![edge.t_start, edge.t_start, edge.t_end, edge.t_end])
+                        .expect("valid degree-1 knot vector");
+                let nurbs = NurbsCurve::bspline(vec![start, end], knots).expect("valid B-spline");
+                *geo.curves.get_mut(curve_id).unwrap() = Curve3::nurbs(nurbs);
+                return (curve_id, start, end);
+            }
+        }
+        panic!("body has no straight edge to convert");
+    }
+
+    #[test]
+    fn transformed_nurbs_curve_moves_with_the_body() {
+        let (mut store, mut geo) = stores();
+        let body = primitives::block(&mut store, &mut geo, 2.0, 2.0, 2.0).expect("valid block");
+        let (curve_id, start, end) = nurbs_ify_one_edge(&store, &mut geo, body);
+        // The swap is geometry-preserving, so the body is still consistent
+        // before anything moves — otherwise the assertion after the
+        // transform would prove nothing.
+        assert_consistent(&store, &geo, body);
+        let before_volume = closed_volume(&store, &geo, body);
+
+        let axis = Vector3::new(1.0, 2.0, 3.0);
+        rotate_body(
+            &mut store,
+            &mut geo,
+            body,
+            Point3::new(1.0, 0.0, -1.0),
+            axis,
+            0.9,
+        )
+        .expect("valid rotation");
+        translate_body(&mut store, &mut geo, body, Vector3::new(4.0, -2.0, 1.0)).expect("finite");
+
+        // The control points followed the vertices, and the knot domain —
+        // which the edge's parameter range indexes into — did not move.
+        let Some(Curve3::Nurbs(nurbs)) = geo.curve(curve_id) else {
+            panic!("the transform must not change the curve's variant");
+        };
+        assert_eq!(nurbs.knot_vector().domain(), (0.0, 2.0));
+        let moved: Vec<Point3> = nurbs.control_points().to_vec();
+        assert!((moved[0] - start).norm() > 1.0, "control points must move");
+
+        assert_consistent(&store, &geo, body);
+        assert!(
+            (closed_volume(&store, &geo, body) - before_volume).abs() < 1e-9,
+            "a rigid transform must preserve volume"
+        );
+        // The moved control points still bracket the moved vertices: the
+        // degree-1 curve interpolates them exactly.
+        let edge_len = (end - start).norm();
+        assert!(((moved[1] - moved[0]).norm() - edge_len).abs() < 1e-9);
     }
 
     #[test]

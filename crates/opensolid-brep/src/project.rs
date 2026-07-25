@@ -352,6 +352,10 @@ impl CurveProject for Curve3 {
                 let d = point - center;
                 (major_radius * d.dot(&minor_dir)).atan2(minor_radius * d.dot(major_dir))
             }
+            // Freeform: no closed-form seed, so hand the whole projection
+            // to the curve's own span-scan-then-Newton implementation
+            // below rather than reproducing its seeding here.
+            Curve3::Nurbs(nurbs) => return nurbs.project_point(point),
         };
         newton_curve(self, point, seed)
     }
@@ -834,6 +838,34 @@ mod tests {
         assert_near(proj.t, 1.0, "t clamped to domain end");
         assert_point_near(&proj.point, &Point3::new(2.0, 0.0, 0.0), "endpoint");
         assert_near(proj.distance, 2.0f64.sqrt(), "distance");
+    }
+
+    /// `Curve3::Nurbs` must hand the whole projection to the inner curve,
+    /// seeding included — the analytic arms' closed-form seeds have no
+    /// freeform analogue, and a wrong seed lands Newton on the wrong local
+    /// minimum of a wiggly spline rather than merely converging slower.
+    #[test]
+    fn curve3_nurbs_projection_delegates_to_the_inner_curve() {
+        let inner = generic_rational_cubic();
+        let wrapped = Curve3::nurbs(inner.clone());
+        // `orthogonal` marks the points whose foot is interior; a point
+        // beyond an end pins to the endpoint, where the residual has no
+        // reason to be perpendicular.
+        for (p, orthogonal) in [
+            (Point3::new(2.0, 3.0, 0.0), true),
+            (Point3::new(5.0, -3.0, 1.5), true),
+            (Point3::new(0.5, 0.5, 0.5), true),
+            (Point3::new(-4.0, 0.0, 0.0), false), // before the start: clamps
+        ] {
+            let direct = inner.project_point(&p);
+            let through = wrapped.project_point(&p);
+            if orthogonal {
+                check_curve_projection(&wrapped, &p, &through);
+            }
+            assert_near(through.t, direct.t, "parameter");
+            assert_point_near(&through.point, &direct.point, "foot");
+            assert_near(through.distance, direct.distance, "distance");
+        }
     }
 
     #[test]

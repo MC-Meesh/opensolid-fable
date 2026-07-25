@@ -50,6 +50,7 @@
 use crate::check::CheckFailure;
 use crate::curve::{Curve3, CurveEval, TWO_PI, plane_basis};
 use crate::geometry::GeometryStore;
+use crate::nurbs::curve::NurbsCurve;
 use crate::nurbs::surface::NurbsSurface;
 use crate::project::{CurveProject, SurfaceProject, SurfaceProjection};
 use crate::ssi::{
@@ -1120,9 +1121,32 @@ struct SampledCurve {
     closed: bool,
 }
 
+/// Distinct knot spans of `nurbs` that the parameter range `[t0, t1]`
+/// covers, at least one.
+fn nurbs_spans_covered(nurbs: &NurbsCurve, t0: f64, t1: f64) -> usize {
+    let (lo, hi) = (t0.min(t1), t0.max(t1));
+    let interior = nurbs
+        .knot_vector()
+        .knots()
+        .windows(2)
+        .filter(|w| w[1] > w[0] && w[1] > lo && w[1] < hi)
+        .count();
+    interior + 1
+}
+
 fn sample_edge(edge: &SolidEdge) -> SampledCurve {
-    let n = match edge.curve {
+    let n = match &edge.curve {
         Curve3::Line { .. } => LINE_SAMPLES,
+        // A freeform edge has no angular sweep to price samples off, so
+        // spans are the unit instead: within one knot span the curve is a
+        // single polynomial piece of bounded turning, and the exact
+        // rational-quadratic circle is four spans by construction — so
+        // `SAMPLES_PER_CIRCLE / 4` per span samples a NURBS circle at the
+        // same density `Curve3::Circle` gets, which is what keeps the two
+        // representations of the same hole from disagreeing here.
+        Curve3::Nurbs(nurbs) => {
+            nurbs_spans_covered(nurbs, edge.t0, edge.t1) * (SAMPLES_PER_CIRCLE / 4)
+        }
         _ => {
             let span = (edge.t1 - edge.t0).abs() / TWO_PI;
             ((SAMPLES_PER_CIRCLE as f64 * span).ceil() as usize).max(8)
@@ -2526,6 +2550,16 @@ impl<'a> Pipeline<'a> {
                     .map(|i| t_lo + (t_hi - t_lo) * i as f64 / n as f64)
                     .collect()
             }
+            // The remaining arm stations over `[0, 2π)`, which is only
+            // meaningful for an angle-parameterized curve. A NURBS locus
+            // lives on its knot interval and would be stationed over the
+            // wrong range entirely, so refuse it — the caller falls back
+            // to F-Rep, which is a coarser answer but never a wrong one.
+            Curve3::Nurbs(_) => {
+                return Err(CoreError::NotImplemented {
+                    feature: "tangency triage for a NURBS tangential locus",
+                });
+            }
             _ => (0..SAMPLES_PER_CIRCLE)
                 .map(|i| TWO_PI * i as f64 / SAMPLES_PER_CIRCLE as f64)
                 .collect(),
@@ -2587,6 +2621,16 @@ impl<'a> Pipeline<'a> {
                 };
                 let ts = (0..distinct).map(|i| i as f64).collect::<Vec<f64>>();
                 (ts, *closed, (points.len() - 1) as f64)
+            }
+            // No SSI path produces one today (freeform intersections come
+            // back marched, as polylines), and the conic arm below would
+            // station it over the wrong interval. Refuse rather than clip
+            // against a wrongly-parameterized curve; the boolean falls
+            // back to F-Rep.
+            Curve3::Nurbs(_) => {
+                return Err(CoreError::NotImplemented {
+                    feature: "imprinting a NURBS intersection curve",
+                });
             }
             _ => {
                 let n = SAMPLES_PER_CIRCLE;
@@ -7045,6 +7089,73 @@ mod tests {
 
     fn tol() -> ToleranceContext {
         ToleranceContext::default()
+    }
+
+    /// A NURBS edge must be discretized at the same density its analytic
+    /// twin gets. The exact rational-quadratic circle and `Curve3::Circle`
+    /// describe the *same* hole; if one is sampled coarser the two point
+    /// clouds disagree and the imprint welds against a polygon that is not
+    /// the one the other solid sees.
+    #[test]
+    fn nurbs_edge_samples_as_densely_as_the_analytic_circle() {
+        use crate::nurbs::KnotVector;
+        let s = std::f64::consts::FRAC_1_SQRT_2;
+        let circle = NurbsCurve::new(
+            vec![
+                Point3::new(1.0, 0.0, 0.0),
+                Point3::new(1.0, 1.0, 0.0),
+                Point3::new(0.0, 1.0, 0.0),
+                Point3::new(-1.0, 1.0, 0.0),
+                Point3::new(-1.0, 0.0, 0.0),
+                Point3::new(-1.0, -1.0, 0.0),
+                Point3::new(0.0, -1.0, 0.0),
+                Point3::new(1.0, -1.0, 0.0),
+                Point3::new(1.0, 0.0, 0.0),
+            ],
+            vec![1.0, s, 1.0, s, 1.0, s, 1.0, s, 1.0],
+            KnotVector::new(
+                2,
+                vec![
+                    0.0, 0.0, 0.0, 0.25, 0.25, 0.5, 0.5, 0.75, 0.75, 1.0, 1.0, 1.0,
+                ],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        let nurbs_edge = SolidEdge {
+            curve: Curve3::nurbs(circle),
+            t0: 0.0,
+            t1: 1.0,
+            closed: true,
+        };
+        let analytic_edge = SolidEdge {
+            curve: Curve3::circle(Point3::origin(), Vector3::z(), 1.0).unwrap(),
+            t0: 0.0,
+            t1: TWO_PI,
+            closed: true,
+        };
+        let from_nurbs = sample_edge(&nurbs_edge);
+        let from_analytic = sample_edge(&analytic_edge);
+        assert_eq!(from_nurbs.points.len(), from_analytic.points.len());
+        assert!(from_nurbs.closed);
+        // And the samples really are on the unit circle, so the density
+        // above is measuring the right geometry.
+        for p in &from_nurbs.points {
+            assert!(((p - Point3::origin()).norm() - 1.0).abs() < 1e-12);
+        }
+
+        // A quarter of the domain is a quarter of the spans, and gets a
+        // quarter of the samples (plus the open edge's closing point).
+        let quarter = SolidEdge {
+            t1: 0.25,
+            closed: false,
+            ..nurbs_edge
+        };
+        assert_eq!(
+            sample_edge(&quarter).points.len(),
+            SAMPLES_PER_CIRCLE / 4 + 1
+        );
     }
 
     /// All 24 (op, solid, verdict) cells, transcribed from the table in
