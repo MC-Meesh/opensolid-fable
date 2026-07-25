@@ -270,17 +270,17 @@ pub fn read_step_bytes(
 
 /// Why mapping (or fallback-meshing) an entity failed.
 #[derive(Debug)]
-enum MapError {
+pub(super) enum MapError {
     /// Valid STEP the kernel cannot represent exactly.
     Unsupported { entity: u64, what: String },
     /// Malformed or unresolvable data.
     Invalid { entity: u64, what: String },
 }
 
-type MapResult<T> = Result<T, MapError>;
+pub(super) type MapResult<T> = Result<T, MapError>;
 
 impl MapError {
-    fn diagnostic(&self) -> Diagnostic {
+    pub(super) fn diagnostic(&self) -> Diagnostic {
         match self {
             MapError::Unsupported { entity, what } => Diagnostic {
                 entity: Some(*entity),
@@ -296,14 +296,14 @@ impl MapError {
     }
 }
 
-fn invalid(entity: u64, what: impl Into<String>) -> MapError {
+pub(super) fn invalid(entity: u64, what: impl Into<String>) -> MapError {
     MapError::Invalid {
         entity,
         what: what.into(),
     }
 }
 
-fn unsupported(entity: u64, what: impl Into<String>) -> MapError {
+pub(super) fn unsupported(entity: u64, what: impl Into<String>) -> MapError {
     MapError::Unsupported {
         entity,
         what: what.into(),
@@ -323,7 +323,7 @@ fn nurbs_error(entity: u64, error: &NurbsError) -> MapError {
 // Attribute and instance access
 // ---------------------------------------------------------------------
 
-fn attr(rec: &SimpleRecord, index: usize, entity: u64) -> MapResult<&Value> {
+pub(super) fn attr(rec: &SimpleRecord, index: usize, entity: u64) -> MapResult<&Value> {
     rec.attributes.get(index).ok_or_else(|| {
         invalid(
             entity,
@@ -367,7 +367,7 @@ fn int_attr(rec: &SimpleRecord, index: usize, entity: u64) -> MapResult<i64> {
     })
 }
 
-fn ref_attr(rec: &SimpleRecord, index: usize, entity: u64) -> MapResult<u64> {
+pub(super) fn ref_attr(rec: &SimpleRecord, index: usize, entity: u64) -> MapResult<u64> {
     attr(rec, index, entity)?.as_ref_id().ok_or_else(|| {
         invalid(
             entity,
@@ -393,7 +393,7 @@ fn bool_attr(rec: &SimpleRecord, index: usize, entity: u64) -> MapResult<bool> {
     }
 }
 
-fn list_attr(rec: &SimpleRecord, index: usize, entity: u64) -> MapResult<&[Value]> {
+pub(super) fn list_attr(rec: &SimpleRecord, index: usize, entity: u64) -> MapResult<&[Value]> {
     attr(rec, index, entity)?.as_list().ok_or_else(|| {
         invalid(
             entity,
@@ -454,7 +454,7 @@ fn int_list(rec: &SimpleRecord, index: usize, entity: u64) -> MapResult<Vec<i64>
 }
 
 /// The name attribute (index 0) of a record, or `""` when absent/unset.
-fn name_attr(rec: &SimpleRecord) -> String {
+pub(super) fn name_attr(rec: &SimpleRecord) -> String {
     rec.attributes
         .first()
         .and_then(Value::as_str)
@@ -462,13 +462,13 @@ fn name_attr(rec: &SimpleRecord) -> String {
         .to_string()
 }
 
-fn instance(file: &StepFile, id: u64, referrer: u64) -> MapResult<&Instance> {
+pub(super) fn instance(file: &StepFile, id: u64, referrer: u64) -> MapResult<&Instance> {
     file.get(id)
         .ok_or_else(|| invalid(referrer, format!("dangling reference #{id}")))
 }
 
 /// Human-readable type name(s) of an instance, for messages.
-fn type_names(inst: &Instance) -> String {
+pub(super) fn type_names(inst: &Instance) -> String {
     match inst.entity.as_complex() {
         Some(parts) => parts
             .iter()
@@ -486,7 +486,7 @@ fn type_names(inst: &Instance) -> String {
 
 /// The partial record of type `type_name` bound to instance `id`
 /// (searching complex instances' parts).
-fn typed_record<'f>(
+pub(super) fn typed_record<'f>(
     file: &'f StepFile,
     id: u64,
     type_name: &str,
@@ -775,13 +775,18 @@ fn resolve_vector(file: &StepFile, id: u64, referrer: u64, scale: f64) -> MapRes
 
 /// A resolved `AXIS2_PLACEMENT_3D`: location plus its z axis and optional
 /// x reference direction (defaults per ISO 10303-42: axis → +Z).
-struct Placement {
-    location: Point3,
-    axis: Vector3,
-    ref_dir: Option<Vector3>,
+pub(super) struct Placement {
+    pub(super) location: Point3,
+    pub(super) axis: Vector3,
+    pub(super) ref_dir: Option<Vector3>,
 }
 
-fn resolve_axis2(file: &StepFile, id: u64, referrer: u64, scale: f64) -> MapResult<Placement> {
+pub(super) fn resolve_axis2(
+    file: &StepFile,
+    id: u64,
+    referrer: u64,
+    scale: f64,
+) -> MapResult<Placement> {
     let rec = typed_record(file, id, "AXIS2_PLACEMENT_3D", referrer)?;
     let location = resolve_point(file, ref_attr(rec, 1, id)?, id, scale)?;
     let axis = match attr(rec, 2, id)? {
@@ -1416,7 +1421,7 @@ fn resolve_curve(
 /// Orthonormal in-plane frame of a conic's placement: `x_dir` from the
 /// placement's ref_direction (Gram-Schmidt against the axis, defaulting to
 /// [`plane_basis`]), `y_dir = axis × x_dir`.
-fn conic_frame(p: &Placement, entity: u64) -> MapResult<(Vector3, Vector3)> {
+pub(super) fn conic_frame(p: &Placement, entity: u64) -> MapResult<(Vector3, Vector3)> {
     let axis_norm = p.axis.norm();
     if axis_norm == 0.0 || !axis_norm.is_finite() {
         return Err(invalid(entity, "conic placement axis is degenerate"));
