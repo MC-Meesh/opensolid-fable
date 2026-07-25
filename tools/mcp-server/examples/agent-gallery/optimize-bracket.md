@@ -22,7 +22,7 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 > ```
 > ```json
 > {
->   "model_id": "model-1",
+>   "model_id": "model-8",
 >   "name": "optimize-bracket",
 >   "exact": false,
 >   "mesh": {
@@ -65,7 +65,7 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 > 🔧 **`optimize`**
 > ```json
 > {
->   "model_id": "model-1",
+>   "model_id": "model-8",
 >   "params": [
 >     {
 >       "name": "thickness"
@@ -84,7 +84,7 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 > ```
 > ```json
 > {
->   "model_id": "model-1",
+>   "model_id": "model-8",
 >   "converged": true,
 >   "feasible": true,
 >   "stopReason": "tol",
@@ -372,7 +372,7 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 
 **Agent:** Converged in 16 iterations to thickness **3.641 mm**, an achieved mass of **45.00 g** — -0.01% off the 45 g target, measured on the exact mesh, not the field. `converged: true` with an empty `warnings` means no parameter is pinned to a bound and nothing is left on the table; the per-iteration `trajectory` shows the loss falling monotonically. `optimize` has already written the winning thickness back into the model, so the next call sees the optimized part — let me confirm that independently.
 
-> 🔧 **`measure`** `{ "model_id": "model-1", "query": "mass" }`
+> 🔧 **`measure`** `{ "model_id": "model-8", "query": "mass" }`
 > ```json
 > {
 >   "volume": 16665.69730681346,
@@ -405,7 +405,7 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 
 **Agent:** An independent `measure` on the (now optimized) model reads 45.00 g — the same part the optimizer reported, confirming the parameter really was committed and not just returned. A quick validity check, then the STL:
 
-> 🔧 **`validate`** `{ "model_id": "model-1" }`
+> 🔧 **`validate`** `{ "model_id": "model-8" }`
 > ```json
 > {
 >   "valid": true,
@@ -420,10 +420,10 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 
 **Agent:** `valid: true` — the optimized thickness still bounds a closed, manifold solid, so it is safe to export. STL for the slicer:
 
-> 🔧 **`export`** `{ "model_id": "model-1", "format": "stl", "path": "optimize-bracket.stl" }`
+> 🔧 **`export`** `{ "model_id": "model-8", "format": "stl", "path": "optimize-bracket.stl" }`
 > ```json
 > {
->   "model_id": "model-1",
+>   "model_id": "model-8",
 >   "format": "stl",
 >   "path": "output/optimize-bracket.stl",
 >   "bytes": 873684

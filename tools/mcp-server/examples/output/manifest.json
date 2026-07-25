@@ -161,34 +161,34 @@
           "name": "hinge-leaf",
           "exact": false,
           "mesh": {
-            "triangles": 24684,
-            "vertices": 12342
+            "triangles": 31292,
+            "vertices": 15642
           },
           "boundingBox": {
             "min": [
-              -31.15627444612003,
+              -30,
               -30.75,
-              -4
+              -3.9999607582315595
             ],
             "max": [
-              31.15627444612003,
-              6.264428351177253,
-              4
+              30,
+              3.999932899561649,
+              3.999962822786223
             ],
             "size": [
-              62.31254889224006,
-              37.01442835117725,
-              8
+              60,
+              34.74993289956165,
+              7.999923581017782
             ]
           },
-          "volume": 3977.0056213444655,
+          "volume": 3815.201362779873,
           "valid": true,
           "issues": []
         }
       },
       {
         "kind": "narration",
-        "text": "Valid solid, 24,684 triangles — the pin bore runs cleanly through all three knuckles. One sizing note worth being honest about: I opened the bore to Ø4 because at Ø3.2 this part comes back `valid: false` with a *pinched* mesh — two surface sheets fused through one octree cell where the bore goes tangent. That is a known mesher defect (of-o0o), not a part that is too small to see, and it is worth knowing which it is: a finer `accuracy` does not clear a pinch, and the bore sizes that trip it are not the small ones in particular (Ø2.4 and Ø7 fail; Ø2.8, Ø3.6 and Ø4 are fine). So Ø4 is a workaround I found by moving, not a rule I derived. Let me confirm the mesh is watertight before exporting."
+        "text": "Valid solid, 31,292 triangles — the pin bore runs cleanly through all three knuckles. One historical note, because this transcript used to carry a warning here: earlier kernel versions *pinched* the mesh at several bore diameters — Ø2.4, Ø3.2 and Ø7 all came back `valid: false` with two surface sheets fused through one octree cell where the bore runs near-tangent, the mesher defect tracked as of-o0o — so Ø4 was originally a workaround found by trial. The mesher fixes (of-obv, of-o0o) cleared that: every bore size I retried now meshes closed, Ø2.4 through Ø7. Ø4 stays because it is a sensible pin for a 1.5 mm leaf, not because the mesher demands it. Let me confirm the mesh is watertight before exporting."
       },
       {
         "kind": "screenshot",
@@ -199,7 +199,7 @@
           "height": 540
         },
         "file": "hinge-leaf-iso.png",
-        "bytes": 26640
+        "bytes": 27421
       },
       {
         "kind": "validate",
@@ -209,9 +209,9 @@
         "payload": {
           "valid": true,
           "closedManifold": true,
-          "triangles": 24684,
-          "vertices": 12342,
-          "volume": 3977.0056213444655,
+          "triangles": 31292,
+          "vertices": 15642,
+          "volume": 3815.201362779873,
           "exact": false,
           "issues": []
         }
@@ -227,11 +227,16 @@
           "format": "step",
           "path": "hinge-leaf.step"
         },
-        "error": "Error: export failed: STEP export failed: degenerate geometry in sdf_to_brep: adaptive meshing did not produce a closed manifold: 2 pinched edge(s) joining 3+ triangles — two surface sheets fused through one cell, typically at a near-tangent CSG feature; this is a mesher defect (of-o0o), and a finer accuracy does not reliably clear it"
+        "payload": {
+          "model_id": "model-2",
+          "format": "step",
+          "path": "output/hinge-leaf.step",
+          "bytes": 18541158
+        }
       },
       {
         "kind": "narration",
-        "text": "STEP declines here, and the reason it gives is the same pinch as above — this part has no exact B-Rep companion, so STEP takes the faceted SDF→B-Rep path, which needs a closed manifold and does not get one. Note it names the actual defect (pinched edges) rather than blaming resolution, so I know not to burn time retrying at a finer accuracy. The tool says no plainly rather than emitting a broken file. I can still give you the mesh:"
+        "text": "STEP exports — 18.5 MB. This part has no exact B-Rep companion (it is built from rotated primitives, not a `Profile`), so STEP takes the faceted SDF→B-Rep path: the exporter meshes the solid to a closed manifold and emits every facet as a planar face — which is why the file is large. That path is also why the pinch above used to matter: a pinched mesh is not a closed manifold, and on this exact part STEP used to decline — naming the defect rather than writing a corrupt file. With the mesher fixed, it exports. The STL as well:"
       },
       {
         "kind": "export",
@@ -244,12 +249,12 @@
           "model_id": "model-2",
           "format": "stl",
           "path": "output/hinge-leaf.stl",
-          "bytes": 1234284
+          "bytes": 1564684
         }
       },
       {
         "kind": "narration",
-        "text": "So: a valid, watertight STL, and an honest no on STEP. If the STEP file is the deliverable, the route is to build the leaf from an extruded `Profile` so it carries an exact B-Rep (see the [right-angle bracket](bracket-right-angle.md)) rather than from rotated primitives. Mirror this leaf about X and pin the two together and you have a working hinge."
+        "text": "So: a watertight STL and a faceted STEP from one prompt. If crisp analytic faces or a smaller STEP file are the deliverable, the route is to build the leaf from an extruded `Profile` (see the [right-angle bracket](bracket-right-angle.md)) rather than from rotated primitives. Mirror this leaf about X and pin the two together and you have a working hinge."
       }
     ]
   },
@@ -272,8 +277,8 @@
           "name": "enclosure-body",
           "exact": false,
           "mesh": {
-            "triangles": 25868,
-            "vertices": 12936
+            "triangles": 29596,
+            "vertices": 14800
           },
           "boundingBox": {
             "min": [
@@ -284,22 +289,22 @@
             "max": [
               40,
               30,
-              15
+              15.001301777746544
             ],
             "size": [
               80,
               60,
-              30
+              30.001301777746544
             ]
           },
-          "volume": 34621.162880956064,
+          "volume": 34763.23671539217,
           "valid": true,
           "issues": []
         }
       },
       {
         "kind": "narration",
-        "text": "Body is valid — volume 34621 mm³ after hollowing. Rendering it to check the wall broke through the top:"
+        "text": "Body is valid — volume 34763 mm³ after hollowing. Rendering it to check the wall broke through the top:"
       },
       {
         "kind": "screenshot",
@@ -310,7 +315,7 @@
           "height": 540
         },
         "file": "enclosure-body-iso.png",
-        "bytes": 24741
+        "bytes": 23084
       },
       {
         "kind": "export",
@@ -323,7 +328,7 @@
           "model_id": "model-3",
           "format": "step",
           "path": "output/enclosure-body.step",
-          "bytes": 4985617
+          "bytes": 5924702
         }
       },
       {
@@ -337,7 +342,7 @@
           "model_id": "model-3",
           "format": "stl",
           "path": "output/enclosure-body.stl",
-          "bytes": 1293484
+          "bytes": 1479884
         }
       },
       {
@@ -355,27 +360,27 @@
           "name": "enclosure-lid",
           "exact": false,
           "mesh": {
-            "triangles": 15124,
-            "vertices": 7564
+            "triangles": 17284,
+            "vertices": 8644
           },
           "boundingBox": {
             "min": [
-              -40,
-              -30,
+              -39.59760855470059,
+              -29.593651240604697,
               11
             ],
             "max": [
-              40,
-              30,
+              39.59760855469844,
+              29.59258910921366,
               18
             ],
             "size": [
-              80,
-              60,
+              79.19521710939904,
+              59.186240349818355,
               7
             ]
           },
-          "volume": 28863.973766896357,
+          "volume": 28883.29791850566,
           "valid": true,
           "issues": []
         }
@@ -389,7 +394,7 @@
           "height": 540
         },
         "file": "enclosure-lid-iso.png",
-        "bytes": 21835
+        "bytes": 17566
       },
       {
         "kind": "export",
@@ -402,7 +407,7 @@
           "model_id": "model-4",
           "format": "step",
           "path": "output/enclosure-lid.step",
-          "bytes": 4416489
+          "bytes": 4721868
         }
       },
       {
@@ -416,7 +421,7 @@
           "model_id": "model-4",
           "format": "stl",
           "path": "output/enclosure-lid.stl",
-          "bytes": 756284
+          "bytes": 864284
         }
       },
       {
@@ -444,34 +449,34 @@
           "name": "gear-disk",
           "exact": false,
           "mesh": {
-            "triangles": 65762,
-            "vertices": 32881
+            "triangles": 95856,
+            "vertices": 47928
           },
           "boundingBox": {
             "min": [
-              -20.614211729823097,
+              -20.5,
               -4,
-              -20.61083951798434
+              -20.500000000000004
             ],
             "max": [
-              20.567131070203015,
+              20.5,
               4,
-              20.577241106166063
+              20.5
             ],
             "size": [
-              41.181342800026115,
+              41,
               8,
-              41.1880806241504
+              41
             ]
           },
-          "volume": 8373.391779139787,
+          "volume": 8601.14607606569,
           "valid": true,
           "issues": []
         }
       },
       {
         "kind": "narration",
-        "text": "All 16 teeth resolved — `valid: true`, volume 8373 mm³. Top view to check the tooth count and spacing, then iso:"
+        "text": "All 16 teeth resolved — `valid: true`, volume 8601 mm³. Top view to check the tooth count and spacing, then iso:"
       },
       {
         "kind": "screenshot",
@@ -482,7 +487,7 @@
           "height": 540
         },
         "file": "gear-disk-top.png",
-        "bytes": 19552
+        "bytes": 22751
       },
       {
         "kind": "screenshot",
@@ -493,7 +498,7 @@
           "height": 540
         },
         "file": "gear-disk-iso.png",
-        "bytes": 33168
+        "bytes": 35007
       },
       {
         "kind": "narration",
@@ -510,7 +515,7 @@
           "model_id": "model-5",
           "format": "stl",
           "path": "output/gear-disk.stl",
-          "bytes": 3288184
+          "bytes": 4792884
         }
       },
       {
@@ -528,7 +533,7 @@
           "model_id": "model-5",
           "format": "step",
           "path": "output/gear-disk.step",
-          "bytes": 33721874
+          "bytes": 41675080
         }
       }
     ]
@@ -552,27 +557,27 @@
           "name": "bottle",
           "exact": false,
           "mesh": {
-            "triangles": 23388,
-            "vertices": 11688
+            "triangles": 33252,
+            "vertices": 16628
           },
           "boundingBox": {
             "min": [
-              -18.768181818181816,
-              0,
-              -18.768181818181816
+              -18.708655072485083,
+              -3.5525888480913304e-15,
+              -18.70865507245069
             ],
             "max": [
-              18.768181818181816,
-              74,
-              18.768181818181816
+              18.708655072468762,
+              74.0000000001367,
+              18.70865507247004
             ],
             "size": [
-              37.53636363636363,
-              74,
-              37.53636363636363
+              37.417310144953845,
+              74.0000000001367,
+              37.417310144920734
             ]
           },
-          "volume": 21531.303576462276,
+          "volume": 21522.428820026827,
           "valid": true,
           "issues": []
         }
@@ -590,7 +595,7 @@
           "height": 540
         },
         "file": "bottle-front.png",
-        "bytes": 36330
+        "bytes": 41127
       },
       {
         "kind": "screenshot",
@@ -601,7 +606,7 @@
           "height": 540
         },
         "file": "bottle-iso.png",
-        "bytes": 42558
+        "bytes": 47609
       },
       {
         "kind": "narration",
@@ -615,16 +620,16 @@
         "payload": {
           "valid": true,
           "closedManifold": true,
-          "triangles": 23388,
-          "vertices": 11688,
-          "volume": 21531.303576462276,
+          "triangles": 33252,
+          "vertices": 16628,
+          "volume": 21522.428820026827,
           "exact": false,
           "issues": []
         }
       },
       {
         "kind": "narration",
-        "text": "`closedManifold: true`, volume 21531 mm³ — a genuine hollow solid with an open mouth. Exporting mesh formats:"
+        "text": "`closedManifold: true`, volume 21522 mm³ — a genuine hollow solid with an open mouth. Exporting mesh formats:"
       },
       {
         "kind": "export",
@@ -637,7 +642,7 @@
           "model_id": "model-6",
           "format": "stl",
           "path": "output/bottle.stl",
-          "bytes": 1169484
+          "bytes": 1662684
         }
       },
       {
@@ -651,7 +656,7 @@
           "model_id": "model-6",
           "format": "obj",
           "path": "output/bottle.obj",
-          "bytes": 1985008
+          "bytes": 2961475
         }
       },
       {
@@ -675,7 +680,7 @@
       {
         "kind": "create_model",
         "args": {
-          "script": "// Right-angle bracket: 60×40×5 base plate, 40×40×5 vertical plate, triangular\n// gusset, 4× M5 clearance holes, 3 mm fillets on the interior corner and gusset.\n//\n// extrude() sweeps a profile along +Y, mapping profile (u,v) -> (x,z). So the\n// L cross-section is drawn in (x, z) and swept 40 mm for the bracket's width.\nconst B = 0.41421356237309503;          // tan(90°/4): a 90° arc, DXF bulge\nconst p = new Profile(-30, 0);          // base underside, at the wall end\np.lineTo(30, 0);                        // base plate, 60 long\np.lineTo(30, 5);                        // base plate, 5 thick\np.lineTo(-22, 5);                       // top of base, out to the fillet tangent\np.arcTo(-25, 8, -B);                    // 3 mm fillet on the interior corner\np.lineTo(-25, 40);                      // wall inner face, 40 tall\np.lineTo(-30, 40);                      // wall top, 5 thick\np.close();\nconst ell = Shape.extrude(p, 40);       // sweep +Y: the 40 mm width\n\n// Triangular gusset: 20 mm legs, 5 mm thick, centered across the width.\nconst t = new Profile(-25, 5);\nt.lineTo(-5, 5);\nt.lineTo(-25, 25);\nt.close();\nconst gusset = Shape.extrude(t, 5).translate(0, 17.5, 0);\n\n// smoothUnion blends the gusset into both plates: the 3 mm gusset fillets.\nlet part = ell.smoothUnion(gusset, 3);\n\n// 4× M5 clearance holes (Ø5). cylinder() is +Y-axis, so rotate it onto the\n// drilling axis: +Z for the base plate, +X for the vertical plate.\nconst zHole = Shape.cylinder(2.5, 10).rotate(1, 0, 0, 90);   // -> +Z\nfor (const y of [10, 30]) part = part.subtract(zHole.translate(15, y, 0));\nconst xHole = Shape.cylinder(2.5, 10).rotate(0, 0, 1, 90);   // -> +X\nfor (const y of [10, 30]) part = part.subtract(xHole.translate(-27.5, y, 32));\n\n// The trailing no-op rotation is a WORKAROUND, not modelling (of-obv):\n// without it this exact part meshes open at the default accuracy and STEP\n// export declines. A 360° rotation is geometrically the identity; all it\n// changes is the shape's tracked bounding box, and that shifts the meshing\n// grid onto an alignment where the mesh closes. This specific expression was\n// found by trial: other identity-equivalent spellings still fail.\nreturn part.rotate(0, 1, 0, 360);",
+          "script": "// Right-angle bracket: 60×40×5 base plate, 40×40×5 vertical plate, triangular\n// gusset, 4× M5 clearance holes, 3 mm fillets on the interior corner and gusset.\n//\n// extrude() sweeps a profile along +Y, mapping profile (u,v) -> (x,z). So the\n// L cross-section is drawn in (x, z) and swept 40 mm for the bracket's width.\nconst B = 0.41421356237309503;          // tan(90°/4): a 90° arc, DXF bulge\nconst p = new Profile(-30, 0);          // base underside, at the wall end\np.lineTo(30, 0);                        // base plate, 60 long\np.lineTo(30, 5);                        // base plate, 5 thick\np.lineTo(-22, 5);                       // top of base, out to the fillet tangent\np.arcTo(-25, 8, -B);                    // 3 mm fillet on the interior corner\np.lineTo(-25, 40);                      // wall inner face, 40 tall\np.lineTo(-30, 40);                      // wall top, 5 thick\np.close();\nconst ell = Shape.extrude(p, 40);       // sweep +Y: the 40 mm width\n\n// Triangular gusset: 20 mm legs, 5 mm thick, centered across the width.\nconst t = new Profile(-25, 5);\nt.lineTo(-5, 5);\nt.lineTo(-25, 25);\nt.close();\nconst gusset = Shape.extrude(t, 5).translate(0, 17.5, 0);\n\n// smoothUnion blends the gusset into both plates: the 3 mm gusset fillets.\nlet part = ell.smoothUnion(gusset, 3);\n\n// 4× M5 clearance holes (Ø5). cylinder() is +Y-axis, so rotate it onto the\n// drilling axis: +Z for the base plate, +X for the vertical plate.\nconst zHole = Shape.cylinder(2.5, 10).rotate(1, 0, 0, 90);   // -> +Z\nfor (const y of [10, 30]) part = part.subtract(zHole.translate(15, y, 0));\nconst xHole = Shape.cylinder(2.5, 10).rotate(0, 0, 1, 90);   // -> +X\nfor (const y of [10, 30]) part = part.subtract(xHole.translate(-27.5, y, 32));\nreturn part;",
           "name": "bracket-right-angle"
         },
         "payload": {
@@ -683,34 +688,34 @@
           "name": "bracket-right-angle",
           "exact": false,
           "mesh": {
-            "triangles": 28716,
-            "vertices": 14352
+            "triangles": 28796,
+            "vertices": 14392
           },
           "boundingBox": {
             "min": [
-              -9.442687855771439,
-              -0.75,
-              -41.047070473065915
+              -30.000000000000167,
+              -1.7015596003106645e-15,
+              -2.5604518505418055e-10
             ],
             "max": [
-              47.7993167923437,
-              40.75,
-              29.699426813604816
+              30,
+              40,
+              40
             ],
             "size": [
-              57.24200464811514,
-              41.5,
-              70.74649728667073
+              60.00000000000017,
+              40,
+              40.000000000256044
             ]
           },
-          "volume": 19725.638807373976,
+          "volume": 19786.79765644562,
           "valid": true,
           "issues": []
         }
       },
       {
         "kind": "narration",
-        "text": "`valid: true`, volume 19726 mm³. That is the oracle that matters: hand-integrating the section gives 19792 mm³ (19077 for the filleted L, +1000 gusset, +blend, −393 for four Ø5 holes through 5 mm), so the mesh is reading 0.3% under — the same bias a plain 60×40×5 slab shows (11968 vs 12000). The holes are real: drop them and the body measures 20184 mm³. Let me look at it from three sides before exporting."
+        "text": "`valid: true`, volume 19787 mm³. That is the oracle that matters: hand-integrating the section gives 19792 mm³ (19077 for the filleted L, +1000 gusset, +blend, −393 for four Ø5 holes through 5 mm), so the mesh is reading well under 0.1% off — the same small bias a plain 60×40×5 slab shows (11996 vs 12000). The holes are real: drop them and the body measures 20177 mm³. Let me look at it from three sides before exporting."
       },
       {
         "kind": "screenshot",
@@ -721,7 +726,7 @@
           "height": 540
         },
         "file": "bracket-right-angle-iso.png",
-        "bytes": 17561
+        "bytes": 32505
       },
       {
         "kind": "screenshot",
@@ -732,7 +737,7 @@
           "height": 540
         },
         "file": "bracket-right-angle-top.png",
-        "bytes": 20373
+        "bytes": 17684
       },
       {
         "kind": "screenshot",
@@ -743,7 +748,7 @@
           "height": 540
         },
         "file": "bracket-right-angle-front.png",
-        "bytes": 21524
+        "bytes": 29460
       },
       {
         "kind": "narration",
@@ -756,28 +761,28 @@
           "query": "mass"
         },
         "payload": {
-          "volume": 19725.638807373976,
-          "surfaceArea": 9238.05993943162,
+          "volume": 19786.79765644562,
+          "surfaceArea": 9221.085221281435,
           "centroid": [
-            12.45185878217461,
-            20.014728438991696,
-            7.576835948929436
+            -10.742706235801062,
+            20.000016553543194,
+            9.808830414815995
           ],
           "inertia": [
             [
-              7686048.81609845,
-              3952.9543972890824,
-              -3147808.0321175363
+              4926679.008941298,
+              40.11055980809033,
+              2343981.4189155716
             ],
             [
-              3952.9543972890824,
-              9226802.870358348,
-              6567.799299844075
+              40.11055980809033,
+              9299727.545560187,
+              -80.87396221142262
             ],
             [
-              -3147808.0321175363,
-              6567.799299844075,
-              6525541.356571443
+              2343981.4189155716,
+              -80.87396221142262,
+              9366653.418768229
             ]
           ],
           "exact": false
@@ -785,7 +790,7 @@
       },
       {
         "kind": "narration",
-        "text": "Volume 19726 mm³ = 19.7 cm³; in 6061 aluminium (2.70 g/cm³) that is about **53 g**. Note the `boundingBox` the tools report is the *tracked* box, not the part: it reads 61.5 × 41.5 × 41.5 for a part that is really 60 × 40 × 40, because `smoothUnion` pads the tracked box by `radius/4` and the no-op rotation pads it further. Do not trust it as a measurement. Exporting:"
+        "text": "Volume 19787 mm³ = 19.8 cm³; in 6061 aluminium (2.70 g/cm³) that is about **53 g**. The reported `boundingBox` measures the part itself (it is taken off the same mesh these mass properties integrate), so it is good to the meshing accuracy and can be read as a measurement. Exporting:"
       },
       {
         "kind": "export",
@@ -798,7 +803,7 @@
           "model_id": "model-7",
           "format": "step",
           "path": "output/bracket-right-angle.step",
-          "bytes": 20819785
+          "bytes": 11887645
         }
       },
       {
@@ -812,12 +817,454 @@
           "model_id": "model-7",
           "format": "stl",
           "path": "output/bracket-right-angle.stl",
-          "bytes": 1435884
+          "bytes": 1439884
         }
       },
       {
         "kind": "narration",
-        "text": "A valid, watertight right-angle bracket — gusset blended, corner filleted, four M5 holes drilled on two axes — as a faceted STEP and a print-ready STL. Two caveats an agent should carry forward. The **+Y** axis convention for `extrude`/`cylinder`: get it wrong and a hole silently becomes a channel through the part, with no error and a `valid: true` mesh — the volume delta is the only thing that catches it, which is why measuring against a hand-computed number is not optional here. And the faceted STEP path is fragile: this part exports only because of the trailing no-op rotation. The identical part without it, and every other identity-equivalent spelling tried, meshes open and declines to export — while STL, which uses a different mesher, exports fine either way."
+        "text": "A valid, watertight right-angle bracket — gusset blended, corner filleted, four M5 holes drilled on two axes — as a faceted STEP and a print-ready STL. Two caveats an agent should carry forward. The **+Y** axis convention for `extrude`/`cylinder`: get it wrong and a hole silently becomes a channel through the part, with no error and a `valid: true` mesh — the volume delta is the only thing that catches it, which is why measuring against a hand-computed number is not optional here. And the view names: a z-up part makes the renderer’s `top` the section elevation and `front` the plan — read them literally, not geometrically. One retired caveat, for readers of older versions of this script: the part used to need a trailing no-op `rotate(0, 1, 0, 360)` to mesh closed at all — without it the mesh came back open and STEP declined, a bounds-alignment mesher defect tracked as of-obv. That fix landed; the workaround is gone and the part meshes closed as written."
+      }
+    ]
+  },
+  {
+    "slug": "optimize-bracket",
+    "title": "hitting a mass target with the optimize tool",
+    "turns": [
+      {
+        "kind": "narration",
+        "text": "Mass is volume × density, and for this bracket volume is a smooth, monotone function of one number — the shared wall thickness. That makes it a textbook job for the gradient optimizer instead of hand-tuning. The move is to expose the thickness as a `param(name, default, {min, max})`: the model still builds at the default (4 mm), but `optimize` can now move it. 6061 aluminium is 2.70 g/cm³ = 0.0027 g/mm³, so 45 g is a volume the search will find; I bound the thickness to a manufacturable 2–8 mm."
+      },
+      {
+        "kind": "create_model",
+        "args": {
+          "script": "// L-bracket: a 60×40 base flange and a 60×40 back wall sharing one wall\n// thickness `t`, exposed as the design variable optimize() will move. The\n// model builds at t's default (4 mm); optimize re-runs it at other values.\nconst t = param('thickness', 4, { min: 2, max: 8 });\nconst base = Shape.box3(30, 20, t / 2);                            // 60 × 40 × t\nconst wall = Shape.box3(30, t / 2, 20).translate(0, -(20 - t / 2), 20 - t / 2); // 60 × t × 40\nreturn base.union(wall);",
+          "name": "optimize-bracket"
+        },
+        "payload": {
+          "model_id": "model-8",
+          "name": "optimize-bracket",
+          "exact": false,
+          "mesh": {
+            "triangles": 15772,
+            "vertices": 7888
+          },
+          "boundingBox": {
+            "min": [
+              -30,
+              -20,
+              -2
+            ],
+            "max": [
+              30,
+              20,
+              38
+            ],
+            "size": [
+              60,
+              40,
+              40
+            ]
+          },
+          "volume": 18217.806820822865,
+          "valid": true,
+          "issues": [],
+          "params": [
+            {
+              "name": "thickness",
+              "value": 4,
+              "min": 2,
+              "max": 8
+            }
+          ]
+        }
+      },
+      {
+        "kind": "narration",
+        "text": "The create call echoes the declared param back — `thickness` at its 4 mm default, bounded 2–8 — and the part is `valid: true` at 49.2 g. Too heavy. Rather than bisect it by hand, I hand the numeric search to `optimize`: target mass 45 g, the one param free to move, everything else the script fixed. It descends the smooth occupancy-field gradient — no mesh rebuild per step — and calibrates against the exact mesh each iteration so the reported grams are the real ones, not the field estimate."
+      },
+      {
+        "kind": "optimize",
+        "args": {
+          "model_id": "model-8",
+          "params": [
+            {
+              "name": "thickness"
+            }
+          ],
+          "objective": {
+            "type": "target_mass",
+            "value": 45,
+            "density": 0.0027
+          },
+          "options": {
+            "max_iters": 40,
+            "resolution": 40
+          }
+        },
+        "payload": {
+          "model_id": "model-8",
+          "converged": true,
+          "feasible": true,
+          "stopReason": "tol",
+          "iterations": 16,
+          "params": {
+            "thickness": 3.640721154116419
+          },
+          "objective": {
+            "type": "target_mass",
+            "target": 45,
+            "achieved": 44.997382728396346,
+            "error": -0.0026172716036541033,
+            "relativeError": -0.00005816159119231341,
+            "density": 0.0027
+          },
+          "constraints": [],
+          "pinned": [],
+          "field": {
+            "domain": {
+              "min": [
+                -36,
+                -26,
+                -10
+              ],
+              "max": [
+                36,
+                26,
+                45
+              ]
+            },
+            "resolution": 40
+          },
+          "exactMeasure": {
+            "volume": 16665.69730681346,
+            "centroid": [
+              -0.0000035558723502926033,
+              -8.660297833477484,
+              9.51949237394923
+            ],
+            "exact": false
+          },
+          "trajectory": [
+            {
+              "iter": 0,
+              "loss": 0.008661728800208572,
+              "params": {
+                "thickness": 4
+              },
+              "volume": 18217.806820822865,
+              "mass": 49.188078416221735,
+              "centroid": [
+                0.00007772973257155594,
+                -8.5306007675487,
+                9.469487693224067
+              ]
+            },
+            {
+              "iter": 1,
+              "loss": 0.0002657012113538008,
+              "params": {
+                "thickness": 3.703106989357371
+              },
+              "volume": 16938.33906504884,
+              "mass": 45.73351547563187,
+              "centroid": [
+                -0.0000715430485042657,
+                -8.63699015933339,
+                9.51145621120269
+              ]
+            },
+            {
+              "iter": 2,
+              "loss": 0.000006532055199409747,
+              "params": {
+                "thickness": 3.6320035767819436
+              },
+              "volume": 16624.07019054934,
+              "mass": 44.88498951448322,
+              "centroid": [
+                -0.0000665503131500353,
+                -8.660953027551976,
+                9.523003812594073
+              ]
+            },
+            {
+              "iter": 3,
+              "loss": 0.0000029832922716104837,
+              "params": {
+                "thickness": 3.647568595813828
+              },
+              "volume": 16695.453682796677,
+              "mass": 45.07772494355103,
+              "centroid": [
+                -0.00004358183498895986,
+                -8.657772968859378,
+                9.518442209507551
+              ]
+            },
+            {
+              "iter": 4,
+              "loss": 0.0000021275077724279555,
+              "params": {
+                "thickness": 3.646525351545411
+              },
+              "volume": 16690.97663131555,
+              "mass": 45.06563690455199,
+              "centroid": [
+                -0.000006487909182258181,
+                -8.658206615858408,
+                9.518681250860983
+              ]
+            },
+            {
+              "iter": 5,
+              "loss": 0.0000013039763234210085,
+              "params": {
+                "thickness": 3.6365900574703653
+              },
+              "volume": 16647.63470288479,
+              "mass": 44.94861369778893,
+              "centroid": [
+                -0.0000449769796278324,
+                -8.66173110328724,
+                9.519973867977601
+              ]
+            },
+            {
+              "iter": 6,
+              "loss": 0.000001278894022683998,
+              "params": {
+                "thickness": 3.637438996801559
+              },
+              "volume": 16647.818633887768,
+              "mass": 44.94911031149697,
+              "centroid": [
+                -0.000032729199785557155,
+                -8.659055082370127,
+                9.522335598992758
+              ]
+            },
+            {
+              "iter": 7,
+              "loss": 0.0000011567276079950595,
+              "params": {
+                "thickness": 3.6450592310564973
+              },
+              "volume": 16684.5918786443,
+              "mass": 45.04839807233961,
+              "centroid": [
+                -0.000006432945316622695,
+                -8.658734637610374,
+                9.518886345447504
+              ]
+            },
+            {
+              "iter": 8,
+              "loss": 1.686510753439114e-7,
+              "params": {
+                "thickness": 3.6425149821525187
+              },
+              "volume": 16673.511191553673,
+              "mass": 45.01848021719492,
+              "centroid": [
+                -0.000005556885886139866,
+                -8.659651207065576,
+                9.519242017248306
+              ]
+            },
+            {
+              "iter": 9,
+              "loss": 2.320137305926015e-7,
+              "params": {
+                "thickness": 3.639938160334597
+              },
+              "volume": 16658.63869939606,
+              "mass": 44.97832448836936,
+              "centroid": [
+                -0.00006841009382861224,
+                -8.658098591589996,
+                9.521891042629953
+              ]
+            },
+            {
+              "iter": 10,
+              "loss": 3.898140376106942e-8,
+              "params": {
+                "thickness": 3.641698990809089
+              },
+              "volume": 16669.95728480182,
+              "mass": 45.00888466896492,
+              "centroid": [
+                -0.000005512164459213006,
+                -8.65994505201141,
+                9.519356199404506
+              ]
+            },
+            {
+              "iter": 11,
+              "loss": 7.096645103877519e-8,
+              "params": {
+                "thickness": 3.640740980916185
+              },
+              "volume": 16662.22674515088,
+              "mass": 44.98801221190738,
+              "centroid": [
+                -0.00006031121481398385,
+                -8.65790821965666,
+                9.521759710720655
+              ]
+            },
+            {
+              "iter": 12,
+              "loss": 9.066419182353897e-8,
+              "params": {
+                "thickness": 3.642095697838832
+              },
+              "volume": 16671.685082525157,
+              "mass": 45.01354972281793,
+              "centroid": [
+                -0.000005533906378549381,
+                -8.659802195543094,
+                9.51930068707893
+              ]
+            },
+            {
+              "iter": 13,
+              "loss": 3.497829960806186e-7,
+              "params": {
+                "thickness": 3.639502912036757
+              },
+              "volume": 16656.809590865207,
+              "mass": 44.97338589533606,
+              "centroid": [
+                -0.00003285084225482921,
+                -8.65831266226435,
+                9.522045995516235
+              ]
+            },
+            {
+              "iter": 14,
+              "loss": 1.0509960421517967e-7,
+              "params": {
+                "thickness": 3.642198976939655
+              },
+              "volume": 16672.06984485216,
+              "mass": 45.01458858110084,
+              "centroid": [
+                -0.00004675032411063216,
+                -8.659708474226493,
+                9.519192037303819
+              ]
+            },
+            {
+              "iter": 15,
+              "loss": 1.1664632851178628e-8,
+              "params": {
+                "thickness": 3.6405307293271947
+              },
+              "volume": 16664.86661783622,
+              "mass": 44.99513986815779,
+              "centroid": [
+                -0.000006789843237442419,
+                -8.660367207889145,
+                9.519518219275602
+              ]
+            },
+            {
+              "iter": 16,
+              "loss": 3.3827706900217886e-9,
+              "params": {
+                "thickness": 3.640721154116419
+              },
+              "volume": 16665.69730681346,
+              "mass": 44.997382728396346,
+              "centroid": [
+                -0.0000035558723502926033,
+                -8.660297833477484,
+                9.51949237394923
+              ]
+            }
+          ],
+          "warnings": []
+        }
+      },
+      {
+        "kind": "narration",
+        "text": "Converged in 16 iterations to thickness **3.641 mm**, an achieved mass of **45.00 g** — -0.01% off the 45 g target, measured on the exact mesh, not the field. `converged: true` with an empty `warnings` means no parameter is pinned to a bound and nothing is left on the table; the per-iteration `trajectory` shows the loss falling monotonically. `optimize` has already written the winning thickness back into the model, so the next call sees the optimized part — let me confirm that independently."
+      },
+      {
+        "kind": "measure",
+        "args": {
+          "model_id": "model-8",
+          "query": "mass"
+        },
+        "payload": {
+          "volume": 16665.69730681346,
+          "surfaceArea": 10089.519693927085,
+          "centroid": [
+            -0.0000035558723502926033,
+            -8.660297833477484,
+            9.51949237394923
+          ],
+          "inertia": [
+            [
+              5088933.96134093,
+              8.327180086564669,
+              -15.147056092936893
+            ],
+            [
+              8.327180086564669,
+              7539676.475320203,
+              1510083.277011141
+            ],
+            [
+              -15.147056092936893,
+              1510083.277011141,
+              7539654.486100106
+            ]
+          ],
+          "exact": false
+        }
+      },
+      {
+        "kind": "narration",
+        "text": "An independent `measure` on the (now optimized) model reads 45.00 g — the same part the optimizer reported, confirming the parameter really was committed and not just returned. A quick validity check, then the STL:"
+      },
+      {
+        "kind": "validate",
+        "args": {
+          "model_id": "model-8"
+        },
+        "payload": {
+          "valid": true,
+          "closedManifold": true,
+          "triangles": 17472,
+          "vertices": 8738,
+          "volume": 16665.69730681346,
+          "exact": false,
+          "issues": []
+        }
+      },
+      {
+        "kind": "narration",
+        "text": "`valid: true` — the optimized thickness still bounds a closed, manifold solid, so it is safe to export. STL for the slicer:"
+      },
+      {
+        "kind": "export",
+        "args": {
+          "model_id": "model-8",
+          "format": "stl",
+          "path": "optimize-bracket.stl"
+        },
+        "payload": {
+          "model_id": "model-8",
+          "format": "stl",
+          "path": "output/optimize-bracket.stl",
+          "bytes": 873684
+        }
+      },
+      {
+        "kind": "narration",
+        "text": "That is the whole differentiable loop the agent layer is built around: the agent owns the *topology* (an L-bracket, one shared thickness), and the gradient owns the *numbers*. Want three ribs instead of a plain wall, or the hole moved? Edit the script and call `optimize` again — it moves numbers, never structure."
       }
     ]
   }

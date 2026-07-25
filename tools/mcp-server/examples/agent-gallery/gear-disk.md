@@ -30,45 +30,45 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 >   "name": "gear-disk",
 >   "exact": false,
 >   "mesh": {
->     "triangles": 65762,
->     "vertices": 32881
+>     "triangles": 95856,
+>     "vertices": 47928
 >   },
 >   "boundingBox": {
 >     "min": [
->       -20.614211729823097,
+>       -20.5,
 >       -4,
->       -20.61083951798434
+>       -20.500000000000004
 >     ],
 >     "max": [
->       20.567131070203015,
+>       20.5,
 >       4,
->       20.577241106166063
+>       20.5
 >     ],
 >     "size": [
->       41.181342800026115,
+>       41,
 >       8,
->       41.1880806241504
+>       41
 >     ]
 >   },
->   "volume": 8373.391779139787,
+>   "volume": 8601.14607606569,
 >   "valid": true,
 >   "issues": []
 > }
 > ```
 
-**Agent:** All 16 teeth resolved — `valid: true`, volume 8373 mm³. Top view to check the tooth count and spacing, then iso:
+**Agent:** All 16 teeth resolved — `valid: true`, volume 8601 mm³. Top view to check the tooth count and spacing, then iso:
 
 > 🔧 **`get_screenshot`** `{ "model_id": "model-5", "view": "top", "width": 720, "height": 540 }`
 >
 > ![gear-disk — top view](../output/gear-disk-top.png)
 >
-> *(real 720×540 render, 19 KB PNG)*
+> *(real 720×540 render, 22 KB PNG)*
 
 > 🔧 **`get_screenshot`** `{ "model_id": "model-5", "view": "iso", "width": 720, "height": 540 }`
 >
 > ![gear-disk — iso view](../output/gear-disk-iso.png)
 >
-> *(real 720×540 render, 32 KB PNG)*
+> *(real 720×540 render, 34 KB PNG)*
 
 **Agent:** Sixteen evenly-spaced teeth, and the disk reads 8 mm thick in y — which is the check that matters here. Had I patterned about Z, the top view would still show a tidy ring of sixteen blocks and `valid` would still be `true`, but the bounding box would come back 41 × 41 × 32 instead of 41 × 8 × 41: teeth orbiting the disk rather than sitting on its rim. STL exports the mesh directly:
 
@@ -78,7 +78,7 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 >   "model_id": "model-5",
 >   "format": "stl",
 >   "path": "output/gear-disk.stl",
->   "bytes": 3288184
+>   "bytes": 4792884
 > }
 > ```
 
@@ -90,6 +90,6 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 >   "model_id": "model-5",
 >   "format": "step",
 >   "path": "output/gear-disk.step",
->   "bytes": 33721874
+>   "bytes": 41675080
 > }
 > ```

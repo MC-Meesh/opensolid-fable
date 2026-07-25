@@ -669,24 +669,17 @@ const zHole = Shape.cylinder(2.5, 10).rotate(1, 0, 0, 90);   // -> +Z
 for (const y of [10, 30]) part = part.subtract(zHole.translate(15, y, 0));
 const xHole = Shape.cylinder(2.5, 10).rotate(0, 0, 1, 90);   // -> +X
 for (const y of [10, 30]) part = part.subtract(xHole.translate(-27.5, y, 32));
-
-// The trailing no-op rotation is a WORKAROUND, not modelling (of-obv):
-// without it this exact part meshes open at the default accuracy and STEP
-// export declines. A 360° rotation is geometrically the identity; all it
-// changes is the shape's tracked bounding box, and that shifts the meshing
-// grid onto an alignment where the mesh closes. This specific expression was
-// found by trial: other identity-equivalent spellings still fail.
-return part.rotate(0, 1, 0, 360);
+return part;
 `.trim();
     const m = t.create_model(script, 'bracket-right-angle');
     t.say(
       `\`valid: ${m.valid}\`, volume ${m.volume.toFixed(0)} mm³. That is the ` +
         'oracle that matters: hand-integrating the section gives 19792 mm³ ' +
         '(19077 for the filleted L, +1000 gusset, +blend, −393 for four Ø5 ' +
-        'holes through 5 mm), so the mesh is reading 0.3% under — the same ' +
-        'bias a plain 60×40×5 slab shows (11968 vs 12000). The holes are ' +
-        'real: drop them and the body measures 20184 mm³. Let me look at it ' +
-        'from three sides before exporting.',
+        'holes through 5 mm), so the mesh is reading well under 0.1% off — ' +
+        'the same small bias a plain 60×40×5 slab shows (11996 vs 12000). ' +
+        'The holes are real: drop them and the body measures 20177 mm³. Let ' +
+        'me look at it from three sides before exporting.',
     );
     t.screenshot(m.model_id, 'bracket-right-angle-iso.png', 'iso');
     t.screenshot(m.model_id, 'bracket-right-angle-top.png', 'top');
@@ -716,11 +709,14 @@ return part.rotate(0, 1, 0, 360);
         'hole silently becomes a channel through the part, with no error and a ' +
         '`valid: true` mesh — the volume delta is the only thing that catches ' +
         'it, which is why measuring against a hand-computed number is not ' +
-        'optional here. And the faceted STEP path is fragile: this part ' +
-        'exports only because of the trailing no-op rotation. The identical ' +
-        'part without it, and every other identity-equivalent spelling tried, ' +
-        'meshes open and declines to export — while STL, which uses a ' +
-        'different mesher, exports fine either way.',
+        'optional here. And the view names: a z-up part makes the renderer’s ' +
+        '`top` the section elevation and `front` the plan — read them ' +
+        'literally, not geometrically. One retired caveat, for readers of ' +
+        'older versions of this script: the part used to need a trailing ' +
+        'no-op `rotate(0, 1, 0, 360)` to mesh closed at all — without it the ' +
+        'mesh came back open and STEP declined, a bounds-alignment mesher ' +
+        'defect tracked as of-obv. That fix landed; the workaround is gone ' +
+        'and the part meshes closed as written.',
     );
   },
 );

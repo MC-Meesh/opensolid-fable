@@ -44,7 +44,7 @@ const HOLES = 4 * Math.PI * 2.5 ** 2 * 5;
 const ANALYTIC_VOLUME = L_SECTION + GUSSET - HOLES; // ~19791.6 mm^3
 
 // The SDF mesher reads slightly under true volume at the default accuracy
-// (a plain 60x40x5 slab measures 11968 against a true 12000, -0.26%). 1.5%
+// (a plain 60x40x5 slab measures 11996 against a true 12000, -0.03%). 1.5%
 // is loose enough for that bias plus the blend, and tight enough to fail if a
 // hole goes in on the wrong axis (that is a ~2-4x error, not a percent).
 const VOLUME_TOL = 0.015;
@@ -77,12 +77,12 @@ const xHole = Shape.cylinder(2.5, 10).rotate(0, 0, 1, 90);   // -> +X, vertical 
 for (const y of [10, 30]) part = part.subtract(xHole.translate(-27.5, y, 32));
 `;
 
-// The trailing 360° rotation is a workaround, not modelling: it is the
-// identity geometrically, but it perturbs the tracked bounding box, and
-// without that perturbation this part meshes open at the default accuracy and
-// STEP export declines. Tracked in of-obv.
-const BRACKET_SCRIPT = `${BODY_SCRIPT}${DRILL_SCRIPT}\nreturn part.rotate(0, 1, 0, 360);`;
-const UNDRILLED_SCRIPT = `${BODY_SCRIPT}\nreturn part.rotate(0, 1, 0, 360);`;
+// This script once ended in a no-op 360° rotation: a workaround for a
+// bounds-alignment mesher defect (of-obv) without which the part meshed open
+// and STEP export declined. The of-obv fix removed the need; the part meshes
+// closed as written.
+const BRACKET_SCRIPT = `${BODY_SCRIPT}${DRILL_SCRIPT}\nreturn part;`;
+const UNDRILLED_SCRIPT = `${BODY_SCRIPT}\nreturn part;`;
 
 // ── Minimal MCP stdio client ───────────────────────────────────────────────
 function connect(outputDir) {
@@ -183,12 +183,12 @@ describe('right-angle bracket acceptance (of-2y4.1)', () => {
     // Four Ø5 holes through 5 mm of plate = 392.7 mm^3.
     //
     // The band is wide on purpose. This differences two *independently meshed*
-    // volumes, and each carries the mesher's ~0.3% bias on a ~20000 mm^3 body
-    // — around +/-60 mm^3 of noise on a 392.7 mm^3 signal, so ~15% before
-    // anything is wrong. (Measured drift on the reference part: 438.8.) It
-    // still separates cleanly from the failure it exists to catch: a hole on
-    // the wrong axis bores a channel lengthwise through the part and removes
-    // 800-1600 mm^3, several times the true figure.
+    // volumes, and each carries the mesher's per-mesh bias on a ~20000 mm^3
+    // body — tens of mm^3 of noise on a 392.7 mm^3 signal. (Measured drift on
+    // the reference part: 390.3.) It still separates cleanly from the failure
+    // it exists to catch: a hole on the wrong axis bores a channel lengthwise
+    // through the part and removes 800-1600 mm^3, several times the true
+    // figure.
     const HOLE_TOL = 0.25;
     assert.ok(
       Math.abs(removed - HOLES) / HOLES < HOLE_TOL,
