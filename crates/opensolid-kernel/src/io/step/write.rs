@@ -10,7 +10,10 @@
 //!   [`Curve3`] → `line`, `circle`, `ellipse` (each positioned by
 //!   `axis2_placement_3d` built from `cartesian_point` / `direction`);
 //!   [`Curve3::Polyline`] (marched SSI edges) → degree-1
-//!   `b_spline_curve_with_knots` with knots at the vertex indices.
+//!   `b_spline_curve_with_knots` with knots at the vertex indices;
+//!   [`Curve3::Nurbs`] / [`Surface3::Nurbs`] → `b_spline_curve_with_knots`
+//!   / `b_spline_surface_with_knots`, or the `rational_b_spline_*`
+//!   complex-instance form when any weight differs from 1 (of-3qy.7).
 //! - **Topology**: `Vertex` / `Edge` / `Loop` / `Face` / `Shell` / `Body` →
 //!   `vertex_point`, `edge_curve`, `oriented_edge`, `edge_loop`,
 //!   `face_outer_bound` / `face_bound`, `advanced_face`, `closed_shell`,
@@ -53,16 +56,18 @@
 //! # What is supported
 //!
 //! Solid bodies ([`BodyType::Solid`]) with exactly one closed shell, whose
-//! faces all carry analytic surfaces and whose edges all carry analytic
-//! curves. Anything else — sheet/wire bodies, voids (multiple shells),
-//! vertex loops, missing geometry — fails with [`StepWriteError`] rather
-//! than emitting an unreadable file. NURBS geometry *can* occur — both
-//! [`Curve3`] and [`Surface3`] carry a freeform variant — but it is
-//! refused rather than approximated: emitting
-//! `B_SPLINE_CURVE_WITH_KNOTS` / `B_SPLINE_SURFACE_WITH_KNOTS` is
-//! of-3qy.7, and sampling a freeform into the analytic forms above would
-//! export different geometry under a name that reads exact. See the
-//! [reader docs](super::read) for the import-side mirror.
+//! faces and edges all carry attached geometry — analytic or freeform.
+//! Anything else — sheet/wire bodies, voids (multiple shells), vertex
+//! loops, missing geometry — fails with [`StepWriteError`] rather than
+//! emitting an unreadable file.
+//!
+//! Freeform geometry is emitted *exactly*, never sampled: control points,
+//! degrees and knot vectors (collapsed to STEP's distinct-knots plus
+//! multiplicities pair) go out verbatim, so `expand · collapse` is the
+//! identity and every knot re-reads to the same `f64`. A patch or curve
+//! with any weight ≠ 1 needs the `RATIONAL_B_SPLINE_*` complex-instance
+//! form, since the plain `*_WITH_KNOTS` entity has nowhere to carry
+//! weights. See the [reader docs](super::read) for the import-side mirror.
 //!
 //! # External tool compatibility
 //!
@@ -104,8 +109,8 @@ use std::fmt::Write as _;
 
 use opensolid_brep::curve::plane_basis;
 use opensolid_brep::{
-    Body, BodyType, Curve3, Edge, FaceSense, FinSense, GeometryStore, Loop, Surface3,
-    TopologyStore, Vertex,
+    Body, BodyType, Curve3, Edge, FaceSense, FinSense, GeometryStore, Loop, NurbsCurve,
+    NurbsSurface, Surface3, TopologyStore, Vertex,
 };
 use opensolid_core::{EntityId, Point3, Transform3, Vector3};
 
@@ -491,6 +496,55 @@ fn step_bool(b: bool) -> &'static str {
     if b { ".T." } else { ".F." }
 }
 
+/// `a,b,…` over reals in Part 21 grammar (no surrounding parentheses).
+fn real_items(xs: &[f64]) -> String {
+    xs.iter()
+        .map(|&x| fmt_real(x))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// `a,b,…` over integers (no surrounding parentheses).
+fn int_items(xs: &[usize]) -> String {
+    xs.iter()
+        .map(|x| x.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Collapse a flat knot sequence into STEP's `(distinct knots,
+/// multiplicities)` pair — the exact inverse of the reader's
+/// `expand_knots`.
+///
+/// Runs are grouped by bit-exact equality, which is what makes the pair a
+/// true inverse: [`KnotVector`](opensolid_brep::KnotVector) stores repeated
+/// knots as identical `f64`s (they arrive from an expansion, a clamped
+/// constructor, or knot insertion, never from separate arithmetic), and
+/// each distinct value is written in shortest round-trip form. Two knots
+/// that differ in the last bit stay two knots of multiplicity one rather
+/// than being silently merged into one of multiplicity two, which would
+/// change the curve.
+fn collapse_knots(flat: &[f64]) -> (Vec<f64>, Vec<usize>) {
+    let mut knots: Vec<f64> = Vec::new();
+    let mut mults: Vec<usize> = Vec::new();
+    for &knot in flat {
+        if knots.last() == Some(&knot) {
+            *mults.last_mut().expect("knots and mults grow together") += 1;
+        } else {
+            knots.push(knot);
+            mults.push(1);
+        }
+    }
+    (knots, mults)
+}
+
+/// Whether weights need the `RATIONAL_B_SPLINE_*` complex form. Exact
+/// comparison: the plain entity has no weight slot at all, so anything but
+/// a literal 1.0 must take the rational path or be lost.
+fn is_rational(weights: &[f64]) -> bool {
+    weights.iter().any(|&w| w != 1.0)
+}
+
 struct Emitter<'a> {
     store: &'a TopologyStore,
     geo: &'a GeometryStore,
@@ -862,22 +916,54 @@ impl<'a> Emitter<'a> {
                     knots.join(",")
                 ))
             }
-            // A real B_SPLINE_CURVE_WITH_KNOTS needs the control points,
-            // the knot vector collapsed to distinct-knots-plus-
-            // multiplicities, and — for a rational curve — the
-            // `RATIONAL_B_SPLINE_CURVE` complex-instance form carrying the
-            // weights. That is of-3qy.7, not this phase; the degree-1
-            // polyline emission above is deliberately not reused, because
-            // sampling a freeform curve into one would silently downgrade
-            // exact geometry.
-            Curve3::Nurbs(_) => {
-                return Err(StepWriteError::Unsupported(
-                    "NURBS curve (B_SPLINE_CURVE_WITH_KNOTS emission is the of-3qy.7 phase)".into(),
-                ));
-            }
+            // The freeform arm. Deliberately *not* the degree-1 polyline
+            // emission above: sampling a curve into one would downgrade
+            // exact geometry under a name that reads exact.
+            Curve3::Nurbs(ref nurbs) => self.emit_nurbs_curve(nurbs),
         };
         self.curves.insert(curve, id);
         Ok(id)
+    }
+
+    /// A `Curve3::Nurbs` as `B_SPLINE_CURVE_WITH_KNOTS`, or the
+    /// `RATIONAL_B_SPLINE_CURVE` complex instance when it carries weights.
+    ///
+    /// Degree, control points and the knot vector are written verbatim;
+    /// nothing is resampled or approximated. `closed_curve` is decided by
+    /// the control polygon's endpoints, which for the clamped curves the
+    /// kernel builds is exactly the curve's own closure; `self_intersect`
+    /// is `.U.` (unknown) rather than a claim we have not tested.
+    fn emit_nurbs_curve(&mut self, nurbs: &NurbsCurve) -> u64 {
+        let cps: Vec<u64> = nurbs
+            .control_points()
+            .iter()
+            .map(|p| self.emit_point(*p))
+            .collect();
+        let refs = ref_list(&cps);
+        let degree = nurbs.degree();
+        let (knots, mults) = collapse_knots(nurbs.knot_vector().knots());
+        let (knots, mults) = (real_items(&knots), int_items(&mults));
+        let points = nurbs.control_points();
+        let closed = step_bool(points.first() == points.last() && points.len() > 1);
+
+        if is_rational(nurbs.weights()) {
+            // The partial records carry no inherited attributes, so each
+            // one starts at its own first declared attribute — the name
+            // lives on REPRESENTATION_ITEM. Parts are in the alphabetical
+            // order AP203 exporters conventionally emit.
+            let weights = real_items(nurbs.weights());
+            self.emit(format!(
+                "( BOUNDED_CURVE() B_SPLINE_CURVE({degree},{refs},.UNSPECIFIED.,{closed},.U.) \
+                 B_SPLINE_CURVE_WITH_KNOTS(({mults}),({knots}),.UNSPECIFIED.) CURVE() \
+                 GEOMETRIC_REPRESENTATION_ITEM() RATIONAL_B_SPLINE_CURVE(({weights})) \
+                 REPRESENTATION_ITEM('') )"
+            ))
+        } else {
+            self.emit(format!(
+                "B_SPLINE_CURVE_WITH_KNOTS('',{degree},{refs},.UNSPECIFIED.,{closed},.U.,\
+                 ({mults}),({knots}),.UNSPECIFIED.)"
+            ))
+        }
     }
 
     fn emit_surface(&mut self, surface: EntityId<Surface3>) -> WriteResult<u64> {
@@ -941,19 +1027,74 @@ impl<'a> Emitter<'a> {
                     fmt_real(minor_radius)
                 ))
             }
-            // AP203 spells this B_SPLINE_SURFACE_WITH_KNOTS, which needs
-            // the control grid, both knot vectors with multiplicities, and
-            // the rational weight grid emitted; that is the of-37i STEP
-            // round-trip phase, not this one.
-            Surface3::Nurbs(_) => {
-                return Err(StepWriteError::Unsupported(
-                    "NURBS surface (B_SPLINE_SURFACE_WITH_KNOTS emission is a later of-37i phase)"
-                        .into(),
-                ));
-            }
+            Surface3::Nurbs(ref nurbs) => self.emit_nurbs_surface(nurbs),
         };
         self.surfaces.insert(surface, id);
         Ok(id)
+    }
+
+    /// A `Surface3::Nurbs` as `B_SPLINE_SURFACE_WITH_KNOTS`, or the
+    /// `RATIONAL_B_SPLINE_SURFACE` complex instance when the patch carries
+    /// weights.
+    ///
+    /// The control grid's outer list runs over `u` and each inner list over
+    /// `v`, which is [`NurbsSurface`]'s own row-major convention and the
+    /// one the reader expects back. Degrees and both knot vectors are
+    /// written verbatim.
+    fn emit_nurbs_surface(&mut self, nurbs: &NurbsSurface) -> u64 {
+        let (rows, cols) = nurbs.grid_size();
+        let grid: Vec<String> = (0..rows)
+            .map(|i| {
+                let row: Vec<u64> = (0..cols)
+                    .map(|j| self.emit_point(nurbs.control_point(i, j)))
+                    .collect();
+                ref_list(&row)
+            })
+            .collect();
+        let grid = format!("({})", grid.join(","));
+
+        let (u_degree, v_degree) = (nurbs.degree_u(), nurbs.degree_v());
+        let (u_knots, u_mults) = collapse_knots(nurbs.knot_vector_u().knots());
+        let (v_knots, v_mults) = collapse_knots(nurbs.knot_vector_v().knots());
+        let (u_knots, u_mults) = (real_items(&u_knots), int_items(&u_mults));
+        let (v_knots, v_mults) = (real_items(&v_knots), int_items(&v_mults));
+
+        // Closure of the control grid: the u direction wraps when its first
+        // and last rows coincide, the v direction when its first and last
+        // columns do.
+        let point = |i: usize, j: usize| nurbs.control_point(i, j);
+        let u_closed = step_bool(rows > 1 && (0..cols).all(|j| point(0, j) == point(rows - 1, j)));
+        let v_closed = step_bool(cols > 1 && (0..rows).all(|i| point(i, 0) == point(i, cols - 1)));
+
+        let weights: Vec<f64> = (0..rows)
+            .flat_map(|i| (0..cols).map(move |j| nurbs.weight(i, j)))
+            .collect();
+        if is_rational(&weights) {
+            let grid_weights: Vec<String> = (0..rows)
+                .map(|i| {
+                    let row: Vec<f64> = (0..cols).map(|j| nurbs.weight(i, j)).collect();
+                    format!("({})", real_items(&row))
+                })
+                .collect();
+            let grid_weights = grid_weights.join(",");
+            // Partial records carry no inherited attributes; the name lives
+            // on REPRESENTATION_ITEM. Alphabetical part order, as AP203
+            // exporters conventionally emit.
+            self.emit(format!(
+                "( BOUNDED_SURFACE() \
+                 B_SPLINE_SURFACE({u_degree},{v_degree},{grid},.UNSPECIFIED.,\
+                 {u_closed},{v_closed},.U.) \
+                 B_SPLINE_SURFACE_WITH_KNOTS(({u_mults}),({v_mults}),({u_knots}),({v_knots}),\
+                 .UNSPECIFIED.) GEOMETRIC_REPRESENTATION_ITEM() \
+                 RATIONAL_B_SPLINE_SURFACE(({grid_weights})) REPRESENTATION_ITEM('') SURFACE() )"
+            ))
+        } else {
+            self.emit(format!(
+                "B_SPLINE_SURFACE_WITH_KNOTS('',{u_degree},{v_degree},{grid},.UNSPECIFIED.,\
+                 {u_closed},{v_closed},.U.,({u_mults}),({v_mults}),({u_knots}),({v_knots}),\
+                 .UNSPECIFIED.)"
+            ))
+        }
     }
 }
 
@@ -1545,42 +1686,503 @@ mod tests {
         assert!(emitter.data.contains("DIRECTION('',(1.0,0.0,0.0))"));
     }
 
-    /// A NURBS curve must be refused outright, not quietly sampled into
-    /// the degree-1 polyline form sitting right next to it in
-    /// `emit_curve` — that would export a *different* curve under a name
-    /// that reads exact (of-3qy.7 emits the real thing).
-    #[test]
-    fn rejects_nurbs_curves_rather_than_downgrading_them() {
-        let store = TopologyStore::new();
-        let mut geo = GeometryStore::new();
-        let curve_id = geo.add_curve(Curve3::nurbs(
-            NurbsCurve::bspline(
-                vec![
-                    Point3::origin(),
-                    Point3::new(1.0, 2.0, 0.0),
-                    Point3::new(3.0, 0.0, 1.0),
-                ],
-                KnotVector::new(2, vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0]).expect("knots"),
-            )
-            .expect("b-spline"),
-        ));
-        let mut emitter = Emitter {
-            store: &store,
-            geo: &geo,
+    // ------------------------------------------------------------------
+    // Freeform geometry (of-3qy.7)
+    // ------------------------------------------------------------------
+
+    /// An emitter over `geo` alone, for geometry-level emission tests.
+    fn geometry_emitter<'a>(store: &'a TopologyStore, geo: &'a GeometryStore) -> Emitter<'a> {
+        Emitter {
+            store,
+            geo,
             data: String::new(),
             next_id: 1,
             vertices: HashMap::new(),
             edges: HashMap::new(),
             curves: HashMap::new(),
             surfaces: HashMap::new(),
-        };
-        let err = emitter.emit_curve(curve_id).unwrap_err();
-        assert!(matches!(err, StepWriteError::Unsupported(_)), "{err}");
+        }
+    }
+
+    /// Degree-2 B-spline with an interior knot: the collapsed knot vector
+    /// is `((3,1,3), (0.0, 0.5, 1.0))`, so a writer that forgot
+    /// multiplicities would be visible immediately.
+    fn sample_curve() -> NurbsCurve {
+        NurbsCurve::bspline(
+            vec![
+                Point3::origin(),
+                Point3::new(1.0, 2.0, 0.0),
+                Point3::new(3.0, 0.0, 1.0),
+                Point3::new(4.0, 2.0, 2.0),
+            ],
+            KnotVector::new(2, vec![0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0]).expect("knots"),
+        )
+        .expect("b-spline")
+    }
+
+    /// The classic rational quarter circle: weights `(1, √2/2, 1)`.
+    fn sample_rational_curve() -> NurbsCurve {
+        let w = std::f64::consts::FRAC_1_SQRT_2;
+        NurbsCurve::new(
+            vec![
+                Point3::new(1.0, 0.0, 0.0),
+                Point3::new(1.0, 1.0, 0.0),
+                Point3::new(0.0, 1.0, 0.0),
+            ],
+            vec![1.0, w, 1.0],
+            KnotVector::new(2, vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0]).expect("knots"),
+        )
+        .expect("rational quarter circle")
+    }
+
+    /// Bilinear patch with distinct degrees in u and v (degree 1 × degree
+    /// 2), so a writer that transposed the two knot vectors would fail.
+    fn sample_surface() -> NurbsSurface {
+        NurbsSurface::bspline(
+            vec![
+                vec![
+                    Point3::origin(),
+                    Point3::new(0.0, 1.0, 0.0),
+                    Point3::new(0.0, 2.0, 1.0),
+                ],
+                vec![
+                    Point3::new(1.0, 0.0, 0.0),
+                    Point3::new(1.0, 1.0, 1.0),
+                    Point3::new(1.0, 2.0, 0.0),
+                ],
+            ],
+            KnotVector::new(1, vec![0.0, 0.0, 1.0, 1.0]).expect("u knots"),
+            KnotVector::new(2, vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0]).expect("v knots"),
+        )
+        .expect("patch")
+    }
+
+    #[test]
+    fn collapse_knots_inverts_expansion() {
+        let (knots, mults) = collapse_knots(&[0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0]);
+        assert_eq!(knots, vec![0.0, 0.5, 1.0]);
+        assert_eq!(mults, vec![3, 1, 3]);
+
+        // Re-expanding reproduces the input, which is the property the
+        // reader relies on.
+        let expanded: Vec<f64> = knots
+            .iter()
+            .zip(&mults)
+            .flat_map(|(&k, &m)| std::iter::repeat_n(k, m))
+            .collect();
+        assert_eq!(expanded, vec![0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0]);
+
+        // Bit-distinct neighbours must stay distinct: merging them would
+        // raise a multiplicity and change the curve.
+        let epsilon = f64::from_bits(1.0_f64.to_bits() + 1);
+        let (knots, mults) = collapse_knots(&[1.0, epsilon]);
+        assert_eq!(mults, vec![1, 1], "near-equal knots must not merge");
+        assert_eq!(knots.len(), 2);
+    }
+
+    /// A NURBS curve emits the real `B_SPLINE_CURVE_WITH_KNOTS` — never the
+    /// degree-1 polyline form sitting next to it in `emit_curve`, which
+    /// would export a *different* curve under a name that reads exact.
+    #[test]
+    fn nurbs_curve_emits_b_spline_curve_with_knots() {
+        let store = TopologyStore::new();
+        let mut geo = GeometryStore::new();
+        let curve_id = geo.add_curve(Curve3::nurbs(sample_curve()));
+        let mut emitter = geometry_emitter(&store, &geo);
+        emitter
+            .emit_curve(curve_id)
+            .expect("NURBS curve serializes");
+
+        // Four control points are #1..#4, so the curve is #5.
         assert!(
-            !emitter.data.contains("B_SPLINE_CURVE_WITH_KNOTS"),
-            "nothing may be emitted for a refused curve:\n{}",
+            emitter.data.contains(
+                "#5 = B_SPLINE_CURVE_WITH_KNOTS('',2,(#1,#2,#3,#4),.UNSPECIFIED.,.F.,.U.,\
+                 (3,1,3),(0.0,0.5,1.0),.UNSPECIFIED.);"
+            ),
+            "unexpected emission:\n{}",
             emitter.data
         );
+        assert!(
+            !emitter.data.contains("POLYLINE_FORM"),
+            "a freeform curve must not be downgraded to the polyline form:\n{}",
+            emitter.data
+        );
+        assert!(
+            !emitter.data.contains("RATIONAL"),
+            "an unweighted curve needs no complex instance:\n{}",
+            emitter.data
+        );
+    }
+
+    #[test]
+    fn rational_nurbs_curve_emits_the_complex_rational_instance() {
+        let store = TopologyStore::new();
+        let mut geo = GeometryStore::new();
+        let curve_id = geo.add_curve(Curve3::nurbs(sample_rational_curve()));
+        let mut emitter = geometry_emitter(&store, &geo);
+        emitter
+            .emit_curve(curve_id)
+            .expect("rational curve serializes");
+
+        let w = fmt_real(std::f64::consts::FRAC_1_SQRT_2);
+        assert!(
+            emitter.data.contains(&format!(
+                "#4 = ( BOUNDED_CURVE() B_SPLINE_CURVE(2,(#1,#2,#3),.UNSPECIFIED.,.F.,.U.) \
+                 B_SPLINE_CURVE_WITH_KNOTS((3,3),(0.0,1.0),.UNSPECIFIED.) CURVE() \
+                 GEOMETRIC_REPRESENTATION_ITEM() RATIONAL_B_SPLINE_CURVE((1.0,{w},1.0)) \
+                 REPRESENTATION_ITEM('') );"
+            )),
+            "unexpected emission:\n{}",
+            emitter.data
+        );
+    }
+
+    #[test]
+    fn nurbs_surface_emits_b_spline_surface_with_knots() {
+        let store = TopologyStore::new();
+        let mut geo = GeometryStore::new();
+        let surface_id = geo.add_surface(Surface3::nurbs(sample_surface()));
+        let mut emitter = geometry_emitter(&store, &geo);
+        emitter
+            .emit_surface(surface_id)
+            .expect("NURBS surface serializes");
+
+        // Six control points are #1..#6, row-major with the outer index
+        // over u, so the surface is #7.
+        assert!(
+            emitter.data.contains(
+                "#7 = B_SPLINE_SURFACE_WITH_KNOTS('',1,2,((#1,#2,#3),(#4,#5,#6)),.UNSPECIFIED.,\
+                 .F.,.F.,.U.,(2,2),(3,3),(0.0,1.0),(0.0,1.0),.UNSPECIFIED.);"
+            ),
+            "unexpected emission:\n{}",
+            emitter.data
+        );
+    }
+
+    #[test]
+    fn rational_nurbs_surface_emits_the_complex_rational_instance() {
+        let store = TopologyStore::new();
+        let mut geo = GeometryStore::new();
+        let patch = sample_surface();
+        let (rows, cols) = patch.grid_size();
+        let grid: Vec<Vec<Point3>> = (0..rows)
+            .map(|i| (0..cols).map(|j| patch.control_point(i, j)).collect())
+            .collect();
+        let weighted = NurbsSurface::new(
+            grid,
+            vec![vec![1.0, 0.5, 1.0], vec![2.0, 1.0, 1.0]],
+            patch.knot_vector_u().clone(),
+            patch.knot_vector_v().clone(),
+        )
+        .expect("weighted patch");
+        let surface_id = geo.add_surface(Surface3::nurbs(weighted));
+        let mut emitter = geometry_emitter(&store, &geo);
+        emitter
+            .emit_surface(surface_id)
+            .expect("rational surface serializes");
+
+        assert!(
+            emitter.data.contains(
+                "#7 = ( BOUNDED_SURFACE() \
+                 B_SPLINE_SURFACE(1,2,((#1,#2,#3),(#4,#5,#6)),.UNSPECIFIED.,.F.,.F.,.U.) \
+                 B_SPLINE_SURFACE_WITH_KNOTS((2,2),(3,3),(0.0,1.0),(0.0,1.0),.UNSPECIFIED.) \
+                 GEOMETRIC_REPRESENTATION_ITEM() \
+                 RATIONAL_B_SPLINE_SURFACE(((1.0,0.5,1.0),(2.0,1.0,1.0))) \
+                 REPRESENTATION_ITEM('') SURFACE() );"
+            ),
+            "unexpected emission:\n{}",
+            emitter.data
+        );
+    }
+
+    /// A control grid whose first and last rows coincide is `u`-closed;
+    /// the flag is derived, not guessed.
+    #[test]
+    fn closed_control_grid_emits_the_closure_flag() {
+        let store = TopologyStore::new();
+        let mut geo = GeometryStore::new();
+        let ring = vec![
+            Point3::origin(),
+            Point3::new(1.0, 0.0, 0.0),
+            Point3::new(1.0, 1.0, 0.0),
+        ];
+        let patch = NurbsSurface::bspline(
+            vec![
+                ring.clone(),
+                vec![
+                    Point3::new(0.0, 0.0, 1.0),
+                    Point3::new(1.0, 0.0, 1.0),
+                    Point3::new(1.0, 1.0, 1.0),
+                ],
+                ring,
+            ],
+            KnotVector::new(1, vec![0.0, 0.0, 0.5, 1.0, 1.0]).expect("u knots"),
+            KnotVector::new(2, vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0]).expect("v knots"),
+        )
+        .expect("patch");
+        let surface_id = geo.add_surface(Surface3::nurbs(patch));
+        let mut emitter = geometry_emitter(&store, &geo);
+        emitter.emit_surface(surface_id).expect("serializes");
+        assert!(
+            emitter.data.contains(".UNSPECIFIED.,.T.,.F.,.U."),
+            "u closure must be reported, v openness must not:\n{}",
+            emitter.data
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Freeform round trip: the emitted numbers must re-read exactly
+    // ------------------------------------------------------------------
+
+    /// Expand a `(knots, multiplicities)` pair back into a flat knot
+    /// sequence — the reader's inverse, re-derived here so the check does
+    /// not lean on the reader agreeing with the writer by construction.
+    fn expand(knots: &[f64], mults: &[i64]) -> Vec<f64> {
+        knots
+            .iter()
+            .zip(mults)
+            .flat_map(|(&k, &m)| std::iter::repeat_n(k, m as usize))
+            .collect()
+    }
+
+    /// Numeric list attribute of `rec` at `index`.
+    fn reals(rec: &crate::io::step::SimpleRecord, index: usize) -> Vec<f64> {
+        rec.attributes[index]
+            .as_list()
+            .expect("list attribute")
+            .iter()
+            .map(|v| v.as_real().expect("real item"))
+            .collect()
+    }
+
+    fn ints(rec: &crate::io::step::SimpleRecord, index: usize) -> Vec<i64> {
+        rec.attributes[index]
+            .as_list()
+            .expect("list attribute")
+            .iter()
+            .map(|v| v.as_integer().expect("integer item"))
+            .collect()
+    }
+
+    /// Every `CARTESIAN_POINT` referenced by `refs`, in order.
+    fn points(file: &crate::io::step::StepFile, refs: &[crate::io::step::Value]) -> Vec<Point3> {
+        refs.iter()
+            .map(|r| {
+                let id = r.as_ref_id().expect("control point reference");
+                let rec = file
+                    .get(id)
+                    .expect("live point")
+                    .as_simple()
+                    .expect("simple");
+                let coords = reals(rec, 1);
+                Point3::new(coords[0], coords[1], coords[2])
+            })
+            .collect()
+    }
+
+    /// Parse the emitted DATA section and rebuild the curve from the
+    /// records alone: control points, weights and the expanded knot vector
+    /// must be bit-identical to what went in.
+    fn assert_curve_reparses(original: &NurbsCurve) {
+        let store = TopologyStore::new();
+        let mut geo = GeometryStore::new();
+        let curve_id = geo.add_curve(Curve3::nurbs(original.clone()));
+        let mut emitter = geometry_emitter(&store, &geo);
+        emitter.emit_curve(curve_id).expect("serializes");
+        let file = crate::io::step::parse(&format!(
+            "ISO-10303-21;\nHEADER;\nFILE_SCHEMA(('CONFIG_CONTROL_DESIGN'));\nENDSEC;\n\
+             DATA;\n{}ENDSEC;\nEND-ISO-10303-21;\n",
+            emitter.data
+        ))
+        .expect("emitted records parse");
+
+        let inst = file
+            .data
+            .iter()
+            .find(|i| i.entity.part("B_SPLINE_CURVE_WITH_KNOTS").is_some())
+            .expect("a b-spline curve was emitted");
+        let rational = inst.entity.part("RATIONAL_B_SPLINE_CURVE");
+        // The complex form splits the attributes over its parts, so the
+        // indices differ between the two spellings.
+        let (base, knots_rec, shift) = match inst.entity.part("B_SPLINE_CURVE") {
+            Some(base) => (
+                base,
+                inst.entity
+                    .part("B_SPLINE_CURVE_WITH_KNOTS")
+                    .expect("knots"),
+                0,
+            ),
+            None => {
+                let simple = inst
+                    .entity
+                    .part("B_SPLINE_CURVE_WITH_KNOTS")
+                    .expect("knots");
+                (simple, simple, 1)
+            }
+        };
+        assert_eq!(
+            base.attributes[shift].as_integer().expect("degree"),
+            original.degree() as i64,
+            "degree"
+        );
+        let control = points(
+            &file,
+            base.attributes[shift + 1]
+                .as_list()
+                .expect("control points"),
+        );
+        assert_eq!(control, original.control_points(), "control points");
+        let (mults, knots) = if shift == 0 {
+            (ints(knots_rec, 0), reals(knots_rec, 1))
+        } else {
+            (ints(knots_rec, 6), reals(knots_rec, 7))
+        };
+        assert_eq!(
+            expand(&knots, &mults),
+            original.knot_vector().knots(),
+            "knot vector"
+        );
+        let weights = match rational {
+            Some(rec) => reals(rec, 0),
+            None => vec![1.0; control.len()],
+        };
+        assert_eq!(weights, original.weights(), "weights");
+    }
+
+    #[test]
+    fn emitted_nurbs_curve_reparses_bit_identically() {
+        assert_curve_reparses(&sample_curve());
+    }
+
+    #[test]
+    fn emitted_rational_nurbs_curve_reparses_bit_identically() {
+        assert_curve_reparses(&sample_rational_curve());
+    }
+
+    /// Same gate for a patch: degrees, both knot vectors, the control grid
+    /// and the weight grid all survive verbatim.
+    fn assert_surface_reparses(original: &NurbsSurface) {
+        let store = TopologyStore::new();
+        let mut geo = GeometryStore::new();
+        let surface_id = geo.add_surface(Surface3::nurbs(original.clone()));
+        let mut emitter = geometry_emitter(&store, &geo);
+        emitter.emit_surface(surface_id).expect("serializes");
+        let file = crate::io::step::parse(&format!(
+            "ISO-10303-21;\nHEADER;\nFILE_SCHEMA(('CONFIG_CONTROL_DESIGN'));\nENDSEC;\n\
+             DATA;\n{}ENDSEC;\nEND-ISO-10303-21;\n",
+            emitter.data
+        ))
+        .expect("emitted records parse");
+
+        let inst = file
+            .data
+            .iter()
+            .find(|i| i.entity.part("B_SPLINE_SURFACE_WITH_KNOTS").is_some())
+            .expect("a b-spline surface was emitted");
+        let (base, knots_rec, shift) = match inst.entity.part("B_SPLINE_SURFACE") {
+            Some(base) => (
+                base,
+                inst.entity
+                    .part("B_SPLINE_SURFACE_WITH_KNOTS")
+                    .expect("knots"),
+                0,
+            ),
+            None => {
+                let simple = inst
+                    .entity
+                    .part("B_SPLINE_SURFACE_WITH_KNOTS")
+                    .expect("knots");
+                (simple, simple, 1)
+            }
+        };
+        assert_eq!(
+            base.attributes[shift].as_integer().expect("u degree"),
+            original.degree_u() as i64
+        );
+        assert_eq!(
+            base.attributes[shift + 1].as_integer().expect("v degree"),
+            original.degree_v() as i64
+        );
+
+        let (rows, cols) = original.grid_size();
+        let grid = base.attributes[shift + 2].as_list().expect("control grid");
+        assert_eq!(grid.len(), rows, "grid rows (outer index runs over u)");
+        for (i, row) in grid.iter().enumerate() {
+            let row = points(&file, row.as_list().expect("grid row"));
+            assert_eq!(row.len(), cols, "grid row {i} length");
+            for (j, point) in row.iter().enumerate() {
+                assert_eq!(
+                    *point,
+                    original.control_point(i, j),
+                    "control point {i},{j}"
+                );
+            }
+        }
+
+        let base_index = if shift == 0 { 0 } else { 8 };
+        let (u_mults, v_mults) = (ints(knots_rec, base_index), ints(knots_rec, base_index + 1));
+        let (u_knots, v_knots) = (
+            reals(knots_rec, base_index + 2),
+            reals(knots_rec, base_index + 3),
+        );
+        assert_eq!(
+            expand(&u_knots, &u_mults),
+            original.knot_vector_u().knots(),
+            "u knot vector"
+        );
+        assert_eq!(
+            expand(&v_knots, &v_mults),
+            original.knot_vector_v().knots(),
+            "v knot vector"
+        );
+
+        match inst.entity.part("RATIONAL_B_SPLINE_SURFACE") {
+            Some(rec) => {
+                let weights = rec.attributes[0].as_list().expect("weight grid");
+                assert_eq!(weights.len(), rows, "weight grid rows");
+                for (i, row) in weights.iter().enumerate() {
+                    let row: Vec<f64> = row
+                        .as_list()
+                        .expect("weight row")
+                        .iter()
+                        .map(|v| v.as_real().expect("real weight"))
+                        .collect();
+                    for (j, w) in row.iter().enumerate() {
+                        assert_eq!(*w, original.weight(i, j), "weight {i},{j}");
+                    }
+                }
+            }
+            None => {
+                for i in 0..rows {
+                    for j in 0..cols {
+                        assert_eq!(original.weight(i, j), 1.0, "unweighted patch");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn emitted_nurbs_surface_reparses_bit_identically() {
+        assert_surface_reparses(&sample_surface());
+    }
+
+    #[test]
+    fn emitted_rational_nurbs_surface_reparses_bit_identically() {
+        let patch = sample_surface();
+        let (rows, cols) = patch.grid_size();
+        let grid: Vec<Vec<Point3>> = (0..rows)
+            .map(|i| (0..cols).map(|j| patch.control_point(i, j)).collect())
+            .collect();
+        let w = std::f64::consts::FRAC_1_SQRT_2;
+        let weighted = NurbsSurface::new(
+            grid,
+            vec![vec![1.0, w, 1.0], vec![2.0, 0.25, 1.0]],
+            patch.knot_vector_u().clone(),
+            patch.knot_vector_v().clone(),
+        )
+        .expect("weighted patch");
+        assert_surface_reparses(&weighted);
     }
 
     // ------------------------------------------------------------------

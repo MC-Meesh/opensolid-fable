@@ -32,7 +32,9 @@
 //! # Mesh fallback
 //!
 //! `b_spline_curve_with_knots` / `b_spline_surface_with_knots` parse into
-//! [`NurbsCurve`] / [`NurbsSurface`] for evaluation. The geometry store
+//! [`NurbsCurve`] / [`NurbsSurface`] for evaluation — in both spellings,
+//! the plain entity and the `rational_b_spline_*` complex instance that
+//! carries a weight grid (of-3qy.7). The geometry store
 //! now has freeform variants to hold them ([`Curve3::Nurbs`],
 //! [`Surface3::Nurbs`]) and every consumer — evaluation, projection,
 //! tessellation, transform — handles them, but this mapper does not yet
@@ -886,6 +888,17 @@ fn resolve_surface(
 ) -> MapResult<RawSurface> {
     let inst = instance(file, id, referrer)?;
     let Some(rec) = inst.as_simple() else {
+        // The one complex instance with a kernel form: a (usually
+        // rational) B-spline patch, spelled as B_SPLINE_SURFACE +
+        // B_SPLINE_SURFACE_WITH_KNOTS + RATIONAL_B_SPLINE_SURFACE. Without
+        // the WITH_KNOTS part the knots are implied by some other subtype
+        // (QUASI_UNIFORM_SURFACE and friends) and there is nothing exact to
+        // recover, so those keep falling through as unsupported.
+        if inst.entity.part("B_SPLINE_SURFACE_WITH_KNOTS").is_some() {
+            return Ok(RawSurface::Nurbs(Box::new(
+                resolve_complex_bspline_surface(file, inst, id, scale)?,
+            )));
+        }
         return Err(unsupported(
             id,
             format!("complex surface instance ({})", type_names(inst)),
@@ -1333,6 +1346,14 @@ fn resolve_curve(
 ) -> MapResult<RawCurve> {
     let inst = instance(file, id, referrer)?;
     let Some(rec) = inst.as_simple() else {
+        // Mirror of the surface side: a rational B-spline curve is spelled
+        // as a complex instance because the plain entity has no weight
+        // slot. Other complex curves stay unsupported.
+        if inst.entity.part("B_SPLINE_CURVE_WITH_KNOTS").is_some() {
+            return Ok(RawCurve::Nurbs(Box::new(resolve_complex_bspline_curve(
+                file, inst, id, scale,
+            )?)));
+        }
         return Err(unsupported(
             id,
             format!("complex curve instance ({})", type_names(inst)),
@@ -1535,18 +1556,16 @@ fn resolve_bspline_curve(
     NurbsCurve::bspline(control_points, kv).map_err(|e| nurbs_error(id, &e))
 }
 
-/// `B_SPLINE_SURFACE_WITH_KNOTS(name, u_degree, v_degree, control_grid,
-/// form, u_closed, v_closed, self_intersect, u_mults, v_mults, u_knots,
-/// v_knots, knot_spec)`. The control grid's outer index runs over `u`.
-fn resolve_bspline_surface(
+/// A rectangular list-of-lists of `cartesian_point` references at `index`,
+/// resolved row by row. The outer index runs over `u`.
+fn resolve_control_grid(
     file: &StepFile,
     rec: &SimpleRecord,
+    index: usize,
     id: u64,
     scale: f64,
-) -> MapResult<NurbsSurface> {
-    let u_degree = int_attr(rec, 1, id)?;
-    let v_degree = int_attr(rec, 2, id)?;
-    let rows = list_attr(rec, 3, id)?;
+) -> MapResult<Vec<Vec<Point3>>> {
+    let rows = list_attr(rec, index, id)?;
     let mut grid = Vec::with_capacity(rows.len());
     for row in rows {
         let cells = row
@@ -1563,6 +1582,40 @@ fn resolve_bspline_surface(
             .collect::<MapResult<Vec<_>>>()?;
         grid.push(points);
     }
+    Ok(grid)
+}
+
+/// A rectangular list-of-lists of reals at `index` (a rational patch's
+/// weight grid, shaped like its control grid).
+fn resolve_weight_grid(rec: &SimpleRecord, index: usize, id: u64) -> MapResult<Vec<Vec<f64>>> {
+    list_attr(rec, index, id)?
+        .iter()
+        .map(|row| {
+            let cells = row
+                .as_list()
+                .ok_or_else(|| invalid(id, "weight grid row is not a list"))?;
+            cells
+                .iter()
+                .map(|cell| {
+                    as_number(cell).ok_or_else(|| invalid(id, "weight grid cell is not a number"))
+                })
+                .collect::<MapResult<Vec<_>>>()
+        })
+        .collect()
+}
+
+/// `B_SPLINE_SURFACE_WITH_KNOTS(name, u_degree, v_degree, control_grid,
+/// form, u_closed, v_closed, self_intersect, u_mults, v_mults, u_knots,
+/// v_knots, knot_spec)`. The control grid's outer index runs over `u`.
+fn resolve_bspline_surface(
+    file: &StepFile,
+    rec: &SimpleRecord,
+    id: u64,
+    scale: f64,
+) -> MapResult<NurbsSurface> {
+    let u_degree = int_attr(rec, 1, id)?;
+    let v_degree = int_attr(rec, 2, id)?;
+    let grid = resolve_control_grid(file, rec, 3, id, scale)?;
     let u_mults = int_list(rec, 8, id)?;
     let v_mults = int_list(rec, 9, id)?;
     let u_knots = real_list(rec, 10, id)?;
@@ -1570,6 +1623,94 @@ fn resolve_bspline_surface(
     let kv_u = knot_vector(u_degree, &u_knots, &u_mults, id)?;
     let kv_v = knot_vector(v_degree, &v_knots, &v_mults, id)?;
     NurbsSurface::bspline(grid, kv_u, kv_v).map_err(|e| nurbs_error(id, &e))
+}
+
+/// The partial record of a complex instance, by type name.
+fn complex_part<'a>(inst: &'a Instance, type_name: &str, id: u64) -> MapResult<&'a SimpleRecord> {
+    inst.entity.part(type_name).ok_or_else(|| {
+        invalid(
+            id,
+            format!(
+                "complex instance ({}) has no {type_name} part",
+                type_names(inst)
+            ),
+        )
+    })
+}
+
+/// A rational B-spline curve spelled as a complex instance:
+///
+/// ```text
+/// ( BOUNDED_CURVE() B_SPLINE_CURVE(degree, control_points, form, closed,
+///   self_intersect) B_SPLINE_CURVE_WITH_KNOTS(mults, knots, spec) CURVE()
+///   GEOMETRIC_REPRESENTATION_ITEM() RATIONAL_B_SPLINE_CURVE(weights)
+///   REPRESENTATION_ITEM(name) )
+/// ```
+///
+/// Partial records carry only their own declared attributes, so the indices
+/// are all shifted relative to the simple `*_WITH_KNOTS` form — there is no
+/// inherited `name` in front. The `RATIONAL_` part is optional: exporters
+/// occasionally spell a non-rational curve this way, and unit weights are
+/// then the right reading.
+fn resolve_complex_bspline_curve(
+    file: &StepFile,
+    inst: &Instance,
+    id: u64,
+    scale: f64,
+) -> MapResult<NurbsCurve> {
+    let base = complex_part(inst, "B_SPLINE_CURVE", id)?;
+    let knots_rec = complex_part(inst, "B_SPLINE_CURVE_WITH_KNOTS", id)?;
+    let degree = int_attr(base, 0, id)?;
+    let control_points = ref_list(base, 1, id)?
+        .into_iter()
+        .map(|p| resolve_point(file, p, id, scale))
+        .collect::<MapResult<Vec<_>>>()?;
+    let multiplicities = int_list(knots_rec, 0, id)?;
+    let knots = real_list(knots_rec, 1, id)?;
+    let kv = knot_vector(degree, &knots, &multiplicities, id)?;
+    let weights = match inst.entity.part("RATIONAL_B_SPLINE_CURVE") {
+        Some(rational) => real_list(rational, 0, id)?,
+        None => vec![1.0; control_points.len()],
+    };
+    NurbsCurve::new(control_points, weights, kv).map_err(|e| nurbs_error(id, &e))
+}
+
+/// A rational B-spline surface spelled as a complex instance:
+///
+/// ```text
+/// ( BOUNDED_SURFACE() B_SPLINE_SURFACE(u_degree, v_degree, control_grid,
+///   form, u_closed, v_closed, self_intersect)
+///   B_SPLINE_SURFACE_WITH_KNOTS(u_mults, v_mults, u_knots, v_knots, spec)
+///   GEOMETRIC_REPRESENTATION_ITEM() RATIONAL_B_SPLINE_SURFACE(weights)
+///   REPRESENTATION_ITEM(name) SURFACE() )
+/// ```
+///
+/// Same attribute shift as the curve form, and the same optional
+/// `RATIONAL_` part.
+fn resolve_complex_bspline_surface(
+    file: &StepFile,
+    inst: &Instance,
+    id: u64,
+    scale: f64,
+) -> MapResult<NurbsSurface> {
+    let base = complex_part(inst, "B_SPLINE_SURFACE", id)?;
+    let knots_rec = complex_part(inst, "B_SPLINE_SURFACE_WITH_KNOTS", id)?;
+    let u_degree = int_attr(base, 0, id)?;
+    let v_degree = int_attr(base, 1, id)?;
+    let grid = resolve_control_grid(file, base, 2, id, scale)?;
+    let u_mults = int_list(knots_rec, 0, id)?;
+    let v_mults = int_list(knots_rec, 1, id)?;
+    let u_knots = real_list(knots_rec, 2, id)?;
+    let v_knots = real_list(knots_rec, 3, id)?;
+    let kv_u = knot_vector(u_degree, &u_knots, &u_mults, id)?;
+    let kv_v = knot_vector(v_degree, &v_knots, &v_mults, id)?;
+    match inst.entity.part("RATIONAL_B_SPLINE_SURFACE") {
+        Some(rational) => {
+            let weights = resolve_weight_grid(rational, 0, id)?;
+            NurbsSurface::new(grid, weights, kv_u, kv_v).map_err(|e| nurbs_error(id, &e))
+        }
+        None => NurbsSurface::bspline(grid, kv_u, kv_v).map_err(|e| nurbs_error(id, &e)),
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -4340,6 +4481,113 @@ mod tests {
         assert_eq!(surface.degree_v(), 1);
         assert!((surface.point(0.0, 0.0) - Point3::new(0.0, 0.0, 0.0)).norm() < 1e-12);
         assert!((surface.point(1.0, 1.0) - Point3::new(1.0, 1.0, 1.0)).norm() < 1e-12);
+    }
+
+    /// The rational spelling: weights live on a `RATIONAL_B_SPLINE_CURVE`
+    /// part of a complex instance, and the partial records drop the
+    /// inherited `name`, so every attribute index shifts (of-3qy.7).
+    #[test]
+    fn resolves_rational_bspline_curve_complex_instance() {
+        // The standard rational quarter circle: weights (1, √2/2, 1) about
+        // the unit circle's control triangle.
+        let file = parse_fixture(
+            "#1 = CARTESIAN_POINT('', (1., 0., 0.));
+             #2 = CARTESIAN_POINT('', (1., 1., 0.));
+             #3 = CARTESIAN_POINT('', (0., 1., 0.));
+             #4 = ( BOUNDED_CURVE() B_SPLINE_CURVE(2, (#1, #2, #3), .UNSPECIFIED., .F., .U.) \
+                  B_SPLINE_CURVE_WITH_KNOTS((3, 3), (0., 1.), .UNSPECIFIED.) CURVE() \
+                  GEOMETRIC_REPRESENTATION_ITEM() \
+                  RATIONAL_B_SPLINE_CURVE((1., 0.7071067811865476, 1.)) \
+                  REPRESENTATION_ITEM('') );",
+        );
+        let RawCurve::Nurbs(curve) = resolve_curve(&file, 4, 0, 1.0, 1.0).unwrap() else {
+            panic!("expected a NURBS curve");
+        };
+        assert_eq!(curve.degree(), 2);
+        assert_eq!(curve.weights()[1], std::f64::consts::FRAC_1_SQRT_2);
+        // The weights are what make this an exact arc: the midpoint lies on
+        // the unit circle, which an unweighted curve would miss by ~0.03.
+        let (t0, t1) = curve.knot_vector().domain();
+        let mid = curve.point((t0 + t1) / 2.0);
+        assert!(
+            (mid.coords.norm() - 1.0).abs() < 1e-12,
+            "midpoint {mid:?} is not on the unit circle — weights were dropped"
+        );
+    }
+
+    #[test]
+    fn resolves_rational_bspline_surface_complex_instance() {
+        let file = parse_fixture(
+            "#1 = CARTESIAN_POINT('', (1., 0., 0.));
+             #2 = CARTESIAN_POINT('', (1., 1., 0.));
+             #3 = CARTESIAN_POINT('', (0., 1., 0.));
+             #4 = CARTESIAN_POINT('', (1., 0., 1.));
+             #5 = CARTESIAN_POINT('', (1., 1., 1.));
+             #6 = CARTESIAN_POINT('', (0., 1., 1.));
+             #7 = ( BOUNDED_SURFACE() \
+                  B_SPLINE_SURFACE(1, 2, ((#1, #2, #3), (#4, #5, #6)), .UNSPECIFIED., \
+                  .F., .F., .U.) \
+                  B_SPLINE_SURFACE_WITH_KNOTS((2, 2), (3, 3), (0., 1.), (0., 1.), \
+                  .UNSPECIFIED.) GEOMETRIC_REPRESENTATION_ITEM() \
+                  RATIONAL_B_SPLINE_SURFACE(((1., 0.7071067811865476, 1.), \
+                  (1., 0.7071067811865476, 1.))) REPRESENTATION_ITEM('') SURFACE() );",
+        );
+        let RawSurface::Nurbs(surface) = resolve_surface(&file, 7, 0, 1.0, 1.0).unwrap() else {
+            panic!("expected a NURBS surface");
+        };
+        assert_eq!(surface.degree_u(), 1);
+        assert_eq!(surface.degree_v(), 2);
+        assert_eq!(surface.grid_size(), (2, 3));
+        assert_eq!(surface.weight(1, 1), std::f64::consts::FRAC_1_SQRT_2);
+        // A quarter-cylinder: every v-isoline is the exact unit arc.
+        let mid = surface.point(0.5, 0.5);
+        assert!(
+            (mid.coords.xy().norm() - 1.0).abs() < 1e-12,
+            "patch midpoint {mid:?} is off the unit cylinder — weights were dropped"
+        );
+    }
+
+    /// The complex spelling without the `RATIONAL_` part — some exporters
+    /// emit it for plain B-splines. Unit weights are the right reading.
+    #[test]
+    fn resolves_complex_bspline_without_rational_part_as_unweighted() {
+        let file = parse_fixture(
+            "#1 = CARTESIAN_POINT('', (0., 0., 0.));
+             #2 = CARTESIAN_POINT('', (1., 1., 0.));
+             #3 = CARTESIAN_POINT('', (2., 0., 0.));
+             #4 = ( BOUNDED_CURVE() B_SPLINE_CURVE(2, (#1, #2, #3), .UNSPECIFIED., .F., .U.) \
+                  B_SPLINE_CURVE_WITH_KNOTS((3, 3), (0., 1.), .UNSPECIFIED.) CURVE() \
+                  GEOMETRIC_REPRESENTATION_ITEM() REPRESENTATION_ITEM('') );",
+        );
+        let RawCurve::Nurbs(curve) = resolve_curve(&file, 4, 0, 1.0, 1.0).unwrap() else {
+            panic!("expected a NURBS curve");
+        };
+        assert_eq!(curve.weights(), &[1.0, 1.0, 1.0]);
+    }
+
+    /// A complex surface with no `B_SPLINE_SURFACE_WITH_KNOTS` part has its
+    /// knots implied by some other subtype (QUASI_UNIFORM_SURFACE and
+    /// friends); there is nothing exact to recover, so it must still be
+    /// refused rather than guessed at.
+    #[test]
+    fn complex_surface_without_explicit_knots_stays_unsupported() {
+        let file = parse_fixture(
+            "#1 = CARTESIAN_POINT('', (0., 0., 0.));
+             #2 = CARTESIAN_POINT('', (0., 1., 0.));
+             #3 = CARTESIAN_POINT('', (1., 0., 0.));
+             #4 = CARTESIAN_POINT('', (1., 1., 1.));
+             #5 = ( BOUNDED_SURFACE() \
+                  B_SPLINE_SURFACE(1, 1, ((#1, #2), (#3, #4)), .UNSPECIFIED., .F., .F., .U.) \
+                  GEOMETRIC_REPRESENTATION_ITEM() QUASI_UNIFORM_SURFACE() \
+                  REPRESENTATION_ITEM('') SURFACE() );",
+        );
+        let Err(err) = resolve_surface(&file, 5, 0, 1.0, 1.0) else {
+            panic!("a knot-less complex surface must not resolve");
+        };
+        assert!(
+            matches!(err, MapError::Unsupported { .. }),
+            "expected an unsupported diagnostic, got {err:?}"
+        );
     }
 
     // ---- entity-coverage: edge trimming ----

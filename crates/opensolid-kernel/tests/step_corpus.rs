@@ -12,6 +12,11 @@
 //!    to the exact `f64` and the whole topology graph to the same traversal.
 //!    Stores that share geometry across faces reach it from the second write
 //!    rather than the first (of-kb8, below); every other case is immediate.
+//!    Freeform (NURBS) bodies are gated one step short of that: the writer
+//!    emits them exactly (of-3qy.7), but the reader's exact path does not
+//!    hang a `Surface3::Nurbs` on a face yet (of-3qy.8), so they come back
+//!    through the tessellated fallback and are gated on volume rather than
+//!    on a byte-identical re-write.
 //! 2. **Synthetic adversarial files** — missing entities, cyclic references,
 //!    degenerate geometry, unit mismatches, huge coordinates, overflowing
 //!    reals, truncation, garbage. The reader must return structured errors
@@ -381,6 +386,266 @@ fn round_trip_large_but_finite_coordinates() {
     )
     .expect("translate");
     assert_round_trip(&store, &geo, body, "1e6-scale block");
+}
+
+// ---------------------------------------------------------------------
+// 1c. Round trips: freeform (NURBS) geometry (of-3qy.7)
+// ---------------------------------------------------------------------
+// The writer used to refuse `Curve3::Nurbs` / `Surface3::Nurbs` outright
+// rather than approximate them; it now emits the real
+// `B_SPLINE_CURVE_WITH_KNOTS` / `B_SPLINE_SURFACE_WITH_KNOTS` (and the
+// `RATIONAL_B_SPLINE_*` complex instance when weights are present).
+//
+// The reader's *exact* path still refuses to hang a `Surface3::Nurbs` on a
+// face (that is of-3qy.8), so today these bodies re-import through the
+// tessellated fallback. That still gates the emission end to end: the
+// fallback evaluates the patch the file actually carries, so a transposed
+// control grid, a dropped knot multiplicity or a lost weight lands as the
+// wrong volume. The outcome assertion accepts an exact B-Rep too, so these
+// tests keep gating once of-3qy.8 flips the import side.
+
+mod freeform {
+    use super::*;
+    use opensolid_kernel::brep::curve::plane_basis;
+    use opensolid_kernel::brep::{
+        Curve3, CurveEval, KnotVector, NurbsCurve, NurbsSurface, Surface3,
+    };
+    use opensolid_kernel::core::mesh::TriangleMesh;
+
+    /// Signed volume by the divergence theorem: works on a fallback mesh,
+    /// which is not indexed as a manifold but is closed and outward-wound.
+    fn signed_volume(mesh: &TriangleMesh) -> f64 {
+        mesh.indices
+            .iter()
+            .map(|tri| {
+                let [a, b, c] = tri.map(|i| mesh.positions[i].coords);
+                a.dot(&b.cross(&c)) / 6.0
+            })
+            .sum()
+    }
+
+    /// A control point's weight, as a function of *where it is* rather than
+    /// which patch owns it.
+    ///
+    /// That is what keeps the six rational patches meshing into a closed
+    /// manifold. Each block edge is shared by two faces, and the boundary
+    /// of a rational bilinear patch is the rational degree-1 curve carrying
+    /// its two corner weights; position-keyed weights make both faces
+    /// assign that edge the same pair, so both sample it at the same points
+    /// (the sample set is symmetric under t ↦ 1−t, so the two traversal
+    /// directions agree) and the fallback's weld finds them. A weight grid
+    /// keyed to each face's own (u, v) frame instead reparameterizes shared
+    /// edges differently on either side and tears the mesh at T-junctions.
+    ///
+    /// The coefficients are arbitrary and small: all eight corners get
+    /// distinct, positive weights well away from 1, so a writer that
+    /// dropped or transposed the weight grid changes the parameterization
+    /// visibly.
+    fn corner_weight(p: &opensolid_kernel::core::types::Point3) -> f64 {
+        1.0 + 0.05 * p.x + 0.03 * p.y + 0.02 * p.z
+    }
+
+    /// A 2×3×4 block whose six faces are bilinear NURBS patches **exactly
+    /// coincident with the planes they replace**, and one of whose edges
+    /// carries a degree-1 NURBS curve coincident with its line.
+    ///
+    /// Coincident on purpose: the solid's volume stays exactly 24, so the
+    /// round trip is gated against an analytic number rather than against
+    /// itself. Every freeform code path is still exercised — the writer
+    /// takes both NURBS arms, and the reader re-evaluates the patches and
+    /// the curve it finds in the file. Replacing *every* planar face rather
+    /// than one keeps the tessellated re-import a closed manifold: the
+    /// fallback grids a NURBS face over its whole domain, so a lone patch
+    /// among plane neighbours would meet them at T-junctions.
+    ///
+    /// `rational` weights each control point by [`corner_weight`], which
+    /// makes every patch a genuine `RATIONAL_B_SPLINE_SURFACE`. The locus
+    /// is unchanged — a positive-weight rational combination of coplanar
+    /// control points stays in their plane and still spans the same quad —
+    /// so the volume gate holds either way.
+    fn nurbs_block(rational: bool) -> (TopologyStore, GeometryStore, EntityId<Body>) {
+        let mut store = TopologyStore::new();
+        let mut geo = GeometryStore::new();
+        let body = primitives::block(&mut store, &mut geo, 2.0, 3.0, 4.0).expect("block");
+
+        let faces = store.faces_of_body(body);
+        for &face in &faces {
+            let sid = store
+                .face(face)
+                .expect("live face")
+                .surface
+                .expect("surface");
+            let Surface3::Plane { origin, normal } = *geo.surface(sid).expect("live surface")
+            else {
+                panic!("a block's faces are all planar");
+            };
+
+            // The face's rectangle in its own frame. `plane_basis`
+            // guarantees du × dv = normal, so each patch's normal agrees
+            // with the plane's and the face's stored sense stays correct.
+            let (du, dv) = plane_basis(&normal);
+            let (mut u_lo, mut u_hi, mut v_lo, mut v_hi) = (
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+            );
+            for vertex in store.vertices_of_face(face) {
+                let d = store.vertex(vertex).expect("live vertex").point - origin;
+                let (u, v) = (d.dot(&du), d.dot(&dv));
+                u_lo = u_lo.min(u);
+                u_hi = u_hi.max(u);
+                v_lo = v_lo.min(v);
+                v_hi = v_hi.max(v);
+            }
+            let at = |u: f64, v: f64| origin + du * u + dv * v;
+            let grid = vec![
+                vec![at(u_lo, v_lo), at(u_lo, v_hi)],
+                vec![at(u_hi, v_lo), at(u_hi, v_hi)],
+            ];
+            let knots = || KnotVector::new(1, vec![0.0, 0.0, 1.0, 1.0]).expect("bilinear knots");
+            let patch = if rational {
+                let weights = grid
+                    .iter()
+                    .map(|row| row.iter().map(corner_weight).collect())
+                    .collect();
+                NurbsSurface::new(grid, weights, knots(), knots()).expect("rational patch")
+            } else {
+                NurbsSurface::bspline(grid, knots(), knots()).expect("patch")
+            };
+            store.faces.get_mut(face).expect("live face").surface =
+                Some(geo.add_surface(Surface3::nurbs(patch)));
+        }
+
+        // One edge becomes a degree-1 NURBS curve through its own
+        // endpoints, clamped over the edge's own parameter range — the same
+        // locus and the same parameterization as the line it replaces.
+        let edge_id = store.edges_of_face(faces[0])[0];
+        let edge = store.edge(edge_id).expect("live edge").clone();
+        let line = geo
+            .curve(edge.curve.expect("edge curve"))
+            .expect("live curve")
+            .clone();
+        let spline = NurbsCurve::bspline(
+            vec![line.point(edge.t_start), line.point(edge.t_end)],
+            KnotVector::new(1, vec![edge.t_start, edge.t_start, edge.t_end, edge.t_end])
+                .expect("clamped knots"),
+        )
+        .expect("degree-1 spline");
+        store.edges.get_mut(edge_id).expect("live edge").curve =
+            Some(geo.add_curve(Curve3::nurbs(spline)));
+
+        (store, geo, body)
+    }
+
+    /// Write, re-import, and require the solid's volume to survive. Today
+    /// the freeform import lands in the mesh fallback; once of-3qy.8 wires
+    /// the exact path it lands as a B-Rep, and either is measured here.
+    fn assert_freeform_round_trip(
+        store: &TopologyStore,
+        geo: &GeometryStore,
+        body: EntityId<Body>,
+        expected_volume: f64,
+        context: &str,
+    ) -> String {
+        assert!(
+            store.check(body).is_empty(),
+            "{context}: original body must pass check: {:?}",
+            store.check(body)
+        );
+        let text = write_step(store, geo, &[body], &StepWriteOptions::default())
+            .unwrap_or_else(|e| panic!("{context}: freeform body must serialize: {e}"));
+
+        let (store2, geo2, report) = import(&text);
+        assert!(
+            !report.has_errors(),
+            "{context}: reader reported errors: {:?}",
+            report.diagnostics
+        );
+        assert_structured(&report);
+        assert_eq!(report.solids.len(), 1, "{context}: expected one solid");
+        let measured = match &report.solids[0].outcome {
+            SolidOutcome::BRep(body2) => closed_volume(&store2, &geo2, *body2)
+                .unwrap_or_else(|| panic!("{context}: exact re-import must tessellate")),
+            SolidOutcome::Mesh { mesh, .. } => signed_volume(mesh),
+            other => panic!("{context}: unstructured outcome {other:?}"),
+        };
+        let drift = (measured - expected_volume).abs() / expected_volume;
+        assert!(
+            drift <= 1e-9,
+            "{context}: volume {measured} is not {expected_volume} \
+             — the emitted control grid, knots or weights did not survive"
+        );
+        text
+    }
+
+    #[test]
+    fn round_trip_nurbs_faced_block() {
+        let (store, geo, body) = nurbs_block(false);
+        let text = assert_freeform_round_trip(&store, &geo, body, 24.0, "NURBS block");
+        assert!(
+            text.contains("B_SPLINE_SURFACE_WITH_KNOTS"),
+            "the faces must be emitted as real B-spline surfaces"
+        );
+        assert!(
+            text.contains("B_SPLINE_CURVE_WITH_KNOTS"),
+            "the freeform edge must be emitted as a real B-spline curve"
+        );
+        assert!(
+            !text.contains("RATIONAL"),
+            "unweighted geometry needs no complex instance"
+        );
+        // Emission is deterministic: the same stores produce the same file.
+        let again =
+            write_step(&store, &geo, &[body], &StepWriteOptions::default()).expect("second write");
+        assert_eq!(text, again, "writing twice must produce the same file");
+    }
+
+    #[test]
+    fn round_trip_rational_nurbs_faced_block() {
+        let (store, geo, body) = nurbs_block(true);
+        let text = assert_freeform_round_trip(&store, &geo, body, 24.0, "rational NURBS block");
+        // A weighted patch has nowhere to put its weights in the plain
+        // entity, so it must take the complex-instance form.
+        assert!(
+            text.contains("BOUNDED_SURFACE()") && text.contains("RATIONAL_B_SPLINE_SURFACE((("),
+            "a rational patch needs the complex-instance form"
+        );
+        assert!(
+            !text.contains("B_SPLINE_SURFACE_WITH_KNOTS('',"),
+            "no face may fall back to the unweighted entity and lose its weights"
+        );
+        // Weights are what make the re-imported parameterization match, and
+        // a patch written with all weights 1 would still pass the volume
+        // gate (same locus) — so pin every emitted weight grid exactly
+        // against the patch it came from.
+        let mut checked = 0;
+        for (_, surface) in geo.surfaces.iter() {
+            let Surface3::Nurbs(patch) = surface else {
+                continue;
+            };
+            let (rows, cols) = patch.grid_size();
+            let grid: Vec<String> = (0..rows)
+                .map(|i| {
+                    let row: Vec<String> = (0..cols)
+                        .map(|j| {
+                            let w = patch.weight(i, j);
+                            assert_ne!(w, 1.0, "the fixture must carry non-unit weights");
+                            format!("{w:?}")
+                        })
+                        .collect();
+                    format!("({})", row.join(","))
+                })
+                .collect();
+            let expected = format!("RATIONAL_B_SPLINE_SURFACE(({}))", grid.join(","));
+            assert!(
+                text.contains(&expected),
+                "weight grid missing from the emitted file: {expected}"
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 6, "every face of the block must be a patch");
+    }
 }
 
 // ---------------------------------------------------------------------
