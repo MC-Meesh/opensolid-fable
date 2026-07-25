@@ -2721,11 +2721,23 @@ impl<'a> Pipeline<'a> {
                     break;
                 }
             }
-            let mut pts: Vec<Point3> = Vec::with_capacity(run.len() + 2);
-            // Refine entry point (before the run's first sample).
+            let mut pts: Vec<Point3> = run.iter().map(|&i| curve.point(ts[i])).collect();
+            // Every run endpoint is polished onto its exact boundary
+            // junction — the refined clip crossings AND the raw ends of a
+            // run that begins or ends at an open curve's own station. A
+            // marched fragment ends where marching left the patch domain,
+            // i.e. ON a host face's boundary edge but only to the
+            // marcher's landing tolerance (~1e-8), an order beyond the
+            // welding snap; left raw, the imprints meeting at that
+            // junction disagree and the tessellation tears (of-bd3).
+            // Polishing is a no-op for endpoints away from any boundary
+            // edge (mid-face tangent ends, seam cuts).
+            //
+            // Entry point (before the run's first sample).
             let first_idx = run[0];
             let prev_idx = (first_idx + total - 1) % total;
-            if (closed_curve || first_idx > 0) && !flags[prev_idx] {
+            let entry_refined = (closed_curve || first_idx > 0) && !flags[prev_idx];
+            if entry_refined {
                 let mut t_out = ts[prev_idx];
                 let t_in = ts[first_idx];
                 if closed_curve && t_out > t_in {
@@ -2734,22 +2746,59 @@ impl<'a> Pipeline<'a> {
                 // Seed from the run's first station: it is inside, so its
                 // parameters are on the sheet the crossing belongs to.
                 let t = refine_clip_crossing(&inside, t_out, t_in, Some(uvs[first_idx]))?;
-                let p = curve.point(t);
-                pts.push(self.polish_clip_endpoint(p, fa, fb));
+                let p = self.polish_clip_endpoint(curve.point(t), fa, fb);
+                pts.insert(0, p);
+            } else {
+                pts[0] = self.polish_clip_endpoint(pts[0], fa, fb);
             }
-            pts.extend(run.iter().map(|&i| curve.point(ts[i])));
-            // Refine exit point (after the run's last sample).
+            // Exit point (after the run's last sample).
             let last_idx = *run.last().expect("non-empty run");
             let next_idx = step(last_idx);
-            if (closed_curve || last_idx + 1 < total) && !flags[next_idx] {
+            let exit_refined = (closed_curve || last_idx + 1 < total) && !flags[next_idx];
+            if exit_refined {
                 let mut t_out = ts[next_idx];
                 let t_in = ts[last_idx];
                 if closed_curve && t_out < t_in {
                     t_out += period;
                 }
                 let t = refine_clip_crossing(&inside, t_out, t_in, Some(uvs[last_idx]))?;
-                let p = curve.point(t);
-                pts.push(self.polish_clip_endpoint(p, fa, fb));
+                let p = self.polish_clip_endpoint(curve.point(t), fa, fb);
+                pts.push(p);
+            } else {
+                let last = pts.len() - 1;
+                pts[last] = self.polish_clip_endpoint(pts[last], fa, fb);
+            }
+            // A polished endpoint *supersedes* raw stations the marcher
+            // left within its landing tolerance of the junction (observed
+            // up to ~2.5e-7 — two orders beyond the welding snap and not a
+            // fixed length, so the criterion is relative to the local
+            // station pitch). Kept, such a station forms a sliver segment
+            // the weld cannot close — and when the polish moved the
+            // endpoint *past* it, a backtracking tail that defeats the
+            // straight-run detection in `build_output` — tearing the
+            // tessellation at the junction (of-bd3). Dropping a station
+            // within a fraction of a pitch of the endpoint never loses
+            // geometry: the neighboring chord's sagitta over one station
+            // step is the same error the sampling already accepts.
+            let band = self.snap * EDGE_MATCH_SNAP * 4.0;
+            while pts.len() > 2 {
+                let gap = (pts[1] - pts[0]).norm();
+                let pitch = (pts[2] - pts[1]).norm();
+                if gap <= band || gap <= pitch * 0.1 {
+                    pts.remove(1);
+                } else {
+                    break;
+                }
+            }
+            while pts.len() > 2 {
+                let n = pts.len();
+                let gap = (pts[n - 2] - pts[n - 1]).norm();
+                let pitch = (pts[n - 3] - pts[n - 2]).norm();
+                if gap <= band || gap <= pitch * 0.1 {
+                    pts.remove(n - 2);
+                } else {
+                    break;
+                }
             }
             // An open marched fragment can genuinely close on itself: a
             // ring cut at a single chart seam ends where it starts. Keep
@@ -5058,6 +5107,28 @@ fn source_curve<'p>(pipe: &'p Pipeline<'_>, source: CurveSource) -> &'p Curve3 {
     }
 }
 
+/// Whether an open polyline is geometrically a straight segment: every
+/// interior point within `tol` of the endpoint chord (distance to the
+/// clamped segment, so points marginally past an end still count as
+/// oversampling while a genuine doubling-back run does not). Degenerate
+/// chords (length ≤ `tol`) report `false`; there is nothing to safely
+/// drop against them.
+fn polyline_is_straight(points: &[Point3], tol: f64) -> bool {
+    if points.len() < 3 {
+        return true;
+    }
+    let a = points[0];
+    let chord = points[points.len() - 1] - a;
+    let len2 = chord.norm_squared();
+    if len2 <= tol * tol {
+        return false;
+    }
+    points[1..points.len() - 1].iter().all(|p| {
+        let t = ((p - a).dot(&chord) / len2).clamp(0.0, 1.0);
+        (a + chord * t - p).norm() <= tol
+    })
+}
+
 /// Arc-length midpoint of a polyline: the point half its length along.
 ///
 /// Used as an atom's positional signature, and taken by length rather than
@@ -5350,8 +5421,17 @@ fn build_output(
                 let dart_count = cy.dart_offsets.len();
                 let mut keep = vec![true; n];
                 for (k, &(ai, _)) in cy.darts.iter().enumerate() {
+                    // Line-sourced darts are straight by construction;
+                    // marched imprints (NURBS SSI is always marched) need
+                    // the geometric test — a planar-patch junction is a
+                    // straight polyline carried by a `Curve3::Polyline`,
+                    // and its interior samples are the same ear-clip
+                    // hazard (of-bd3). The test runs on the shared atom,
+                    // so the two faces hosting the run drop identically
+                    // and rim welding is preserved.
                     let straight =
-                        matches!(source_curve(pipe, atom_source[ai]), Curve3::Line { .. });
+                        matches!(source_curve(pipe, atom_source[ai]), Curve3::Line { .. })
+                            || polyline_is_straight(&atoms[ai].points, pipe.snap);
                     if !straight || atoms[ai].closed {
                         continue;
                     }

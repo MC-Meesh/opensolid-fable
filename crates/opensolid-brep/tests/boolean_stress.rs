@@ -28,15 +28,17 @@
 //! fallback. The campaigns' history — the bugs they filed and the fixes
 //! that retired them — is in the git log, not here.
 //!
-//! Every case here is live. The last `#[ignore]` (of-9ia,
-//! `skew_frustums_inclusion_exclusion`) lifted with of-37i.5: its two
+//! Every case here is live. The of-9ia `#[ignore]`
+//! (`skew_frustums_inclusion_exclusion`) lifted with of-37i.5: its two
 //! blockers were both in imprint hosting and neither was specific to the
 //! marched cone-cone arc, which had been correct all along. The coaxial
 //! cone-cone pair goes through the analytic SSI
 //! (`opposed_cones_intersection`, `coaxial_frustums_union_identity`).
 //! The no-panic guard `no_panics_on_cone_configurations` stays live across
 //! the promotion — it accepts both a valid exact solid and the structured
-//! `NotImplemented` F-Rep fallback.
+//! `NotImplemented` F-Rep fallback. Section (14)'s ignores lifted too:
+//! of-hqb (the curved NURBS bore) and of-bd3 (the randomized
+//! planar-NURBS campaigns) — its whole promotion gate is live.
 //!
 //! Section (14) is the FREEFORM §9 NURBS promotion-gate campaign
 //! (of-37i.5), written stress-suite-first per the same policy: until it is
@@ -3742,18 +3744,20 @@ fn nurbs_box_bored_by_analytic_bar() {
 // predicates in the NURBS slots (of-3oj), so classification never
 // abstains and any failure is the pipeline's, not the crutch's.
 //
-// GATE STATUS: RED. The deterministic checks (knot scaling, multi-span,
-// domain-boundary slivers) are green and live, and the curved-operand
-// bore (the highest-value test below) is green since of-hqb: the clip
-// predicate now inverts chord-sampled stations by banded projection
-// (`Chart::param_within`) and NURBS mesh faces take the boundary-CDT
-// seed. One pipeline defect from the general-position campaigns remains
-// `#[ignore]`d:
-//   - of-bd3 — randomized planar-NURBS pairs (both NURBS↔analytic and
-//     NURBS↔NURBS) tessellate non-manifold in configurations the
-//     analytic campaigns handle.
-// Until it lands and the ignores lift, the hybrid kernel's F-Rep
-// fallback for NURBS operands stays the correct route.
+// GATE STATUS: GREEN — every case in this section is live. The
+// deterministic checks (knot scaling, multi-span, domain-boundary
+// slivers) were green first; the curved-operand bore (the highest-value
+// test below) is green since of-hqb (the clip predicate inverts
+// chord-sampled stations by banded projection, `Chart::param_within`,
+// and NURBS mesh faces take the boundary-CDT seed); and the randomized
+// planar-NURBS campaigns (identity + rotation invariance) are green
+// since of-bd3 (marched imprint run endpoints are polished onto their
+// exact boundary junctions, superseding raw stations inside the
+// marcher's landing tolerance, and geometrically straight marched runs
+// get the same interior-sample drop as Line-sourced darts, so the ear
+// clippers of adjacent faces no longer disagree along shared junction
+// lines). Retiring the hybrid kernel's F-Rep fallback routing for NURBS
+// operands is of-ew7 (the §9 promotion).
 
 /// Exact strict interior predicate for the finite solid cylinder (axis
 /// `+Z` through `(cx, cy)`, radius `r`, `z ∈ (z0, z1)`), to inject via
@@ -3982,9 +3986,6 @@ fn expected_subtract_topology(pair: &BlockPair, repro: &str) -> (usize, usize) {
 /// from the pair's overlap structure — through-bores are *expected* to
 /// come out genus 1, full slabs to split `A` in two.
 #[test]
-#[ignore = "of-bd3: general-position NURBS booleans tessellate non-manifold \
-            (seed 0xACE5 case 0: NURBS ∪ analytic corner notch, 618 triangles) \
-            — deterministic fixtures pass, randomized configurations do not"]
 fn random_transversal_nurbs_block_pairs_volume_identity() {
     // Seed chosen (see of-37i.5) so all 12 pairs are transversal AND the
     // expected subtract topologies are diverse: two through-bores
@@ -4060,9 +4061,6 @@ fn random_transversal_nurbs_block_pairs_volume_identity() {
 /// the same invariant through NURBS↔NURBS SSI and NURBS charts, where a
 /// frame-dependent seed or normalization would show up as volume drift.
 #[test]
-#[ignore = "of-bd3: general-position NURBS booleans tessellate non-manifold \
-            (seed 0x0F37_501A case 3: axis-aligned NURBS ∩ NURBS thin slab, \
-            470 triangles — fails before any rotation is applied)"]
 fn random_nurbs_block_pairs_rotation_invariance() {
     let mut rng = Rng::new(0x0F37_501A);
     for case in 0..4 {
