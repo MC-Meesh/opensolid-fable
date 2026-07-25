@@ -8,8 +8,14 @@
 //!   `axis1_placement`, `axis2_placement_3d`; `plane`,
 //!   `cylindrical_surface`, `conical_surface`, `spherical_surface`,
 //!   `toroidal_surface` → [`Surface3`]; `line`, `circle`, `ellipse` →
-//!   [`Curve3`]. A `trimmed_curve` is transparent (edges re-trim by their
-//!   vertices), and `surface_of_linear_extrusion` /
+//!   [`Curve3`]. Freeform geometry is exact too (of-3qy.8):
+//!   `b_spline_surface` → [`Surface3::Nurbs`] and `b_spline_curve` →
+//!   [`Curve3::Nurbs`], in every AP203 spelling — the explicit
+//!   `*_with_knots` form, the `rational_b_spline_*` complex instance that
+//!   carries weights, and the implicit-knot subtypes `quasi_uniform_*`,
+//!   `uniform_*` and `bezier_*`, whose knot vectors are derived from the
+//!   degree and control-point count. A `trimmed_curve` is transparent
+//!   (edges re-trim by their vertices), and `surface_of_linear_extrusion` /
 //!   `surface_of_revolution` reduce to the exact quadric where one exists
 //!   (line → plane/cylinder/cone, axis-coplanar circle → sphere/torus,
 //!   circle along its normal → cylinder; NURBS bases extrude to an exact
@@ -31,22 +37,16 @@
 //!
 //! # Mesh fallback
 //!
-//! `b_spline_curve_with_knots` / `b_spline_surface_with_knots` parse into
-//! [`NurbsCurve`] / [`NurbsSurface`] for evaluation — in both spellings,
-//! the plain entity and the `rational_b_spline_*` complex instance that
-//! carries a weight grid (of-3qy.7). The geometry store
-//! now has freeform variants to hold them ([`Curve3::Nurbs`],
-//! [`Surface3::Nurbs`]) and every consumer — evaluation, projection,
-//! tessellation, transform — handles them, but this mapper does not yet
-//! build them: retiring the mesh fallback for B-splines is of-3qy.8.
-//! Until then it is unsupported, as are `parabola` / `hyperbola` edges
-//! (no conic variant), `composite_curve` edges, and swept surfaces with
-//! no quadric reduction. Solids containing any of those (or any
-//! other unmappable entity), and solids whose mapped topology fails
-//! `check`, fall back to a **tessellated import**: each face is
-//! triangulated straight from the STEP graph (planar faces ear-clipped
-//! from their boundary polylines, quadrics gridded over their parameter
-//! rectangle, NURBS patches gridded over their knot domain, swept
+//! B-splines no longer take this path (of-3qy.8) — they map exactly, as
+//! above. What is still unsupported is `parabola` / `hyperbola` edges (the
+//! geometry store has no conic variant), `composite_curve` edges, and
+//! swept surfaces with neither a quadric reduction nor a NURBS form.
+//! Solids containing any of those (or any other unmappable entity), and
+//! solids whose mapped topology fails `check`, fall back to a
+//! **tessellated import**: each face is triangulated straight from the
+//! STEP graph (planar faces ear-clipped from their boundary polylines,
+//! quadrics gridded over their parameter rectangle, NURBS patches gridded
+//! over their knot domain, swept
 //! surfaces gridded from their sampled basis curve), welded, and
 //! wrapped as a [`MeshSdf`] — an F-Rep field ready for CSG. Faces of one
 //! solid share each edge's discretization, so junctions weld watertight.
@@ -146,7 +146,7 @@ use opensolid_core::{EntityId, Point3, Vector3};
 
 use super::heal::{GeometryHealer, HealOptions, HealStrategy};
 use super::product::{PlacedSolid, resolve_instances};
-use super::{Instance, SimpleRecord, StepError, StepFile, Value};
+use super::{EntityRecord, Instance, SimpleRecord, StepError, StepFile, Value};
 use crate::convert::MeshSdf;
 
 const TAU: f64 = std::f64::consts::TAU;
@@ -887,18 +887,14 @@ fn resolve_surface(
     angle_scale: f64,
 ) -> MapResult<RawSurface> {
     let inst = instance(file, id, referrer)?;
+    // As for curves: one path for every B-spline spelling, including the
+    // `RATIONAL_B_SPLINE_SURFACE` complex instance.
+    if let Some(parts) = BSplineParts::surface(&inst.entity) {
+        return Ok(RawSurface::Nurbs(Box::new(resolve_bspline_surface(
+            file, &parts, id, scale,
+        )?)));
+    }
     let Some(rec) = inst.as_simple() else {
-        // The one complex instance with a kernel form: a (usually
-        // rational) B-spline patch, spelled as B_SPLINE_SURFACE +
-        // B_SPLINE_SURFACE_WITH_KNOTS + RATIONAL_B_SPLINE_SURFACE. Without
-        // the WITH_KNOTS part the knots are implied by some other subtype
-        // (QUASI_UNIFORM_SURFACE and friends) and there is nothing exact to
-        // recover, so those keep falling through as unsupported.
-        if inst.entity.part("B_SPLINE_SURFACE_WITH_KNOTS").is_some() {
-            return Ok(RawSurface::Nurbs(Box::new(
-                resolve_complex_bspline_surface(file, inst, id, scale)?,
-            )));
-        }
         return Err(unsupported(
             id,
             format!("complex surface instance ({})", type_names(inst)),
@@ -949,9 +945,6 @@ fn resolve_surface(
                     .map_err(|e| geometry_error(id, &e))?,
             ))
         }
-        "B_SPLINE_SURFACE_WITH_KNOTS" => Ok(RawSurface::Nurbs(Box::new(resolve_bspline_surface(
-            file, rec, id, scale,
-        )?))),
         // `SURFACE_OF_LINEAR_EXTRUSION(name, swept_curve, extrusion_axis)`.
         // A line extrudes to a plane and a circle along its own normal to a
         // cylinder — the forms real exporters emit for prismatic walls —
@@ -1289,13 +1282,31 @@ enum RawCurve {
 }
 
 impl RawCurve {
-    /// The analytic basis under any `TRIMMED_CURVE` wrapping — what the
-    /// exact path and the swept-surface reductions care about (vertex and
-    /// face bounds re-trim, so the wrapper itself is transparent).
-    fn analytic_basis(&self) -> Option<&Curve3> {
+    /// The curve under any `TRIMMED_CURVE` wrapping. Vertex and face bounds
+    /// re-trim, so the wrapper itself is transparent to every consumer here.
+    fn basis(&self) -> &RawCurve {
         match self {
-            RawCurve::Analytic(c) => Some(c),
-            RawCurve::Trimmed { basis, .. } => basis.analytic_basis(),
+            RawCurve::Trimmed { basis, .. } => basis.basis(),
+            other => other,
+        }
+    }
+
+    /// The analytic basis — what the swept-surface reductions care about
+    /// (a NURBS basis never collapses to a quadric).
+    fn analytic_basis(&self) -> Option<&Curve3> {
+        match self.basis() {
+            RawCurve::Analytic(curve) => Some(curve),
+            _ => None,
+        }
+    }
+
+    /// The exact [`Curve3`] the geometry store can hold, analytic or NURBS.
+    /// `None` for the forms that still have no store representation
+    /// (conics, composites) and therefore force the mesh fallback.
+    fn exact_curve(&self) -> Option<Curve3> {
+        match self.basis() {
+            RawCurve::Analytic(curve) => Some(curve.clone()),
+            RawCurve::Nurbs(nurbs) => Some(Curve3::nurbs((**nurbs).clone())),
             _ => None,
         }
     }
@@ -1345,15 +1356,15 @@ fn resolve_curve(
     angle_scale: f64,
 ) -> MapResult<RawCurve> {
     let inst = instance(file, id, referrer)?;
+    // Every B-spline spelling — simple `B_SPLINE_CURVE_WITH_KNOTS`, an
+    // implicit-knot subtype, or the complex instance that carries rational
+    // weights — resolves through one path.
+    if let Some(parts) = BSplineParts::curve(&inst.entity) {
+        return Ok(RawCurve::Nurbs(Box::new(resolve_bspline_curve(
+            file, &parts, id, scale,
+        )?)));
+    }
     let Some(rec) = inst.as_simple() else {
-        // Mirror of the surface side: a rational B-spline curve is spelled
-        // as a complex instance because the plain entity has no weight
-        // slot. Other complex curves stay unsupported.
-        if inst.entity.part("B_SPLINE_CURVE_WITH_KNOTS").is_some() {
-            return Ok(RawCurve::Nurbs(Box::new(resolve_complex_bspline_curve(
-                file, inst, id, scale,
-            )?)));
-        }
         return Err(unsupported(
             id,
             format!("complex curve instance ({})", type_names(inst)),
@@ -1397,9 +1408,6 @@ fn resolve_curve(
                     .map_err(|e| geometry_error(id, &e))?,
             ))
         }
-        "B_SPLINE_CURVE_WITH_KNOTS" => Ok(RawCurve::Nurbs(Box::new(resolve_bspline_curve(
-            file, rec, id, scale,
-        )?))),
         // `PARABOLA(name, position, focal_dist)` — see [`ConicCurve`].
         "PARABOLA" => {
             let p = resolve_axis2(file, ref_attr(rec, 1, id)?, id, scale)?;
@@ -1502,6 +1510,199 @@ pub(super) fn conic_frame(p: &Placement, entity: u64) -> MapResult<(Vector3, Vec
     Ok((x_dir, unit_axis.cross(&x_dir)))
 }
 
+/// A B-spline subtype that derives its knots from the degree and the
+/// control-point count instead of listing them (ISO 10303-42 §4.4.42–44).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ImplicitKnots {
+    /// `quasi_uniform_*`: clamped ends, interior knots one apart.
+    QuasiUniform,
+    /// `uniform_*`: every multiplicity 1, running `-degree ..= count`.
+    Uniform,
+    /// `bezier_*`: a single span over `[0, 1]`.
+    Bezier,
+}
+
+/// Where a B-spline record keeps its pieces.
+///
+/// AP203 spells a B-spline either as one simple record — `B_SPLINE_CURVE_-
+/// WITH_KNOTS(name, degree, control_points, …, multiplicities, knots, spec)`
+/// — or as a complex instance whose parts split the same data across the
+/// supertype chain:
+///
+/// ```text
+/// ( BOUNDED_CURVE() B_SPLINE_CURVE(degree, control_points, form, closed,
+///   self_intersect) B_SPLINE_CURVE_WITH_KNOTS(mults, knots, spec) CURVE()
+///   GEOMETRIC_REPRESENTATION_ITEM() RATIONAL_B_SPLINE_CURVE(weights)
+///   REPRESENTATION_ITEM(name) )
+/// ```
+///
+/// Partial records carry only their own declared attributes, so every index
+/// shifts by one against the simple form — there is no inherited `name` in
+/// front, the complex form having moved it to `REPRESENTATION_ITEM`.
+/// `base_offset` absorbs that shift so one resolver serves both spellings.
+/// The `RATIONAL_` part is optional: exporters occasionally spell a
+/// non-rational curve this way, and unit weights are then the right
+/// reading. Surfaces follow the same pattern with `_SURFACE` names, a
+/// `u`/`v` degree pair, and grid-shaped control points and weights.
+struct BSplineParts<'a> {
+    /// Record carrying the degree(s) and the control points.
+    base: &'a SimpleRecord,
+    /// Index of the first degree attribute in `base`.
+    base_offset: usize,
+    /// Record carrying the multiplicity and knot lists, plus the index of
+    /// the first multiplicity list — absent for the implicit-knot subtypes.
+    knots: Option<(&'a SimpleRecord, usize)>,
+    /// The implicit-knot subtype, when `knots` is absent.
+    implicit: Option<ImplicitKnots>,
+    /// The `RATIONAL_*` weights record. Only complex instances have one: a
+    /// rational B-spline is always multiply inherited.
+    weights: Option<&'a SimpleRecord>,
+}
+
+/// The curve subtypes whose knots are implicit, in the order they are
+/// probed. Mirrored by [`SURFACE_IMPLICIT`].
+const CURVE_IMPLICIT: [(&str, ImplicitKnots); 3] = [
+    ("QUASI_UNIFORM_CURVE", ImplicitKnots::QuasiUniform),
+    ("UNIFORM_CURVE", ImplicitKnots::Uniform),
+    ("BEZIER_CURVE", ImplicitKnots::Bezier),
+];
+
+const SURFACE_IMPLICIT: [(&str, ImplicitKnots); 3] = [
+    ("QUASI_UNIFORM_SURFACE", ImplicitKnots::QuasiUniform),
+    ("UNIFORM_SURFACE", ImplicitKnots::Uniform),
+    ("BEZIER_SURFACE", ImplicitKnots::Bezier),
+];
+
+impl<'a> BSplineParts<'a> {
+    /// Locate a curve's pieces, or `None` if `entity` is not a B-spline
+    /// curve in any of its spellings.
+    fn curve(entity: &'a EntityRecord) -> Option<Self> {
+        Self::find(
+            entity,
+            "B_SPLINE_CURVE",
+            "B_SPLINE_CURVE_WITH_KNOTS",
+            "RATIONAL_B_SPLINE_CURVE",
+            &CURVE_IMPLICIT,
+            6,
+        )
+    }
+
+    /// Locate a surface's pieces, or `None` if `entity` is not a B-spline
+    /// surface in any of its spellings.
+    fn surface(entity: &'a EntityRecord) -> Option<Self> {
+        Self::find(
+            entity,
+            "B_SPLINE_SURFACE",
+            "B_SPLINE_SURFACE_WITH_KNOTS",
+            "RATIONAL_B_SPLINE_SURFACE",
+            &SURFACE_IMPLICIT,
+            8,
+        )
+    }
+
+    /// `simple_knot_index` is where the multiplicity lists start in the
+    /// single-record spelling (after `name`, the degrees, the control
+    /// points and the form/closed/self-intersect flags).
+    fn find(
+        entity: &'a EntityRecord,
+        base_type: &str,
+        with_knots_type: &str,
+        rational_type: &str,
+        implicit_types: &[(&str, ImplicitKnots)],
+        simple_knot_index: usize,
+    ) -> Option<Self> {
+        match entity {
+            EntityRecord::Simple(rec) => {
+                let implicit = implicit_types
+                    .iter()
+                    .find(|(name, _)| *name == rec.type_name)
+                    .map(|&(_, form)| form);
+                if implicit.is_none() && rec.type_name != with_knots_type {
+                    return None;
+                }
+                Some(Self {
+                    base: rec,
+                    base_offset: 1,
+                    knots: implicit.is_none().then_some((rec, simple_knot_index)),
+                    implicit,
+                    weights: None,
+                })
+            }
+            EntityRecord::Complex(_) => {
+                let base = entity.part(base_type)?;
+                let knots = entity.part(with_knots_type).map(|rec| (rec, 0));
+                let implicit = implicit_types
+                    .iter()
+                    .find(|(name, _)| entity.part(name).is_some())
+                    .map(|&(_, form)| form);
+                // A complex instance that inherits `B_SPLINE_*` but states
+                // its knots neither way is not one we can parameterize.
+                if knots.is_none() && implicit.is_none() {
+                    return None;
+                }
+                Some(Self {
+                    base,
+                    base_offset: 0,
+                    knots,
+                    implicit,
+                    weights: entity.part(rational_type),
+                })
+            }
+        }
+    }
+}
+
+/// Derive the knot vector of an implicit-knot B-spline subtype
+/// (ISO 10303-42 §4.4.42–44) from its degree and control-point count.
+fn implicit_knot_vector(
+    form: ImplicitKnots,
+    degree: i64,
+    count: usize,
+    entity: u64,
+) -> MapResult<KnotVector> {
+    if degree < 1 {
+        return Err(invalid(entity, format!("B-spline degree {degree} < 1")));
+    }
+    let degree = degree as usize;
+    if count < degree + 1 {
+        return Err(invalid(
+            entity,
+            format!("{count} control points cannot carry a degree-{degree} B-spline"),
+        ));
+    }
+    let knots: Vec<f64> = match form {
+        ImplicitKnots::Bezier => {
+            if count != degree + 1 {
+                return Err(invalid(
+                    entity,
+                    format!(
+                        "Bezier form has {count} control points, expected {}",
+                        degree + 1
+                    ),
+                ));
+            }
+            let mut knots = vec![0.0; degree + 1];
+            knots.extend(std::iter::repeat_n(1.0, degree + 1));
+            knots
+        }
+        // Clamped, with one knot per interior span boundary: the domain is
+        // `[0, count - degree]`, one unit per span.
+        ImplicitKnots::QuasiUniform => {
+            let spans = count - degree;
+            let mut knots = vec![0.0; degree + 1];
+            knots.extend((1..spans).map(|i| i as f64));
+            knots.extend(std::iter::repeat_n(spans as f64, degree + 1));
+            knots
+        }
+        // Unclamped: the first `degree` knots sit below the domain, so the
+        // curve starts short of its first control point.
+        ImplicitKnots::Uniform => (0..count + degree + 1)
+            .map(|i| i as f64 - degree as f64)
+            .collect(),
+    };
+    KnotVector::new(degree, knots).map_err(|e| nurbs_error(entity, &e))
+}
+
 /// Expand STEP's `(knots, multiplicities)` pair into a flat knot sequence.
 fn expand_knots(knots: &[f64], multiplicities: &[i64], entity: u64) -> MapResult<Vec<f64>> {
     if knots.len() != multiplicities.len() {
@@ -1537,23 +1738,40 @@ fn knot_vector(
     KnotVector::new(degree as usize, flat).map_err(|e| nurbs_error(entity, &e))
 }
 
-/// `B_SPLINE_CURVE_WITH_KNOTS(name, degree, control_points, form, closed,
-/// self_intersect, multiplicities, knots, knot_spec)`.
+/// `B_SPLINE_CURVE(degree, control_points, form, closed, self_intersect)`
+/// plus, per [`BSplineParts`], the knots (explicit or derived) and the
+/// optional rational weights.
 fn resolve_bspline_curve(
     file: &StepFile,
-    rec: &SimpleRecord,
+    parts: &BSplineParts,
     id: u64,
     scale: f64,
 ) -> MapResult<NurbsCurve> {
-    let degree = int_attr(rec, 1, id)?;
-    let control_points = ref_list(rec, 2, id)?
+    let base = parts.base;
+    let offset = parts.base_offset;
+    let degree = int_attr(base, offset, id)?;
+    let control_points = ref_list(base, offset + 1, id)?
         .into_iter()
         .map(|p| resolve_point(file, p, id, scale))
         .collect::<MapResult<Vec<_>>>()?;
-    let multiplicities = int_list(rec, 6, id)?;
-    let knots = real_list(rec, 7, id)?;
-    let kv = knot_vector(degree, &knots, &multiplicities, id)?;
-    NurbsCurve::bspline(control_points, kv).map_err(|e| nurbs_error(id, &e))
+    let kv = match parts.knots {
+        Some((rec, first)) => {
+            let multiplicities = int_list(rec, first, id)?;
+            let knots = real_list(rec, first + 1, id)?;
+            knot_vector(degree, &knots, &multiplicities, id)?
+        }
+        None => implicit_knot_vector(
+            parts.implicit.expect("knots are explicit or implicit"),
+            degree,
+            control_points.len(),
+            id,
+        )?,
+    };
+    match parts.weights {
+        Some(rec) => NurbsCurve::new(control_points, real_list(rec, 0, id)?, kv),
+        None => NurbsCurve::bspline(control_points, kv),
+    }
+    .map_err(|e| nurbs_error(id, &e))
 }
 
 /// A rectangular list-of-lists of `cartesian_point` references at `index`,
@@ -1604,113 +1822,46 @@ fn resolve_weight_grid(rec: &SimpleRecord, index: usize, id: u64) -> MapResult<V
         .collect()
 }
 
-/// `B_SPLINE_SURFACE_WITH_KNOTS(name, u_degree, v_degree, control_grid,
-/// form, u_closed, v_closed, self_intersect, u_mults, v_mults, u_knots,
-/// v_knots, knot_spec)`. The control grid's outer index runs over `u`.
+/// `B_SPLINE_SURFACE(u_degree, v_degree, control_grid, form, u_closed,
+/// v_closed, self_intersect)` plus, per [`BSplineParts`], the knots
+/// (explicit or derived) and the optional rational weight grid. The control
+/// grid's outer index runs over `u`.
 fn resolve_bspline_surface(
     file: &StepFile,
-    rec: &SimpleRecord,
+    parts: &BSplineParts,
     id: u64,
     scale: f64,
 ) -> MapResult<NurbsSurface> {
-    let u_degree = int_attr(rec, 1, id)?;
-    let v_degree = int_attr(rec, 2, id)?;
-    let grid = resolve_control_grid(file, rec, 3, id, scale)?;
-    let u_mults = int_list(rec, 8, id)?;
-    let v_mults = int_list(rec, 9, id)?;
-    let u_knots = real_list(rec, 10, id)?;
-    let v_knots = real_list(rec, 11, id)?;
-    let kv_u = knot_vector(u_degree, &u_knots, &u_mults, id)?;
-    let kv_v = knot_vector(v_degree, &v_knots, &v_mults, id)?;
-    NurbsSurface::bspline(grid, kv_u, kv_v).map_err(|e| nurbs_error(id, &e))
-}
-
-/// The partial record of a complex instance, by type name.
-fn complex_part<'a>(inst: &'a Instance, type_name: &str, id: u64) -> MapResult<&'a SimpleRecord> {
-    inst.entity.part(type_name).ok_or_else(|| {
-        invalid(
-            id,
-            format!(
-                "complex instance ({}) has no {type_name} part",
-                type_names(inst)
-            ),
-        )
-    })
-}
-
-/// A rational B-spline curve spelled as a complex instance:
-///
-/// ```text
-/// ( BOUNDED_CURVE() B_SPLINE_CURVE(degree, control_points, form, closed,
-///   self_intersect) B_SPLINE_CURVE_WITH_KNOTS(mults, knots, spec) CURVE()
-///   GEOMETRIC_REPRESENTATION_ITEM() RATIONAL_B_SPLINE_CURVE(weights)
-///   REPRESENTATION_ITEM(name) )
-/// ```
-///
-/// Partial records carry only their own declared attributes, so the indices
-/// are all shifted relative to the simple `*_WITH_KNOTS` form — there is no
-/// inherited `name` in front. The `RATIONAL_` part is optional: exporters
-/// occasionally spell a non-rational curve this way, and unit weights are
-/// then the right reading.
-fn resolve_complex_bspline_curve(
-    file: &StepFile,
-    inst: &Instance,
-    id: u64,
-    scale: f64,
-) -> MapResult<NurbsCurve> {
-    let base = complex_part(inst, "B_SPLINE_CURVE", id)?;
-    let knots_rec = complex_part(inst, "B_SPLINE_CURVE_WITH_KNOTS", id)?;
-    let degree = int_attr(base, 0, id)?;
-    let control_points = ref_list(base, 1, id)?
-        .into_iter()
-        .map(|p| resolve_point(file, p, id, scale))
-        .collect::<MapResult<Vec<_>>>()?;
-    let multiplicities = int_list(knots_rec, 0, id)?;
-    let knots = real_list(knots_rec, 1, id)?;
-    let kv = knot_vector(degree, &knots, &multiplicities, id)?;
-    let weights = match inst.entity.part("RATIONAL_B_SPLINE_CURVE") {
-        Some(rational) => real_list(rational, 0, id)?,
-        None => vec![1.0; control_points.len()],
-    };
-    NurbsCurve::new(control_points, weights, kv).map_err(|e| nurbs_error(id, &e))
-}
-
-/// A rational B-spline surface spelled as a complex instance:
-///
-/// ```text
-/// ( BOUNDED_SURFACE() B_SPLINE_SURFACE(u_degree, v_degree, control_grid,
-///   form, u_closed, v_closed, self_intersect)
-///   B_SPLINE_SURFACE_WITH_KNOTS(u_mults, v_mults, u_knots, v_knots, spec)
-///   GEOMETRIC_REPRESENTATION_ITEM() RATIONAL_B_SPLINE_SURFACE(weights)
-///   REPRESENTATION_ITEM(name) SURFACE() )
-/// ```
-///
-/// Same attribute shift as the curve form, and the same optional
-/// `RATIONAL_` part.
-fn resolve_complex_bspline_surface(
-    file: &StepFile,
-    inst: &Instance,
-    id: u64,
-    scale: f64,
-) -> MapResult<NurbsSurface> {
-    let base = complex_part(inst, "B_SPLINE_SURFACE", id)?;
-    let knots_rec = complex_part(inst, "B_SPLINE_SURFACE_WITH_KNOTS", id)?;
-    let u_degree = int_attr(base, 0, id)?;
-    let v_degree = int_attr(base, 1, id)?;
-    let grid = resolve_control_grid(file, base, 2, id, scale)?;
-    let u_mults = int_list(knots_rec, 0, id)?;
-    let v_mults = int_list(knots_rec, 1, id)?;
-    let u_knots = real_list(knots_rec, 2, id)?;
-    let v_knots = real_list(knots_rec, 3, id)?;
-    let kv_u = knot_vector(u_degree, &u_knots, &u_mults, id)?;
-    let kv_v = knot_vector(v_degree, &v_knots, &v_mults, id)?;
-    match inst.entity.part("RATIONAL_B_SPLINE_SURFACE") {
-        Some(rational) => {
-            let weights = resolve_weight_grid(rational, 0, id)?;
-            NurbsSurface::new(grid, weights, kv_u, kv_v).map_err(|e| nurbs_error(id, &e))
+    let base = parts.base;
+    let offset = parts.base_offset;
+    let u_degree = int_attr(base, offset, id)?;
+    let v_degree = int_attr(base, offset + 1, id)?;
+    let grid = resolve_control_grid(file, base, offset + 2, id, scale)?;
+    let (kv_u, kv_v) = match parts.knots {
+        Some((rec, first)) => {
+            let u_mults = int_list(rec, first, id)?;
+            let v_mults = int_list(rec, first + 1, id)?;
+            let u_knots = real_list(rec, first + 2, id)?;
+            let v_knots = real_list(rec, first + 3, id)?;
+            (
+                knot_vector(u_degree, &u_knots, &u_mults, id)?,
+                knot_vector(v_degree, &v_knots, &v_mults, id)?,
+            )
         }
-        None => NurbsSurface::bspline(grid, kv_u, kv_v).map_err(|e| nurbs_error(id, &e)),
+        None => {
+            let form = parts.implicit.expect("knots are explicit or implicit");
+            let cols = grid.first().map_or(0, Vec::len);
+            (
+                implicit_knot_vector(form, u_degree, grid.len(), id)?,
+                implicit_knot_vector(form, v_degree, cols, id)?,
+            )
+        }
+    };
+    match parts.weights {
+        Some(rec) => NurbsSurface::new(grid, resolve_weight_grid(rec, 0, id)?, kv_u, kv_v),
+        None => NurbsSurface::bspline(grid, kv_u, kv_v),
     }
+    .map_err(|e| nurbs_error(id, &e))
 }
 
 // ---------------------------------------------------------------------
@@ -2031,8 +2182,8 @@ impl SolidBuilder<'_> {
         let surface_ref = ref_attr(rec, 2, face_ref)?;
         let same_sense = bool_attr(rec, 3, face_ref)?;
 
-        // Surface first: an unmappable surface (NURBS) is the more
-        // fundamental finding than any bound-level problem.
+        // Surface first: an unmappable surface is the more fundamental
+        // finding than any bound-level problem.
         let surface = match resolve_surface(
             self.file,
             surface_ref,
@@ -2041,16 +2192,7 @@ impl SolidBuilder<'_> {
             self.angle_scale,
         )? {
             RawSurface::Analytic(surface) => surface,
-            RawSurface::Nurbs(_) => {
-                return Err(unsupported(
-                    surface_ref,
-                    // `Surface3::Nurbs` has existed since of-ew7; what is
-                    // missing is this mapping, which is of-3qy.8 alongside
-                    // the curve side.
-                    "exact NURBS surface import (of-3qy.8 wires B_SPLINE_SURFACE_WITH_KNOTS \
-                     onto Surface3::Nurbs); falling back to tessellation",
-                ));
-            }
+            RawSurface::Nurbs(nurbs) => Surface3::nurbs(*nurbs),
             RawSurface::Extruded { .. } | RawSurface::Revolved { .. } => {
                 return Err(unsupported(
                     surface_ref,
@@ -2190,25 +2332,19 @@ impl SolidBuilder<'_> {
         )?;
         // TRIMMED_CURVE wrapping is transparent here: the edge's vertices
         // re-trim whatever basis the wrapper carries.
-        let curve = match raw.analytic_basis() {
-            Some(curve) => curve.clone(),
+        let curve = match raw.exact_curve() {
+            Some(curve) => curve,
             None => {
-                let what = match raw {
-                    // `Curve3::Nurbs` exists and every consumer handles it
-                    // (of-3qy.6); what is still missing is this mapping —
-                    // building the edge's `Curve3::Nurbs` and trimming it
-                    // by the vertices, which is of-3qy.8.
-                    RawCurve::Nurbs(_) | RawCurve::Trimmed { .. } => {
-                        "exact NURBS curve import (of-3qy.8 wires B_SPLINE_CURVE_WITH_KNOTS \
-                         onto Curve3::Nurbs)"
-                    }
+                let what = match raw.basis() {
                     RawCurve::Conic(_) => {
                         "exact PARABOLA/HYPERBOLA import (geometry store has no conic variant)"
                     }
                     RawCurve::Composite(_) => {
                         "exact COMPOSITE_CURVE import (geometry store has no multi-segment curve)"
                     }
-                    RawCurve::Analytic(_) => unreachable!("analytic_basis covers Analytic"),
+                    RawCurve::Analytic(_) | RawCurve::Nurbs(_) | RawCurve::Trimmed { .. } => {
+                        unreachable!("exact_curve covers the storable bases")
+                    }
                 };
                 return Err(unsupported(
                     geometry_ref,
@@ -3578,10 +3714,40 @@ mod tests {
         wrap(&b)
     }
 
+    /// The same block with every planar face respelled as the degree-1
+    /// B-spline patch spanning its own four corners. A bilinear patch over
+    /// a rectangle *is* that plane, so the solid is unchanged — only the
+    /// STEP spelling, and so the imported [`Surface3`] variant.
+    fn bspline_block_step(x: f64, y: f64, z: f64) -> String {
+        let mut b = String::new();
+        let shell = block_shell_with_surfaces(&mut b, 0, x, y, z, true);
+        writeln!(
+            b,
+            "#{} = MANIFOLD_SOLID_BREP('bspline block', #{shell});",
+            shell + 1
+        )
+        .unwrap();
+        wrap(&b)
+    }
+
     /// Emit one outward-wound block `CLOSED_SHELL` with instance names
     /// offset by `base`; returns the shell's id. Shared by the plain block
     /// fixture and the `BREP_WITH_VOIDS` fixtures (outer + cavity shells).
     fn block_shell_at(b: &mut String, base: u64, x: f64, y: f64, z: f64) -> u64 {
+        block_shell_with_surfaces(b, base, x, y, z, false)
+    }
+
+    /// `nurbs_faces` swaps each face's `PLANE` for the equivalent bilinear
+    /// `B_SPLINE_SURFACE_WITH_KNOTS`; everything else — vertices, line edge
+    /// curves, loop winding, face senses — is identical either way.
+    fn block_shell_with_surfaces(
+        b: &mut String,
+        base: u64,
+        x: f64,
+        y: f64,
+        z: f64,
+        nurbs_faces: bool,
+    ) -> u64 {
         let id = |k: u64| base + k;
         let (hx, hy, hz) = (x / 2.0, y / 2.0, z / 2.0);
         let corners = [
@@ -3667,7 +3833,26 @@ mod tests {
                 id(cycle[0] as u64 + 1)
             )
             .unwrap();
-            writeln!(b, "#{} = PLANE('', #{});", fb + 2, fb + 1).unwrap();
+            if nurbs_faces {
+                // Control rows `[[a, d], [b, c]]` put `u` along a→d and `v`
+                // along a→b, so `du x dv` is the same outward normal the
+                // `PLANE` placement above declares.
+                let p = |k: usize| id(cycle[k] as u64 + 1);
+                writeln!(
+                    b,
+                    "#{} = B_SPLINE_SURFACE_WITH_KNOTS('', 1, 1, ((#{}, #{}), (#{}, #{})), \
+                     .UNSPECIFIED., .F., .F., .F., (2, 2), (2, 2), (0., 1.), (0., 1.), \
+                     .UNSPECIFIED.);",
+                    fb + 2,
+                    p(0),
+                    p(3),
+                    p(1),
+                    p(2)
+                )
+                .unwrap();
+            } else {
+                writeln!(b, "#{} = PLANE('', #{});", fb + 2, fb + 1).unwrap();
+            }
             for k in 0..4 {
                 let (from, to) = (cycle[k], cycle[(k + 1) % 4]);
                 let (idx, &(a, _)) = EDGE_PAIRS
@@ -3850,8 +4035,10 @@ mod tests {
         ))
     }
 
-    /// A block whose six faces are degree-1 B-spline patches: exact NURBS
-    /// import is unsupported, so this must take the mesh fallback.
+    /// A block whose six faces are degree-1 B-spline patches carrying *no
+    /// bounds at all*. The exact path refuses the empty bound list, so this
+    /// is the fixture that still exercises the NURBS mesh fallback now that
+    /// bounded B-spline faces import exactly (see [`bspline_block_step`]).
     fn nurbs_block_step(x: f64, y: f64, z: f64) -> String {
         let (hx, hy, hz) = (x / 2.0, y / 2.0, z / 2.0);
         let corners = [
@@ -4000,6 +4187,37 @@ mod tests {
         assert!(mesh.is_closed_manifold());
         let exact = 4.0 / 3.0 * PI * 8.0;
         assert!((signed_volume(&mesh) - exact).abs() / exact < 0.05);
+    }
+
+    /// The of-3qy.8 headline: bounded B-spline faces take the *exact* path.
+    /// Same block, same topology, same volume as the planar spelling — but
+    /// the store holds `Surface3::Nurbs`, not a plane the reader inferred.
+    #[test]
+    fn bspline_faced_block_imports_as_exact_nurbs_brep() {
+        let (store, geo, report) = import(&bspline_block_step(2.0, 3.0, 4.0));
+        no_error_diagnostics(&report);
+        let body = brep_body(&report.solids[0].outcome);
+
+        assert!(store.check(body).is_empty());
+        let counts = store.euler_counts(body);
+        assert_eq!((counts.vertices, counts.edges, counts.faces), (8, 12, 6));
+        for face in store.faces_of_body(body) {
+            let surface = geo
+                .surface(store.face(face).unwrap().surface.unwrap())
+                .unwrap();
+            assert!(
+                matches!(surface, Surface3::Nurbs(_)),
+                "expected an exact NURBS face, got {surface:?}"
+            );
+        }
+        assert_edges_interpolate(&store, &geo, body);
+
+        let mesh = tessellate_body(&store, &geo, body, &TessellationOptions::default()).unwrap();
+        assert!(mesh.is_closed_manifold());
+        assert!(
+            (signed_volume(&mesh) - 24.0).abs() < 1e-9,
+            "bilinear patches mesh exactly"
+        );
     }
 
     #[test]
@@ -4565,12 +4783,11 @@ mod tests {
         assert_eq!(curve.weights(), &[1.0, 1.0, 1.0]);
     }
 
-    /// A complex surface with no `B_SPLINE_SURFACE_WITH_KNOTS` part has its
-    /// knots implied by some other subtype (QUASI_UNIFORM_SURFACE and
-    /// friends); there is nothing exact to recover, so it must still be
-    /// refused rather than guessed at.
+    /// A complex surface with no `B_SPLINE_SURFACE_WITH_KNOTS` part states
+    /// its knots through a subtype instead. That used to be refused; of-3qy.8
+    /// derives them, so the patch now resolves exactly.
     #[test]
-    fn complex_surface_without_explicit_knots_stays_unsupported() {
+    fn resolves_complex_quasi_uniform_surface_with_derived_knots() {
         let file = parse_fixture(
             "#1 = CARTESIAN_POINT('', (0., 0., 0.));
              #2 = CARTESIAN_POINT('', (0., 1., 0.));
@@ -4581,12 +4798,123 @@ mod tests {
                   GEOMETRIC_REPRESENTATION_ITEM() QUASI_UNIFORM_SURFACE() \
                   REPRESENTATION_ITEM('') SURFACE() );",
         );
-        let Err(err) = resolve_surface(&file, 5, 0, 1.0, 1.0) else {
-            panic!("a knot-less complex surface must not resolve");
+        let RawSurface::Nurbs(surface) = resolve_surface(&file, 5, 0, 1.0, 1.0).unwrap() else {
+            panic!("expected a NURBS surface");
+        };
+        assert_eq!(surface.knot_vector_u().domain(), (0.0, 1.0));
+        assert!((surface.point(0.0, 0.0) - Point3::new(0.0, 0.0, 0.0)).norm() < 1e-12);
+        assert!((surface.point(1.0, 1.0) - Point3::new(1.0, 1.0, 1.0)).norm() < 1e-12);
+    }
+
+    /// `QUASI_UNIFORM_*` states no knots at all: they are derived clamped
+    /// and one unit per span, so the domain is `[0, count - degree]`.
+    #[test]
+    fn resolves_quasi_uniform_curve_with_derived_knots() {
+        let file = parse_fixture(
+            "#1 = CARTESIAN_POINT('', (0., 0., 0.));
+             #2 = CARTESIAN_POINT('', (1., 1., 0.));
+             #3 = CARTESIAN_POINT('', (2., 1., 0.));
+             #4 = CARTESIAN_POINT('', (3., 0., 0.));
+             #5 = QUASI_UNIFORM_CURVE('', 2, (#1, #2, #3, #4), .UNSPECIFIED., .F., .U.);",
+        );
+        let RawCurve::Nurbs(curve) = resolve_curve(&file, 5, 0, 1.0, 1.0).unwrap() else {
+            panic!("expected a NURBS curve");
+        };
+        assert_eq!(
+            curve.knot_vector().knots(),
+            &[0.0, 0.0, 0.0, 1.0, 2.0, 2.0, 2.0]
+        );
+        assert_eq!(curve.knot_vector().domain(), (0.0, 2.0));
+        // Clamped, so it interpolates its end control points.
+        assert!((curve.point(0.0) - Point3::new(0.0, 0.0, 0.0)).norm() < 1e-12);
+        assert!((curve.point(2.0) - Point3::new(3.0, 0.0, 0.0)).norm() < 1e-12);
+    }
+
+    #[test]
+    fn resolves_quasi_uniform_surface_with_derived_knots() {
+        let file = parse_fixture(
+            "#1 = CARTESIAN_POINT('', (0., 0., 0.));
+             #2 = CARTESIAN_POINT('', (0., 1., 0.));
+             #3 = CARTESIAN_POINT('', (1., 0., 0.));
+             #4 = CARTESIAN_POINT('', (1., 1., 0.));
+             #5 = QUASI_UNIFORM_SURFACE('', 1, 1, ((#1, #2), (#3, #4)), .PLANE_SURF., \
+                  .F., .F., .U.);",
+        );
+        let RawSurface::Nurbs(surface) = resolve_surface(&file, 5, 0, 1.0, 1.0).unwrap() else {
+            panic!("expected a NURBS surface");
+        };
+        assert_eq!(surface.knot_vector_u().domain(), (0.0, 1.0));
+        assert!((surface.point(0.5, 0.5) - Point3::new(0.5, 0.5, 0.0)).norm() < 1e-12);
+    }
+
+    /// A Bézier is a single span: `count == degree + 1`, knots `(0, 1)` at
+    /// full multiplicity. Anything else is a malformed record.
+    #[test]
+    fn resolves_bezier_curve_and_rejects_a_wrong_control_count() {
+        let file = parse_fixture(
+            "#1 = CARTESIAN_POINT('', (0., 0., 0.));
+             #2 = CARTESIAN_POINT('', (1., 2., 0.));
+             #3 = CARTESIAN_POINT('', (2., 0., 0.));
+             #4 = BEZIER_CURVE('', 2, (#1, #2, #3), .UNSPECIFIED., .F., .U.);
+             #5 = BEZIER_CURVE('', 1, (#1, #2, #3), .UNSPECIFIED., .F., .U.);",
+        );
+        let RawCurve::Nurbs(curve) = resolve_curve(&file, 4, 0, 1.0, 1.0).unwrap() else {
+            panic!("expected a NURBS curve");
+        };
+        assert_eq!(curve.knot_vector().knots(), &[0.0, 0.0, 0.0, 1.0, 1.0, 1.0]);
+        // Apex of the quadratic Bézier: halfway to the middle control point.
+        assert!((curve.point(0.5) - Point3::new(1.0, 1.0, 0.0)).norm() < 1e-12);
+
+        let Err(err) = resolve_curve(&file, 5, 0, 1.0, 1.0) else {
+            panic!("expected a degree/control-count mismatch");
         };
         assert!(
-            matches!(err, MapError::Unsupported { .. }),
-            "expected an unsupported diagnostic, got {err:?}"
+            err.diagnostic()
+                .message
+                .contains("Bezier form has 3 control points"),
+            "{err:?}"
+        );
+    }
+
+    /// `UNIFORM_*` is the unclamped form: the domain starts `degree` knots
+    /// in, so the curve never reaches its first control point.
+    #[test]
+    fn resolves_uniform_curve_with_unclamped_knots() {
+        let file = parse_fixture(
+            "#1 = CARTESIAN_POINT('', (0., 0., 0.));
+             #2 = CARTESIAN_POINT('', (1., 3., 0.));
+             #3 = CARTESIAN_POINT('', (2., 0., 0.));
+             #4 = UNIFORM_CURVE('', 2, (#1, #2, #3), .UNSPECIFIED., .F., .U.);",
+        );
+        let RawCurve::Nurbs(curve) = resolve_curve(&file, 4, 0, 1.0, 1.0).unwrap() else {
+            panic!("expected a NURBS curve");
+        };
+        assert_eq!(
+            curve.knot_vector().knots(),
+            &[-2.0, -1.0, 0.0, 1.0, 2.0, 3.0]
+        );
+        assert_eq!(curve.knot_vector().domain(), (0.0, 1.0));
+        // Start of the domain is the de Boor average, not control point #1.
+        assert!(curve.point(0.0).y > 0.0);
+    }
+
+    /// A complex instance inheriting `B_SPLINE_CURVE` but stating its knots
+    /// neither explicitly nor by subtype is not parameterizable — it must
+    /// report unsupported rather than silently guessing a knot vector.
+    #[test]
+    fn rejects_a_knotless_bspline_complex_instance() {
+        let file = parse_fixture(
+            "#1 = CARTESIAN_POINT('', (0., 0., 0.));
+             #2 = CARTESIAN_POINT('', (1., 1., 0.));
+             #3 = (BOUNDED_CURVE() B_SPLINE_CURVE(1, (#1, #2), .POLYLINE_FORM., .F., .F.) \
+                  CURVE() GEOMETRIC_REPRESENTATION_ITEM() REPRESENTATION_ITEM(''));",
+        );
+        let Err(err) = resolve_curve(&file, 3, 0, 1.0, 1.0) else {
+            panic!("expected a knotless complex instance to be refused");
+        };
+        assert!(
+            err.diagnostic().message.contains("complex curve instance"),
+            "{err:?}"
         );
     }
 
@@ -4781,7 +5109,7 @@ mod tests {
     // ---- mesh fallback ----
 
     #[test]
-    fn nurbs_block_falls_back_to_watertight_mesh() {
+    fn unbounded_nurbs_block_falls_back_to_watertight_mesh() {
         let (store, geo, report) = import(&nurbs_block_step(2.0, 2.0, 2.0));
         assert_eq!(report.solids.len(), 1);
         let SolidOutcome::Mesh { mesh, sdf } = &report.solids[0].outcome else {
@@ -4808,8 +5136,8 @@ mod tests {
             report
                 .diagnostics
                 .iter()
-                .any(|d| d.severity == Severity::Warning && d.message.contains("NURBS")),
-            "expected a NURBS warning: {:?}",
+                .any(|d| d.message.contains("no bounds")),
+            "expected the unbounded-face diagnostic: {:?}",
             report.diagnostics
         );
         // The failed exact attempt left nothing behind.

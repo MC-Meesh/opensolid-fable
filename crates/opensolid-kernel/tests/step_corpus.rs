@@ -12,11 +12,10 @@
 //!    to the exact `f64` and the whole topology graph to the same traversal.
 //!    Stores that share geometry across faces reach it from the second write
 //!    rather than the first (of-kb8, below); every other case is immediate.
-//!    Freeform (NURBS) bodies are gated one step short of that: the writer
-//!    emits them exactly (of-3qy.7), but the reader's exact path does not
-//!    hang a `Surface3::Nurbs` on a face yet (of-3qy.8), so they come back
-//!    through the tessellated fallback and are gated on volume rather than
-//!    on a byte-identical re-write.
+//!    Freeform (NURBS) bodies now close the same loop: the writer emits them
+//!    exactly (of-3qy.7) and the reader's exact path hangs `Surface3::Nurbs`
+//!    on the face (of-3qy.8), so they return as B-Reps and are gated on
+//!    volume through the tessellator wherever it can measure them.
 //! 2. **Synthetic adversarial files** — missing entities, cyclic references,
 //!    degenerate geometry, unit mismatches, huge coordinates, overflowing
 //!    reals, truncation, garbage. The reader must return structured errors
@@ -26,8 +25,8 @@
 //! 3. **Vendored real-world files** — CATIA V5-authored CAx-IF test parts
 //!    under `tests/data/step/` (see the README there for provenance and
 //!    licensing). Analytic parts must import as exact B-Reps and survive a
-//!    write round trip; NURBS-bearing parts must degrade to structured
-//!    diagnostics.
+//!    write round trip; so must NURBS-bearing parts, since of-3qy.7 and
+//!    of-3qy.8 closed the freeform loop on both sides.
 //!
 //! Protocol (same as `boolean_stress.rs`): a failing case is documented as
 //! a `bd` bug bead with a minimal repro and the test is `#[ignore]`d
@@ -59,8 +58,8 @@
 
 use opensolid_kernel::brep::boolean::{BooleanOutput, intersect, subtract, unite};
 use opensolid_kernel::brep::{
-    Body, GeometryStore, TessellationOptions, TopologyStore, primitives, tessellate_body,
-    translate_body,
+    Body, Curve3, CurveEval, GeometryStore, Surface3, SurfaceProject, TessellationOptions,
+    TopologyStore, primitives, tessellate_body, translate_body,
 };
 use opensolid_kernel::core::EntityId;
 use opensolid_kernel::core::tolerance::ToleranceContext;
@@ -538,9 +537,9 @@ mod freeform {
         (store, geo, body)
     }
 
-    /// Write, re-import, and require the solid's volume to survive. Today
-    /// the freeform import lands in the mesh fallback; once of-3qy.8 wires
-    /// the exact path it lands as a B-Rep, and either is measured here.
+    /// Write, re-import, and require the solid's volume to survive. Since
+    /// of-3qy.8 wired the reader's exact path this lands as a B-Rep rather
+    /// than the mesh fallback; both outcomes are measured here.
     fn assert_freeform_round_trip(
         store: &TopologyStore,
         geo: &GeometryStore,
@@ -1734,24 +1733,135 @@ mod corpus {
     }
 
     #[test]
-    fn dm1_id_nurbs_part_degrades_to_structured_diagnostics() {
-        // Three solids carrying B-spline surfaces (including complex
-        // instances and QUASI_UNIFORM_SURFACE) the kernel cannot represent
-        // yet. Whatever the per-solid outcome, it must be structured —
-        // today all three fail with unsupported-surface diagnostics; if
-        // NURBS support lands they must import as valid B-Reps instead.
+    fn dm1_id_nurbs_part_imports_exactly() {
+        // Three solids whose walls are B-splines in every AP203 spelling:
+        // simple `B_SPLINE_SURFACE_WITH_KNOTS`, the `RATIONAL_B_SPLINE_-
+        // SURFACE` complex instance, and knot-free `QUASI_UNIFORM_SURFACE`
+        // (with the matching curve forms on the edges). Before of-3qy.8
+        // every one of them was refused off the exact path; now all three
+        // solids must land as valid B-Reps carrying real NURBS geometry —
+        // no tessellated fallback, no unsupported-geometry warnings.
         let bytes = load("dm1-id-214.stp");
-        let (store, _, report) = import_bytes(&bytes);
+        let (store, geo, report) = import_bytes(&bytes);
         assert_eq!(report.solids.len(), 3, "expected three solids");
-        assert_all_outcomes_structured(&store, &report);
         assert!(
+            !report
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("unsupported")),
+            "expected no unsupported-geometry diagnostics, got: {:?}",
             report
                 .diagnostics
                 .iter()
-                .any(|d| d.severity == Severity::Warning && d.message.contains("unsupported")),
-            "expected unsupported-geometry warnings, got: {:?}",
-            report.diagnostics.iter().take(5).collect::<Vec<_>>()
+                .filter(|d| d.message.contains("unsupported"))
+                .take(5)
+                .collect::<Vec<_>>()
         );
+        let breps = assert_all_outcomes_structured(&store, &report);
+        assert_eq!(breps.len(), 3, "expected three exact B-Rep imports");
+
+        // The exactness is the point: the walls must be NURBS in the
+        // geometry store, not quadrics some reduction guessed at, and the
+        // rational ones must carry their non-unit weights.
+        let nurbs_surfaces = geo
+            .surfaces
+            .iter()
+            .filter(|(_, s)| matches!(s, Surface3::Nurbs(_)))
+            .count();
+        assert!(
+            nurbs_surfaces >= 3,
+            "expected NURBS surfaces in the store, got {nurbs_surfaces}"
+        );
+        let nurbs_curves = geo
+            .curves
+            .iter()
+            .filter(|(_, c)| matches!(c, Curve3::Nurbs(_)))
+            .count();
+        assert!(
+            nurbs_curves >= 3,
+            "expected NURBS curves in the store, got {nurbs_curves}"
+        );
+        assert!(
+            geo.curves.iter().any(|(_, c)| match c {
+                Curve3::Nurbs(nurbs) => nurbs.weights().iter().any(|&w| w != 1.0),
+                _ => false,
+            }),
+            "expected a rational (non-unit weight) NURBS curve from the \
+             RATIONAL_B_SPLINE_CURVE complex instances"
+        );
+
+        // `check` is topological, so it would pass a mis-parameterized
+        // patch just as happily (swapped u/v, a knot vector expanded from
+        // the wrong multiplicity list, weights read off the wrong record).
+        // Every one of those moves the surface off its own edges, so
+        // require the geometry to agree: each bounding edge must lie on
+        // the face it bounds.
+        for &body in &breps {
+            assert_edges_lie_on_faces(&store, &geo, body);
+        }
+
+        // The freeform loop closes here on *authored* CAD geometry rather
+        // than a synthetic patch: export (of-3qy.7) re-emits what this
+        // import read, and reading that back must reproduce the same
+        // surfaces on the same edges. A knot vector or weight list that
+        // survived import but not the write would show up as a re-import
+        // whose edges no longer lie on their faces.
+        for &body in &breps {
+            let text = write_step(&store, &geo, &[body], &StepWriteOptions::default())
+                .expect("NURBS body must serialize");
+            let (store2, geo2, report2) = import_bytes(text.as_bytes());
+            assert!(
+                !report2.has_errors(),
+                "re-import reported errors: {:?}",
+                report2.diagnostics
+            );
+            let breps2 = assert_all_outcomes_structured(&store2, &report2);
+            assert_eq!(breps2.len(), 1, "re-import must be one exact B-Rep");
+            assert_counts_equal(&store, body, &store2, breps2[0], "dm1 NURBS round trip");
+            assert_edges_lie_on_faces(&store2, &geo2, breps2[0]);
+        }
+    }
+
+    /// Sample every face's bounding edges and require each sample to lie on
+    /// that face's surface. The tolerance is relative: this part's
+    /// coordinates are inches-scaled-to-mm, and STEP carries only finite
+    /// decimal text.
+    fn assert_edges_lie_on_faces(store: &TopologyStore, geo: &GeometryStore, body: EntityId<Body>) {
+        const SAMPLES: usize = 7;
+        let mut checked = 0usize;
+        for shell_id in &store.body(body).expect("imported body").shells {
+            for face_id in &store.shell(*shell_id).expect("shell").faces {
+                let face = store.face(*face_id).expect("face");
+                let surface = geo
+                    .surfaces
+                    .get(face.surface.expect("imported face has a surface"))
+                    .expect("surface");
+                let loops = face.outer_loop.iter().chain(&face.inner_loops);
+                for loop_id in loops {
+                    for fin_id in &store.loop_(*loop_id).expect("loop").fins {
+                        let fin = store.fin(*fin_id).expect("fin");
+                        let edge = store.edge(fin.edge).expect("edge");
+                        let curve = geo
+                            .curves
+                            .get(edge.curve.expect("imported edge has a curve"))
+                            .expect("curve");
+                        for i in 0..=SAMPLES {
+                            let t = edge.t_start
+                                + (edge.t_end - edge.t_start) * i as f64 / SAMPLES as f64;
+                            let point = curve.point(t);
+                            let distance = surface.project_point(&point).distance;
+                            let tol = 1e-6 * (1.0 + point.coords.norm());
+                            assert!(
+                                distance <= tol,
+                                "edge sample at t={t} is {distance} off its face's surface"
+                            );
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked > 0, "body had no edge samples to check");
     }
 
     // -----------------------------------------------------------------
