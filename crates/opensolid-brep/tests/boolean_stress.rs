@@ -3743,16 +3743,16 @@ fn nurbs_box_bored_by_analytic_bar() {
 // abstains and any failure is the pipeline's, not the crutch's.
 //
 // GATE STATUS: RED. The deterministic checks (knot scaling, multi-span,
-// domain-boundary slivers) are green and live; the campaigns that put
-// NURBS in general position found two pipeline defects on first contact
-// and are `#[ignore]`d referencing them:
-//   - of-hqb — the curved-operand bore aborts in `Chart::param(Nurbs)`
-//     on an interpolated (uncarried) marched station that sits a chord
-//     sagitta off the exact patch;
+// domain-boundary slivers) are green and live, and the curved-operand
+// bore (the highest-value test below) is green since of-hqb: the clip
+// predicate now inverts chord-sampled stations by banded projection
+// (`Chart::param_within`) and NURBS mesh faces take the boundary-CDT
+// seed. One pipeline defect from the general-position campaigns remains
+// `#[ignore]`d:
 //   - of-bd3 — randomized planar-NURBS pairs (both NURBS↔analytic and
 //     NURBS↔NURBS) tessellate non-manifold in configurations the
 //     analytic campaigns handle.
-// Until both land and the ignores lift, the hybrid kernel's F-Rep
+// Until it lands and the ignores lift, the hybrid kernel's F-Rep
 // fallback for NURBS operands stays the correct route.
 
 /// Exact strict interior predicate for the finite solid cylinder (axis
@@ -3874,9 +3874,6 @@ fn assert_vertices_on_boundary(
 /// quarter patches and their seam edges, exercising marched Plane↔NURBS
 /// SSI junction welding (of-9ia) on curved geometry.
 #[test]
-#[ignore = "of-hqb: Chart::param(Nurbs) hard-rejects an interpolated marched \
-            station 4.1e-4 off the rational cylinder patch (chord sagitta), \
-            aborting the boolean — first curved NURBS operand in the suite"]
 fn block_bored_by_exact_nurbs_cylinder_matches_analytic() {
     let (cx, cy, r) = (1.0, 1.0, 0.5);
     let (z0, h) = (-1.0, 4.0);

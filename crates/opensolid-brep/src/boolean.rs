@@ -51,7 +51,7 @@ use crate::check::CheckFailure;
 use crate::curve::{Curve3, CurveEval, TWO_PI, plane_basis};
 use crate::geometry::GeometryStore;
 use crate::nurbs::surface::NurbsSurface;
-use crate::project::{CurveProject, SurfaceProject};
+use crate::project::{CurveProject, SurfaceProject, SurfaceProjection};
 use crate::ssi::{
     IntersectionKind, MarchedCurve, SurfaceIntersection, intersect as ssi_intersect,
     intersect_marched, intersect_marched_bounded,
@@ -101,6 +101,16 @@ const EDGE_MATCH_SNAP: f64 = 10.0;
 /// position; an absolute band instead swallows whole small faces and
 /// misses grazing hits on large ones (of-lxk, of-260).
 const BOUNDARY_BAND_FRAC: f64 = 5e-4;
+/// Acceptance band for discretization-noise inputs, as a fraction of the
+/// local face extent: how far off its true locus a chord-sampled point may
+/// legitimately sit before it stops being noise and starts being a
+/// different feature. Marched/boundary polylines carry a chord sagitta of
+/// at most ~`5e-4 * extent` ([`BOUNDARY_BAND_FRAC`]'s sizing), while
+/// distinct features (another edge, another face) are a face extent apart,
+/// so 2% clears the noise by ~40x and the wrong feature by 50x. Used by
+/// [`Pipeline::polish_clip_endpoint`] to pick the crossed edge and by
+/// [`Chart::param_within`]'s NURBS residual gate (of-hqb).
+const DISCRETIZATION_BAND_FRAC: f64 = 0.02;
 /// Fixed ray directions for point classification; each is retried in turn
 /// when a cast grazes a surface or hits near a face boundary.
 const RAY_DIRECTIONS: [[f64; 3]; 6] = [
@@ -779,6 +789,54 @@ impl Chart {
         })
     }
 
+    /// [`Chart::param`] for clip-predicate samples, which legitimately sit
+    /// up to a chord sagitta off a curved chart: the bisection midpoints of
+    /// [`refine_clip_crossing`] on a marched polyline, and the interpolated
+    /// seam-cut stations whose pin solve failed, both evaluate on a *chord*
+    /// of the true intersection curve, not on it (of-hqb).
+    ///
+    /// Every analytic arm of [`Chart::param`] already inverts such points by
+    /// projection — the cylinder arm reads an angle at any radius, which is
+    /// exactly what lets `regions_overlap` probe sagged chord centroids. The
+    /// NURBS arm is the one place a residual gate exists, and its weld-scale
+    /// bound is right for hosting inversions (whose inputs must genuinely
+    /// lie on the surface) but wrong here. This entry keeps the projection
+    /// and gates it at `band` instead: a discretization-scale bound (a
+    /// fraction of the face extent, mirroring [`Pipeline::polish_clip_endpoint`]'s
+    /// edge band) that accepts chord sagitta while still refusing the
+    /// feature-scale distances of a genuinely-elsewhere point, whose uv
+    /// would silently corrupt clip containment.
+    ///
+    /// The uv it returns feeds only snap-resolution containment tests and
+    /// projection seeds; the imprint's stored geometry never comes from
+    /// here (run vertices are marched stations, refined endpoints go
+    /// through the endpoint polish).
+    ///
+    /// # Errors
+    /// Non-convergence, or a residual beyond `band` (NURBS only).
+    fn param_within(
+        &self,
+        p: &Point3,
+        hint: Option<(f64, f64)>,
+        band: f64,
+    ) -> CoreResult<(f64, f64)> {
+        let Chart::Nurbs { surface, .. } = self else {
+            return self.param(p, hint);
+        };
+        let proj = nurbs_project(surface, p, hint)?;
+        if proj.distance > band {
+            return Err(CoreError::Degenerate {
+                context: "boolean::Chart::param(Nurbs)",
+                reason: format!(
+                    "point {p:?} is {} from the NURBS patch, beyond the discretization \
+                     band {band}: it does not belong to this chart",
+                    proj.distance
+                ),
+            });
+        }
+        Ok((proj.u, proj.v))
+    }
+
     /// Outward unit surface normal at parameters `(u, v)`. `v` is ignored
     /// for planes and cylinders but genuinely needed for the sphere and
     /// torus, whose normal tilts with latitude / minor angle.
@@ -991,6 +1049,32 @@ fn nurbs_param(
     hint: Option<(f64, f64)>,
     tol: &ToleranceContext,
 ) -> CoreResult<(f64, f64)> {
+    let proj = nurbs_project(surface, p, hint)?;
+    // `points_approx_eq` keeps the bound absolute for unit-scale geometry
+    // and relative for large models, so a patch does not fail this check
+    // merely by sitting far from the origin.
+    if !tol.points_approx_eq(&proj.point, p) {
+        return Err(CoreError::Degenerate {
+            context: "boolean::Chart::param(Nurbs)",
+            reason: format!(
+                "point {p:?} is {} from the NURBS patch: it does not lie on this surface, \
+                 so it has no inverse here",
+                proj.distance
+            ),
+        });
+    }
+    Ok((proj.u, proj.v))
+}
+
+/// The seeded closest-point projection both [`nurbs_param`] gates share.
+///
+/// # Errors
+/// Non-convergence only; the caller judges the residual.
+fn nurbs_project(
+    surface: &NurbsSurface,
+    p: &Point3,
+    hint: Option<(f64, f64)>,
+) -> CoreResult<SurfaceProjection> {
     // A seeded Newton both costs less than the per-span search and, more
     // importantly, picks the intended sheet where the patch approaches
     // itself and several local minima compete.
@@ -1006,20 +1090,7 @@ fn nurbs_param(
             ),
         });
     }
-    // `points_approx_eq` keeps the bound absolute for unit-scale geometry
-    // and relative for large models, so a patch does not fail this check
-    // merely by sitting far from the origin.
-    if !tol.points_approx_eq(&proj.point, p) {
-        return Err(CoreError::Degenerate {
-            context: "boolean::Chart::param(Nurbs)",
-            reason: format!(
-                "point {p:?} is {} from the NURBS patch: it does not lie on this surface, \
-                 so it has no inverse here",
-                proj.distance
-            ),
-        });
-    }
-    Ok((proj.u, proj.v))
+    Ok(proj)
 }
 
 /// Shift `angle` by whole turns so it lands within π of `hint` (no-op when
@@ -2530,6 +2601,15 @@ impl<'a> Pipeline<'a> {
         // optimization: on a NURBS host an unseeded projection of a patch
         // that approaches itself can converge onto the wrong sheet, and a
         // wrong uv here clips the imprint against the wrong region.
+        //
+        // `param_within`, not `param`: bisection midpoints and interpolated
+        // seam-cut stations of a marched polyline evaluate on a chord, a
+        // sagitta off the curved hosts, which the strict NURBS on-surface
+        // gate would refuse (of-hqb).
+        let bands = [
+            DISCRETIZATION_BAND_FRAC * self.face_extents[0][fa],
+            DISCRETIZATION_BAND_FRAC * self.face_extents[1][fb],
+        ];
         let project = |t: f64, hint: Option<HostUv>| -> CoreResult<HostUv> {
             let p = curve.point(t);
             let (hint_a, hint_b) = match hint {
@@ -2539,8 +2619,12 @@ impl<'a> Pipeline<'a> {
             // Both inversions run regardless: each seeds the next station's
             // hint, and a coincident partner's curve still has to stay
             // walkable on the side that does not clip it.
-            let pa = self.face_polys[0][fa].chart.param(&p, hint_a)?;
-            let pb = self.face_polys[1][fb].chart.param(&p, hint_b)?;
+            let pa = self.face_polys[0][fa]
+                .chart
+                .param_within(&p, hint_a, bands[0])?;
+            let pb = self.face_polys[1][fb]
+                .chart
+                .param_within(&p, hint_b, bands[1])?;
             Ok((pa, pb))
         };
         let contains = |(pa, pb): HostUv| -> bool {
@@ -2770,7 +2854,7 @@ impl<'a> Pipeline<'a> {
         // extent apart).
         let mut best: Option<(f64, SolidTag, usize)> = None;
         for (s, f) in [(0usize, fa), (1usize, fb)] {
-            let band = 0.02 * self.face_extents[s][f];
+            let band = DISCRETIZATION_BAND_FRAC * self.face_extents[s][f];
             for lp in &self.solids[s].faces[f].loops {
                 for de in lp {
                     let sampled = &self.edge_samples[s][de.edge];
@@ -5679,10 +5763,15 @@ fn triangulate_mesh_face(mf: &MeshFace, weld_eps: f64) -> CoreResult<(Vec<Triang
         Chart::Plane { .. } => None,
         // A freeform patch has no u-circle to price an angular pitch off,
         // and its curvature varies across the domain; the curvature-derived
-        // pitch is of-37i.6 (phase 4). `None` leaves the region on the
-        // ear-clip seed, which the mesh deviation gate then diverts to the
-        // F-Rep fallback — quality-only, exactly as for the cone estimate
-        // above, and never a correctness risk.
+        // pitch is of-37i.6 (phase 4). `None` skips the interior lattice,
+        // leaving the region on the boundary-CDT seed below (of-hqb):
+        // its trim rings are marched/sampled densely, and Delaunay between
+        // dense opposing rings yields thin strips that already hug the
+        // surface (a bore wall loses ~0.1% of its volume, vs ~13% under
+        // the ear-clip fans). A patch whose interior genuinely needs Steiner
+        // points diverts to the F-Rep fallback via the mesh deviation gate
+        // — quality-only, exactly as for the cone estimate above, and
+        // never a correctness risk.
         Chart::Nurbs { .. } => None,
     };
     // Curved charts: replace the ear-clip seed with a constrained Delaunay
@@ -5695,7 +5784,12 @@ fn triangulate_mesh_face(mf: &MeshFace, weld_eps: f64) -> CoreResult<(Vec<Triang
     // so bridging across a hole is impossible by construction. Fall back to
     // the ear-clip seed if the CDT cannot be built (e.g. a degenerate ring or
     // an unrecoverable constraint edge) — no worse than today for those.
-    if lattice.is_some() {
+    //
+    // NURBS charts take the CDT seed too, even though they lay no lattice:
+    // both of-6ry's folding hazard and the wide-chord hazard are properties
+    // of the chart being curved, not of having a lattice pitch (see the
+    // `lattice` match above).
+    if lattice.is_some() || matches!(mf.chart, Chart::Nurbs { .. }) {
         if let Some(cdt) = boundary_cdt(&all_uv, &ring_ranges) {
             tris = cdt;
         }
@@ -10221,6 +10315,45 @@ mod tests {
         let err = chart
             .param(&off, Some((0.5, 0.5)))
             .expect_err("a point a quarter unit off the patch has no inverse");
+        assert!(
+            matches!(err, CoreError::Degenerate { context, .. } if context.contains("Nurbs")),
+            "expected a Degenerate naming the NURBS inverse, got {err:?}"
+        );
+    }
+
+    /// The clip-predicate inverse ([`Chart::param_within`]) accepts a
+    /// chord-sagitta point `param` refuses — projecting it to the uv of
+    /// its surface foot — while still refusing a feature-scale distance
+    /// (of-hqb). On an analytic chart it is exactly `param`.
+    #[test]
+    fn nurbs_param_within_projects_chord_noise_and_refuses_far_points() {
+        let tol = tol();
+        let mut rng = Rng::new(0x0FF2);
+        let patch = wavy_patch(&mut rng, (0.0, 1.0), (0.0, 1.0), 0.3);
+        let chart = build_chart(&Surface3::nurbs(patch)).expect("regular patch");
+        let on = chart_point(&chart, (0.5, 0.5));
+        let normal = chart.normal(0.5, 0.5);
+        let band = 0.02;
+
+        // A chord-sagitta offset: refused by the strict on-surface gate,
+        // inverted by the banded projection to the foot's uv.
+        let sagitta = on + normal * (0.5 * band);
+        chart
+            .param(&sagitta, Some((0.5, 0.5)))
+            .expect_err("the strict gate refuses a sagitta-scale offset");
+        let (u, v) = chart
+            .param_within(&sagitta, Some((0.5, 0.5)), band)
+            .expect("the banded projection inverts it");
+        assert!(
+            tol.points_approx_eq(&chart_point(&chart, (u, v)), &on),
+            "the projected uv must name the offset point's surface foot"
+        );
+
+        // A feature-scale distance is a wrong point, not noise.
+        let far = on + normal * 0.25;
+        let err = chart
+            .param_within(&far, Some((0.5, 0.5)), band)
+            .expect_err("a quarter unit off the patch is beyond any band");
         assert!(
             matches!(err, CoreError::Degenerate { context, .. } if context.contains("Nurbs")),
             "expected a Degenerate naming the NURBS inverse, got {err:?}"
