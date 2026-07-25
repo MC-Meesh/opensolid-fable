@@ -5,13 +5,22 @@
 //! APIs ([`TopologyStore`] / [`GeometryStore`]), exactly when possible:
 //!
 //! - **Geometry**: `cartesian_point`, `direction`, `vector`,
-//!   `axis2_placement_3d`; `plane`, `cylindrical_surface`,
-//!   `conical_surface`, `spherical_surface`, `toroidal_surface` →
-//!   [`Surface3`]; `line`, `circle`, `ellipse` → [`Curve3`].
+//!   `axis1_placement`, `axis2_placement_3d`; `plane`,
+//!   `cylindrical_surface`, `conical_surface`, `spherical_surface`,
+//!   `toroidal_surface` → [`Surface3`]; `line`, `circle`, `ellipse` →
+//!   [`Curve3`]. A `trimmed_curve` is transparent (edges re-trim by their
+//!   vertices), and `surface_of_linear_extrusion` /
+//!   `surface_of_revolution` reduce to the exact quadric where one exists
+//!   (line → plane/cylinder/cone, axis-coplanar circle → sphere/torus,
+//!   circle along its normal → cylinder; NURBS bases extrude to an exact
+//!   ruled patch).
 //! - **Topology**: `vertex_point`, `edge_curve`, `oriented_edge`,
 //!   `edge_loop`, `face_bound` / `face_outer_bound`, `advanced_face`,
 //!   `closed_shell`, `manifold_solid_brep` → `Vertex` / `Edge` / `Loop` /
-//!   `Face` / `Shell` / `Body`.
+//!   `Face` / `Shell` / `Body`. A `brep_with_voids` maps its
+//!   `oriented_closed_shell` cavities to inner shells
+//!   ([`ShellOrientation::Inward`](opensolid_brep::ShellOrientation)),
+//!   reversing faces whose orientation flag negates the authored winding.
 //!
 //! STEP trims edges by their vertices, not by curve parameters, so the
 //! mapper recovers each edge's parameter range by inverse-projecting the
@@ -25,12 +34,15 @@
 //! `b_spline_curve_with_knots` / `b_spline_surface_with_knots` parse into
 //! [`NurbsCurve`] / [`NurbsSurface`] for evaluation, but the geometry
 //! store's [`Curve3`] / [`Surface3`] enums have no NURBS variants yet, so
-//! exact NURBS import is unsupported. Solids containing NURBS (or any
+//! exact NURBS import is unsupported — as are `parabola` / `hyperbola`
+//! edges (no conic variant), `composite_curve` edges, and swept surfaces
+//! with no quadric reduction. Solids containing any of those (or any
 //! other unmappable entity), and solids whose mapped topology fails
 //! `check`, fall back to a **tessellated import**: each face is
 //! triangulated straight from the STEP graph (planar faces ear-clipped
 //! from their boundary polylines, quadrics gridded over their parameter
-//! rectangle, NURBS patches gridded over their knot domain), welded, and
+//! rectangle, NURBS patches gridded over their knot domain, swept
+//! surfaces gridded from their sampled basis curve), welded, and
 //! wrapped as a [`MeshSdf`] — an F-Rep field ready for CSG. Faces of one
 //! solid share each edge's discretization, so junctions weld watertight.
 //! Anything the fallback cannot handle either fails the solid
@@ -792,6 +804,19 @@ fn resolve_axis2(file: &StepFile, id: u64, referrer: u64, scale: f64) -> MapResu
 enum RawSurface {
     Analytic(Surface3),
     Nurbs(Box<NurbsSurface>),
+    /// `SURFACE_OF_LINEAR_EXTRUSION` with no analytic/NURBS reduction:
+    /// tessellation-only (the basis polyline swept along `dir`).
+    Extruded {
+        basis: Box<RawCurve>,
+        dir: Vector3,
+    },
+    /// `SURFACE_OF_REVOLUTION` with no analytic reduction:
+    /// tessellation-only (the basis polyline revolved about the axis).
+    Revolved {
+        basis: Box<RawCurve>,
+        origin: Point3,
+        axis: Vector3,
+    },
 }
 
 fn resolve_surface(
@@ -856,17 +881,398 @@ fn resolve_surface(
         "B_SPLINE_SURFACE_WITH_KNOTS" => Ok(RawSurface::Nurbs(Box::new(resolve_bspline_surface(
             file, rec, id, scale,
         )?))),
+        // `SURFACE_OF_LINEAR_EXTRUSION(name, swept_curve, extrusion_axis)`.
+        // A line extrudes to a plane and a circle along its own normal to a
+        // cylinder — the forms real exporters emit for prismatic walls —
+        // giving an exact import; NURBS bases extrude to an exact ruled
+        // NURBS patch; anything else keeps the swept form for tessellation.
+        "SURFACE_OF_LINEAR_EXTRUSION" => {
+            let basis = resolve_curve(file, ref_attr(rec, 1, id)?, id, scale, angle_scale)?;
+            let dir = resolve_vector(file, ref_attr(rec, 2, id)?, id, scale)?;
+            let dir_norm = dir.norm();
+            if dir_norm < 1e-12 || !dir_norm.is_finite() {
+                return Err(invalid(
+                    id,
+                    "SURFACE_OF_LINEAR_EXTRUSION axis is degenerate",
+                ));
+            }
+            if let Some(reduced) = reduce_extrusion(basis.analytic_basis(), &dir, id)? {
+                return Ok(RawSurface::Analytic(reduced));
+            }
+            if let RawCurve::Nurbs(curve) = &basis {
+                return Ok(RawSurface::Nurbs(Box::new(extrude_nurbs_curve(
+                    curve, &dir, id,
+                )?)));
+            }
+            Ok(RawSurface::Extruded {
+                basis: Box::new(basis),
+                dir,
+            })
+        }
+        // `SURFACE_OF_REVOLUTION(name, swept_curve, axis_position)`. Lines
+        // revolve to planes/cylinders/cones and axis-coplanar circles to
+        // spheres/tori — exporters routinely spell quadrics this way — all
+        // reduced to exact analytic imports; other bases keep the swept
+        // form for tessellation.
+        "SURFACE_OF_REVOLUTION" => {
+            let basis = resolve_curve(file, ref_attr(rec, 1, id)?, id, scale, angle_scale)?;
+            let (origin, axis_raw) = resolve_axis1(file, ref_attr(rec, 2, id)?, id, scale)?;
+            let axis_norm = axis_raw.norm();
+            if axis_norm < 1e-12 || !axis_norm.is_finite() {
+                return Err(invalid(id, "SURFACE_OF_REVOLUTION axis is degenerate"));
+            }
+            let axis = axis_raw / axis_norm;
+            if let Some(reduced) = reduce_revolution(basis.analytic_basis(), origin, &axis, id)? {
+                return Ok(RawSurface::Analytic(reduced));
+            }
+            Ok(RawSurface::Revolved {
+                basis: Box::new(basis),
+                origin,
+                axis,
+            })
+        }
         other => Err(unsupported(id, format!("surface type {other}"))),
     }
+}
+
+/// Reduction acceptance tolerance for swept-surface geometry: directions
+/// and relative positions within this of an exact quadric configuration
+/// map to the quadric. Far looser than machine epsilon (STEP files carry
+/// finite decimal text) but tight enough that a genuinely skew sweep never
+/// silently becomes the wrong exact surface.
+const SWEEP_REDUCE_TOL: f64 = 1e-9;
+
+/// The exact quadric a linear extrusion collapses to, if any: a plane
+/// (line basis) or a circular cylinder (circle basis extruded along its
+/// own normal).
+fn reduce_extrusion(
+    basis: Option<&Curve3>,
+    dir: &Vector3,
+    entity: u64,
+) -> MapResult<Option<Surface3>> {
+    let unit = dir / dir.norm();
+    match basis {
+        Some(Curve3::Line { origin, dir: d }) => {
+            let normal = d.cross(&unit);
+            if normal.norm() < SWEEP_REDUCE_TOL {
+                return Err(invalid(
+                    entity,
+                    "SURFACE_OF_LINEAR_EXTRUSION sweeps a line along itself",
+                ));
+            }
+            Ok(Some(
+                Surface3::plane(*origin, normal).map_err(|e| geometry_error(entity, &e))?,
+            ))
+        }
+        Some(Curve3::Circle {
+            center,
+            axis,
+            radius,
+        }) if axis.dot(&unit).abs() > 1.0 - SWEEP_REDUCE_TOL => Ok(Some(
+            Surface3::cylinder(*center, *axis, *radius).map_err(|e| geometry_error(entity, &e))?,
+        )),
+        _ => Ok(None),
+    }
+}
+
+/// The exact quadric a revolution collapses to, if any.
+///
+/// - Line ⊥ axis → plane (every line point keeps its height).
+/// - Line ∥ axis → cylinder of the line-to-axis distance.
+/// - Line meeting the axis obliquely → cone with its apex at the
+///   intersection, opening toward the side the line's anchor point lies on.
+/// - Circle whose plane contains the axis → sphere (center on the axis) or
+///   torus (center off it, when the tube clears the axis).
+fn reduce_revolution(
+    basis: Option<&Curve3>,
+    origin: Point3,
+    axis: &Vector3,
+    entity: u64,
+) -> MapResult<Option<Surface3>> {
+    match basis {
+        Some(Curve3::Line { origin: c0, dir: d }) => {
+            let b = d.dot(axis);
+            let w = c0 - origin;
+            if b.abs() > 1.0 - SWEEP_REDUCE_TOL {
+                // Parallel: cylinder, unless the line lies on the axis.
+                let radial = w - axis * w.dot(axis);
+                if radial.norm() < SWEEP_REDUCE_TOL * (1.0 + w.norm()) {
+                    return Err(invalid(
+                        entity,
+                        "SURFACE_OF_REVOLUTION revolves a line lying on its axis",
+                    ));
+                }
+                return Ok(Some(
+                    Surface3::cylinder(origin, *axis, radial.norm())
+                        .map_err(|e| geometry_error(entity, &e))?,
+                ));
+            }
+            if b.abs() < SWEEP_REDUCE_TOL {
+                // Perpendicular: all line points share one height → plane.
+                return Ok(Some(
+                    Surface3::plane(*c0, *axis).map_err(|e| geometry_error(entity, &e))?,
+                ));
+            }
+            // Oblique: a cone exactly when the line meets the axis
+            // (coplanar); a skew line sweeps a hyperboloid (no reduction).
+            let n = d.cross(axis);
+            if w.dot(&n).abs() > SWEEP_REDUCE_TOL * (1.0 + w.norm()) * n.norm() {
+                return Ok(None);
+            }
+            let t_apex = (b * w.dot(axis) - w.dot(d)) / (1.0 - b * b);
+            let apex = c0 + d * t_apex;
+            let half_angle = b.abs().clamp(0.0, 1.0).acos();
+            // Open the nappe toward the line's anchor point; if the anchor
+            // IS the apex, along the line direction's axial component.
+            let side = (c0 - apex).dot(axis);
+            let toward = if side.abs() > SWEEP_REDUCE_TOL * (1.0 + apex.coords.norm()) {
+                side
+            } else {
+                b
+            };
+            let cone_axis = if toward >= 0.0 { *axis } else { -*axis };
+            Ok(Some(
+                Surface3::cone(apex, cone_axis, half_angle, 0.0)
+                    .map_err(|e| geometry_error(entity, &e))?,
+            ))
+        }
+        Some(Curve3::Circle {
+            center,
+            axis: circle_axis,
+            radius,
+        }) => {
+            let w = center - origin;
+            let scale = 1.0 + w.norm() + radius;
+            // The circle's plane must contain the axis: normals
+            // perpendicular, and the axis passing through the plane.
+            if circle_axis.dot(axis).abs() > SWEEP_REDUCE_TOL
+                || w.dot(circle_axis).abs() > SWEEP_REDUCE_TOL * scale
+            {
+                return Ok(None);
+            }
+            let radial = w - axis * w.dot(axis);
+            let major = radial.norm();
+            if major < SWEEP_REDUCE_TOL * scale {
+                // Meridian circle centered on the axis → sphere.
+                return Ok(Some(
+                    Surface3::sphere(*center, *axis, *radius)
+                        .map_err(|e| geometry_error(entity, &e))?,
+                ));
+            }
+            if major > radius + SWEEP_REDUCE_TOL * scale {
+                let tube_center = origin + axis * w.dot(axis);
+                return Ok(Some(
+                    Surface3::torus(tube_center, *axis, major, *radius)
+                        .map_err(|e| geometry_error(entity, &e))?,
+                ));
+            }
+            // Tube crossing the axis: a self-intersecting (lemon/apple)
+            // torus the kernel cannot hold — tessellate instead.
+            Ok(None)
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Extrude a NURBS curve along `dir` into the exact ruled patch: the curve
+/// as both `v` rows (`v = 1` translated by `dir`), degree 1 in `v`, the
+/// curve's weights repeated (a translate preserves rationality).
+fn extrude_nurbs_curve(curve: &NurbsCurve, dir: &Vector3, entity: u64) -> MapResult<NurbsSurface> {
+    let knots_v =
+        KnotVector::new(1, vec![0.0, 0.0, 1.0, 1.0]).map_err(|e| nurbs_error(entity, &e))?;
+    // Control grid outer index runs over u — the curve direction — so the
+    // surface normal du × dv matches curve-tangent × extrusion, the STEP
+    // convention for surface_of_linear_extrusion.
+    let grid: Vec<Vec<Point3>> = curve
+        .control_points()
+        .iter()
+        .map(|p| vec![*p, p + dir])
+        .collect();
+    let weights: Vec<Vec<f64>> = curve.weights().iter().map(|&w| vec![w, w]).collect();
+    NurbsSurface::new(grid, weights, curve.knot_vector().clone(), knots_v)
+        .map_err(|e| nurbs_error(entity, &e))
+}
+
+/// A resolved `AXIS1_PLACEMENT`: location plus its axis direction
+/// (defaulting to +Z per ISO 10303-42 when unset).
+fn resolve_axis1(
+    file: &StepFile,
+    id: u64,
+    referrer: u64,
+    scale: f64,
+) -> MapResult<(Point3, Vector3)> {
+    let rec = typed_record(file, id, "AXIS1_PLACEMENT", referrer)?;
+    let location = resolve_point(file, ref_attr(rec, 1, id)?, id, scale)?;
+    let axis = match attr(rec, 2, id)? {
+        Value::Unset => Vector3::z(),
+        Value::Ref(dir) => resolve_direction(file, *dir, id)?,
+        _ => {
+            return Err(invalid(
+                id,
+                "AXIS1_PLACEMENT axis is neither $ nor a reference",
+            ));
+        }
+    };
+    Ok((location, axis))
+}
+
+/// A conic the geometry store has no [`Curve3`] variant for (parabola,
+/// hyperbola). Carries the exact STEP parameterization plus a closed-form
+/// parameter inverse, so the mesh fallback can trim it by edge vertices;
+/// the exact B-Rep path rejects it (degrading the solid to tessellation).
+#[derive(Clone)]
+enum ConicCurve {
+    /// `PARABOLA`: `p(t) = location + focal·t²·x_dir + 2·focal·t·y_dir`
+    /// (ISO 10303-42), the axis of symmetry along `x_dir`.
+    Parabola {
+        location: Point3,
+        x_dir: Vector3,
+        y_dir: Vector3,
+        focal: f64,
+    },
+    /// `HYPERBOLA`: `p(t) = location + a·cosh(t)·x_dir + b·sinh(t)·y_dir`
+    /// (ISO 10303-42), one branch opening along `+x_dir`.
+    Hyperbola {
+        location: Point3,
+        x_dir: Vector3,
+        y_dir: Vector3,
+        a: f64,
+        b: f64,
+    },
+}
+
+impl ConicCurve {
+    fn point(&self, t: f64) -> Point3 {
+        match self {
+            ConicCurve::Parabola {
+                location,
+                x_dir,
+                y_dir,
+                focal,
+            } => location + x_dir * (focal * t * t) + y_dir * (2.0 * focal * t),
+            ConicCurve::Hyperbola {
+                location,
+                x_dir,
+                y_dir,
+                a,
+                b,
+            } => location + x_dir * (a * t.cosh()) + y_dir * (b * t.sinh()),
+        }
+    }
+
+    /// Parameter of `p`, assuming it lies on the curve: both conics are
+    /// strictly monotonic in their `y_dir` coordinate, so the inverse is
+    /// closed-form (no projection iteration needed).
+    fn param_of(&self, p: &Point3) -> f64 {
+        match self {
+            ConicCurve::Parabola {
+                location,
+                y_dir,
+                focal,
+                ..
+            } => (p - location).dot(y_dir) / (2.0 * focal),
+            ConicCurve::Hyperbola {
+                location, y_dir, b, ..
+            } => ((p - location).dot(y_dir) / b).asinh(),
+        }
+    }
+
+    /// The same point set traversed the other way (`t → -t` relabeling):
+    /// both parameterizations are odd in `y_dir`, so flipping it reverses.
+    fn reversed(&self) -> ConicCurve {
+        let mut flipped = self.clone();
+        match &mut flipped {
+            ConicCurve::Parabola { y_dir, .. } | ConicCurve::Hyperbola { y_dir, .. } => {
+                *y_dir = -*y_dir;
+            }
+        }
+        flipped
+    }
+}
+
+/// One parameter-or-point trim bound of a `TRIMMED_CURVE` (STEP allows
+/// either or both; cartesian points are preferred as unit-scale-proof).
+#[derive(Clone, Copy, Default)]
+struct RawTrim {
+    point: Option<Point3>,
+    param: Option<f64>,
 }
 
 /// An edge curve as mapped from STEP (same split as [`RawSurface`]).
 enum RawCurve {
     Analytic(Curve3),
     Nurbs(Box<NurbsCurve>),
+    /// Parabola/hyperbola: mesh fallback only (no `Curve3` variant).
+    Conic(ConicCurve),
+    /// `TRIMMED_CURVE`: a basis plus its trim bounds. Edge geometry re-trims
+    /// by vertices, so the bounds only matter for bases inside
+    /// `COMPOSITE_CURVE` segments (where no vertices exist).
+    Trimmed {
+        basis: Box<RawCurve>,
+        trims: [RawTrim; 2],
+        sense: bool,
+    },
+    /// `COMPOSITE_CURVE`: chained `(parent, same_sense)` segments; mesh
+    /// fallback only (sampled into a polyline).
+    Composite(Vec<(RawCurve, bool)>),
 }
 
-fn resolve_curve(file: &StepFile, id: u64, referrer: u64, scale: f64) -> MapResult<RawCurve> {
+impl RawCurve {
+    /// The analytic basis under any `TRIMMED_CURVE` wrapping — what the
+    /// exact path and the swept-surface reductions care about (vertex and
+    /// face bounds re-trim, so the wrapper itself is transparent).
+    fn analytic_basis(&self) -> Option<&Curve3> {
+        match self {
+            RawCurve::Analytic(c) => Some(c),
+            RawCurve::Trimmed { basis, .. } => basis.analytic_basis(),
+            _ => None,
+        }
+    }
+}
+
+/// One bound of a `TRIMMED_CURVE`: a `(cartesian_point | parameter_value)`
+/// select, possibly listing both representations.
+fn resolve_trim(
+    file: &StepFile,
+    value: &Value,
+    entity: u64,
+    scale: f64,
+    param_scale: f64,
+) -> MapResult<RawTrim> {
+    let mut trim = RawTrim::default();
+    let items = match value {
+        Value::List(items) => items.as_slice(),
+        single => std::slice::from_ref(single),
+    };
+    for item in items {
+        match item {
+            Value::Ref(point_ref) => {
+                trim.point = Some(resolve_point(file, *point_ref, entity, scale)?);
+            }
+            Value::Typed { type_name, value } if type_name == "PARAMETER_VALUE" => {
+                let t = as_number(value)
+                    .ok_or_else(|| invalid(entity, "non-numeric PARAMETER_VALUE trim"))?;
+                trim.param = Some(t * param_scale);
+            }
+            _ => {}
+        }
+    }
+    if trim.point.is_none() && trim.param.is_none() {
+        return Err(invalid(
+            entity,
+            "TRIMMED_CURVE trim carries neither a cartesian point nor a parameter value",
+        ));
+    }
+    Ok(trim)
+}
+
+fn resolve_curve(
+    file: &StepFile,
+    id: u64,
+    referrer: u64,
+    scale: f64,
+    angle_scale: f64,
+) -> MapResult<RawCurve> {
     let inst = instance(file, id, referrer)?;
     let Some(rec) = inst.as_simple() else {
         return Err(unsupported(
@@ -915,8 +1321,106 @@ fn resolve_curve(file: &StepFile, id: u64, referrer: u64, scale: f64) -> MapResu
         "B_SPLINE_CURVE_WITH_KNOTS" => Ok(RawCurve::Nurbs(Box::new(resolve_bspline_curve(
             file, rec, id, scale,
         )?))),
+        // `PARABOLA(name, position, focal_dist)` — see [`ConicCurve`].
+        "PARABOLA" => {
+            let p = resolve_axis2(file, ref_attr(rec, 1, id)?, id, scale)?;
+            let focal = real_attr(rec, 2, id)? * scale;
+            if !(focal > 0.0 && focal.is_finite()) {
+                return Err(invalid(id, format!("PARABOLA focal distance {focal} <= 0")));
+            }
+            let (x_dir, y_dir) = conic_frame(&p, id)?;
+            Ok(RawCurve::Conic(ConicCurve::Parabola {
+                location: p.location,
+                x_dir,
+                y_dir,
+                focal,
+            }))
+        }
+        // `HYPERBOLA(name, position, semi_axis, semi_imag_axis)`.
+        "HYPERBOLA" => {
+            let p = resolve_axis2(file, ref_attr(rec, 1, id)?, id, scale)?;
+            let a = real_attr(rec, 2, id)? * scale;
+            let b = real_attr(rec, 3, id)? * scale;
+            if !(a > 0.0 && a.is_finite() && b > 0.0 && b.is_finite()) {
+                return Err(invalid(id, format!("HYPERBOLA semi-axes ({a}, {b}) <= 0")));
+            }
+            let (x_dir, y_dir) = conic_frame(&p, id)?;
+            Ok(RawCurve::Conic(ConicCurve::Hyperbola {
+                location: p.location,
+                x_dir,
+                y_dir,
+                a,
+                b,
+            }))
+        }
+        // `TRIMMED_CURVE(name, basis_curve, trim_1, trim_2, sense_agreement,
+        // master_representation)`. The basis resolves recursively; trims are
+        // kept for bases that have no vertices to re-trim by (composite
+        // segments). Parameter trims on circles/ellipses are plane-angle
+        // measures and scale into radians; conic (parabola/hyperbola) and
+        // B-spline parameters are unit-free.
+        "TRIMMED_CURVE" => {
+            let basis = resolve_curve(file, ref_attr(rec, 1, id)?, id, scale, angle_scale)?;
+            let param_scale = match &basis {
+                RawCurve::Analytic(Curve3::Circle { .. } | Curve3::Ellipse { .. }) => angle_scale,
+                _ => 1.0,
+            };
+            let trims = [
+                resolve_trim(file, attr(rec, 2, id)?, id, scale, param_scale)?,
+                resolve_trim(file, attr(rec, 3, id)?, id, scale, param_scale)?,
+            ];
+            let sense = bool_attr(rec, 4, id)?;
+            Ok(RawCurve::Trimmed {
+                basis: Box::new(basis),
+                trims,
+                sense,
+            })
+        }
+        // `COMPOSITE_CURVE(name, segments, self_intersect)`; each segment is
+        // a `COMPOSITE_CURVE_SEGMENT(transition, same_sense, parent_curve)`.
+        "COMPOSITE_CURVE" => {
+            let mut segments = Vec::new();
+            for seg_ref in ref_list(rec, 1, id)? {
+                let seg = typed_record(file, seg_ref, "COMPOSITE_CURVE_SEGMENT", id)?;
+                let same_sense = bool_attr(seg, 1, seg_ref)?;
+                let parent = resolve_curve(
+                    file,
+                    ref_attr(seg, 2, seg_ref)?,
+                    seg_ref,
+                    scale,
+                    angle_scale,
+                )?;
+                segments.push((parent, same_sense));
+            }
+            if segments.is_empty() {
+                return Err(invalid(id, "COMPOSITE_CURVE has no segments"));
+            }
+            Ok(RawCurve::Composite(segments))
+        }
         other => Err(unsupported(id, format!("curve type {other}"))),
     }
+}
+
+/// Orthonormal in-plane frame of a conic's placement: `x_dir` from the
+/// placement's ref_direction (Gram-Schmidt against the axis, defaulting to
+/// [`plane_basis`]), `y_dir = axis × x_dir`.
+fn conic_frame(p: &Placement, entity: u64) -> MapResult<(Vector3, Vector3)> {
+    let axis_norm = p.axis.norm();
+    if axis_norm == 0.0 || !axis_norm.is_finite() {
+        return Err(invalid(entity, "conic placement axis is degenerate"));
+    }
+    let unit_axis = p.axis / axis_norm;
+    let x_raw = p.ref_dir.unwrap_or_else(|| plane_basis(&unit_axis).0);
+    let x_planar = x_raw - unit_axis * x_raw.dot(&unit_axis);
+    let x_norm = x_planar.norm();
+    if x_norm < 1e-12 {
+        return Err(invalid(
+            entity,
+            "conic placement ref_direction is parallel to its axis",
+        ));
+    }
+    let x_dir = x_planar / x_norm;
+    Ok((x_dir, unit_axis.cross(&x_dir)))
 }
 
 /// Expand STEP's `(knots, multiplicities)` pair into a flat knot sequence.
@@ -1167,7 +1671,7 @@ fn verify_trim(trimmed: &TrimmedCurve, start: Point3, end: Point3, entity: u64) 
 #[derive(Default)]
 struct Created {
     body: Option<EntityId<Body>>,
-    shell: Option<EntityId<Shell>>,
+    shells: Vec<EntityId<Shell>>,
     faces: Vec<EntityId<Face>>,
     loops: Vec<EntityId<Loop>>,
     fins: Vec<EntityId<Fin>>,
@@ -1195,7 +1699,7 @@ fn rollback(store: &mut TopologyStore, geo: &mut GeometryStore, created: &Create
     for &id in &created.vertices {
         store.vertices.remove(id);
     }
-    if let Some(id) = created.shell {
+    for &id in &created.shells {
         store.shells.remove(id);
     }
     if let Some(id) = created.body {
@@ -1226,27 +1730,37 @@ struct SolidBuilder<'a> {
 }
 
 impl SolidBuilder<'_> {
-    fn build(&mut self, msb_id: u64, shell_ref: u64) -> MapResult<EntityId<Body>> {
-        let shell_rec = typed_record(self.file, shell_ref, "CLOSED_SHELL", msb_id)?;
-        let face_refs = ref_list(shell_rec, 1, shell_ref)?;
-        if face_refs.is_empty() {
-            return Err(invalid(shell_ref, "CLOSED_SHELL has no faces"));
-        }
-
+    /// Build the body: the outer `CLOSED_SHELL`, then one inner shell per
+    /// `BREP_WITH_VOIDS` void. A void arrives as an `ORIENTED_CLOSED_SHELL`
+    /// whose flag says whether the underlying shell is used as authored;
+    /// a `false` flag reverses every face, so the stored (effective) void
+    /// boundary always has its normals pointing into the cavity — which is
+    /// what [`ShellOrientation::Inward`] documents.
+    fn build(
+        &mut self,
+        msb_id: u64,
+        shell_ref: u64,
+        voids: &[(u64, bool)],
+    ) -> MapResult<EntityId<Body>> {
         let body = self.store.create_body(BodyType::Solid);
         self.created.body = Some(body);
-        let shell = self
-            .store
-            .create_shell(body, true, ShellOrientation::Outward);
-        self.created.shell = Some(shell);
-
-        for face_ref in face_refs {
-            self.map_face(shell, face_ref, shell_ref)?;
+        self.build_shell(msb_id, shell_ref, ShellOrientation::Outward, false, body)?;
+        for &(void_ref, as_authored) in voids {
+            self.build_shell(
+                msb_id,
+                void_ref,
+                ShellOrientation::Inward,
+                !as_authored,
+                body,
+            )?;
         }
 
         // STEP carries no genus; recover it from the Euler-Poincaré formula
         // so `check` validates the imported topology's own consistency
-        // (an odd or negative implied genus still fails the formula).
+        // (an odd or negative implied genus still fails the formula). Any
+        // residual genus is attributed to the outer shell — a handled void
+        // with handles of its own would mis-assign, and then fail `check`
+        // into the mesh fallback rather than import wrongly.
         let counts = self.store.euler_counts(body);
         let euler = counts.vertices as i64 - counts.edges as i64 + counts.faces as i64
             - counts.rings as i64;
@@ -1254,14 +1768,44 @@ impl SolidBuilder<'_> {
         if genus_x2 >= 0 && genus_x2 % 2 == 0 {
             self.store
                 .shells
-                .get_mut(shell)
+                .get_mut(self.created.shells[0])
                 .expect("just created")
                 .genus = (genus_x2 / 2) as u32;
         }
         Ok(body)
     }
 
-    fn map_face(&mut self, shell: EntityId<Shell>, face_ref: u64, referrer: u64) -> MapResult<()> {
+    fn build_shell(
+        &mut self,
+        msb_id: u64,
+        shell_ref: u64,
+        orientation: ShellOrientation,
+        flip: bool,
+        body: EntityId<Body>,
+    ) -> MapResult<()> {
+        let shell_rec = typed_record(self.file, shell_ref, "CLOSED_SHELL", msb_id)?;
+        let face_refs = ref_list(shell_rec, 1, shell_ref)?;
+        if face_refs.is_empty() {
+            return Err(invalid(shell_ref, "CLOSED_SHELL has no faces"));
+        }
+        let shell = self.store.create_shell(body, true, orientation);
+        self.created.shells.push(shell);
+        for face_ref in face_refs {
+            self.map_face(shell, face_ref, shell_ref, flip)?;
+        }
+        Ok(())
+    }
+
+    /// Map one `ADVANCED_FACE` onto `shell`. `flip` reverses the face — the
+    /// surface sense and every bound's traversal — for void shells whose
+    /// `ORIENTED_CLOSED_SHELL` flag negates the authored orientation.
+    fn map_face(
+        &mut self,
+        shell: EntityId<Shell>,
+        face_ref: u64,
+        referrer: u64,
+        flip: bool,
+    ) -> MapResult<()> {
         let rec = typed_record(self.file, face_ref, "ADVANCED_FACE", referrer)?;
         let bounds = ref_list(rec, 1, face_ref)?;
         let surface_ref = ref_attr(rec, 2, face_ref)?;
@@ -1284,6 +1828,13 @@ impl SolidBuilder<'_> {
                      falling back to tessellation",
                 ));
             }
+            RawSurface::Extruded { .. } | RawSurface::Revolved { .. } => {
+                return Err(unsupported(
+                    surface_ref,
+                    "exact swept-surface import (no analytic reduction applies); \
+                     falling back to tessellation",
+                ));
+            }
         };
         if bounds.is_empty() {
             return Err(invalid(face_ref, "ADVANCED_FACE has no bounds"));
@@ -1303,7 +1854,7 @@ impl SolidBuilder<'_> {
         }
         let outer_index = outer_index.unwrap_or(0);
 
-        let sense = if same_sense {
+        let sense = if same_sense != flip {
             FaceSense::Positive
         } else {
             FaceSense::Negative
@@ -1321,7 +1872,7 @@ impl SolidBuilder<'_> {
         for (i, &bound_ref) in bounds.iter().enumerate() {
             let (loop_ref, orientation) = self.resolve_bound(bound_ref, face_ref)?;
             let mut loop_edges = self.map_loop(loop_ref, bound_ref)?;
-            if !orientation {
+            if orientation == flip {
                 loop_edges.reverse();
                 for (_, sense) in &mut loop_edges {
                     *sense = sense.opposite();
@@ -1407,13 +1958,33 @@ impl SolidBuilder<'_> {
         let start = self.store.vertex(v_start).expect("just created").point;
         let end = self.store.vertex(v_end).expect("just created").point;
 
-        let curve = match resolve_curve(self.file, geometry_ref, edge_ref, self.scale)? {
-            RawCurve::Analytic(curve) => curve,
-            RawCurve::Nurbs(_) => {
+        let raw = resolve_curve(
+            self.file,
+            geometry_ref,
+            edge_ref,
+            self.scale,
+            self.angle_scale,
+        )?;
+        // TRIMMED_CURVE wrapping is transparent here: the edge's vertices
+        // re-trim whatever basis the wrapper carries.
+        let curve = match raw.analytic_basis() {
+            Some(curve) => curve.clone(),
+            None => {
+                let what = match raw {
+                    RawCurve::Nurbs(_) | RawCurve::Trimmed { .. } => {
+                        "exact NURBS curve import (geometry store has no NURBS variant)"
+                    }
+                    RawCurve::Conic(_) => {
+                        "exact PARABOLA/HYPERBOLA import (geometry store has no conic variant)"
+                    }
+                    RawCurve::Composite(_) => {
+                        "exact COMPOSITE_CURVE import (geometry store has no multi-segment curve)"
+                    }
+                    RawCurve::Analytic(_) => unreachable!("analytic_basis covers Analytic"),
+                };
                 return Err(unsupported(
                     geometry_ref,
-                    "exact NURBS curve import (geometry store has no NURBS variant); \
-                     falling back to tessellation",
+                    format!("{what}; falling back to tessellation"),
                 ));
             }
         };
@@ -1487,29 +2058,29 @@ struct FallbackMesher<'a> {
 impl FallbackMesher<'_> {
     /// Tessellate one solid straight from the STEP graph. `None` (with
     /// diagnostics) when any face fails or the welded result is not a
-    /// closed manifold.
-    fn mesh_solid(&mut self, msb_id: u64, shell_ref: u64) -> Option<TriangleMesh> {
-        let shell_rec = match typed_record(self.file, shell_ref, "CLOSED_SHELL", msb_id) {
-            Ok(rec) => rec,
-            Err(e) => {
-                self.diagnostics.push(e.diagnostic());
-                return None;
-            }
-        };
-        let face_refs = match ref_list(shell_rec, 1, shell_ref) {
-            Ok(refs) => refs,
-            Err(e) => {
-                self.diagnostics.push(e.diagnostic());
-                return None;
-            }
-        };
-
+    /// closed manifold. Void shells tessellate into the same mesh; a void
+    /// whose `ORIENTED_CLOSED_SHELL` flag negates the authored orientation
+    /// has its triangles rewound (and normals negated), so cavity triangles
+    /// always face into the cavity and the mesh SDF signs correctly.
+    fn mesh_solid(
+        &mut self,
+        msb_id: u64,
+        shell_ref: u64,
+        voids: &[(u64, bool)],
+    ) -> Option<TriangleMesh> {
         let mut mesh = TriangleMesh::new();
-        let mut ok = true;
-        for face_ref in face_refs {
-            if let Err(e) = self.mesh_face(&mut mesh, face_ref, shell_ref) {
-                self.diagnostics.push(e.diagnostic());
-                ok = false;
+        let mut ok = self.mesh_shell(&mut mesh, msb_id, shell_ref);
+        for &(void_ref, as_authored) in voids {
+            let tri_start = mesh.indices.len();
+            let vertex_start = mesh.positions.len();
+            ok &= self.mesh_shell(&mut mesh, msb_id, void_ref);
+            if !as_authored {
+                for tri in &mut mesh.indices[tri_start..] {
+                    tri.swap(1, 2);
+                }
+                for normal in &mut mesh.normals[vertex_start..] {
+                    *normal = -*normal;
+                }
             }
         }
         if !ok {
@@ -1530,6 +2101,33 @@ impl FallbackMesher<'_> {
             return None;
         }
         Some(welded)
+    }
+
+    /// Tessellate every face of one `CLOSED_SHELL` into `mesh`, reporting
+    /// per-face diagnostics; false if any face failed.
+    fn mesh_shell(&mut self, mesh: &mut TriangleMesh, msb_id: u64, shell_ref: u64) -> bool {
+        let shell_rec = match typed_record(self.file, shell_ref, "CLOSED_SHELL", msb_id) {
+            Ok(rec) => rec,
+            Err(e) => {
+                self.diagnostics.push(e.diagnostic());
+                return false;
+            }
+        };
+        let face_refs = match ref_list(shell_rec, 1, shell_ref) {
+            Ok(refs) => refs,
+            Err(e) => {
+                self.diagnostics.push(e.diagnostic());
+                return false;
+            }
+        };
+        let mut ok = true;
+        for face_ref in face_refs {
+            if let Err(e) = self.mesh_face(mesh, face_ref, shell_ref) {
+                self.diagnostics.push(e.diagnostic());
+                ok = false;
+            }
+        }
+        ok
     }
 
     fn mesh_face(
@@ -1567,7 +2165,217 @@ impl FallbackMesher<'_> {
                 mesh_nurbs_face(mesh, &surface, same_sense);
                 Ok(())
             }
+            RawSurface::Extruded { basis, dir } => {
+                self.mesh_extruded_face(mesh, face_ref, &bounds, &basis, &dir, same_sense)
+            }
+            RawSurface::Revolved {
+                basis,
+                origin,
+                axis,
+            } => self.mesh_revolved_face(mesh, face_ref, &basis, origin, &axis, same_sense),
         }
+    }
+
+    /// Grid a non-reducible extruded face: the bounded basis polyline swept
+    /// along the extrusion direction, the sweep span recovered from the
+    /// face's boundary (like the quadric mesher, the face is assumed to
+    /// cover the full basis curve).
+    fn mesh_extruded_face(
+        &mut self,
+        mesh: &mut TriangleMesh,
+        face_ref: u64,
+        bounds: &[u64],
+        basis: &RawCurve,
+        dir: &Vector3,
+        same_sense: bool,
+    ) -> MapResult<()> {
+        let profile = self.sample_bounded(basis, face_ref)?;
+        if profile.len() < 2 {
+            return Err(invalid(face_ref, "extrusion basis samples to a point"));
+        }
+        let unit = dir / dir.norm();
+
+        // Sweep span along the axis, from the boundary polylines (which the
+        // adjacent faces also use, so the end rows weld).
+        let mut v_lo = f64::INFINITY;
+        let mut v_hi = f64::NEG_INFINITY;
+        for &bound_ref in bounds {
+            for p in self.bound_polygon(bound_ref, face_ref)? {
+                let v = (p - profile[0]).dot(&unit);
+                v_lo = v_lo.min(v);
+                v_hi = v_hi.max(v);
+            }
+        }
+        // NaN-safe: only a strictly positive span is acceptable.
+        if (v_hi - v_lo).partial_cmp(&1e-12) != Some(std::cmp::Ordering::Greater) {
+            return Err(invalid(
+                face_ref,
+                "face boundary does not span the extrusion direction",
+            ));
+        }
+
+        // A closed profile wraps around (drop the duplicated closing point).
+        let closed = (profile[profile.len() - 1] - profile[0]).norm()
+            < 1e-9 * (1.0 + profile[0].coords.norm());
+        let columns: &[Point3] = if closed {
+            &profile[..profile.len() - 1]
+        } else {
+            &profile
+        };
+        let n_cols = columns.len();
+        let flip = if same_sense { 1.0 } else { -1.0 };
+
+        let base = mesh.positions.len();
+        for (i, p) in columns.iter().enumerate() {
+            // Central-difference tangent (wrapping when closed).
+            let prev = if i > 0 {
+                columns[i - 1]
+            } else if closed {
+                columns[n_cols - 1]
+            } else {
+                columns[0]
+            };
+            let next = if i + 1 < n_cols {
+                columns[i + 1]
+            } else if closed {
+                columns[0]
+            } else {
+                columns[n_cols - 1]
+            };
+            let tangent = next - prev;
+            let normal = tangent.cross(&unit);
+            let normal = if normal.norm() > 1e-12 {
+                normal.normalize() * flip
+            } else {
+                Vector3::zeros()
+            };
+            for v in [v_lo, v_hi] {
+                mesh.positions.push(p + unit * v);
+                mesh.normals.push(normal);
+            }
+        }
+        // Vertex layout: column i contributes [bottom, top] at base + 2i.
+        let quads = if closed { n_cols } else { n_cols - 1 };
+        for i in 0..quads {
+            let j = (i + 1) % n_cols;
+            let (a, b) = (base + 2 * i, base + 2 * j); // bottom row, +u
+            let (d, c) = (base + 2 * i + 1, base + 2 * j + 1); // top row
+            // Winding follows du × dv = tangent × extrusion when outward.
+            let tris = if same_sense {
+                [[a, b, c], [a, c, d]]
+            } else {
+                [[a, c, b], [a, d, c]]
+            };
+            for tri in tris {
+                if tri[0] != tri[1] && tri[1] != tri[2] && tri[0] != tri[2] {
+                    mesh.indices.push(tri);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Grid a non-reducible revolved face: the bounded basis polyline
+    /// revolved through the full turn (like the quadric mesher, trimmed
+    /// sweeps are assumed to cover the full angular range). Profile points
+    /// on the axis collapse to singular rows, exactly like sphere poles.
+    fn mesh_revolved_face(
+        &mut self,
+        mesh: &mut TriangleMesh,
+        face_ref: u64,
+        basis: &RawCurve,
+        origin: Point3,
+        axis: &Vector3,
+        same_sense: bool,
+    ) -> MapResult<()> {
+        let profile = self.sample_bounded(basis, face_ref)?;
+        if profile.len() < 2 {
+            return Err(invalid(face_ref, "revolution basis samples to a point"));
+        }
+        // A closed profile (revolved tube) wraps in v as well.
+        let wrap_v = (profile[profile.len() - 1] - profile[0]).norm()
+            < 1e-9 * (1.0 + profile[0].coords.norm());
+        let rows_pts: &[Point3] = if wrap_v {
+            &profile[..profile.len() - 1]
+        } else {
+            &profile
+        };
+        let n_rows = rows_pts.len();
+        let n_u = angular_segments(TAU, self.options);
+        let flip = if same_sense { 1.0 } else { -1.0 };
+        let scale = 1.0 + origin.coords.norm();
+
+        // Rodrigues rotation of `p` about the axis line by angle `theta`.
+        let rotate = |p: &Point3, theta: f64| -> Point3 {
+            let w = p - origin;
+            let (sin, cos) = theta.sin_cos();
+            origin + w * cos + axis.cross(&w) * sin + *axis * (axis.dot(&w) * (1.0 - cos))
+        };
+
+        let mut rows: Vec<Vec<usize>> = Vec::with_capacity(n_rows);
+        for (j, p) in rows_pts.iter().enumerate() {
+            let radial = (p - origin) - *axis * (p - origin).dot(axis);
+            let singular = radial.norm() < 1e-9 * scale;
+            // Profile tangent for normals (central difference, wrapping).
+            let prev = rows_pts[if j > 0 {
+                j - 1
+            } else if wrap_v {
+                n_rows - 1
+            } else {
+                0
+            }];
+            let next = rows_pts[if j + 1 < n_rows {
+                j + 1
+            } else if wrap_v {
+                0
+            } else {
+                n_rows - 1
+            }];
+            let tangent = next - prev;
+            let columns = if singular { 1 } else { n_u };
+            let mut row = Vec::with_capacity(columns);
+            for i in 0..columns {
+                let theta = TAU * i as f64 / n_u as f64;
+                let position = rotate(p, theta);
+                // du (circumferential, +theta) × dv (profile tangent).
+                let radial_here = (position - origin) - *axis * (position - origin).dot(axis);
+                let du = axis.cross(&radial_here);
+                let dv = rotate(&Point3::from(p.coords + tangent), theta) - position;
+                let normal = du.cross(&dv);
+                let normal = if normal.norm() > 1e-12 {
+                    normal.normalize() * flip
+                } else {
+                    Vector3::zeros()
+                };
+                row.push(mesh.positions.len());
+                mesh.positions.push(position);
+                mesh.normals.push(normal);
+            }
+            rows.push(row);
+        }
+
+        let at = |j: usize, i: usize| -> usize {
+            let row = &rows[j % n_rows];
+            row[i % row.len()]
+        };
+        let bands = if wrap_v { n_rows } else { n_rows - 1 };
+        for j in 0..bands {
+            for i in 0..n_u {
+                let (a, b) = (at(j, i), at(j, i + 1));
+                let (d, c) = (at(j + 1, i), at(j + 1, i + 1));
+                let tris = if same_sense {
+                    [[a, b, c], [a, c, d]]
+                } else {
+                    [[a, c, b], [a, d, c]]
+                };
+                for tri in tris {
+                    if tri[0] != tri[1] && tri[1] != tri[2] && tri[0] != tri[2] {
+                        mesh.indices.push(tri);
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Ear-clip a planar face's boundary polygon, bridging in any hole
@@ -1785,7 +2593,31 @@ impl FallbackMesher<'_> {
         let start = vertex_point(start_ref)?;
         let end = vertex_point(end_ref)?;
 
-        let points = match resolve_curve(self.file, geometry_ref, edge_ref, self.scale)? {
+        let raw = resolve_curve(
+            self.file,
+            geometry_ref,
+            edge_ref,
+            self.scale,
+            self.angle_scale,
+        )?;
+        let points = self.edge_points(raw, start, end, same_sense, closed, edge_ref)?;
+        self.polylines.insert(edge_ref, points.clone());
+        Ok(points)
+    }
+
+    /// Discretize resolved edge geometry between the edge's vertex points.
+    /// Analytic curves and conics trim by the vertices exactly; sampled
+    /// forms (NURBS, composites) snap their endpoints onto the vertices.
+    fn edge_points(
+        &mut self,
+        raw: RawCurve,
+        start: Point3,
+        end: Point3,
+        same_sense: bool,
+        closed: bool,
+        edge_ref: u64,
+    ) -> MapResult<Vec<Point3>> {
+        match raw {
             RawCurve::Analytic(curve) => {
                 let trimmed = trim_curve(&curve, same_sense, start, end, closed, edge_ref)?;
                 let segments = match trimmed.curve {
@@ -1800,7 +2632,7 @@ impl FallbackMesher<'_> {
                     points.push(trimmed.curve.point(t));
                 }
                 points.push(end);
-                points
+                Ok(points)
             }
             RawCurve::Nurbs(curve) => {
                 let (t0, t1) = curve.knot_vector().domain();
@@ -1811,26 +2643,283 @@ impl FallbackMesher<'_> {
                 if !same_sense {
                     points.reverse();
                 }
-                let scale = start.coords.norm().max(end.coords.norm());
-                let tol = TRIM_TOL_REL * (1.0 + scale);
-                if (points[0] - start).norm() > tol || (points[points.len() - 1] - end).norm() > tol
-                {
-                    self.diagnostics.push(Diagnostic {
-                        entity: Some(edge_ref),
-                        severity: Severity::Warning,
-                        message: "B-spline edge curve endpoints do not match the edge's \
-                                  vertex points; snapping"
-                            .to_string(),
-                    });
-                }
-                points[0] = start;
-                let last = points.len() - 1;
-                points[last] = end;
-                points
+                self.snap_endpoints(&mut points, start, end, edge_ref, "B-spline");
+                Ok(points)
             }
-        };
-        self.polylines.insert(edge_ref, points.clone());
-        Ok(points)
+            // Vertex trim via the closed-form parameter inverse; both conics
+            // are open curves, so a closed edge is malformed.
+            RawCurve::Conic(conic) => {
+                if closed {
+                    return Err(invalid(
+                        edge_ref,
+                        "a parabola/hyperbola cannot carry a closed edge",
+                    ));
+                }
+                let oriented = if same_sense { conic } else { conic.reversed() };
+                let t0 = oriented.param_of(&start);
+                let t1 = oriented.param_of(&end);
+                // NaN-safe: only a strictly positive advance is acceptable.
+                if (t1 - t0).partial_cmp(&1e-12) != Some(std::cmp::Ordering::Greater) {
+                    return Err(invalid(
+                        edge_ref,
+                        "edge endpoints do not advance along its conic (check same_sense)",
+                    ));
+                }
+                let tol = TRIM_TOL_REL * (1.0 + start.coords.norm().max(end.coords.norm()));
+                if (oriented.point(t0) - start).norm() > tol
+                    || (oriented.point(t1) - end).norm() > tol
+                {
+                    return Err(invalid(
+                        edge_ref,
+                        "edge geometry does not pass through the edge's vertex points",
+                    ));
+                }
+                // Conic parameters are not angles; the angular step is a
+                // density proxy (t spans O(1) over visually curved arcs).
+                let segments = angular_segments(t1 - t0, self.options);
+                let mut points = Vec::with_capacity(segments + 1);
+                points.push(start);
+                for k in 1..segments {
+                    points.push(oriented.point(t0 + (t1 - t0) * k as f64 / segments as f64));
+                }
+                points.push(end);
+                Ok(points)
+            }
+            // The edge's vertices re-trim the basis; the wrapper's own
+            // bounds only matter inside composite segments.
+            RawCurve::Trimmed { basis, .. } => {
+                self.edge_points(*basis, start, end, same_sense, closed, edge_ref)
+            }
+            RawCurve::Composite(segments) => {
+                let mut points = self.sample_composite(&segments, edge_ref)?;
+                if !same_sense {
+                    points.reverse();
+                }
+                if points.len() < 2 {
+                    return Err(invalid(
+                        edge_ref,
+                        "COMPOSITE_CURVE samples to fewer than 2 points",
+                    ));
+                }
+                self.snap_endpoints(&mut points, start, end, edge_ref, "composite");
+                Ok(points)
+            }
+        }
+    }
+
+    /// Force a sampled polyline's endpoints onto the edge's vertex points,
+    /// warning when they were not already there.
+    fn snap_endpoints(
+        &mut self,
+        points: &mut [Point3],
+        start: Point3,
+        end: Point3,
+        edge_ref: u64,
+        what: &str,
+    ) {
+        let scale = start.coords.norm().max(end.coords.norm());
+        let tol = TRIM_TOL_REL * (1.0 + scale);
+        let last = points.len() - 1;
+        if (points[0] - start).norm() > tol || (points[last] - end).norm() > tol {
+            self.diagnostics.push(Diagnostic {
+                entity: Some(edge_ref),
+                severity: Severity::Warning,
+                message: format!(
+                    "{what} edge curve endpoints do not match the edge's vertex points; snapping"
+                ),
+            });
+        }
+        points[0] = start;
+        points[last] = end;
+    }
+
+    /// Sample a bounded curve (no vertices available — swept-surface bases
+    /// and composite segments). Bounds come from the curve itself: the full
+    /// period of a circle/ellipse, a NURBS knot domain, or a
+    /// `TRIMMED_CURVE`'s explicit trim bounds.
+    fn sample_bounded(&self, raw: &RawCurve, entity: u64) -> MapResult<Vec<Point3>> {
+        match raw {
+            RawCurve::Analytic(curve @ (Curve3::Circle { .. } | Curve3::Ellipse { .. })) => {
+                let n = angular_segments(TAU, self.options);
+                Ok((0..=n)
+                    .map(|k| curve.point(TAU * k as f64 / n as f64))
+                    .collect())
+            }
+            RawCurve::Analytic(_) => Err(unsupported(
+                entity,
+                "an unbounded curve here needs TRIMMED_CURVE bounds",
+            )),
+            RawCurve::Nurbs(curve) => {
+                let (t0, t1) = curve.knot_vector().domain();
+                let n = nurbs_segments(curve.knot_vector().control_count());
+                Ok((0..=n)
+                    .map(|k| curve.point(t0 + (t1 - t0) * k as f64 / n as f64))
+                    .collect())
+            }
+            RawCurve::Conic(_) => Err(unsupported(
+                entity,
+                "a parabola/hyperbola here needs TRIMMED_CURVE bounds",
+            )),
+            RawCurve::Trimmed {
+                basis,
+                trims,
+                sense,
+            } => self.sample_trimmed(basis, trims, *sense, entity),
+            RawCurve::Composite(segments) => self.sample_composite(segments, entity),
+        }
+    }
+
+    /// Sample a `TRIMMED_CURVE` between its trim bounds, honoring
+    /// `sense_agreement` (the trimmed curve runs trim_1 → trim_2 along the
+    /// basis direction when true, against it when false).
+    fn sample_trimmed(
+        &self,
+        basis: &RawCurve,
+        trims: &[RawTrim; 2],
+        sense: bool,
+        entity: u64,
+    ) -> MapResult<Vec<Point3>> {
+        match basis {
+            RawCurve::Analytic(curve @ Curve3::Line { .. }) => {
+                // Line parameters scale by the underlying VECTOR magnitude,
+                // which normalization discarded — only points are reliable.
+                let (Some(p0), Some(p1)) = (trims[0].point, trims[1].point) else {
+                    return Err(unsupported(
+                        entity,
+                        "TRIMMED_CURVE over a LINE without cartesian trim points",
+                    ));
+                };
+                let tol = TRIM_TOL_REL * (1.0 + p0.coords.norm().max(p1.coords.norm()));
+                let Curve3::Line { origin, dir } = curve else {
+                    unreachable!("matched Line");
+                };
+                for p in [&p0, &p1] {
+                    let off = (p - origin) - dir * (p - origin).dot(dir);
+                    if off.norm() > tol {
+                        return Err(invalid(entity, "trim point is not on its LINE basis"));
+                    }
+                }
+                Ok(vec![p0, p1])
+            }
+            RawCurve::Analytic(curve @ Curve3::Circle { .. }) => {
+                // Angle bounds from points (preferred) or parameter values;
+                // a coincident pair bounds the full period.
+                let angle = |trim: &RawTrim| -> MapResult<f64> {
+                    if let Some(p) = trim.point {
+                        return Ok(conic_angle(curve, &p).expect("circle is a conic"));
+                    }
+                    trim.param
+                        .ok_or_else(|| invalid(entity, "empty TRIMMED_CURVE bound"))
+                };
+                let t0 = angle(&trims[0])?;
+                let t1 = angle(&trims[1])?;
+                let sweep = if sense {
+                    let s = (t1 - t0).rem_euclid(TAU);
+                    if s < 1e-9 { TAU } else { s }
+                } else {
+                    let s = (t0 - t1).rem_euclid(TAU);
+                    if s < 1e-9 { -TAU } else { -s }
+                };
+                let n = angular_segments(sweep, self.options);
+                Ok((0..=n)
+                    .map(|k| curve.point(t0 + sweep * k as f64 / n as f64))
+                    .collect())
+            }
+            RawCurve::Analytic(curve @ Curve3::Ellipse { .. }) => {
+                // The reader may have swapped the ellipse's axes to enforce
+                // major >= minor, shifting parameter meaning by a quarter
+                // turn — so only cartesian trim points are trustworthy.
+                let (Some(p0), Some(p1)) = (trims[0].point, trims[1].point) else {
+                    return Err(unsupported(
+                        entity,
+                        "TRIMMED_CURVE over an ELLIPSE without cartesian trim points",
+                    ));
+                };
+                let t0 = conic_angle(curve, &p0).expect("ellipse is a conic");
+                let t1 = conic_angle(curve, &p1).expect("ellipse is a conic");
+                let sweep = if sense {
+                    let s = (t1 - t0).rem_euclid(TAU);
+                    if s < 1e-9 { TAU } else { s }
+                } else {
+                    let s = (t0 - t1).rem_euclid(TAU);
+                    if s < 1e-9 { -TAU } else { -s }
+                };
+                let n = angular_segments(sweep, self.options);
+                Ok((0..=n)
+                    .map(|k| curve.point(t0 + sweep * k as f64 / n as f64))
+                    .collect())
+            }
+            RawCurve::Conic(conic) => {
+                let param = |trim: &RawTrim| -> MapResult<f64> {
+                    if let Some(p) = trim.point {
+                        return Ok(conic.param_of(&p));
+                    }
+                    trim.param
+                        .ok_or_else(|| invalid(entity, "empty TRIMMED_CURVE bound"))
+                };
+                // Non-periodic: the parameter order encodes the direction
+                // (descending == against the basis, matching !sense).
+                let t0 = param(&trims[0])?;
+                let t1 = param(&trims[1])?;
+                if (t1 - t0).abs() < 1e-12 {
+                    return Err(invalid(entity, "conic TRIMMED_CURVE sweeps zero length"));
+                }
+                let n = angular_segments(t1 - t0, self.options);
+                Ok((0..=n)
+                    .map(|k| conic.point(t0 + (t1 - t0) * k as f64 / n as f64))
+                    .collect())
+            }
+            RawCurve::Nurbs(curve) => {
+                let (d0, d1) = curve.knot_vector().domain();
+                let t0 = trims[0].param.map_or(d0, |t| t.clamp(d0, d1));
+                let t1 = trims[1].param.map_or(d1, |t| t.clamp(d0, d1));
+                if (t1 - t0).abs() < 1e-12 {
+                    return Err(invalid(entity, "NURBS TRIMMED_CURVE sweeps zero length"));
+                }
+                let n = nurbs_segments(curve.knot_vector().control_count());
+                let mut points: Vec<Point3> = (0..=n)
+                    .map(|k| curve.point(t0 + (t1 - t0) * k as f64 / n as f64))
+                    .collect();
+                if !sense {
+                    points.reverse();
+                }
+                Ok(points)
+            }
+            // Polyline is never produced by the reader; nested wrappers are
+            // pathological files — degrade with a diagnostic, don't guess.
+            RawCurve::Analytic(_) | RawCurve::Trimmed { .. } | RawCurve::Composite(_) => Err(
+                unsupported(entity, "nested TRIMMED_CURVE/COMPOSITE_CURVE bases"),
+            ),
+        }
+    }
+
+    /// Chain a `COMPOSITE_CURVE`'s segment polylines, dropping duplicated
+    /// junction points.
+    fn sample_composite(
+        &self,
+        segments: &[(RawCurve, bool)],
+        entity: u64,
+    ) -> MapResult<Vec<Point3>> {
+        let mut chain: Vec<Point3> = Vec::new();
+        for (parent, seg_sense) in segments {
+            let mut points = self.sample_bounded(parent, entity)?;
+            if !seg_sense {
+                points.reverse();
+            }
+            if let (Some(last), Some(first)) = (chain.last(), points.first()) {
+                let tol = TRIM_TOL_REL * (1.0 + last.coords.norm());
+                if (first - last).norm() <= tol {
+                    points.remove(0);
+                } else {
+                    return Err(invalid(
+                        entity,
+                        "COMPOSITE_CURVE segments do not join end to start",
+                    ));
+                }
+            }
+            chain.extend(points);
+        }
+        Ok(chain)
     }
 }
 
@@ -1952,6 +3041,36 @@ fn mesh_nurbs_face(mesh: &mut TriangleMesh, surface: &NurbsSurface, outward: boo
 // Top-level orchestration
 // ---------------------------------------------------------------------
 
+/// The void shells of a `BREP_WITH_VOIDS`: each an `ORIENTED_CLOSED_SHELL`
+/// resolved to its underlying `CLOSED_SHELL` plus the orientation flag
+/// (true = use as authored). A bare `CLOSED_SHELL` reference — technically
+/// malformed but seen in the wild — heals to an as-authored void.
+fn resolve_voids(file: &StepFile, rec: &SimpleRecord, msb_id: u64) -> MapResult<Vec<(u64, bool)>> {
+    let mut voids = Vec::new();
+    for void_ref in ref_list(rec, 2, msb_id)? {
+        let inst = instance(file, void_ref, msb_id)?;
+        if let Some(oriented) = inst.entity.part("ORIENTED_CLOSED_SHELL") {
+            // `(name, *, closed_shell_element, orientation)` — the inherited
+            // face set is derived (`*`), like ORIENTED_EDGE's vertices.
+            voids.push((
+                ref_attr(oriented, 2, void_ref)?,
+                bool_attr(oriented, 3, void_ref)?,
+            ));
+        } else if inst.entity.part("CLOSED_SHELL").is_some() {
+            voids.push((void_ref, true));
+        } else {
+            return Err(invalid(
+                void_ref,
+                format!(
+                    "BREP_WITH_VOIDS void is not an ORIENTED_CLOSED_SHELL ({})",
+                    type_names(inst)
+                ),
+            ));
+        }
+    }
+    Ok(voids)
+}
+
 fn map_file(
     file: &StepFile,
     store: &mut TopologyStore,
@@ -1963,7 +3082,13 @@ fn map_file(
     let angle_scale = resolve_angle_scale(file, &mut diagnostics);
     let mut solids = Vec::new();
     for inst in &file.data {
-        let Some(rec) = inst.entity.part("MANIFOLD_SOLID_BREP") else {
+        // BREP_WITH_VOIDS is a MANIFOLD_SOLID_BREP subtype; in the common
+        // simple encoding only its own type name appears.
+        let Some(rec) = inst
+            .entity
+            .part("BREP_WITH_VOIDS")
+            .or_else(|| inst.entity.part("MANIFOLD_SOLID_BREP"))
+        else {
             continue;
         };
         let name = name_attr(rec);
@@ -1987,7 +3112,7 @@ fn map_file(
         diagnostics.push(Diagnostic {
             entity: None,
             severity: Severity::Warning,
-            message: "no MANIFOLD_SOLID_BREP instances in the file".to_string(),
+            message: "no MANIFOLD_SOLID_BREP or BREP_WITH_VOIDS instances in the file".to_string(),
         });
     }
     StepImport {
@@ -2010,16 +3135,35 @@ fn map_solid(
     diagnostics: &mut Vec<Diagnostic>,
 ) -> SolidOutcome {
     let msb_id = inst.id;
-    let rec = inst
-        .entity
-        .part("MANIFOLD_SOLID_BREP")
-        .expect("caller selected MANIFOLD_SOLID_BREP instances");
+    // `BREP_WITH_VOIDS(name, outer, voids)` extends the plain
+    // `MANIFOLD_SOLID_BREP(name, outer)` with a list of
+    // `ORIENTED_CLOSED_SHELL` cavities.
+    let (rec, has_voids) = match inst.entity.part("BREP_WITH_VOIDS") {
+        Some(rec) if rec.attributes.len() >= 3 => (rec, true),
+        _ => (
+            inst.entity
+                .part("MANIFOLD_SOLID_BREP")
+                .expect("caller selected solid instances"),
+            false,
+        ),
+    };
     let shell_ref = match ref_attr(rec, 1, msb_id) {
         Ok(shell_ref) => shell_ref,
         Err(e) => {
             diagnostics.push(e.diagnostic());
             return SolidOutcome::Failed;
         }
+    };
+    let voids = if has_voids {
+        match resolve_voids(file, rec, msb_id) {
+            Ok(voids) => voids,
+            Err(e) => {
+                diagnostics.push(e.diagnostic());
+                return SolidOutcome::Failed;
+            }
+        }
+    } else {
+        Vec::new()
     };
 
     // Exact path first.
@@ -2033,7 +3177,7 @@ fn map_solid(
         vertices: HashMap::new(),
         edges: HashMap::new(),
     };
-    let built = builder.build(msb_id, shell_ref);
+    let built = builder.build(msb_id, shell_ref, &voids);
     let created = builder.created;
     match built {
         Ok(body) => {
@@ -2070,7 +3214,7 @@ fn map_solid(
         diagnostics,
         polylines: HashMap::new(),
     };
-    match mesher.mesh_solid(msb_id, shell_ref) {
+    match mesher.mesh_solid(msb_id, shell_ref, &voids) {
         Some(mesh) => match MeshSdf::new(&mesh) {
             Ok(sdf) => SolidOutcome::Mesh {
                 mesh,
@@ -2160,6 +3304,22 @@ mod tests {
 
     /// AP203 block: 8 vertex points, 12 line edges, 6 planar faces.
     fn block_step(x: f64, y: f64, z: f64) -> String {
+        let mut b = String::new();
+        let shell = block_shell_at(&mut b, 0, x, y, z);
+        writeln!(
+            b,
+            "#{} = MANIFOLD_SOLID_BREP('block', #{shell});",
+            shell + 1
+        )
+        .unwrap();
+        wrap(&b)
+    }
+
+    /// Emit one outward-wound block `CLOSED_SHELL` with instance names
+    /// offset by `base`; returns the shell's id. Shared by the plain block
+    /// fixture and the `BREP_WITH_VOIDS` fixtures (outer + cavity shells).
+    fn block_shell_at(b: &mut String, base: u64, x: f64, y: f64, z: f64) -> u64 {
+        let id = |k: u64| base + k;
         let (hx, hy, hz) = (x / 2.0, y / 2.0, z / 2.0);
         let corners = [
             (-hx, -hy, -hz),
@@ -2196,49 +3356,55 @@ mod tests {
             ([3, 0, 4, 7], (-1.0, 0.0, 0.0)),
         ];
 
-        let mut b = String::new();
         for (i, &(px, py, pz)) in corners.iter().enumerate() {
             writeln!(
                 b,
                 "#{} = CARTESIAN_POINT('', ({px:.6}, {py:.6}, {pz:.6}));",
-                i + 1
+                id(i as u64 + 1)
             )
             .unwrap();
         }
-        for i in 0..8 {
-            writeln!(b, "#{} = VERTEX_POINT('', #{});", 9 + i, i + 1).unwrap();
+        for i in 0..8u64 {
+            writeln!(b, "#{} = VERTEX_POINT('', #{});", id(9 + i), id(i + 1)).unwrap();
         }
         for (e, &(a, c)) in EDGE_PAIRS.iter().enumerate() {
-            let base = 17 + 4 * e;
+            let eb = id(17 + 4 * e as u64);
             let (dx, dy, dz) = (
                 corners[c].0 - corners[a].0,
                 corners[c].1 - corners[a].1,
                 corners[c].2 - corners[a].2,
             );
-            writeln!(b, "#{base} = DIRECTION('', ({dx:.6}, {dy:.6}, {dz:.6}));").unwrap();
-            writeln!(b, "#{} = VECTOR('', #{base}, 1.);", base + 1).unwrap();
-            writeln!(b, "#{} = LINE('', #{}, #{});", base + 2, a + 1, base + 1).unwrap();
+            writeln!(b, "#{eb} = DIRECTION('', ({dx:.6}, {dy:.6}, {dz:.6}));").unwrap();
+            writeln!(b, "#{} = VECTOR('', #{eb}, 1.);", eb + 1).unwrap();
+            writeln!(
+                b,
+                "#{} = LINE('', #{}, #{});",
+                eb + 2,
+                id(a as u64 + 1),
+                eb + 1
+            )
+            .unwrap();
             writeln!(
                 b,
                 "#{} = EDGE_CURVE('', #{}, #{}, #{}, .T.);",
-                base + 3,
-                9 + a,
-                9 + c,
-                base + 2
+                eb + 3,
+                id(9 + a as u64),
+                id(9 + c as u64),
+                eb + 2
             )
             .unwrap();
         }
         for (f, &(cycle, (nx, ny, nz))) in face_specs.iter().enumerate() {
-            let base = 65 + 10 * f;
-            writeln!(b, "#{base} = DIRECTION('', ({nx:.6}, {ny:.6}, {nz:.6}));").unwrap();
+            let fb = id(65 + 10 * f as u64);
+            writeln!(b, "#{fb} = DIRECTION('', ({nx:.6}, {ny:.6}, {nz:.6}));").unwrap();
             writeln!(
                 b,
-                "#{} = AXIS2_PLACEMENT_3D('', #{}, #{base}, $);",
-                base + 1,
-                cycle[0] + 1
+                "#{} = AXIS2_PLACEMENT_3D('', #{}, #{fb}, $);",
+                fb + 1,
+                id(cycle[0] as u64 + 1)
             )
             .unwrap();
-            writeln!(b, "#{} = PLANE('', #{});", base + 2, base + 1).unwrap();
+            writeln!(b, "#{} = PLANE('', #{});", fb + 2, fb + 1).unwrap();
             for k in 0..4 {
                 let (from, to) = (cycle[k], cycle[(k + 1) % 4]);
                 let (idx, &(a, _)) = EDGE_PAIRS
@@ -2250,44 +3416,44 @@ mod tests {
                 writeln!(
                     b,
                     "#{} = ORIENTED_EDGE('', *, *, #{}, {orientation});",
-                    base + 3 + k,
-                    17 + 4 * idx + 3
+                    fb + 3 + k as u64,
+                    id(17 + 4 * idx as u64 + 3)
                 )
                 .unwrap();
             }
             writeln!(
                 b,
                 "#{} = EDGE_LOOP('', (#{}, #{}, #{}, #{}));",
-                base + 7,
-                base + 3,
-                base + 4,
-                base + 5,
-                base + 6
+                fb + 7,
+                fb + 3,
+                fb + 4,
+                fb + 5,
+                fb + 6
             )
             .unwrap();
-            writeln!(
-                b,
-                "#{} = FACE_OUTER_BOUND('', #{}, .T.);",
-                base + 8,
-                base + 7
-            )
-            .unwrap();
+            writeln!(b, "#{} = FACE_OUTER_BOUND('', #{}, .T.);", fb + 8, fb + 7).unwrap();
             writeln!(
                 b,
                 "#{} = ADVANCED_FACE('', (#{}), #{}, .T.);",
-                base + 9,
-                base + 8,
-                base + 2
+                fb + 9,
+                fb + 8,
+                fb + 2
             )
             .unwrap();
         }
         writeln!(
             b,
-            "#125 = CLOSED_SHELL('', (#74, #84, #94, #104, #114, #124));"
+            "#{} = CLOSED_SHELL('', (#{}, #{}, #{}, #{}, #{}, #{}));",
+            id(125),
+            id(74),
+            id(84),
+            id(94),
+            id(104),
+            id(114),
+            id(124)
         )
         .unwrap();
-        writeln!(b, "#126 = MANIFOLD_SOLID_BREP('block', #125);").unwrap();
-        wrap(&b)
+        id(125)
     }
 
     /// AP203 cylinder: two circular caps plus a seam-closed wall.
@@ -2998,7 +4164,7 @@ mod tests {
              #4 = AXIS2_PLACEMENT_3D('', #1, #2, #3);
              #5 = ELLIPSE('', #4, 1.0, 2.0);",
         );
-        match resolve_curve(&file, 5, 0, 1.0).unwrap() {
+        match resolve_curve(&file, 5, 0, 1.0, 1.0).unwrap() {
             RawCurve::Analytic(
                 curve @ Curve3::Ellipse {
                     major_radius,
@@ -3026,7 +4192,7 @@ mod tests {
              #4 = B_SPLINE_CURVE_WITH_KNOTS('', 2, (#1, #2, #3), .UNSPECIFIED., .F., .F., \
                   (3, 3), (0., 1.), .UNSPECIFIED.);",
         );
-        let RawCurve::Nurbs(curve) = resolve_curve(&file, 4, 0, 1.0).unwrap() else {
+        let RawCurve::Nurbs(curve) = resolve_curve(&file, 4, 0, 1.0, 1.0).unwrap() else {
             panic!("expected a NURBS curve");
         };
         assert_eq!(curve.degree(), 2);
@@ -3231,5 +4397,326 @@ mod tests {
                 .any(|d| d.severity == Severity::Warning
                     && d.message.contains("MANIFOLD_SOLID_BREP"))
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Schema breadth (of-3qy.9): voids, swept surfaces, trimmed/composite
+    // curves, parabola/hyperbola
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn conic_parameterizations_invert_and_reverse() {
+        let parabola = ConicCurve::Parabola {
+            location: Point3::new(1.0, 2.0, 3.0),
+            x_dir: Vector3::x(),
+            y_dir: Vector3::y(),
+            focal: 0.75,
+        };
+        let hyperbola = ConicCurve::Hyperbola {
+            location: Point3::new(-1.0, 0.5, 0.0),
+            x_dir: Vector3::y(),
+            y_dir: Vector3::z(),
+            a: 2.0,
+            b: 0.5,
+        };
+        for conic in [&parabola, &hyperbola] {
+            for t in [-1.5, -0.25, 0.0, 0.4, 2.0] {
+                let p = conic.point(t);
+                assert!((conic.param_of(&p) - t).abs() < 1e-12, "param roundtrip");
+                let r = conic.reversed();
+                assert!(
+                    (r.point(-t) - p).norm() < 1e-12,
+                    "reversal is the t → -t relabeling"
+                );
+                assert!((r.param_of(&p) - (-t)).abs() < 1e-12);
+            }
+        }
+    }
+
+    #[test]
+    fn extrusion_reduces_to_plane_and_cylinder() {
+        let line = Curve3::line(Point3::new(1.0, 0.0, 0.0), Vector3::x()).unwrap();
+        let plane = reduce_extrusion(Some(&line), &Vector3::new(0.0, 0.0, 2.0), 1)
+            .unwrap()
+            .expect("line extrudes to a plane");
+        assert!(matches!(plane, Surface3::Plane { .. }));
+
+        let circle = Curve3::circle(Point3::new(0.0, 0.0, -1.0), Vector3::z(), 1.5).unwrap();
+        let cylinder = reduce_extrusion(Some(&circle), &Vector3::new(0.0, 0.0, 3.0), 1)
+            .unwrap()
+            .expect("circle along its normal extrudes to a cylinder");
+        assert!(
+            matches!(cylinder, Surface3::Cylinder { radius, .. } if (radius - 1.5).abs() < 1e-12)
+        );
+
+        // A circle swept obliquely is no quadric the store holds.
+        let skew = reduce_extrusion(Some(&circle), &Vector3::new(1.0, 0.0, 3.0), 1).unwrap();
+        assert!(skew.is_none());
+        // Sweeping a line along itself is degenerate, not a plane.
+        assert!(reduce_extrusion(Some(&line), &Vector3::x(), 1).is_err());
+    }
+
+    #[test]
+    fn revolution_reduces_to_quadrics() {
+        let axis = Vector3::z();
+        let origin = Point3::origin();
+
+        // Parallel line → cylinder of the line-to-axis distance.
+        let parallel = Curve3::line(Point3::new(2.0, 0.0, -1.0), Vector3::z()).unwrap();
+        let cyl = reduce_revolution(Some(&parallel), origin, &axis, 1)
+            .unwrap()
+            .expect("cylinder");
+        assert!(matches!(cyl, Surface3::Cylinder { radius, .. } if (radius - 2.0).abs() < 1e-12));
+
+        // Perpendicular line → the plane holding it.
+        let perp = Curve3::line(Point3::new(1.0, 0.0, 4.0), Vector3::x()).unwrap();
+        let plane = reduce_revolution(Some(&perp), origin, &axis, 1)
+            .unwrap()
+            .expect("plane");
+        assert!(matches!(plane, Surface3::Plane { .. }));
+
+        // Oblique line meeting the axis → cone with the apex at the
+        // intersection, opening toward the line's anchor point.
+        let oblique =
+            Curve3::line(Point3::new(1.0, 0.0, 0.0), Vector3::new(-1.0, 0.0, 1.0)).unwrap();
+        let cone = reduce_revolution(Some(&oblique), origin, &axis, 1)
+            .unwrap()
+            .expect("cone");
+        match cone {
+            Surface3::Cone {
+                origin: apex,
+                axis: cone_axis,
+                half_angle,
+                radius,
+            } => {
+                assert!((apex - Point3::new(0.0, 0.0, 1.0)).norm() < 1e-9);
+                assert!((half_angle - FRAC_PI_2 / 2.0).abs() < 1e-9, "45 degrees");
+                assert_eq!(radius, 0.0);
+                // The anchor (1, 0, 0) sits below the apex.
+                assert!(cone_axis.z < 0.0);
+            }
+            other => panic!("expected a cone, got {other:?}"),
+        }
+
+        // A skew line sweeps a hyperboloid: no reduction.
+        let skew = Curve3::line(Point3::new(1.0, 1.0, 0.0), Vector3::new(0.0, 1.0, 1.0)).unwrap();
+        assert!(
+            reduce_revolution(Some(&skew), origin, &axis, 1)
+                .unwrap()
+                .is_none()
+        );
+
+        // Meridian circle centered on the axis → sphere; off-axis → torus;
+        // tube crossing the axis → no reduction.
+        let meridian = Curve3::circle(Point3::origin(), Vector3::new(0.0, -1.0, 0.0), 2.0).unwrap();
+        let sphere = reduce_revolution(Some(&meridian), origin, &axis, 1)
+            .unwrap()
+            .expect("sphere");
+        assert!(matches!(sphere, Surface3::Sphere { radius, .. } if (radius - 2.0).abs() < 1e-12));
+
+        let tube = Curve3::circle(
+            Point3::new(3.0, 0.0, 0.0),
+            Vector3::new(0.0, -1.0, 0.0),
+            1.0,
+        )
+        .unwrap();
+        let torus = reduce_revolution(Some(&tube), origin, &axis, 1)
+            .unwrap()
+            .expect("torus");
+        assert!(matches!(
+            torus,
+            Surface3::Torus {
+                major_radius,
+                minor_radius,
+                ..
+            } if (major_radius - 3.0).abs() < 1e-12 && (minor_radius - 1.0).abs() < 1e-12
+        ));
+
+        let crossing = Curve3::circle(
+            Point3::new(0.5, 0.0, 0.0),
+            Vector3::new(0.0, -1.0, 0.0),
+            1.0,
+        )
+        .unwrap();
+        assert!(
+            reduce_revolution(Some(&crossing), origin, &axis, 1)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// The cylinder fixture with its wall spelled as the extrusion of its
+    /// bottom rim circle — the reduction must recover the exact cylinder.
+    #[test]
+    fn cylinder_via_extruded_circle_imports_exact() {
+        let src = cylinder_step(1.5, 5.0).replace(
+            "#22 = CYLINDRICAL_SURFACE('', #10, 1.500000);",
+            "#22 = SURFACE_OF_LINEAR_EXTRUSION('', #13, #15);",
+        );
+        let (store, geo, report) = import(&src);
+        no_error_diagnostics(&report);
+        let body = brep_body(&report.solids[0].outcome);
+        assert!(store.check(body).is_empty());
+        assert!(store.faces_of_body(body).iter().any(|&f| matches!(
+            geo.surface(store.face(f).unwrap().surface.unwrap()).unwrap(),
+            Surface3::Cylinder { radius, .. } if (radius - 1.5).abs() < 1e-12
+        )));
+        let mesh = tessellate_body(&store, &geo, body, &TessellationOptions::default()).unwrap();
+        assert!(mesh.is_closed_manifold());
+        let exact = PI * 1.5 * 1.5 * 5.0;
+        assert!((signed_volume(&mesh) - exact).abs() / exact < 0.02);
+    }
+
+    /// The sphere fixture with its surface spelled as the revolution of its
+    /// seam meridian about the polar axis.
+    #[test]
+    fn sphere_via_surface_of_revolution_imports_exact() {
+        let src = wrap(&sphere_step_at(1, 2.0).replace(
+            "#12 = SPHERICAL_SURFACE('', #9, 2.000000);",
+            "#90 = AXIS1_PLACEMENT('', #1, #4);\n#12 = SURFACE_OF_REVOLUTION('', #11, #90);",
+        ));
+        let (store, geo, report) = import(&src);
+        no_error_diagnostics(&report);
+        let body = brep_body(&report.solids[0].outcome);
+        assert!(store.check(body).is_empty());
+        let face = store.faces_of_body(body)[0];
+        assert!(matches!(
+            geo.surface(store.face(face).unwrap().surface.unwrap())
+                .unwrap(),
+            Surface3::Sphere { radius, .. } if (radius - 2.0).abs() < 1e-12
+        ));
+        let mesh = tessellate_body(&store, &geo, body, &TessellationOptions::default()).unwrap();
+        assert!(mesh.is_closed_manifold());
+        let exact = 4.0 / 3.0 * PI * 8.0;
+        assert!((signed_volume(&mesh) - exact).abs() / exact < 0.05);
+    }
+
+    /// The torus fixture with its surface spelled as the revolution of its
+    /// tube circle about the main axis.
+    #[test]
+    fn torus_via_surface_of_revolution_imports_exact() {
+        let src = torus_step(3.0, 1.0).replace(
+            "#12 = TOROIDAL_SURFACE('', #8, 3.000000, 1.000000);",
+            "#90 = AXIS1_PLACEMENT('', #1, #4);\n#12 = SURFACE_OF_REVOLUTION('', #11, #90);",
+        );
+        let (store, geo, report) = import(&src);
+        no_error_diagnostics(&report);
+        let body = brep_body(&report.solids[0].outcome);
+        assert!(store.check(body).is_empty());
+        assert_eq!(store.euler_counts(body).genus, 1);
+        let face = store.faces_of_body(body)[0];
+        assert!(matches!(
+            geo.surface(store.face(face).unwrap().surface.unwrap())
+                .unwrap(),
+            Surface3::Torus { major_radius, minor_radius, .. }
+                if (major_radius - 3.0).abs() < 1e-12 && (minor_radius - 1.0).abs() < 1e-12
+        ));
+        let mesh = tessellate_body(&store, &geo, body, &TessellationOptions::default()).unwrap();
+        assert!(mesh.is_closed_manifold());
+        let exact = 2.0 * PI * PI * 3.0;
+        assert!((signed_volume(&mesh) - exact).abs() / exact < 0.05);
+    }
+
+    /// A seam line wrapped in TRIMMED_CURVE must import exactly — edges
+    /// re-trim by their vertices, so the wrapper is transparent.
+    #[test]
+    fn trimmed_curve_wrapping_is_transparent_to_exact_import() {
+        let src = cylinder_step(1.5, 5.0).replace(
+            "#19 = EDGE_CURVE('', #8, #9, #16, .T.);",
+            "#91 = TRIMMED_CURVE('', #16, (#3), (#4), .T., .CARTESIAN.);\n\
+             #19 = EDGE_CURVE('', #8, #9, #91, .T.);",
+        );
+        let (store, geo, report) = import(&src);
+        no_error_diagnostics(&report);
+        let body = brep_body(&report.solids[0].outcome);
+        assert!(store.check(body).is_empty());
+        assert_edges_interpolate(&store, &geo, body);
+        let mesh = tessellate_body(&store, &geo, body, &TessellationOptions::default()).unwrap();
+        let exact = PI * 1.5 * 1.5 * 5.0;
+        assert!((signed_volume(&mesh) - exact).abs() / exact < 0.02);
+    }
+
+    /// A 4×4×4 block with a 2×2×2 cavity: outer shell as authored plus an
+    /// `ORIENTED_CLOSED_SHELL(.F.)` void (authored outward, reversed by the
+    /// flag into the cavity).
+    fn voids_block_step(outer: f64, inner: f64) -> String {
+        let mut b = String::new();
+        let outer_shell = block_shell_at(&mut b, 0, outer, outer, outer);
+        let inner_shell = block_shell_at(&mut b, 200, inner, inner, inner);
+        writeln!(
+            b,
+            "#400 = ORIENTED_CLOSED_SHELL('', *, #{inner_shell}, .F.);"
+        )
+        .unwrap();
+        writeln!(
+            b,
+            "#401 = BREP_WITH_VOIDS('holey', #{outer_shell}, (#400));"
+        )
+        .unwrap();
+        wrap(&b)
+    }
+
+    #[test]
+    fn brep_with_voids_imports_inner_shell_exactly() {
+        let (store, geo, report) = import(&voids_block_step(4.0, 2.0));
+        no_error_diagnostics(&report);
+        assert_eq!(report.solids[0].name, "holey");
+        let body = brep_body(&report.solids[0].outcome);
+        assert!(store.check(body).is_empty(), "{:?}", store.check(body));
+
+        let shells = store.shells_of_body(body);
+        assert_eq!(shells.len(), 2, "outer plus one void shell");
+        let orientations: Vec<ShellOrientation> = shells
+            .iter()
+            .map(|&s| store.shells.get(s).unwrap().orientation)
+            .collect();
+        assert_eq!(
+            orientations,
+            vec![ShellOrientation::Outward, ShellOrientation::Inward]
+        );
+        let counts = store.euler_counts(body);
+        assert_eq!((counts.vertices, counts.edges, counts.faces), (16, 24, 12));
+        assert_eq!(counts.genus, 0);
+
+        // The reversed void faces tessellate wound into the cavity, so the
+        // enclosed volume is the material between the two boxes.
+        let mesh = tessellate_body(&store, &geo, body, &TessellationOptions::default()).unwrap();
+        assert!(mesh.is_closed_manifold());
+        assert!((signed_volume(&mesh) - (64.0 - 8.0)).abs() < 1e-9);
+    }
+
+    /// Voids through the mesh fallback: a composite-curve edge on the outer
+    /// shell forces tessellated import, and the void shell's triangles are
+    /// rewound into the cavity so the mesh volume subtracts it.
+    #[test]
+    fn brep_with_voids_survives_mesh_fallback() {
+        let src = voids_block_step(4.0, 2.0).replace(
+            "#20 = EDGE_CURVE('', #9, #10, #19, .T.);",
+            "#402 = TRIMMED_CURVE('', #19, (#1), (#2), .T., .CARTESIAN.);\n\
+             #403 = COMPOSITE_CURVE_SEGMENT(.CONTINUOUS., .T., #402);\n\
+             #404 = COMPOSITE_CURVE('', (#403), .F.);\n\
+             #20 = EDGE_CURVE('', #9, #10, #404, .T.);",
+        );
+        let (_store, _geo, report) = import(&src);
+        no_error_diagnostics(&report);
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("COMPOSITE_CURVE")),
+            "composite edge reported: {:?}",
+            report.diagnostics
+        );
+        match &report.solids[0].outcome {
+            SolidOutcome::Mesh { mesh, .. } => {
+                assert!(mesh.is_closed_manifold());
+                assert!(
+                    (signed_volume(mesh) - (64.0 - 8.0)).abs() < 1e-9,
+                    "cavity subtracted: {}",
+                    signed_volume(mesh)
+                );
+            }
+            other => panic!("expected the mesh fallback, got {other:?}"),
+        }
     }
 }

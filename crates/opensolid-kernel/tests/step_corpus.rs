@@ -1014,3 +1014,190 @@ mod corpus {
         );
     }
 }
+
+// ---------------------------------------------------------------------
+// 4. Schema breadth (of-3qy.9): swept surfaces, conic and composite curves
+// ---------------------------------------------------------------------
+// Entities real mechanical-CAD exporters emit beyond the quadric core.
+// Conic (parabola/hyperbola) walls have no exact kernel form yet, so these
+// solids must degrade to a *watertight* tessellated import with structured
+// diagnostics — never Failed, never silently wrong.
+
+mod schema_breadth {
+    use super::*;
+    use opensolid_kernel::core::mesh::TriangleMesh;
+
+    /// Signed volume via the divergence theorem: positive iff the mesh is
+    /// consistently outward-wound.
+    fn signed_volume(mesh: &TriangleMesh) -> f64 {
+        mesh.indices
+            .iter()
+            .map(|tri| {
+                let [a, b, c] = tri.map(|i| mesh.positions[i].coords);
+                a.dot(&b.cross(&c)) / 6.0
+            })
+            .sum()
+    }
+
+    /// A prism over the region between a conic arc and its chord, extruded
+    /// one unit along +z. The curved wall is a SURFACE_OF_LINEAR_EXTRUSION
+    /// of the TRIMMED conic; the caps are planes ear-clipped from the arc
+    /// polyline. `(ax, ay)`: the arc endpoints (±ay at x = ax), which for
+    /// both conics here correspond to parameter t = ±1.
+    fn conic_prism(bottom: &str, top: &str, ax: f64, ay: f64) -> String {
+        let nay = -ay;
+        envelope(&format!(
+            "\
+#1 = CARTESIAN_POINT('', (0., 0., 0.));
+#2 = CARTESIAN_POINT('', (0., 0., 1.));
+#3 = CARTESIAN_POINT('', ({ax:.9}, {nay:.9}, 0.));
+#4 = CARTESIAN_POINT('', ({ax:.9}, {ay:.9}, 0.));
+#5 = CARTESIAN_POINT('', ({ax:.9}, {nay:.9}, 1.));
+#6 = CARTESIAN_POINT('', ({ax:.9}, {ay:.9}, 1.));
+#7 = DIRECTION('', (0., 0., 1.));
+#8 = DIRECTION('', (0., 0., -1.));
+#9 = DIRECTION('', (1., 0., 0.));
+#10 = DIRECTION('', (0., 1., 0.));
+#11 = VERTEX_POINT('', #3);
+#12 = VERTEX_POINT('', #4);
+#13 = VERTEX_POINT('', #5);
+#14 = VERTEX_POINT('', #6);
+#15 = AXIS2_PLACEMENT_3D('', #1, #7, #9);
+#16 = AXIS2_PLACEMENT_3D('', #2, #7, #9);
+#17 = {bottom};
+#18 = {top};
+#19 = VECTOR('', #7, 1.);
+#20 = TRIMMED_CURVE('', #17, (#3), (#4), .T., .CARTESIAN.);
+#21 = SURFACE_OF_LINEAR_EXTRUSION('', #20, #19);
+#22 = LINE('', #3, #19);
+#23 = LINE('', #4, #19);
+#24 = VECTOR('', #10, 1.);
+#25 = LINE('', #3, #24);
+#26 = LINE('', #5, #24);
+#27 = EDGE_CURVE('', #11, #12, #17, .T.);
+#28 = EDGE_CURVE('', #13, #14, #18, .T.);
+#29 = EDGE_CURVE('', #11, #13, #22, .T.);
+#30 = EDGE_CURVE('', #12, #14, #23, .T.);
+#31 = EDGE_CURVE('', #11, #12, #25, .T.);
+#32 = EDGE_CURVE('', #13, #14, #26, .T.);
+#33 = AXIS2_PLACEMENT_3D('', #1, #8, #9);
+#34 = PLANE('', #33);
+#35 = PLANE('', #16);
+#36 = AXIS2_PLACEMENT_3D('', #3, #9, #7);
+#37 = PLANE('', #36);
+#39 = ORIENTED_EDGE('', *, *, #27, .T.);
+#40 = ORIENTED_EDGE('', *, *, #31, .F.);
+#41 = EDGE_LOOP('', (#39, #40));
+#42 = FACE_OUTER_BOUND('', #41, .T.);
+#43 = ADVANCED_FACE('', (#42), #34, .T.);
+#44 = ORIENTED_EDGE('', *, *, #32, .T.);
+#45 = ORIENTED_EDGE('', *, *, #28, .F.);
+#46 = EDGE_LOOP('', (#44, #45));
+#47 = FACE_OUTER_BOUND('', #46, .T.);
+#48 = ADVANCED_FACE('', (#47), #35, .T.);
+#49 = ORIENTED_EDGE('', *, *, #29, .T.);
+#50 = ORIENTED_EDGE('', *, *, #28, .T.);
+#51 = ORIENTED_EDGE('', *, *, #30, .F.);
+#52 = ORIENTED_EDGE('', *, *, #27, .F.);
+#53 = EDGE_LOOP('', (#49, #50, #51, #52));
+#54 = FACE_OUTER_BOUND('', #53, .T.);
+#55 = ADVANCED_FACE('', (#54), #21, .F.);
+#56 = ORIENTED_EDGE('', *, *, #31, .T.);
+#57 = ORIENTED_EDGE('', *, *, #30, .T.);
+#58 = ORIENTED_EDGE('', *, *, #32, .F.);
+#59 = ORIENTED_EDGE('', *, *, #29, .F.);
+#60 = EDGE_LOOP('', (#56, #57, #58, #59));
+#61 = FACE_OUTER_BOUND('', #60, .T.);
+#62 = ADVANCED_FACE('', (#61), #37, .T.);
+#63 = CLOSED_SHELL('', (#43, #48, #55, #62));
+#64 = MANIFOLD_SOLID_BREP('prism', #63);"
+        ))
+    }
+
+    /// Expect the mesh-fallback outcome with a watertight mesh whose
+    /// signed volume is `expected` within `rel_tol`.
+    fn assert_watertight_mesh_volume(source: &str, expected: f64, rel_tol: f64) {
+        let (store, _geo, report) = import(source);
+        assert_structured(&report);
+        assert!(
+            !report.has_errors(),
+            "unexpected errors: {:?}",
+            report.diagnostics
+        );
+        assert_eq!(report.solids.len(), 1);
+        match &report.solids[0].outcome {
+            SolidOutcome::Mesh { mesh, .. } => {
+                assert!(mesh.is_closed_manifold(), "fallback mesh not watertight");
+                let volume = signed_volume(mesh);
+                assert!(
+                    (volume - expected).abs() / expected < rel_tol,
+                    "volume {volume} vs expected {expected}"
+                );
+            }
+            other => panic!("expected the mesh fallback, got {other:?}"),
+        }
+        let _ = store;
+    }
+
+    #[test]
+    fn parabola_extrusion_wall_imports_as_watertight_mesh() {
+        // p(t) = (t^2, 2t, 0), t in [-1, 1]: endpoints (1, ±2). Region
+        // between arc and chord x = 1: area 8/3, height 1.
+        let src = conic_prism("PARABOLA('', #15, 1.)", "PARABOLA('', #16, 1.)", 1.0, 2.0);
+        assert_watertight_mesh_volume(&src, 8.0 / 3.0, 0.02);
+    }
+
+    #[test]
+    fn hyperbola_extrusion_wall_imports_as_watertight_mesh() {
+        // p(t) = (cosh t, sinh t, 0), t in [-1, 1]: endpoints
+        // (cosh 1, ±sinh 1). Area between arc and chord x = cosh 1 is
+        // cosh(1)·sinh(1) − 1, height 1.
+        let (ax, ay) = (1.0f64.cosh(), 1.0f64.sinh());
+        let src = conic_prism(
+            "HYPERBOLA('', #15, 1., 1.)",
+            "HYPERBOLA('', #16, 1., 1.)",
+            ax,
+            ay,
+        );
+        assert_watertight_mesh_volume(&src, ax * ay - 1.0, 0.02);
+    }
+
+    #[test]
+    fn composite_curve_seam_imports_as_watertight_mesh() {
+        // The doc-example sphere with its seam meridian spelled as a
+        // COMPOSITE_CURVE of two TRIMMED quarter arcs (south → equator →
+        // north). Exact import has no multi-segment curve, so this must
+        // degrade to a watertight tessellated sphere.
+        let src = envelope(
+            "\
+#1 = CARTESIAN_POINT('', (0., 0., 0.));
+#2 = CARTESIAN_POINT('', (0., 0., -2.));
+#3 = CARTESIAN_POINT('', (0., 0., 2.));
+#4 = DIRECTION('', (0., 0., 1.));
+#5 = DIRECTION('', (0., -1., 0.));
+#6 = DIRECTION('', (1., 0., 0.));
+#7 = VERTEX_POINT('', #2);
+#8 = VERTEX_POINT('', #3);
+#9 = AXIS2_PLACEMENT_3D('', #1, #4, #6);
+#10 = AXIS2_PLACEMENT_3D('', #1, #5, #6);
+#11 = CIRCLE('', #10, 2.);
+#12 = SPHERICAL_SURFACE('', #9, 2.);
+#21 = CARTESIAN_POINT('', (2., 0., 0.));
+#22 = TRIMMED_CURVE('', #11, (#2), (#21), .T., .CARTESIAN.);
+#23 = TRIMMED_CURVE('', #11, (#21), (#3), .T., .CARTESIAN.);
+#24 = COMPOSITE_CURVE_SEGMENT(.CONTINUOUS., .T., #22);
+#25 = COMPOSITE_CURVE_SEGMENT(.CONTINUOUS., .T., #23);
+#26 = COMPOSITE_CURVE('', (#24, #25), .F.);
+#13 = EDGE_CURVE('', #7, #8, #26, .T.);
+#14 = ORIENTED_EDGE('', *, *, #13, .T.);
+#15 = ORIENTED_EDGE('', *, *, #13, .F.);
+#16 = EDGE_LOOP('', (#14, #15));
+#17 = FACE_OUTER_BOUND('', #16, .T.);
+#18 = ADVANCED_FACE('', (#17), #12, .T.);
+#19 = CLOSED_SHELL('', (#18));
+#20 = MANIFOLD_SOLID_BREP('ball', #19);",
+        );
+        let expected = 4.0 / 3.0 * std::f64::consts::PI * 8.0;
+        assert_watertight_mesh_volume(&src, expected, 0.05);
+    }
+}
