@@ -373,15 +373,16 @@ return leaf.subtract(pin);
     const m = t.create_model(script, 'hinge-leaf');
     t.say(
       `Valid solid, ${m.mesh.triangles.toLocaleString('en-US')} triangles — the pin ` +
-        'bore runs cleanly through all three knuckles. One sizing note worth being ' +
-        'honest about: I opened the bore to Ø4 because at Ø3.2 this part comes back ' +
-        '`valid: false` with a *pinched* mesh — two surface sheets fused through one ' +
-        'octree cell where the bore goes tangent. That is a known mesher defect ' +
-        '(of-o0o), not a part that is too small to see, and it is worth knowing which ' +
-        'it is: a finer `accuracy` does not clear a pinch, and the bore sizes that ' +
-        'trip it are not the small ones in particular (Ø2.4 and Ø7 fail; Ø2.8, Ø3.6 ' +
-        'and Ø4 are fine). So Ø4 is a workaround I found by moving, not a rule I ' +
-        'derived. Let me confirm the mesh is watertight before exporting.',
+        'bore runs cleanly through all three knuckles. One historical note, because ' +
+        'this transcript used to carry a warning here: earlier kernel versions ' +
+        '*pinched* the mesh at several bore diameters — Ø2.4, Ø3.2 and Ø7 all came ' +
+        'back `valid: false` with two surface sheets fused through one octree cell ' +
+        'where the bore runs near-tangent, the mesher defect tracked as of-o0o — so ' +
+        'Ø4 was originally a workaround found by trial. The mesher fixes (of-obv, ' +
+        'of-o0o) cleared that: every bore size I retried now meshes closed, Ø2.4 ' +
+        'through Ø7. Ø4 stays because it is a sensible pin for a 1.5 mm leaf, not ' +
+        'because the mesher demands it. Let me confirm the mesh is watertight ' +
+        'before exporting.',
     );
     t.screenshot(m.model_id, 'hinge-leaf-iso.png', 'iso');
     const v = t.validate(m.model_id);
@@ -389,22 +390,25 @@ return leaf.subtract(pin);
       `\`closedManifold: ${v.closedManifold}\`, no issues — a real solid, not a ` +
         'surface soup. The STEP file you asked for:',
     );
-    t.export(m.model_id, 'step', 'hinge-leaf.step');
+    const st = t.export(m.model_id, 'step', 'hinge-leaf.step');
     t.say(
-      'STEP declines here, and the reason it gives is the same pinch as above — this ' +
-        'part has no exact B-Rep companion, so STEP takes the faceted SDF→B-Rep path, ' +
-        'which needs a closed manifold and does not get one. Note it names the actual ' +
-        'defect (pinched edges) rather than blaming resolution, so I know not to burn ' +
-        'time retrying at a finer accuracy. The tool says no plainly rather than ' +
-        'emitting a broken file. I can still give you the mesh:',
+      `STEP exports — ${st.bytes ? (st.bytes / 1e6).toFixed(1) : '?'} MB. This part has no exact ` +
+        'B-Rep companion (it is built from rotated primitives, not a `Profile`), so ' +
+        'STEP takes the faceted SDF→B-Rep path: the exporter meshes the solid to a ' +
+        'closed manifold and emits every facet as a planar face — which is why the ' +
+        'file is large. That path is also why the pinch above used to matter: a ' +
+        'pinched mesh is not a closed manifold, and on this exact part STEP used to ' +
+        'decline — naming the defect rather than writing a corrupt file. With the ' +
+        'mesher fixed, it exports. The STL as well:',
     );
     t.export(m.model_id, 'stl', 'hinge-leaf.stl');
     t.say(
-      'So: a valid, watertight STL, and an honest no on STEP. If the STEP file is the ' +
-        'deliverable, the route is to build the leaf from an extruded `Profile` so it ' +
-        'carries an exact B-Rep (see the [right-angle bracket](bracket-right-angle.md)) ' +
-        'rather than from rotated primitives. Mirror this leaf about X and pin the two ' +
-        'together and you have a working hinge.',
+      'So: a watertight STL and a faceted STEP from one prompt. If crisp analytic ' +
+        'faces or a smaller STEP file are the deliverable, the route is to build the ' +
+        'leaf from an extruded `Profile` (see the ' +
+        '[right-angle bracket](bracket-right-angle.md)) rather than from rotated ' +
+        'primitives. Mirror this leaf about X and pin the two together and you have ' +
+        'a working hinge.',
     );
   },
 );
@@ -588,8 +592,10 @@ return bottle.subtract(Shape.revolve(cavity, 360));
 // 6. Right-angle bracket: gusset, interior fillet, M5 holes ────────────────
 // The acceptance part (of-2y4.1). Unlike the examples above, this one is a
 // dogfood run: the narration keeps the two kernel facts the agent had to
-// discover the hard way (the +Y axis convention, and the bounds-dependent
-// faceted STEP failure), because an agent reading this gallery needs them.
+// discover the hard way (the +Y axis convention, and the renderer's y-up view
+// names vs a z-up part), because an agent reading this gallery needs them.
+// (It used to keep a third — a no-op 360° rotation the part needed to mesh
+// closed for STEP export — but the of-obv mesher fix removed the need.)
 example(
   {
     slug: 'bracket-right-angle',
