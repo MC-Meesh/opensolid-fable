@@ -1988,10 +1988,20 @@ impl<'a> Pipeline<'a> {
                 Ok(SurfaceIntersection::Curves(curves)) => {
                     for ic in curves {
                         if ic.kind == IntersectionKind::Tangential {
-                            return Err(CoreError::NotImplemented {
-                                feature: "boolean operations with tangential \
-                                          intersection curves (transversal MVP)",
-                            });
+                            // Same triage as the tangent point (of-bxl.6):
+                            // the tangency belongs to the infinite surfaces,
+                            // and only bars the exact path where its locus
+                            // actually enters both trims. A locus outside
+                            // either trim imprints nothing — skip it. Real
+                            // tangential contact stays refused (tier 3,
+                            // of-bxl.7).
+                            if self.tangential_locus_in_trims(&ic.curve, fa, fb, box_a, box_b)? {
+                                return Err(CoreError::NotImplemented {
+                                    feature: "boolean operations with tangential \
+                                              intersection curves (transversal MVP)",
+                                });
+                            }
+                            continue;
                         }
                         // Analytic SSI hands back a closed-form curve, not a
                         // traced one: there are no converged preimages
@@ -2408,6 +2418,64 @@ impl<'a> Pipeline<'a> {
     /// host face (NURBS hosts only), which aborts the boolean to the F-Rep
     /// fallback rather than clipping against a wrongly-parameterized
     /// region.
+    /// Tangency triage (of-bxl.6, COINCIDENT.md §6 tier 1): does this
+    /// tangential locus enter both trimmed regions? SSI reports tangency
+    /// of the *infinite* surfaces, so the locus frequently lies wholly
+    /// outside one face's trim — a rod resting on the plane of a plate's
+    /// face just beyond its edge is tangent to the *plane* but not to the
+    /// *face*. Such a pair imprints nothing and the boolean is ordinary.
+    /// Only in-trim contact is real, and real tangential contact stays
+    /// `NotImplemented`: the union is non-manifold along the locus, which
+    /// the ≤2-fins-per-edge topology cannot represent (tier 2), and
+    /// in-trim tangential curves are of-bxl.7 (tier 3).
+    ///
+    /// A locus lying exactly on a trim boundary counts as contact —
+    /// `contains_for_clip`'s snap band reads it as inside — which errs
+    /// toward the conservative refusal, never toward a wrong answer.
+    fn tangential_locus_in_trims(
+        &self,
+        curve: &Curve3,
+        fa: usize,
+        fb: usize,
+        box_a: &BoundingBox3,
+        box_b: &BoundingBox3,
+    ) -> CoreResult<bool> {
+        // Stationing mirrors `clip_imprint`: a bbox slab clip for lines,
+        // the full period for closed conics. Analytic tangencies are only
+        // ever lines and circles — there are no marched tangential
+        // polylines to station.
+        let ts: Vec<f64> = match curve {
+            Curve3::Line { origin, dir } => {
+                let joint = box_a.intersection(box_b);
+                let Some((t_lo, t_hi)) = clip_line_to_box(origin, dir, &joint) else {
+                    return Ok(false);
+                };
+                let n = IMPRINT_LINE_SAMPLES;
+                (0..=n)
+                    .map(|i| t_lo + (t_hi - t_lo) * i as f64 / n as f64)
+                    .collect()
+            }
+            _ => (0..SAMPLES_PER_CIRCLE)
+                .map(|i| TWO_PI * i as f64 / SAMPLES_PER_CIRCLE as f64)
+                .collect(),
+        };
+        let uvs = resolve_station_uv(ts.len(), None, |i, hint| {
+            let p = curve.point(ts[i]);
+            let (hint_a, hint_b) = match hint {
+                Some((a, b)) => (Some(a), Some(b)),
+                None => (None, None),
+            };
+            Ok((
+                self.face_polys[0][fa].chart.param(&p, hint_a)?,
+                self.face_polys[1][fb].chart.param(&p, hint_b)?,
+            ))
+        })?;
+        Ok(uvs.iter().any(|&(pa, pb)| {
+            self.face_polys[0][fa].contains_for_clip(pa, self.snap)
+                && self.face_polys[1][fb].contains_for_clip(pb, self.snap)
+        }))
+    }
+
     fn clip_imprint(
         &mut self,
         curve: &Curve3,

@@ -242,6 +242,39 @@ fn exact_pipeline_shortfall_still_falls_back_to_frep_and_stays_valid() {
     assert_volume_within(&out.mesh, 8.0, 0.03, "subtract with tangent contact");
 }
 
+/// Tier-2 tangent contact (of-bxl.6, COINCIDENT.md §6): a sphere resting
+/// on a plate, united, is a body with a non-manifold vertex — not
+/// representable in the exact topology, and by design NOT a gap the exact
+/// path closes. It must divert to the F-Rep fallback. The fallback is the
+/// assertion here, not the result's quality.
+#[test]
+fn sphere_resting_on_plate_union_falls_back_to_frep() {
+    let mut store = TopologyStore::new();
+    let mut geo = GeometryStore::new();
+    let plate = primitives::block(&mut store, &mut geo, 4.0, 4.0, 2.0).unwrap();
+    let ball = primitives::sphere(&mut store, &mut geo, 1.0).unwrap();
+    // Plate top face at z = 1; the ball's south pole touches its center.
+    translate_body(&mut store, &mut geo, ball, Vector3::new(0.0, 0.0, 2.0)).unwrap();
+
+    let err = brep_unite(&store, &geo, plate, ball, &opts().tol)
+        .expect_err("precondition: exact B-Rep must refuse in-trim tangent point contact");
+    assert!(
+        matches!(err, CoreError::NotImplemented { .. }),
+        "expected a structured shortfall, got {err:?}"
+    );
+
+    let out = hybrid::unite(
+        &HybridBody::brep(&store, &geo, plate),
+        &HybridBody::brep(&store, &geo, ball),
+        &opts(),
+    )
+    .unwrap();
+    assert!(
+        matches!(out.path, HybridPath::Frep { .. }),
+        "tier-2 tangent contact must divert to the F-Rep fallback"
+    );
+}
+
 /// One representation conversion cycle: tessellate the body into a mesh
 /// SDF, then recover a faceted B-Rep from the field by adaptive dual
 /// contouring. The sampling cube ±1.4 keeps the test bodies' surfaces

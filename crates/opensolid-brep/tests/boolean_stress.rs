@@ -2324,6 +2324,117 @@ fn no_panics_on_sphere_torus_tangencies() {
 }
 
 // =====================================================================
+// Tangent-contact triage (of-bxl.6, COINCIDENT.md §6 tier 1)
+//
+// SSI reports tangency of the *infinite* surfaces; it only bars the
+// exact path when the contact locus actually enters both trimmed
+// regions. A locus outside either trim imprints nothing and the boolean
+// is ordinary transversal work. In-trim contact stays NotImplemented:
+// tier 2 (point contact → non-manifold vertex) is unrepresentable in
+// the ≤2-fins-per-edge topology, and tier 3 (tangential curves through
+// the trims) is of-bxl.7. The hybrid kernel serves both via F-Rep.
+// =====================================================================
+
+/// Sphere biting the block's side wall while resting on the *plane* of
+/// the block's bottom face: the tangent foot (4.5, 2, 0) — which is also
+/// the sphere's south pole, exercising the chart's pole convention in
+/// the triage test — lies outside the bottom face's trim (x ≤ 4). The
+/// tangency is a false positive and all three ops are ordinary.
+#[test]
+fn tangent_point_outside_trim_is_ordinary() {
+    let mut scene = Scene::new();
+    let block = scene.block([0.0, 0.0, 0.0], [4.0, 4.0, 4.0]);
+    // Center half a radius inside the x = 4 wall's plane: the wall cuts a
+    // cap of depth r − 0.5 off the sphere.
+    let ball = scene.sphere(Point3::new(4.5, 2.0, 1.0), 1.0);
+    let cap = spherical_cap_volume(1.0, 0.5);
+
+    let context = "block ∩ side-biting ball tangent to the bottom plane off-trim";
+    let inter = scene
+        .intersect(block, ball)
+        .unwrap_or_else(|e| panic!("{context}: intersect failed: {e:?}"));
+    assert_close(volume(&inter, context), cap, CURVED_VOLUME_RTOL, context);
+
+    let context = "block − side-biting ball tangent to the bottom plane off-trim";
+    let diff = scene
+        .subtract(block, ball)
+        .unwrap_or_else(|e| panic!("{context}: subtract failed: {e:?}"));
+    assert_close(
+        volume(&diff, context),
+        64.0 - cap,
+        CURVED_VOLUME_RTOL,
+        context,
+    );
+
+    let context = "block ∪ side-biting ball tangent to the bottom plane off-trim";
+    let uni = scene
+        .unite(block, ball)
+        .unwrap_or_else(|e| panic!("{context}: unite failed: {e:?}"));
+    assert_close(
+        volume(&uni, context),
+        64.0 + sphere_volume(1.0) - cap,
+        CURVED_VOLUME_RTOL,
+        context,
+    );
+}
+
+/// The tangential-*curve* analog: a horizontal rod biting the block's
+/// x = 4 wall while its cylinder wall is tangent to the bottom face's
+/// plane along the line x = 4.5 — wholly outside the bottom trim. The
+/// removed material is a circular-segment prism.
+#[test]
+fn tangent_line_outside_trim_is_ordinary() {
+    let context = "block minus rod tangent to the bottom plane off-trim";
+    let mut scene = Scene::new();
+    let block = scene.block([0.0, 0.0, 0.0], [4.0, 4.0, 4.0]);
+    let rod = scene.cylinder(Point3::new(4.5, 1.0, 1.0), Vector3::y(), 1.0, 2.0);
+    let out = scene
+        .subtract(block, rod)
+        .unwrap_or_else(|e| panic!("{context}: subtract failed: {e:?}"));
+    // Segment cut by a chord at distance 0.5 from a unit circle's center,
+    // extruded over the rod's 2-long axis.
+    let segment_area = (0.5f64).acos() - 0.5 * 0.75f64.sqrt();
+    assert_close(
+        volume(&out, context),
+        64.0 - 2.0 * segment_area,
+        CYL_VOLUME_RTOL,
+        context,
+    );
+}
+
+/// Tier 2 stays refused: a sphere resting ON the plate's top face (foot
+/// inside both trims) would union into a body with a non-manifold
+/// vertex, which the topology cannot represent. The exact path must keep
+/// the structured NotImplemented that routes the hybrid kernel to F-Rep
+/// — assert the refusal, not a result.
+#[test]
+fn tangent_point_inside_both_trims_stays_not_implemented() {
+    let context = "sphere resting on the plate's top face, united";
+    let mut scene = Scene::new();
+    let plate = scene.block([0.0, 0.0, 0.0], [4.0, 4.0, 2.0]);
+    let ball = scene.sphere(Point3::new(2.0, 2.0, 3.0), 1.0);
+    match scene.unite(plate, ball) {
+        Err(CoreError::NotImplemented { .. }) => {}
+        other => panic!("{context}: expected NotImplemented, got {other:?}"),
+    }
+}
+
+/// Tier 3 stays refused: the same rod as
+/// [`tangent_line_outside_trim_is_ordinary`] moved into the block, so
+/// its tangent line runs through the bottom face's trim.
+#[test]
+fn tangent_line_through_trim_stays_not_implemented() {
+    let context = "rod resting on the block's bottom face from inside, united";
+    let mut scene = Scene::new();
+    let block = scene.block([0.0, 0.0, 0.0], [4.0, 4.0, 4.0]);
+    let rod = scene.cylinder(Point3::new(2.0, 1.0, 1.0), Vector3::y(), 1.0, 2.0);
+    match scene.unite(block, rod) {
+        Err(CoreError::NotImplemented { .. }) => {}
+        other => panic!("{context}: expected NotImplemented, got {other:?}"),
+    }
+}
+
+// =====================================================================
 // Guard: error paths must be structured, never panics.
 // =====================================================================
 
