@@ -857,6 +857,142 @@ mod corpus {
         assert_exact_single_solid_and_round_trips("io1-cm-214.stp");
     }
 
+    /// Every vendored corpus file — including the NIST tree — must parse and
+    /// land every solid in a structured outcome. Files the reader cannot
+    /// import yet must fail with diagnostics, never with a panic, a hang, or
+    /// silently wrong geometry. This is the test that makes growing the
+    /// corpus cheap: drop a file under `tests/data/step/` and it is covered.
+    #[test]
+    fn every_vendored_file_imports_structurally() {
+        let files = corpus_files();
+        assert!(
+            files.len() >= 17,
+            "corpus shrank? found only {} files",
+            files.len()
+        );
+        for file in &files {
+            let bytes = std::fs::read(file).unwrap_or_else(|e| panic!("read {file:?}: {e}"));
+            let (store, _, report) = import_bytes(&bytes);
+            let name = file.file_name().unwrap_or_default().to_string_lossy();
+            assert!(
+                !report.solids.is_empty(),
+                "{name}: no MANIFOLD_SOLID_BREP found — wrong file vendored?"
+            );
+            assert_all_outcomes_structured(&store, &report);
+        }
+    }
+
+    /// The corpus-wide pass-rate floor (spec/06-step-io.md §Pass-rate
+    /// targets). A file passes when every solid in it imports (exactly or as
+    /// a closed-manifold mesh fallback). The floor pins the current figure so
+    /// a reader regression fails loudly; raise it as import coverage grows.
+    /// The full per-file report: `cargo run --release --example
+    /// step_import_report -- crates/opensolid-kernel/tests/data/step`.
+    #[test]
+    fn corpus_pass_rate_does_not_regress() {
+        let files = corpus_files();
+        let mut passed = Vec::new();
+        for file in &files {
+            let bytes = std::fs::read(file).unwrap_or_else(|e| panic!("read {file:?}: {e}"));
+            let (_, _, report) = import_bytes(&bytes);
+            let ok = !report.solids.is_empty()
+                && report
+                    .solids
+                    .iter()
+                    .all(|s| !matches!(s.outcome, SolidOutcome::Failed));
+            if ok {
+                passed.push(
+                    file.file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+        }
+        // 2026-07-25 baseline: sg1, io1, nist_ctc_03 (both editions),
+        // nist_ftc_09, nist_ftc_11 — 6 of 17.
+        const FLOOR: usize = 6;
+        assert!(
+            passed.len() >= FLOOR,
+            "corpus pass count regressed below {FLOOR}: only {passed:?} pass"
+        );
+    }
+
+    fn corpus_files() -> Vec<std::path::PathBuf> {
+        let root = format!("{}/tests/data/step", env!("CARGO_MANIFEST_DIR"));
+        let mut files = Vec::new();
+        let mut stack = vec![std::path::PathBuf::from(root)];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("read {dir:?}: {e}")) {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| e.eq_ignore_ascii_case("stp"))
+                {
+                    files.push(path);
+                }
+            }
+        }
+        files.sort();
+        files
+    }
+
+    /// NIST parts that import exactly today must keep doing so, and must
+    /// survive our write → read round trip. Unlike the CATIA files these
+    /// carry Info diagnostics (unit scaling), so only Warning+ is rejected.
+    /// Parts whose faces share surfaces re-import with duplicated geometry
+    /// (of-kb8), so their byte-identical fixed point arrives one write late.
+    fn assert_nist_exact_and_round_trips_gate(name: &str, fixed_point: FixedPoint) {
+        let (store, geo, report) = import_bytes(&load(name));
+        assert_eq!(report.solids.len(), 1, "{name}: expected one solid");
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .all(|d| d.severity < Severity::Warning),
+            "{name}: expected no Warning/Error diagnostics, got: {:?}",
+            report.diagnostics
+        );
+        let breps = assert_all_outcomes_structured(&store, &report);
+        assert_eq!(breps.len(), 1, "{name}: expected an exact B-Rep import");
+        assert_round_trip_gate(&store, &geo, breps[0], name, fixed_point);
+    }
+
+    #[test]
+    fn nist_ctc_03_imports_exactly_and_round_trips() {
+        assert_nist_exact_and_round_trips_gate(
+            "nist/nist_ctc_03_asme1_rc.stp",
+            FixedPoint::AfterOneTrip,
+        );
+    }
+
+    #[test]
+    fn nist_ftc_09_imports_exactly_and_round_trips() {
+        assert_nist_exact_and_round_trips_gate(
+            "nist/nist_ftc_09_asme1_rd.stp",
+            FixedPoint::AfterOneTrip,
+        );
+    }
+
+    #[test]
+    fn nist_ftc_11_imports_exactly_and_round_trips() {
+        assert_nist_exact_and_round_trips_gate(
+            "nist/nist_ftc_11_asme1_rb.stp",
+            FixedPoint::Immediate,
+        );
+    }
+
+    #[test]
+    fn nist_ctc_03_ap242_imports_exactly_and_round_trips() {
+        assert_nist_exact_and_round_trips_gate(
+            "nist/nist_ctc_03_asme1_ap242-e2.stp",
+            FixedPoint::AfterOneTrip,
+        );
+    }
+
     #[test]
     fn dm1_id_nurbs_part_degrades_to_structured_diagnostics() {
         // Three solids carrying B-spline surfaces (including complex

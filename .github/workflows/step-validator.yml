@@ -1,0 +1,52 @@
+# External STEP validation (of-3qy.10): round-trip our STEP exports through
+# headless FreeCAD and import FreeCAD's exports through our reader, reporting
+# the pass-rate metric from spec/06-step-io.md.
+#
+# Deliberately NOT part of the default CI: it needs an external CAD kernel
+# (apt freecad), so it runs only on manual dispatch, or on its weekly
+# schedule when the repository variable OPENSOLID_STEP_VALIDATOR is "1".
+# Default `cargo test` stays hermetic.
+name: external-step-validation
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 6 * * 1" # Mondays 06:17 UTC
+
+jobs:
+  validate:
+    name: FreeCAD round-trip
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || vars.OPENSOLID_STEP_VALIDATOR == '1'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.88.0"
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install headless FreeCAD
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends freecad
+          freecadcmd --version
+
+      - name: Run validator
+        run: |
+          OPENSOLID_STEP_VALIDATOR=1 \
+          STEP_VALIDATOR_WORK="$RUNNER_TEMP/step-validator" \
+          tools/step-validator/run.sh | tee validator.log
+
+      - name: Publish metric to job summary
+        if: always()
+        run: |
+          {
+            echo "## External STEP validation"
+            echo '```'
+            grep -E "pass rate|validation" validator.log || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
