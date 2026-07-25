@@ -94,7 +94,7 @@ use opensolid_brep::{
     Body, BodyType, Curve3, Edge, FaceSense, FinSense, GeometryStore, Loop, Surface3,
     TopologyStore, Vertex,
 };
-use opensolid_core::{EntityId, Point3, Vector3};
+use opensolid_core::{EntityId, Point3, Transform3, Vector3};
 
 /// Length unit declared in the emitted representation context.
 /// Coordinates are written verbatim, interpreted in this unit.
@@ -175,76 +175,10 @@ pub fn write_step(
     bodies: &[EntityId<Body>],
     options: &StepWriteOptions,
 ) -> WriteResult<String> {
-    let mut emitter = Emitter {
-        store,
-        geo,
-        data: String::new(),
-        next_id: 1,
-        vertices: HashMap::new(),
-        edges: HashMap::new(),
-        curves: HashMap::new(),
-        surfaces: HashMap::new(),
-    };
-    let name = string_literal(&options.product_name);
-
-    // AP203 product skeleton.
-    let app = emitter.emit(
-        "APPLICATION_CONTEXT('configuration controlled 3d designs of mechanical parts and assemblies')",
-    );
-    emitter.emit(format!(
-        "APPLICATION_PROTOCOL_DEFINITION('international standard','config_control_design',1994,#{app})"
-    ));
-    let mechanical = emitter.emit(format!("MECHANICAL_CONTEXT('',#{app},'mechanical')"));
-    let product = emitter.emit(format!("PRODUCT({name},{name},'',(#{mechanical}))"));
-    emitter.emit(format!(
-        "PRODUCT_RELATED_PRODUCT_CATEGORY('part','',(#{product}))"
-    ));
-    let design = emitter.emit(format!("DESIGN_CONTEXT('',#{app},'design')"));
-    let formation = emitter.emit(format!(
-        "PRODUCT_DEFINITION_FORMATION_WITH_SPECIFIED_SOURCE('','',#{product},.NOT_KNOWN.)"
-    ));
-    let definition = emitter.emit(format!(
-        "PRODUCT_DEFINITION('design','',#{formation},#{design})"
-    ));
-    let shape = emitter.emit(format!("PRODUCT_DEFINITION_SHAPE('','',#{definition})"));
-
-    // Units and the geometric representation context. Metric units emit a
-    // direct SI_UNIT; inch emits a CONVERSION_BASED_UNIT defined as 25.4 mm
-    // so importers resolve it to the correct scale.
-    let length_unit = match options.length_unit {
-        LengthUnit::Millimetre => {
-            emitter.emit("( LENGTH_UNIT() NAMED_UNIT(*) SI_UNIT(.MILLI.,.METRE.) )")
-        }
-        LengthUnit::Centimetre => {
-            emitter.emit("( LENGTH_UNIT() NAMED_UNIT(*) SI_UNIT(.CENTI.,.METRE.) )")
-        }
-        LengthUnit::Metre => emitter.emit("( LENGTH_UNIT() NAMED_UNIT(*) SI_UNIT($,.METRE.) )"),
-        LengthUnit::Inch => {
-            // Base millimetre unit the conversion is expressed against, plus
-            // the length dimensional signature (exponent 1 on length).
-            let mm = emitter.emit("( LENGTH_UNIT() NAMED_UNIT(*) SI_UNIT(.MILLI.,.METRE.) )");
-            let dims = emitter.emit("DIMENSIONAL_EXPONENTS(1.0,0.0,0.0,0.0,0.0,0.0,0.0)");
-            let measure = emitter.emit(format!(
-                "LENGTH_MEASURE_WITH_UNIT(LENGTH_MEASURE(25.4),#{mm})"
-            ));
-            emitter.emit(format!(
-                "( CONVERSION_BASED_UNIT('INCH',#{measure}) LENGTH_UNIT() NAMED_UNIT(#{dims}) )"
-            ))
-        }
-    };
-    let angle_unit = emitter.emit("( NAMED_UNIT(*) PLANE_ANGLE_UNIT() SI_UNIT($,.RADIAN.) )");
-    let solid_angle_unit =
-        emitter.emit("( NAMED_UNIT(*) SI_UNIT($,.STERADIAN.) SOLID_ANGLE_UNIT() )");
-    let uncertainty = emitter.emit(format!(
-        "UNCERTAINTY_MEASURE_WITH_UNIT(LENGTH_MEASURE(1.0E-7),#{length_unit},\
-         'distance_accuracy_value','confusion accuracy')"
-    ));
-    let context = emitter.emit(format!(
-        "( GEOMETRIC_REPRESENTATION_CONTEXT(3) \
-         GLOBAL_UNCERTAINTY_ASSIGNED_CONTEXT((#{uncertainty})) \
-         GLOBAL_UNIT_ASSIGNED_CONTEXT((#{length_unit},#{angle_unit},#{solid_angle_unit})) \
-         REPRESENTATION_CONTEXT('Context #1','3D Context') )"
-    ));
+    let mut emitter = Emitter::new(store, geo);
+    let app = emitter.emit_application_context();
+    let context = emitter.emit_unit_context(options.length_unit);
+    let product = emitter.emit_product(&app, &options.product_name);
 
     // The solids themselves.
     let mut solid_ids = Vec::with_capacity(bodies.len());
@@ -255,28 +189,249 @@ pub fn write_step(
     // One shape representation collecting every solid, anchored at the
     // world placement, tied back to the product definition.
     let world = emitter.emit_axis2(Point3::origin(), Vector3::z(), Vector3::x());
-    let mut items = format!("#{world}");
-    for id in &solid_ids {
-        write!(items, ",#{id}").expect("write to String");
-    }
+    let mut items = vec![world];
+    items.extend_from_slice(&solid_ids);
     let representation = emitter.emit(format!(
-        "ADVANCED_BREP_SHAPE_REPRESENTATION('',({items}),#{context})"
+        "ADVANCED_BREP_SHAPE_REPRESENTATION('',{},#{context})",
+        ref_list(&items)
     ));
     emitter.emit(format!(
-        "SHAPE_DEFINITION_REPRESENTATION(#{shape},#{representation})"
+        "SHAPE_DEFINITION_REPRESENTATION(#{},#{representation})",
+        product.shape
     ));
 
-    let mut out = String::with_capacity(emitter.data.len() + 512);
-    out.push_str("ISO-10303-21;\nHEADER;\n");
-    out.push_str("FILE_DESCRIPTION(('OpenSolid B-Rep export'),'2;1');\n");
-    let _ = writeln!(
-        out,
-        "FILE_NAME({name},'',(''),(''),'OpenSolid','OpenSolid','');"
-    );
-    out.push_str("FILE_SCHEMA(('CONFIG_CONTROL_DESIGN'));\nENDSEC;\nDATA;\n");
-    out.push_str(&emitter.data);
-    out.push_str("ENDSEC;\nEND-ISO-10303-21;\n");
-    Ok(out)
+    Ok(emitter.finish(&options.product_name))
+}
+
+/// One placed component of an exported assembly.
+///
+/// The component is *(part, placement)* — the body stays in its own local
+/// coordinates and [`transform`](Self::transform) says where it goes, the
+/// same instancing model the importer produces
+/// ([`PlacedSolid`](super::PlacedSolid)) and `docs/design/ASSEMBLIES.md`
+/// §1 describes. Listing one body twice with different transforms exports
+/// it as two occurrences of a single `PRODUCT`.
+#[derive(Debug, Clone)]
+pub struct AssemblyComponent {
+    /// The part body, in part-local coordinates.
+    pub body: EntityId<Body>,
+    /// Placement of this occurrence in assembly space.
+    pub transform: Transform3,
+    /// Component name — the `PRODUCT` name for the first occurrence of a
+    /// body, and the `NEXT_ASSEMBLY_USAGE_OCCURRENCE` name for every one.
+    pub name: String,
+}
+
+impl AssemblyComponent {
+    /// A component placed at the assembly origin, unrotated.
+    pub fn new(body: EntityId<Body>, name: impl Into<String>) -> Self {
+        Self {
+            body,
+            transform: Transform3::identity(),
+            name: name.into(),
+        }
+    }
+
+    /// The same component placed by `transform`.
+    pub fn placed(mut self, transform: Transform3) -> Self {
+        self.transform = transform;
+        self
+    }
+}
+
+/// Serialize a **flat (single-level) assembly** to a STEP AP203 Part 21
+/// file: one root `PRODUCT` containing each component as a
+/// `NEXT_ASSEMBLY_USAGE_OCCURRENCE`, placed by a
+/// `CONTEXT_DEPENDENT_SHAPE_REPRESENTATION` /
+/// `ITEM_DEFINED_TRANSFORMATION` pair — the structure
+/// [`read_step`](super::read::read_step) resolves back into
+/// [`StepImport::instances`](super::read::StepImport::instances).
+///
+/// Each distinct body becomes one `PRODUCT` with its own
+/// `ADVANCED_BREP_SHAPE_REPRESENTATION`, written once however many times
+/// it occurs, so a part used ten times costs one copy of its geometry.
+/// Bodies must satisfy the same constraints as [`write_step`]. An empty
+/// `components` slice yields a valid file with an empty root assembly.
+///
+/// [`StepWriteOptions::product_name`] names the root assembly.
+///
+/// # Errors
+/// [`StepWriteError`] if any body is stale, non-solid, multi-shell, or
+/// references missing/unsupported geometry, or if a transform is not
+/// finite. The stores are never mutated.
+///
+/// # Example
+///
+/// ```
+/// use opensolid_kernel::brep::primitives::block;
+/// use opensolid_kernel::brep::{GeometryStore, TopologyStore};
+/// use opensolid_kernel::core::Transform3;
+/// use opensolid_kernel::io::step::read::{StepReadOptions, read_step};
+/// use opensolid_kernel::io::step::write::{
+///     AssemblyComponent, StepWriteOptions, write_step_assembly,
+/// };
+///
+/// let mut store = TopologyStore::new();
+/// let mut geo = GeometryStore::new();
+/// let part = block(&mut store, &mut geo, 2.0, 2.0, 2.0).unwrap();
+///
+/// // The same part twice, 10mm apart.
+/// let components = vec![
+///     AssemblyComponent::new(part, "left"),
+///     AssemblyComponent::new(part, "right")
+///         .placed(Transform3::translation(10.0, 0.0, 0.0)),
+/// ];
+/// let text =
+///     write_step_assembly(&store, &geo, &components, &StepWriteOptions::default()).unwrap();
+///
+/// let mut store2 = TopologyStore::new();
+/// let mut geo2 = GeometryStore::new();
+/// let import = read_step(&text, &mut store2, &mut geo2, &StepReadOptions::default()).unwrap();
+/// assert_eq!(import.solids.len(), 1, "one part, written once");
+/// assert_eq!(import.instances.len(), 2, "placed twice");
+/// assert!(import.is_assembly());
+/// ```
+pub fn write_step_assembly(
+    store: &TopologyStore,
+    geo: &GeometryStore,
+    components: &[AssemblyComponent],
+    options: &StepWriteOptions,
+) -> WriteResult<String> {
+    for component in components {
+        check_rigid(&component.transform)?;
+    }
+    let mut emitter = Emitter::new(store, geo);
+    let app = emitter.emit_application_context();
+    let context = emitter.emit_unit_context(options.length_unit);
+    let assembly = emitter.emit_product(&app, &options.product_name);
+
+    // Each distinct body once: its own product, its own shape
+    // representation holding the solid and the origin the placements are
+    // expressed against.
+    let mut parts: HashMap<EntityId<Body>, PartIds> = HashMap::new();
+    for component in components {
+        if parts.contains_key(&component.body) {
+            continue;
+        }
+        let product = emitter.emit_product(&app, &component.name);
+        let solid = emitter.emit_body(component.body, &component.name)?;
+        let origin = emitter.emit_axis2(Point3::origin(), Vector3::z(), Vector3::x());
+        let representation = emitter.emit(format!(
+            "ADVANCED_BREP_SHAPE_REPRESENTATION({},{},#{context})",
+            string_literal(&component.name),
+            ref_list(&[origin, solid])
+        ));
+        emitter.emit(format!(
+            "SHAPE_DEFINITION_REPRESENTATION(#{},#{representation})",
+            product.shape
+        ));
+        parts.insert(
+            component.body,
+            PartIds {
+                definition: product.definition,
+                representation,
+                origin,
+            },
+        );
+    }
+
+    // Where each occurrence lands, as items of the assembly's own
+    // representation. Emitted before it so the file has no forward
+    // references.
+    let targets: Vec<u64> = components
+        .iter()
+        .map(|component| emitter.emit_transform_axis2(&component.transform))
+        .collect();
+
+    let world = emitter.emit_axis2(Point3::origin(), Vector3::z(), Vector3::x());
+    let mut items = vec![world];
+    items.extend_from_slice(&targets);
+    let assembly_rep = emitter.emit(format!(
+        "SHAPE_REPRESENTATION({},{},#{context})",
+        string_literal(&options.product_name),
+        ref_list(&items)
+    ));
+    emitter.emit(format!(
+        "SHAPE_DEFINITION_REPRESENTATION(#{},#{assembly_rep})",
+        assembly.shape
+    ));
+
+    // One occurrence per component: the usage edge, then the placement
+    // that maps the part's origin onto the component's target.
+    for (index, (component, &target)) in components.iter().zip(&targets).enumerate() {
+        let part = &parts[&component.body];
+        let name = string_literal(&component.name);
+        let usage = emitter.emit(format!(
+            "NEXT_ASSEMBLY_USAGE_OCCURRENCE('{}',{name},'',#{},#{},$)",
+            index + 1,
+            assembly.definition,
+            part.definition,
+        ));
+        let usage_shape = emitter.emit(format!(
+            "PRODUCT_DEFINITION_SHAPE('Placement','Placement of an item',#{usage})"
+        ));
+        let transformation = emitter.emit(format!(
+            "ITEM_DEFINED_TRANSFORMATION('','',#{},#{target})",
+            part.origin
+        ));
+        let relationship = emitter.emit(format!(
+            "( REPRESENTATION_RELATIONSHIP('','',#{},#{assembly_rep}) \
+             REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION(#{transformation}) \
+             SHAPE_REPRESENTATION_RELATIONSHIP() )",
+            part.representation
+        ));
+        emitter.emit(format!(
+            "CONTEXT_DEPENDENT_SHAPE_REPRESENTATION(#{relationship},#{usage_shape})"
+        ));
+    }
+
+    Ok(emitter.finish(&options.product_name))
+}
+
+/// Reject a placement the kernel cannot round-trip: STEP placements are
+/// written as orthonormal axis triples, so a non-finite transform would
+/// serialize as garbage.
+fn check_rigid(transform: &Transform3) -> WriteResult<()> {
+    let finite = transform.translation.vector.iter().all(|c| c.is_finite())
+        && transform
+            .rotation
+            .quaternion()
+            .coords
+            .iter()
+            .all(|c| c.is_finite());
+    if finite {
+        Ok(())
+    } else {
+        Err(invalid(format!(
+            "component placement must be finite, got {transform}"
+        )))
+    }
+}
+
+/// The instance names of one exported part, reused by every occurrence.
+struct PartIds {
+    /// Its `PRODUCT_DEFINITION`.
+    definition: u64,
+    /// Its `ADVANCED_BREP_SHAPE_REPRESENTATION`.
+    representation: u64,
+    /// The `AXIS2_PLACEMENT_3D` in that representation which occurrence
+    /// placements map from.
+    origin: u64,
+}
+
+/// The AP203 application-level context records, shared by every product in
+/// a file.
+struct AppContext {
+    mechanical: u64,
+    design: u64,
+}
+
+/// The per-product records other entities reference.
+struct ProductIds {
+    /// Its `PRODUCT_DEFINITION`.
+    definition: u64,
+    /// Its `PRODUCT_DEFINITION_SHAPE`.
+    shape: u64,
 }
 
 /// Format a Part 21 string literal: quoted, with `'` doubled. Other Part 21
@@ -337,13 +492,136 @@ struct Emitter<'a> {
     surfaces: HashMap<EntityId<Surface3>, u64>,
 }
 
-impl Emitter<'_> {
+impl<'a> Emitter<'a> {
+    fn new(store: &'a TopologyStore, geo: &'a GeometryStore) -> Self {
+        Self {
+            store,
+            geo,
+            data: String::new(),
+            next_id: 1,
+            vertices: HashMap::new(),
+            edges: HashMap::new(),
+            curves: HashMap::new(),
+            surfaces: HashMap::new(),
+        }
+    }
+
     /// Append `#id = record;` and return the assigned instance name.
     fn emit(&mut self, record: impl AsRef<str>) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
         let _ = writeln!(self.data, "#{id} = {};", record.as_ref());
         id
+    }
+
+    /// Wrap the accumulated DATA section in the Part 21 envelope.
+    fn finish(self, name: &str) -> String {
+        let name = string_literal(name);
+        let mut out = String::with_capacity(self.data.len() + 512);
+        out.push_str("ISO-10303-21;\nHEADER;\n");
+        out.push_str("FILE_DESCRIPTION(('OpenSolid B-Rep export'),'2;1');\n");
+        let _ = writeln!(
+            out,
+            "FILE_NAME({name},'',(''),(''),'OpenSolid','OpenSolid','');"
+        );
+        out.push_str("FILE_SCHEMA(('CONFIG_CONTROL_DESIGN'));\nENDSEC;\nDATA;\n");
+        out.push_str(&self.data);
+        out.push_str("ENDSEC;\nEND-ISO-10303-21;\n");
+        out
+    }
+
+    /// The AP203 application context and the two life-cycle contexts every
+    /// product hangs off.
+    fn emit_application_context(&mut self) -> AppContext {
+        let application = self.emit(
+            "APPLICATION_CONTEXT('configuration controlled 3d designs of mechanical parts and assemblies')",
+        );
+        self.emit(format!(
+            "APPLICATION_PROTOCOL_DEFINITION('international standard','config_control_design',1994,\
+             #{application})"
+        ));
+        let mechanical = self.emit(format!(
+            "MECHANICAL_CONTEXT('',#{application},'mechanical')"
+        ));
+        let design = self.emit(format!("DESIGN_CONTEXT('',#{application},'design')"));
+        AppContext { mechanical, design }
+    }
+
+    /// One product and its definition/shape chain. Assemblies and parts
+    /// use the identical skeleton — what makes one an assembly is the
+    /// `NEXT_ASSEMBLY_USAGE_OCCURRENCE`s naming it as a parent.
+    fn emit_product(&mut self, app: &AppContext, name: &str) -> ProductIds {
+        let literal = string_literal(name);
+        let product = self.emit(format!(
+            "PRODUCT({literal},{literal},'',(#{}))",
+            app.mechanical
+        ));
+        self.emit(format!(
+            "PRODUCT_RELATED_PRODUCT_CATEGORY('part','',(#{product}))"
+        ));
+        let formation = self.emit(format!(
+            "PRODUCT_DEFINITION_FORMATION_WITH_SPECIFIED_SOURCE('','',#{product},.NOT_KNOWN.)"
+        ));
+        let definition = self.emit(format!(
+            "PRODUCT_DEFINITION('design','',#{formation},#{})",
+            app.design
+        ));
+        let shape = self.emit(format!("PRODUCT_DEFINITION_SHAPE('','',#{definition})"));
+        ProductIds { definition, shape }
+    }
+
+    /// Units and the geometric representation context every representation
+    /// in the file shares. Metric units emit a direct SI_UNIT; inch emits a
+    /// CONVERSION_BASED_UNIT defined as 25.4 mm so importers resolve it to
+    /// the correct scale.
+    fn emit_unit_context(&mut self, unit: LengthUnit) -> u64 {
+        let length_unit = match unit {
+            LengthUnit::Millimetre => {
+                self.emit("( LENGTH_UNIT() NAMED_UNIT(*) SI_UNIT(.MILLI.,.METRE.) )")
+            }
+            LengthUnit::Centimetre => {
+                self.emit("( LENGTH_UNIT() NAMED_UNIT(*) SI_UNIT(.CENTI.,.METRE.) )")
+            }
+            LengthUnit::Metre => self.emit("( LENGTH_UNIT() NAMED_UNIT(*) SI_UNIT($,.METRE.) )"),
+            LengthUnit::Inch => {
+                // Base millimetre unit the conversion is expressed against,
+                // plus the length dimensional signature (exponent 1 on
+                // length).
+                let mm = self.emit("( LENGTH_UNIT() NAMED_UNIT(*) SI_UNIT(.MILLI.,.METRE.) )");
+                let dims = self.emit("DIMENSIONAL_EXPONENTS(1.0,0.0,0.0,0.0,0.0,0.0,0.0)");
+                let measure = self.emit(format!(
+                    "LENGTH_MEASURE_WITH_UNIT(LENGTH_MEASURE(25.4),#{mm})"
+                ));
+                self.emit(format!(
+                    "( CONVERSION_BASED_UNIT('INCH',#{measure}) LENGTH_UNIT() NAMED_UNIT(#{dims}) )"
+                ))
+            }
+        };
+        let angle_unit = self.emit("( NAMED_UNIT(*) PLANE_ANGLE_UNIT() SI_UNIT($,.RADIAN.) )");
+        let solid_angle_unit =
+            self.emit("( NAMED_UNIT(*) SI_UNIT($,.STERADIAN.) SOLID_ANGLE_UNIT() )");
+        let uncertainty = self.emit(format!(
+            "UNCERTAINTY_MEASURE_WITH_UNIT(LENGTH_MEASURE(1.0E-7),#{length_unit},\
+             'distance_accuracy_value','confusion accuracy')"
+        ));
+        self.emit(format!(
+            "( GEOMETRIC_REPRESENTATION_CONTEXT(3) \
+             GLOBAL_UNCERTAINTY_ASSIGNED_CONTEXT((#{uncertainty})) \
+             GLOBAL_UNIT_ASSIGNED_CONTEXT((#{length_unit},#{angle_unit},#{solid_angle_unit})) \
+             REPRESENTATION_CONTEXT('Context #1','3D Context') )"
+        ))
+    }
+
+    /// A rigid transform as the `AXIS2_PLACEMENT_3D` that maps the world
+    /// frame onto it: its location is the translation, its axis and
+    /// reference direction the rotated z and x.
+    fn emit_transform_axis2(&mut self, transform: &Transform3) -> u64 {
+        let rotation = transform.rotation;
+        self.emit_axis2(
+            Point3::from(transform.translation.vector),
+            rotation * Vector3::z(),
+            rotation * Vector3::x(),
+        )
     }
 
     fn emit_point(&mut self, p: Point3) -> u64 {
@@ -1396,5 +1674,220 @@ mod tests {
 
         let err = write_step(&store, &geo, &[body], &StepWriteOptions::default()).unwrap_err();
         assert!(matches!(err, StepWriteError::Unsupported(_)), "{err}");
+    }
+
+    // ------------------------------------------------------------------
+    // Flat assembly export (of-3qy.13)
+    // ------------------------------------------------------------------
+
+    mod assembly {
+        use super::*;
+        use nalgebra::{Translation3, UnitQuaternion, Vector3 as NaVector3};
+        use std::f64::consts::FRAC_PI_2;
+
+        fn rigid(translation: [f64; 3], axis_angle: NaVector3<f64>) -> Transform3 {
+            Transform3::from_parts(
+                Translation3::new(translation[0], translation[1], translation[2]),
+                UnitQuaternion::new(axis_angle),
+            )
+        }
+
+        /// Re-import an emitted assembly, keeping the placement report.
+        fn reimport_assembly(text: &str) -> crate::io::step::read::StepImport {
+            let mut store = TopologyStore::new();
+            let mut geo = GeometryStore::new();
+            let import = read_step(text, &mut store, &mut geo, &StepReadOptions::default())
+                .expect("emitted assembly must be syntactically valid");
+            assert!(
+                !import.has_errors(),
+                "reader reported errors: {:?}",
+                import.diagnostics
+            );
+            import
+        }
+
+        fn assert_close(a: &Transform3, b: &Transform3, what: &str) {
+            let translation = (a.translation.vector - b.translation.vector).norm();
+            let rotation = a.rotation.angle_to(&b.rotation);
+            assert!(
+                translation < 1e-9 && rotation < 1e-9,
+                "{what}: expected {b}, got {a} (Δt {translation:.3e}, Δr {rotation:.3e})"
+            );
+        }
+
+        #[test]
+        fn two_distinct_parts_round_trip_with_their_placements() {
+            let mut store = TopologyStore::new();
+            let mut geo = GeometryStore::new();
+            let cube = block(&mut store, &mut geo, 2.0, 2.0, 2.0).expect("block");
+            let bar = block(&mut store, &mut geo, 6.0, 1.0, 1.0).expect("block");
+            let cube_at = rigid([10.0, 0.0, 0.0], NaVector3::zeros());
+            let bar_at = rigid([0.0, 4.0, -2.0], NaVector3::new(0.0, 0.0, FRAC_PI_2));
+            let components = vec![
+                AssemblyComponent::new(cube, "cube").placed(cube_at),
+                AssemblyComponent::new(bar, "bar").placed(bar_at),
+            ];
+
+            let text = write_step_assembly(&store, &geo, &components, &StepWriteOptions::default())
+                .expect("write");
+            let import = reimport_assembly(&text);
+
+            assert_eq!(import.solids.len(), 2, "two distinct parts");
+            assert_eq!(import.instances.len(), 2, "placed once each");
+            assert!(import.is_assembly());
+            for (instance, expected) in import.instances.iter().zip([cube_at, bar_at]) {
+                assert_close(&instance.transform, &expected, "component placement");
+            }
+            let names: Vec<&str> = import
+                .instances
+                .iter()
+                .map(|i| i.product.as_str())
+                .collect();
+            assert_eq!(names, ["cube", "bar"], "product names survive");
+            let paths: Vec<&[String]> = import.instances.iter().map(|i| &i.path[..]).collect();
+            assert_eq!(paths[0], ["cube".to_string()], "occurrence path");
+            assert_eq!(paths[1], ["bar".to_string()]);
+        }
+
+        #[test]
+        fn one_body_used_twice_is_written_once_and_read_back_twice() {
+            let mut store = TopologyStore::new();
+            let mut geo = GeometryStore::new();
+            let part = block(&mut store, &mut geo, 1.0, 1.0, 1.0).expect("block");
+            let second = rigid([5.0, 0.0, 0.0], NaVector3::new(FRAC_PI_2, 0.0, 0.0));
+            let components = vec![
+                AssemblyComponent::new(part, "widget"),
+                AssemblyComponent::new(part, "widget").placed(second),
+            ];
+
+            let text = write_step_assembly(&store, &geo, &components, &StepWriteOptions::default())
+                .expect("write");
+            assert_eq!(
+                text.matches("MANIFOLD_SOLID_BREP").count(),
+                1,
+                "the shared part's geometry is emitted once"
+            );
+
+            let import = reimport_assembly(&text);
+            assert_eq!(import.solids.len(), 1, "one part");
+            assert_eq!(import.instances.len(), 2, "two occurrences");
+            assert!(import.instances.iter().all(|i| i.solid == 0));
+            assert_close(
+                &import.instances[0].transform,
+                &Transform3::identity(),
+                "first occurrence",
+            );
+            assert_close(&import.instances[1].transform, &second, "second occurrence");
+        }
+
+        #[test]
+        fn placements_survive_a_second_round_trip() {
+            // The emitted structure must be a fixed point of the placement
+            // resolution, not merely readable once.
+            let mut store = TopologyStore::new();
+            let mut geo = GeometryStore::new();
+            let part = block(&mut store, &mut geo, 2.0, 3.0, 4.0).expect("block");
+            let pose = rigid([1.5, -2.5, 7.0], NaVector3::new(0.3, -0.7, 1.1));
+            let components = vec![AssemblyComponent::new(part, "part").placed(pose)];
+
+            let text = write_step_assembly(&store, &geo, &components, &StepWriteOptions::default())
+                .expect("write");
+            let import = reimport_assembly(&text);
+            assert_close(&import.instances[0].transform, &pose, "first trip");
+
+            // Re-export the re-imported body under the same placement.
+            let mut store2 = TopologyStore::new();
+            let mut geo2 = GeometryStore::new();
+            let import2 = read_step(&text, &mut store2, &mut geo2, &StepReadOptions::default())
+                .expect("valid");
+            let body = match &import2.solids[0].outcome {
+                SolidOutcome::BRep(body) => *body,
+                other => panic!("expected an exact B-Rep, got {other:?}"),
+            };
+            let text2 = write_step_assembly(
+                &store2,
+                &geo2,
+                &[AssemblyComponent::new(body, "part").placed(import2.instances[0].transform)],
+                &StepWriteOptions::default(),
+            )
+            .expect("re-write");
+            let import3 = reimport_assembly(&text2);
+            assert_close(&import3.instances[0].transform, &pose, "second trip");
+        }
+
+        #[test]
+        fn an_empty_assembly_is_a_valid_file() {
+            let store = TopologyStore::new();
+            let geo = GeometryStore::new();
+            let text = write_step_assembly(&store, &geo, &[], &StepWriteOptions::default())
+                .expect("write");
+            let file = crate::io::step::parse(&text).expect("emitted file parses");
+            assert!(!file.is_empty());
+            assert!(!text.contains("NEXT_ASSEMBLY_USAGE_OCCURRENCE"));
+        }
+
+        #[test]
+        fn geometry_is_written_in_part_local_coordinates() {
+            // The placement lives in the product structure, never baked
+            // into the solid — that is what makes instancing free.
+            let mut store = TopologyStore::new();
+            let mut geo = GeometryStore::new();
+            let part = block(&mut store, &mut geo, 2.0, 2.0, 2.0).expect("block");
+            let far = rigid([1000.0, 0.0, 0.0], NaVector3::zeros());
+            let text = write_step_assembly(
+                &store,
+                &geo,
+                &[AssemblyComponent::new(part, "part").placed(far)],
+                &StepWriteOptions::default(),
+            )
+            .expect("write");
+
+            let mut store2 = TopologyStore::new();
+            let mut geo2 = GeometryStore::new();
+            let import = read_step(&text, &mut store2, &mut geo2, &StepReadOptions::default())
+                .expect("valid");
+            let body = match &import.solids[0].outcome {
+                SolidOutcome::BRep(body) => *body,
+                other => panic!("expected an exact B-Rep, got {other:?}"),
+            };
+            let mesh = tessellate_body(&store2, &geo2, body, &TessellationOptions::default())
+                .expect("tessellate");
+            let centroid = mass_properties(&mesh).expect("closed").centroid;
+            assert!(
+                centroid.x.abs() < 1e-9,
+                "the solid must stay at its own origin, got centroid {centroid:?}"
+            );
+        }
+
+        #[test]
+        fn rejects_a_non_finite_placement() {
+            let mut store = TopologyStore::new();
+            let mut geo = GeometryStore::new();
+            let part = block(&mut store, &mut geo, 1.0, 1.0, 1.0).expect("block");
+            let bad = rigid([f64::NAN, 0.0, 0.0], NaVector3::zeros());
+            let err = write_step_assembly(
+                &store,
+                &geo,
+                &[AssemblyComponent::new(part, "part").placed(bad)],
+                &StepWriteOptions::default(),
+            )
+            .unwrap_err();
+            assert!(matches!(err, StepWriteError::Invalid(_)), "{err}");
+        }
+
+        #[test]
+        fn rejects_the_same_bodies_write_step_rejects() {
+            let mut store = TopologyStore::new();
+            let geo = GeometryStore::new();
+            let body = store.create_body(BodyType::Sheet);
+            let err = write_step_assembly(
+                &store,
+                &geo,
+                &[AssemblyComponent::new(body, "sheet")],
+                &StepWriteOptions::default(),
+            )
+            .unwrap_err();
+            assert!(matches!(err, StepWriteError::Unsupported(_)), "{err}");
+        }
     }
 }

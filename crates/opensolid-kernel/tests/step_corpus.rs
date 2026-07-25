@@ -768,6 +768,93 @@ mod adversarial {
              declared in millimetres; got ratio {ratio:e} (units ignored?)"
         );
     }
+
+    // -----------------------------------------------------------------
+    // Malformed product structure (of-3qy.13)
+    // -----------------------------------------------------------------
+    // Broken assembly wiring must degrade the *placement* only: the solids
+    // still import, still get an occurrence each, and the reader says so.
+
+    /// A one-solid file whose root representation holds `items`, with the
+    /// given extra records appended.
+    fn assembly_probe_items(items: &str, extra: &str) -> StepImport {
+        let (_, _, report) = import(&envelope(&format!(
+            "#1 = MANIFOLD_SOLID_BREP('part',#2);\n\
+             #10 = PRODUCT_DEFINITION('design','',#11,#0);\n\
+             #11 = PRODUCT_DEFINITION_FORMATION('','',#12);\n\
+             #12 = PRODUCT('root','root','',());\n\
+             #13 = PRODUCT_DEFINITION_SHAPE('','',#10);\n\
+             #14 = ADVANCED_BREP_SHAPE_REPRESENTATION('',({items}),#0);\n\
+             #15 = SHAPE_DEFINITION_REPRESENTATION(#13,#14);\n\
+             {extra}"
+        )));
+        report
+    }
+
+    /// [`assembly_probe_items`] with the solid as the only root item.
+    fn assembly_probe(extra: &str) -> StepImport {
+        assembly_probe_items("#1", extra)
+    }
+
+    #[test]
+    fn nauo_naming_a_missing_product_does_not_lose_the_solid() {
+        let report =
+            assembly_probe("#20 = NEXT_ASSEMBLY_USAGE_OCCURRENCE('1','ghost','',#10,#999,$);\n");
+        assert_eq!(report.solids.len(), 1);
+        assert_eq!(report.instances.len(), 1, "the real solid still places");
+        assert_structured(&report);
+    }
+
+    #[test]
+    fn dangling_placement_reference_degrades_to_a_diagnostic() {
+        // The CDSR's ITEM_DEFINED_TRANSFORMATION points at an axis that is
+        // not in the file at all.
+        let report = assembly_probe(
+            "#20 = PRODUCT_DEFINITION('design','',#21,#0);\n\
+             #21 = PRODUCT_DEFINITION_FORMATION('','',#22);\n\
+             #22 = PRODUCT('child','child','',());\n\
+             #23 = PRODUCT_DEFINITION_SHAPE('','',#20);\n\
+             #24 = ADVANCED_BREP_SHAPE_REPRESENTATION('',(),#0);\n\
+             #25 = SHAPE_DEFINITION_REPRESENTATION(#23,#24);\n\
+             #30 = NEXT_ASSEMBLY_USAGE_OCCURRENCE('1','child_1','',#10,#20,$);\n\
+             #31 = PRODUCT_DEFINITION_SHAPE('Placement','',#30);\n\
+             #32 = ITEM_DEFINED_TRANSFORMATION('','',#998,#999);\n\
+             #33 = ( REPRESENTATION_RELATIONSHIP('','',#24,#14) \
+             REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION(#32) \
+             SHAPE_REPRESENTATION_RELATIONSHIP() );\n\
+             #34 = CONTEXT_DEPENDENT_SHAPE_REPRESENTATION(#33,#31);\n",
+        );
+        assert_eq!(report.instances.len(), 1);
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|d| d.severity >= Severity::Warning && d.message.contains("dangling")),
+            "expected a dangling-reference diagnostic, got {:?}",
+            report.diagnostics
+        );
+        assert_structured(&report);
+    }
+
+    #[test]
+    fn a_representation_referring_to_itself_terminates() {
+        // A MAPPED_ITEM whose REPRESENTATION_MAP maps the very
+        // representation the item belongs to. Without a guard this is an
+        // infinite descent.
+        let report = assembly_probe_items(
+            "#1,#25",
+            "#20 = REPRESENTATION_MAP(#24,#14);\n\
+             #21 = CARTESIAN_POINT('',(0.,0.,0.));\n\
+             #22 = DIRECTION('',(0.,0.,1.));\n\
+             #23 = DIRECTION('',(1.,0.,0.));\n\
+             #24 = AXIS2_PLACEMENT_3D('',#21,#22,#23);\n\
+             #25 = MAPPED_ITEM('self',#20,#24);\n",
+        );
+        // The solid is reachable; how many times is unimportant, that the
+        // call returns at all is the gate.
+        assert!(!report.instances.is_empty());
+        assert_structured(&report);
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -1400,6 +1487,192 @@ mod corpus {
             "expected unsupported-geometry warnings, got: {:?}",
             report.diagnostics.iter().take(5).collect::<Vec<_>>()
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Assembly structure (of-3qy.13)
+    // -----------------------------------------------------------------
+    // Product structure is resolved independently of whether the geometry
+    // imports, so these gates hold even while AS1's SURFACE_CURVE edges
+    // and DM1's NURBS surfaces still defeat the geometry mapper.
+
+    /// Every solid a file declares must be accounted for by at least one
+    /// placed occurrence, and every placement must be a finite rigid
+    /// transform. This is the invariant that makes `instances` safe to
+    /// consume without cross-checking `solids`.
+    fn assert_instances_cover_every_solid(report: &StepImport, name: &str) {
+        for (index, solid) in report.solids.iter().enumerate() {
+            assert!(
+                report.instances_of(index).next().is_some(),
+                "{name}: solid #{} has no placed occurrence",
+                solid.step_id
+            );
+        }
+        for instance in &report.instances {
+            assert!(
+                instance.solid < report.solids.len(),
+                "{name}: instance indexes solid {} of {}",
+                instance.solid,
+                report.solids.len()
+            );
+            assert_eq!(
+                report.solids[instance.solid].step_id, instance.step_id,
+                "{name}: instance's solid index and step id disagree"
+            );
+            let t = instance.transform;
+            assert!(
+                t.translation.vector.iter().all(|c| c.is_finite())
+                    && t.rotation.quaternion().coords.iter().all(|c| c.is_finite()),
+                "{name}: non-finite placement {t}"
+            );
+            // Rigid: the rotation must preserve lengths and handedness.
+            let matrix = t.rotation.to_rotation_matrix();
+            assert!(
+                (matrix.matrix().determinant() - 1.0).abs() < 1e-9,
+                "{name}: placement rotation is not a proper rotation"
+            );
+        }
+    }
+
+    /// AS1 is the canonical CAx-IF assembly: a plate, two L-bracket
+    /// sub-assemblies of three nut-bolt sub-assemblies each, and a rod
+    /// sub-assembly holding a rod and two nuts — five distinct parts in
+    /// eighteen places, nested three deep.
+    #[test]
+    fn as1_oc_resolves_the_full_assembly_tree() {
+        let (_, _, report) = import_bytes(&load("as1-oc-214.stp"));
+        assert_eq!(report.solids.len(), 5, "five distinct parts");
+        assert_eq!(report.instances.len(), 18, "eighteen placed occurrences");
+        assert!(report.is_assembly());
+        assert_instances_cover_every_solid(&report, "as1-oc-214.stp");
+
+        // Occurrence counts per part, by product name.
+        let mut counts: std::collections::BTreeMap<&str, usize> = Default::default();
+        for instance in &report.instances {
+            *counts.entry(instance.product.as_str()).or_default() += 1;
+        }
+        assert_eq!(counts["nut"], 8, "two on the rod, six in the brackets");
+        assert_eq!(counts["bolt"], 6);
+        assert_eq!(counts["l-bracket"], 2);
+        assert_eq!(counts["rod"], 1);
+        assert_eq!(counts["plate"], 1);
+
+        // Nesting depth: the plate hangs off the root, the bracket nuts are
+        // three levels down.
+        let depths: std::collections::BTreeSet<usize> =
+            report.instances.iter().map(|i| i.path.len()).collect();
+        assert_eq!(
+            depths,
+            std::collections::BTreeSet::from([1, 2, 3]),
+            "one-, two- and three-deep occurrences"
+        );
+
+        // The composed pose of the first nut on the rod, computed by hand
+        // from the file: the rod-assembly is placed by #15 (origin
+        // (-10,75,60), z along +X, x along -Z) and the nut by #45 (origin
+        // (-10,-7.5,185), unrotated), so the nut lands at
+        //     R(#15) · (-10,-7.5,185) + (-10,75,60) = (175, 67.5, 70).
+        let nut_1 = report
+            .instances
+            .iter()
+            .find(|i| i.path == ["rod-assembly_1", "nut_1"])
+            .expect("rod-assembly_1/nut_1");
+        let origin = nut_1.transform * opensolid_kernel::core::Point3::origin();
+        assert!(
+            (origin - opensolid_kernel::core::Point3::new(175.0, 67.5, 70.0)).norm() < 1e-9,
+            "nut_1 landed at {origin:?}"
+        );
+        // Its frame is the rod-assembly's quarter turn.
+        assert!(
+            (nut_1.transform.rotation.angle() - std::f64::consts::FRAC_PI_2).abs() < 1e-9,
+            "nut_1 rotation is {}",
+            nut_1.transform.rotation.angle()
+        );
+
+        // No two occurrences of one part may coincide — that would mean a
+        // placement was silently dropped to identity.
+        let nuts: Vec<_> = report
+            .instances
+            .iter()
+            .filter(|i| i.product == "nut")
+            .map(|i| i.transform * opensolid_kernel::core::Point3::origin())
+            .collect();
+        for (i, a) in nuts.iter().enumerate() {
+            for b in &nuts[i + 1..] {
+                assert!((a - b).norm() > 1e-6, "two nuts coincide at {a:?}");
+            }
+        }
+    }
+
+    /// DM1 is a one-level assembly authored in inches: the placements must
+    /// be scaled into millimetres alongside the geometry, or components
+    /// land 25.4× too close to the origin.
+    #[test]
+    fn dm1_id_places_components_in_millimetres() {
+        let (_, _, report) = import_bytes(&load("dm1-id-214.stp"));
+        assert!((report.length_scale - 25.4).abs() < 1e-12, "an inch file");
+        assert_eq!(report.solids.len(), 3);
+        assert_eq!(
+            report.instances.len(),
+            7,
+            "three bolts, three nuts, a bracket"
+        );
+        assert!(report.is_assembly());
+        assert_instances_cover_every_solid(&report, "dm1-id-214.stp");
+        assert!(
+            report.instances.iter().all(|i| i.path.len() == 1),
+            "DM1 is a single-level assembly"
+        );
+
+        // The bolts sit ~10mm and ~30mm out in X; unscaled they would be at
+        // ~0.4mm and ~1.2mm.
+        let mut bolt_x: Vec<f64> = report
+            .instances
+            .iter()
+            .filter(|i| i.product == "bolt")
+            .map(|i| i.transform.translation.vector.x)
+            .collect();
+        bolt_x.sort_by(f64::total_cmp);
+        assert_eq!(bolt_x.len(), 3);
+        assert!(
+            bolt_x[0] > 5.0 && bolt_x[2] > 25.0,
+            "bolt placements were not scaled into millimetres: {bolt_x:?}"
+        );
+    }
+
+    /// A part file is not an assembly, however the reader models it: one
+    /// identity occurrence per solid and nothing else.
+    #[test]
+    fn part_files_yield_one_identity_occurrence_per_solid() {
+        for name in [
+            "sg1-c5-214.stp",
+            "io1-cm-214.stp",
+            "nist/nist_ftc_11_asme1_rb.stp",
+        ] {
+            let (_, _, report) = import_bytes(&load(name));
+            assert_eq!(
+                report.instances.len(),
+                report.solids.len(),
+                "{name}: one occurrence per solid"
+            );
+            assert!(
+                report.instances.iter().all(|i| i.is_identity()),
+                "{name}: a part file must import at the origin"
+            );
+            assert!(!report.is_assembly(), "{name}: not an assembly");
+        }
+    }
+
+    /// The corpus-wide structural invariant, so a new vendored file is
+    /// covered the moment it is dropped in.
+    #[test]
+    fn every_vendored_file_accounts_for_every_solid() {
+        for file in corpus_files() {
+            let bytes = std::fs::read(&file).unwrap_or_else(|e| panic!("read {file:?}: {e}"));
+            let (_, _, report) = import_bytes(&bytes);
+            let name = file.file_name().unwrap_or_default().to_string_lossy();
+            assert_instances_cover_every_solid(&report, &name);
+        }
     }
 }
 

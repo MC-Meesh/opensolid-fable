@@ -130,6 +130,7 @@ use opensolid_core::mesh::TriangleMesh;
 use opensolid_core::{EntityId, Point3, Vector3};
 
 use super::heal::{GeometryHealer, HealOptions, HealStrategy};
+use super::product::{PlacedSolid, resolve_instances};
 use super::{Instance, SimpleRecord, StepError, StepFile, Value};
 use crate::convert::MeshSdf;
 
@@ -205,6 +206,15 @@ pub struct ImportedSolid {
 #[derive(Debug)]
 pub struct StepImport {
     pub solids: Vec<ImportedSolid>,
+    /// One entry per *placed occurrence* of a solid, resolved from the
+    /// file's product structure (`NEXT_ASSEMBLY_USAGE_OCCURRENCE` /
+    /// `MAPPED_ITEM` — see [`product`](super::product)). A single-part
+    /// file yields exactly one identity-placed entry per solid; an
+    /// assembly yields one per instance, so a part used twice appears
+    /// twice with the same [`PlacedSolid::solid`] index and different
+    /// transforms. The geometry in the stores stays in part-local
+    /// coordinates: an instance is *(part, transform)*, never a copy.
+    pub instances: Vec<PlacedSolid>,
     pub diagnostics: Vec<Diagnostic>,
     /// Millimetres per file length unit, resolved from the file's
     /// `GLOBAL_UNIT_ASSIGNED_CONTEXT` (1.0 when no length unit is declared
@@ -230,6 +240,19 @@ impl StepImport {
         self.diagnostics
             .iter()
             .any(|d| d.severity == Severity::Error)
+    }
+
+    /// Whether the file carries real assembly structure: some solid is
+    /// placed away from the origin, or placed more than once. A flat
+    /// single-part file is not an assembly however many solids it holds.
+    pub fn is_assembly(&self) -> bool {
+        self.instances.len() > self.solids.len() || self.instances.iter().any(|i| !i.is_identity())
+    }
+
+    /// The occurrences of one solid, by its index in
+    /// [`solids`](Self::solids).
+    pub fn instances_of(&self, solid: usize) -> impl Iterator<Item = &PlacedSolid> {
+        self.instances.iter().filter(move |i| i.solid == solid)
     }
 }
 
@@ -752,13 +775,18 @@ fn triple(rec: &SimpleRecord, index: usize, entity: u64) -> MapResult<[f64; 3]> 
 /// `scale` is the file's length-unit factor (mm per file unit); it
 /// multiplies every length-valued quantity so imported geometry is always
 /// millimetres.
-fn resolve_point(file: &StepFile, id: u64, referrer: u64, scale: f64) -> MapResult<Point3> {
+pub(super) fn resolve_point(
+    file: &StepFile,
+    id: u64,
+    referrer: u64,
+    scale: f64,
+) -> MapResult<Point3> {
     let rec = typed_record(file, id, "CARTESIAN_POINT", referrer)?;
     let [x, y, z] = triple(rec, 1, id)?;
     Ok(Point3::new(x * scale, y * scale, z * scale))
 }
 
-fn resolve_direction(file: &StepFile, id: u64, referrer: u64) -> MapResult<Vector3> {
+pub(super) fn resolve_direction(file: &StepFile, id: u64, referrer: u64) -> MapResult<Vector3> {
     let rec = typed_record(file, id, "DIRECTION", referrer)?;
     let [x, y, z] = triple(rec, 1, id)?;
     Ok(Vector3::new(x, y, z))
@@ -3163,8 +3191,13 @@ fn map_file(
             message: "no MANIFOLD_SOLID_BREP or BREP_WITH_VOIDS instances in the file".to_string(),
         });
     }
+    // Product structure last: it places the solids the mapping just found,
+    // and needs their instance names in `solids` order.
+    let solid_ids: Vec<u64> = solids.iter().map(|s| s.step_id).collect();
+    let instances = resolve_instances(file, &solid_ids, length_scale, &mut diagnostics);
     StepImport {
         solids,
+        instances,
         diagnostics,
         length_scale,
         angle_scale,

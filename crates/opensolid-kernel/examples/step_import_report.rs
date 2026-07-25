@@ -68,6 +68,7 @@ fn main() {
     let mut passed = 0usize;
     let mut healed_files = 0usize;
     let mut heal_operations = 0usize;
+    let mut assemblies = 0usize;
     for file in &files {
         let bytes = match std::fs::read(file) {
             Ok(b) => b,
@@ -113,9 +114,18 @@ fn main() {
                     healed_files += 1;
                     heal_operations += report.heal_operations;
                 }
+                // Assembly structure (of-3qy.13): how many placed
+                // occurrences the product structure resolved to. A part
+                // file reports one per solid, all at the origin.
+                let assembly = if report.is_assembly() {
+                    assemblies += 1;
+                    format!("; {} instance(s)", report.instances.len())
+                } else {
+                    String::new()
+                };
                 println!(
                     "{}  {name}: {} solid(s) — {brep} exact, {mesh} mesh, {failed} failed; \
-                     {errors} error(s), {warnings} warning(s), {} heal op(s)",
+                     {errors} error(s), {warnings} warning(s), {} heal op(s){assembly}",
                     if ok { "PASS      " } else { "FAIL      " },
                     report.solids.len(),
                     report.heal_operations,
@@ -131,6 +141,7 @@ fn main() {
     let rate = 100.0 * passed as f64 / files.len() as f64;
     println!("\npass rate: {passed}/{} ({rate:.0}%)", files.len());
     println!("healing: {heal_operations} operation(s) across {healed_files} file(s)");
+    println!("assemblies: {assemblies} file(s) with product structure");
     if rate < min_rate {
         eprintln!("pass rate {rate:.0}% is below the --min-rate floor of {min_rate:.0}%");
         std::process::exit(1);

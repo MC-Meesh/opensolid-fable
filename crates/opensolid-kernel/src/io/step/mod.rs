@@ -9,6 +9,12 @@
 //! and the reverse direction, serializing kernel B-Rep bodies to an AP203
 //! file, is the [`write`] submodule — see [`write::write_step`].
 //!
+//! Assembly files carry a *product structure* on top of that geometry —
+//! `NEXT_ASSEMBLY_USAGE_OCCURRENCE` / `MAPPED_ITEM` placements of one part
+//! inside another. The [`product`] submodule resolves it into one placed
+//! occurrence per instance ([`PlacedSolid`]), and [`write::write_step_assembly`]
+//! writes a flat assembly back out.
+//!
 //! Bodies the reader maps but the kernel rejects (unsewn shells, vertex gaps,
 //! inconsistent face orientation) are repaired by the [`heal`] submodule
 //! before the reader gives up on them — see [`heal::GeometryHealer`].
@@ -57,6 +63,7 @@
 pub mod heal;
 mod lex;
 mod parse;
+pub mod product;
 pub mod read;
 pub mod write;
 
@@ -64,11 +71,15 @@ use std::collections::HashMap;
 
 pub use heal::{GeometryHealer, HealOperation, HealOptions, HealResult, HealStrategy};
 pub use parse::{StepError, parse, parse_bytes};
+pub use product::PlacedSolid;
 pub use read::{
     Diagnostic, ImportedSolid, Severity, SolidOutcome, StepImport, StepReadOptions, read_step,
     read_step_bytes,
 };
-pub use write::{LengthUnit, StepWriteError, StepWriteOptions, write_step};
+pub use write::{
+    AssemblyComponent, LengthUnit, StepWriteError, StepWriteOptions, write_step,
+    write_step_assembly,
+};
 
 /// A parsed STEP Part 21 file: its header records plus the data-section entity
 /// graph, indexed by instance name for O(1) lookup.
