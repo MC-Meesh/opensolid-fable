@@ -9,6 +9,10 @@
 //! and the reverse direction, serializing kernel B-Rep bodies to an AP203
 //! file, is the [`write`] submodule — see [`write::write_step`].
 //!
+//! Bodies the reader maps but the kernel rejects (unsewn shells, vertex gaps,
+//! inconsistent face orientation) are repaired by the [`heal`] submodule
+//! before the reader gives up on them — see [`heal::GeometryHealer`].
+//!
 //! # What it handles
 //!
 //! - The `ISO-10303-21; … END-ISO-10303-21;` envelope.
@@ -50,6 +54,7 @@
 //! assert_eq!(point.attributes.len(), 2);
 //! ```
 
+pub mod heal;
 mod lex;
 mod parse;
 pub mod read;
@@ -57,6 +62,7 @@ pub mod write;
 
 use std::collections::HashMap;
 
+pub use heal::{GeometryHealer, HealOperation, HealOptions, HealResult, HealStrategy};
 pub use parse::{StepError, parse, parse_bytes};
 pub use read::{
     Diagnostic, ImportedSolid, Severity, SolidOutcome, StepImport, StepReadOptions, read_step,

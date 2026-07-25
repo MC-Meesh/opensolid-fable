@@ -771,6 +771,394 @@ mod adversarial {
 }
 
 // ---------------------------------------------------------------------
+// 2b. Healable adversarial files (of-3qy.12)
+//
+// The defects real exporters emit that are *repairable*: shells whose faces
+// never shared a boundary, corners that disagree at the last written decimal,
+// face uses authored backwards. The healer must promote these to exact
+// B-Reps — and, just as importantly, must refuse to "repair" a defect that is
+// really a modelling error, degrading to the structured fallback instead of
+// inventing geometry.
+// ---------------------------------------------------------------------
+
+mod healing {
+    use super::*;
+    use opensolid_kernel::io::step::heal::{HealOptions, HealStrategy};
+    use std::fmt::Write as _;
+
+    /// Corner-cycles of a unit tetrahedron, counterclockwise from outside.
+    const TET: [[usize; 3]; 4] = [[0, 2, 1], [0, 1, 3], [1, 2, 3], [2, 0, 3]];
+    const TET_CORNERS: [[f64; 3]; 4] = [
+        [0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+    ];
+
+    /// An AP203 tetrahedron whose four faces never share a boundary: each
+    /// authors its own three `VERTEX_POINT`s and `EDGE_CURVE`s, so the
+    /// mapped shell has twelve one-fin edges instead of six two-fin ones.
+    ///
+    /// `jitter` displaces each face's private copy of a shared corner along a
+    /// per-face direction; `reversed` lists faces whose whole use (surface
+    /// sense *and* loop traversal) is authored backwards.
+    fn unsewn_tetrahedron(jitter: f64, reversed: &[usize]) -> String {
+        let mut b = String::new();
+        let mut next = 1u64;
+        let mut id = || {
+            next += 1;
+            next - 1
+        };
+        let mut faces = Vec::new();
+
+        for (f, cycle) in TET.iter().enumerate() {
+            let k = (f + 1) as f64;
+            let raw = [(k * 0.7).sin(), (k * 1.3).sin(), (k * 2.1).sin()];
+            let len = raw.iter().map(|c| c * c).sum::<f64>().sqrt();
+            let nudge = raw.map(|c| c / len * jitter);
+            let p: Vec<[f64; 3]> = cycle
+                .iter()
+                .map(|&c| {
+                    let corner = TET_CORNERS[c];
+                    [
+                        corner[0] + nudge[0],
+                        corner[1] + nudge[1],
+                        corner[2] + nudge[2],
+                    ]
+                })
+                .collect();
+
+            // Outward normal of a counterclockwise-from-outside cycle.
+            let (u, v) = (
+                [p[1][0] - p[0][0], p[1][1] - p[0][1], p[1][2] - p[0][2]],
+                [p[2][0] - p[0][0], p[2][1] - p[0][1], p[2][2] - p[0][2]],
+            );
+            let n = [
+                u[1] * v[2] - u[2] * v[1],
+                u[2] * v[0] - u[0] * v[2],
+                u[0] * v[1] - u[1] * v[0],
+            ];
+            let n_len = n.iter().map(|c| c * c).sum::<f64>().sqrt();
+            let n = n.map(|c| c / n_len);
+
+            let points: Vec<u64> = p
+                .iter()
+                .map(|q| {
+                    let pid = id();
+                    writeln!(
+                        b,
+                        "#{pid} = CARTESIAN_POINT('', ({:.9}, {:.9}, {:.9}));",
+                        q[0], q[1], q[2]
+                    )
+                    .unwrap();
+                    pid
+                })
+                .collect();
+            let vertices: Vec<u64> = points
+                .iter()
+                .map(|&pid| {
+                    let vid = id();
+                    writeln!(b, "#{vid} = VERTEX_POINT('', #{pid});").unwrap();
+                    vid
+                })
+                .collect();
+
+            let mut edges = Vec::new();
+            for k in 0..3 {
+                let (a, c) = (k, (k + 1) % 3);
+                let d = [p[c][0] - p[a][0], p[c][1] - p[a][1], p[c][2] - p[a][2]];
+                let dir = id();
+                writeln!(
+                    b,
+                    "#{dir} = DIRECTION('', ({:.9}, {:.9}, {:.9}));",
+                    d[0], d[1], d[2]
+                )
+                .unwrap();
+                let vec = id();
+                writeln!(b, "#{vec} = VECTOR('', #{dir}, 1.);").unwrap();
+                let line = id();
+                writeln!(b, "#{line} = LINE('', #{}, #{vec});", points[a]).unwrap();
+                let edge = id();
+                writeln!(
+                    b,
+                    "#{edge} = EDGE_CURVE('', #{}, #{}, #{line}, .T.);",
+                    vertices[a], vertices[c]
+                )
+                .unwrap();
+                edges.push(edge);
+            }
+
+            let normal = id();
+            writeln!(
+                b,
+                "#{normal} = DIRECTION('', ({:.9}, {:.9}, {:.9}));",
+                n[0], n[1], n[2]
+            )
+            .unwrap();
+            let placement = id();
+            writeln!(
+                b,
+                "#{placement} = AXIS2_PLACEMENT_3D('', #{}, #{normal}, $);",
+                points[0]
+            )
+            .unwrap();
+            let plane = id();
+            writeln!(b, "#{plane} = PLANE('', #{placement});").unwrap();
+
+            let backwards = reversed.contains(&f);
+            let flag = if backwards { ".F." } else { ".T." };
+            let mut oriented: Vec<u64> = edges
+                .iter()
+                .map(|&edge| {
+                    let oe = id();
+                    writeln!(b, "#{oe} = ORIENTED_EDGE('', *, *, #{edge}, {flag});").unwrap();
+                    oe
+                })
+                .collect();
+            if backwards {
+                oriented.reverse();
+            }
+            let edge_loop = id();
+            writeln!(
+                b,
+                "#{edge_loop} = EDGE_LOOP('', (#{}, #{}, #{}));",
+                oriented[0], oriented[1], oriented[2]
+            )
+            .unwrap();
+            let bound = id();
+            writeln!(b, "#{bound} = FACE_OUTER_BOUND('', #{edge_loop}, .T.);").unwrap();
+            let face = id();
+            writeln!(
+                b,
+                "#{face} = ADVANCED_FACE('', (#{bound}), #{plane}, {flag});"
+            )
+            .unwrap();
+            faces.push(face);
+        }
+
+        let shell = id();
+        let refs: Vec<String> = faces.iter().map(|f| format!("#{f}")).collect();
+        writeln!(b, "#{shell} = CLOSED_SHELL('', ({}));", refs.join(", ")).unwrap();
+        let solid = id();
+        writeln!(b, "#{solid} = MANIFOLD_SOLID_BREP('tet', #{shell});").unwrap();
+        envelope(&b)
+    }
+
+    fn import_unhealed(source: &str) -> (TopologyStore, GeometryStore, StepImport) {
+        let mut store = TopologyStore::new();
+        let mut geo = GeometryStore::new();
+        let options = StepReadOptions {
+            heal: HealOptions {
+                strategy: HealStrategy::Off,
+                ..HealOptions::default()
+            },
+            ..StepReadOptions::default()
+        };
+        let report =
+            read_step(source, &mut store, &mut geo, &options).expect("adversarial file parses");
+        (store, geo, report)
+    }
+
+    /// The baseline the healer exists to move: unhealed, an unsewn shell
+    /// cannot import exactly.
+    #[test]
+    fn unsewn_shell_cannot_import_exactly_without_healing() {
+        let (_store, _geo, report) = import_unhealed(&unsewn_tetrahedron(0.0, &[]));
+        assert_structured(&report);
+        assert!(
+            !matches!(report.solids[0].outcome, SolidOutcome::BRep(_)),
+            "an unsewn shell has one fin per edge; it must not pass check"
+        );
+        assert_eq!(report.heal_operations, 0);
+    }
+
+    /// Healed, the same file imports exactly, passes the checker, and
+    /// survives the write → read round trip like any other exact body.
+    #[test]
+    fn unsewn_shell_heals_into_an_exact_brep_and_round_trips() {
+        let (store, geo, report) = import(&unsewn_tetrahedron(0.0, &[]));
+        assert_structured(&report);
+        let body = only_brep(&report);
+        let counts = store.euler_counts(body);
+        assert_eq!(
+            (counts.vertices, counts.edges, counts.faces),
+            (4, 6, 4),
+            "12 private corners sew to 4, 12 half-edges weld to 6"
+        );
+        assert!(report.heal_operations > 0);
+        // The tetrahedron's 45° edge directions renormalize by one ULP on
+        // first import (a `dir/|dir|` round trip through a decimal literal,
+        // nothing to do with healing), so the fixed point arrives one trip
+        // out exactly as of-kb8's shared-geometry cases do.
+        assert_round_trip_gate(
+            &store,
+            &geo,
+            body,
+            "healed unsewn tetrahedron",
+            FixedPoint::AfterOneTrip,
+        );
+    }
+
+    /// Signed volume by the divergence theorem, straight off the
+    /// tessellation. Unlike [`closed_volume`] this does not require the mesh
+    /// to weld watertight — a *tolerant* healed body (one whose curves still
+    /// pass through the pre-merge points) tessellates to rim samples that
+    /// disagree by the closed gap, which is far above the tessellator's
+    /// exact weld epsilon. Tolerance-aware welding is of-61f.
+    fn mesh_volume(store: &TopologyStore, geo: &GeometryStore, body: EntityId<Body>) -> f64 {
+        let mesh = tessellate_body(store, geo, body, &TessellationOptions::default())
+            .expect("healed body tessellates");
+        mesh.indices
+            .iter()
+            .map(|tri| {
+                let [a, b, c] = tri.map(|i| mesh.positions[i].coords);
+                a.dot(&b.cross(&c)) / 6.0
+            })
+            .sum()
+    }
+
+    /// Gaps at the last written decimal, plus two faces authored backwards:
+    /// both passes together, still exact, still the right way out.
+    #[test]
+    fn gapped_and_misoriented_shell_heals_completely() {
+        let (store, geo, report) = import(&unsewn_tetrahedron(1e-7, &[1, 2]));
+        assert_structured(&report);
+        let body = only_brep(&report);
+        let counts = store.euler_counts(body);
+        assert_eq!((counts.vertices, counts.edges, counts.faces), (4, 6, 4));
+        let volume = mesh_volume(&store, &geo, body);
+        assert!(
+            (volume - 1.0 / 6.0).abs() < 1e-6,
+            "outward, not inside out: got {volume}"
+        );
+    }
+
+    /// A file that is consistently oriented but wholly inside out passes
+    /// every combinatorial check there is. Only the geometric volume-sign
+    /// pass can catch it, and it must — importing an inverted solid is
+    /// exactly the "silently wrong geometry" this suite exists to forbid.
+    #[test]
+    fn wholly_inverted_shell_is_uprighted_not_imported_inside_out() {
+        let (store, geo, report) = import(&unsewn_tetrahedron(0.0, &[0, 1, 2, 3]));
+        assert_structured(&report);
+        let body = only_brep(&report);
+        let volume = closed_volume(&store, &geo, body).expect("healed tetrahedron tessellates");
+        assert!(
+            (volume - 1.0 / 6.0).abs() < 1e-9,
+            "an inverted import must be righted, not accepted: got {volume}"
+        );
+    }
+
+    /// The refusal case. A tenth of a millimetre on a 1 mm part is a
+    /// modelling error, not export round-off: healing must leave it alone and
+    /// let the import degrade, never weld a hole shut and call it exact.
+    #[test]
+    fn a_gap_too_wide_to_be_round_off_is_never_welded() {
+        let (store, _geo, report) = import(&unsewn_tetrahedron(0.1, &[]));
+        assert_structured(&report);
+        match &report.solids[0].outcome {
+            SolidOutcome::BRep(body) => panic!(
+                "a 0.1 mm gap was welded shut and imported as exact: {:?}",
+                store.euler_counts(*body)
+            ),
+            SolidOutcome::Mesh { mesh, .. } => {
+                assert!(mesh.is_closed_manifold(), "fallback must still be closed")
+            }
+            SolidOutcome::Failed => {}
+        }
+    }
+
+    /// Healing past [`MAX_ALLOWED_TOLERANCE`] would produce a body the kernel
+    /// rejects for tolerance alone, so an over-wide `max_gap` is clamped
+    /// rather than honoured.
+    #[test]
+    fn an_over_wide_max_gap_is_clamped_not_honoured() {
+        let mut store = TopologyStore::new();
+        let mut geo = GeometryStore::new();
+        let options = StepReadOptions {
+            heal: HealOptions {
+                strategy: HealStrategy::Auto,
+                max_gap: Some(1.0),
+            },
+            ..StepReadOptions::default()
+        };
+        let report = read_step(
+            &unsewn_tetrahedron(0.1, &[]),
+            &mut store,
+            &mut geo,
+            &options,
+        )
+        .expect("adversarial file parses");
+        assert_structured(&report);
+        assert!(
+            !matches!(report.solids[0].outcome, SolidOutcome::BRep(_)),
+            "a 1 mm merge tolerance must be clamped to the kernel limit"
+        );
+    }
+
+    /// Every repair is attributable: one `Info` diagnostic per operation,
+    /// each naming the solid it belongs to.
+    #[test]
+    fn every_repair_is_reported_per_entity() {
+        let (_store, _geo, report) = import(&unsewn_tetrahedron(1e-7, &[3]));
+        assert_structured(&report);
+        let healed: Vec<&opensolid_kernel::io::step::read::Diagnostic> = report
+            .diagnostics
+            .iter()
+            .filter(|d| d.message.starts_with("healed:"))
+            .collect();
+        assert_eq!(healed.len(), report.heal_operations);
+        for diagnostic in healed {
+            assert_eq!(diagnostic.severity, Severity::Info);
+            assert!(
+                diagnostic.entity.is_some(),
+                "a repair must name the solid it belongs to"
+            );
+        }
+    }
+
+    /// `ReportOnly` is a dry run: it says what it would fix and the body is
+    /// left exactly as authored.
+    #[test]
+    fn report_only_never_promotes_a_body() {
+        let mut store = TopologyStore::new();
+        let mut geo = GeometryStore::new();
+        let options = StepReadOptions {
+            heal: HealOptions {
+                strategy: HealStrategy::ReportOnly,
+                ..HealOptions::default()
+            },
+            ..StepReadOptions::default()
+        };
+        let report = read_step(
+            &unsewn_tetrahedron(0.0, &[]),
+            &mut store,
+            &mut geo,
+            &options,
+        )
+        .expect("adversarial file parses");
+        assert_structured(&report);
+        assert!(!matches!(report.solids[0].outcome, SolidOutcome::BRep(_)));
+        assert_eq!(
+            report.heal_operations, 10,
+            "4 vertex merges + 6 edge welds, planned but not applied"
+        );
+    }
+
+    /// Files that were already valid must never acquire a repair — healing
+    /// runs only for bodies the checker rejected.
+    #[test]
+    fn well_formed_files_are_never_healed() {
+        let mut store = TopologyStore::new();
+        let mut geo = GeometryStore::new();
+        let body = primitives::block(&mut store, &mut geo, 2.0, 3.0, 4.0).expect("block");
+        let text = write_step(&store, &geo, &[body], &StepWriteOptions::default()).expect("write");
+        let (_, _, report) = import(&text);
+        assert_eq!(report.heal_operations, 0);
+    }
+}
+
+// ---------------------------------------------------------------------
 // 3. Vendored real-world corpus (tests/data/step/, see README.md there)
 // ---------------------------------------------------------------------
 

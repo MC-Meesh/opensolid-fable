@@ -1,6 +1,7 @@
 //! Import every STEP file given on the command line (or every `.stp`/`.step`
 //! under a directory argument) and print one line per file: outcome counts,
-//! diagnostics summary, and a final pass-rate figure.
+//! diagnostics summary, healing operations applied, and a final pass-rate
+//! figure.
 //!
 //! This is the local half of the external-validator loop (of-3qy.10): point it
 //! at `tests/data/step/` or at a directory of FreeCAD/OCC exports to measure
@@ -65,6 +66,8 @@ fn main() {
     }
 
     let mut passed = 0usize;
+    let mut healed_files = 0usize;
+    let mut heal_operations = 0usize;
     for file in &files {
         let bytes = match std::fs::read(file) {
             Ok(b) => b,
@@ -103,11 +106,19 @@ fn main() {
                 if ok {
                     passed += 1;
                 }
+                // Repairs the healer applied (of-3qy.12). A file with a
+                // non-zero count imported only because healing fixed it, or
+                // would have degraded further without it.
+                if report.heal_operations > 0 {
+                    healed_files += 1;
+                    heal_operations += report.heal_operations;
+                }
                 println!(
                     "{}  {name}: {} solid(s) — {brep} exact, {mesh} mesh, {failed} failed; \
-                     {errors} error(s), {warnings} warning(s)",
+                     {errors} error(s), {warnings} warning(s), {} heal op(s)",
                     if ok { "PASS      " } else { "FAIL      " },
                     report.solids.len(),
+                    report.heal_operations,
                 );
                 if !ok {
                     for d in report.diagnostics.iter().take(4) {
@@ -119,6 +130,7 @@ fn main() {
     }
     let rate = 100.0 * passed as f64 / files.len() as f64;
     println!("\npass rate: {passed}/{} ({rate:.0}%)", files.len());
+    println!("healing: {heal_operations} operation(s) across {healed_files} file(s)");
     if rate < min_rate {
         eprintln!("pass rate {rate:.0}% is below the --min-rate floor of {min_rate:.0}%");
         std::process::exit(1);

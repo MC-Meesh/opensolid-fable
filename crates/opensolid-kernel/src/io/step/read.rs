@@ -126,6 +126,7 @@ use opensolid_core::error::CoreError;
 use opensolid_core::mesh::TriangleMesh;
 use opensolid_core::{EntityId, Point3, Vector3};
 
+use super::heal::{GeometryHealer, HealOptions, HealStrategy};
 use super::{Instance, SimpleRecord, StepError, StepFile, Value};
 use crate::convert::MeshSdf;
 
@@ -141,6 +142,10 @@ const TRIM_TOL_REL: f64 = 1e-6;
 pub struct StepReadOptions {
     /// Fidelity of the mesh-fallback tessellation.
     pub tessellation: TessellationOptions,
+    /// How aggressively a mapped body that fails validation is repaired
+    /// before the reader gives up on the exact path (see [`heal`]). The
+    /// default heals automatically: import heals, it does not reject.
+    pub heal: HealOptions,
 }
 
 /// How serious a [`Diagnostic`] is.
@@ -210,6 +215,10 @@ pub struct StepImport {
     /// surface semi-angles) have already been multiplied by this factor —
     /// angles in the stores are always radians.
     pub angle_scale: f64,
+    /// Total repairs the [healer](super::heal) applied across every solid
+    /// (`spec/06-step-io.md`'s `ImportStats::heal_operations`). Each is also
+    /// reported individually as a [`Severity::Info`] diagnostic.
+    pub heal_operations: usize,
 }
 
 impl StepImport {
@@ -1756,22 +1765,10 @@ impl SolidBuilder<'_> {
         }
 
         // STEP carries no genus; recover it from the Euler-Poincaré formula
-        // so `check` validates the imported topology's own consistency
-        // (an odd or negative implied genus still fails the formula). Any
-        // residual genus is attributed to the outer shell — a handled void
-        // with handles of its own would mis-assign, and then fail `check`
-        // into the mesh fallback rather than import wrongly.
-        let counts = self.store.euler_counts(body);
-        let euler = counts.vertices as i64 - counts.edges as i64 + counts.faces as i64
-            - counts.rings as i64;
-        let genus_x2 = 2 * counts.shells as i64 - euler;
-        if genus_x2 >= 0 && genus_x2 % 2 == 0 {
-            self.store
-                .shells
-                .get_mut(self.created.shells[0])
-                .expect("just created")
-                .genus = (genus_x2 / 2) as u32;
-        }
+        // so `check` validates the imported topology's own consistency (an
+        // odd or negative implied genus still fails the formula). The healer
+        // re-runs this after any repair that changes the counts.
+        super::heal::recover_genus(self.store, body);
         Ok(body)
     }
 
@@ -3081,6 +3078,7 @@ fn map_file(
     let length_scale = resolve_length_scale(file, &mut diagnostics);
     let angle_scale = resolve_angle_scale(file, &mut diagnostics);
     let mut solids = Vec::new();
+    let mut heal_operations = 0;
     for inst in &file.data {
         // BREP_WITH_VOIDS is a MANIFOLD_SOLID_BREP subtype; in the common
         // simple encoding only its own type name appears.
@@ -3101,6 +3099,7 @@ fn map_file(
             angle_scale,
             inst,
             &mut diagnostics,
+            &mut heal_operations,
         );
         solids.push(ImportedSolid {
             step_id: inst.id,
@@ -3120,6 +3119,7 @@ fn map_file(
         diagnostics,
         length_scale,
         angle_scale,
+        heal_operations,
     }
 }
 
@@ -3133,6 +3133,7 @@ fn map_solid(
     angle_scale: f64,
     inst: &Instance,
     diagnostics: &mut Vec<Diagnostic>,
+    heal_operations: &mut usize,
 ) -> SolidOutcome {
     let msb_id = inst.id;
     // `BREP_WITH_VOIDS(name, outer, voids)` extends the plain
@@ -3181,9 +3182,35 @@ fn map_solid(
     let created = builder.created;
     match built {
         Ok(body) => {
-            let failures = store.check(body);
+            let mut failures = store.check(body);
             if failures.is_empty() {
                 return SolidOutcome::BRep(body);
+            }
+            // Import heals, it does not reject (`spec/06-step-io.md` §4): a
+            // body whose only defects are an unsewn shell, a vertex gap or a
+            // flipped face is repaired and re-validated before the exact path
+            // is abandoned for the tessellated one.
+            if options.heal.strategy != HealStrategy::Off {
+                let result = GeometryHealer::heal(body, store, geo, &options.heal);
+                *heal_operations += result.operations.len();
+                for op in &result.operations {
+                    diagnostics.push(Diagnostic {
+                        entity: Some(msb_id),
+                        severity: Severity::Info,
+                        message: format!("healed: {op}"),
+                    });
+                }
+                for note in &result.notes {
+                    diagnostics.push(Diagnostic {
+                        entity: Some(msb_id),
+                        severity: Severity::Info,
+                        message: format!("heal: {note}"),
+                    });
+                }
+                failures = result.remaining;
+                if failures.is_empty() {
+                    return SolidOutcome::BRep(body);
+                }
             }
             for failure in &failures {
                 diagnostics.push(Diagnostic {
@@ -4718,5 +4745,328 @@ mod tests {
             }
             other => panic!("expected the mesh fallback, got {other:?}"),
         }
+    }
+
+    // ---- healing: unsewn and misoriented files (of-3qy.12) ----
+
+    /// AP203 block whose faces never share a boundary: each of the six faces
+    /// authors its own four `CARTESIAN_POINT`s, `VERTEX_POINT`s and
+    /// `EDGE_CURVE`s, as an exporter that skipped the sewing step writes.
+    ///
+    /// `jitter` displaces each face's private copy of a shared corner along a
+    /// per-face direction, modelling the last-decimal disagreement real files
+    /// carry. Faces listed in `reversed` have their whole use authored
+    /// backwards — `ADVANCED_FACE.same_sense` *and* the loop's traversal.
+    fn unsewn_block_step(x: f64, y: f64, z: f64, jitter: f64, reversed: &[usize]) -> String {
+        let (hx, hy, hz) = (x / 2.0, y / 2.0, z / 2.0);
+        let corners = [
+            (-hx, -hy, -hz),
+            (hx, -hy, -hz),
+            (hx, hy, -hz),
+            (-hx, hy, -hz),
+            (-hx, -hy, hz),
+            (hx, -hy, hz),
+            (hx, hy, hz),
+            (-hx, hy, hz),
+        ];
+        // Same cycles and outward normals as `block_shell_at`.
+        let face_specs: [([usize; 4], (f64, f64, f64)); 6] = [
+            ([0, 3, 2, 1], (0.0, 0.0, -1.0)),
+            ([4, 5, 6, 7], (0.0, 0.0, 1.0)),
+            ([0, 1, 5, 4], (0.0, -1.0, 0.0)),
+            ([1, 2, 6, 5], (1.0, 0.0, 0.0)),
+            ([2, 3, 7, 6], (0.0, 1.0, 0.0)),
+            ([3, 0, 4, 7], (-1.0, 0.0, 0.0)),
+        ];
+
+        let mut b = String::new();
+        let mut next = 1u64;
+        let mut id = || {
+            next += 1;
+            next - 1
+        };
+        let mut face_ids = Vec::new();
+        for (f, &(cycle, (nx, ny, nz))) in face_specs.iter().enumerate() {
+            // A per-face nudge that is not parallel to any other face's, so
+            // coincident corners scatter instead of stacking.
+            let k = (f + 1) as f64;
+            let raw = ((k * 0.7).sin(), (k * 1.3).sin(), (k * 2.1).sin());
+            let len = (raw.0 * raw.0 + raw.1 * raw.1 + raw.2 * raw.2).sqrt();
+            let nudge = (
+                raw.0 / len * jitter,
+                raw.1 / len * jitter,
+                raw.2 / len * jitter,
+            );
+
+            let points: Vec<(f64, f64, f64)> = cycle
+                .iter()
+                .map(|&c| {
+                    (
+                        corners[c].0 + nudge.0,
+                        corners[c].1 + nudge.1,
+                        corners[c].2 + nudge.2,
+                    )
+                })
+                .collect();
+            let point_ids: Vec<u64> = points
+                .iter()
+                .map(|&(px, py, pz)| {
+                    let pid = id();
+                    writeln!(
+                        b,
+                        "#{pid} = CARTESIAN_POINT('', ({px:.9}, {py:.9}, {pz:.9}));"
+                    )
+                    .unwrap();
+                    pid
+                })
+                .collect();
+            let vertex_ids: Vec<u64> = point_ids
+                .iter()
+                .map(|&pid| {
+                    let vid = id();
+                    writeln!(b, "#{vid} = VERTEX_POINT('', #{pid});").unwrap();
+                    vid
+                })
+                .collect();
+
+            let mut edge_ids = Vec::new();
+            for k in 0..4 {
+                let (a, c) = (k, (k + 1) % 4);
+                let (dx, dy, dz) = (
+                    points[c].0 - points[a].0,
+                    points[c].1 - points[a].1,
+                    points[c].2 - points[a].2,
+                );
+                let dir = id();
+                writeln!(b, "#{dir} = DIRECTION('', ({dx:.9}, {dy:.9}, {dz:.9}));").unwrap();
+                let vec = id();
+                writeln!(b, "#{vec} = VECTOR('', #{dir}, 1.);").unwrap();
+                let line = id();
+                writeln!(b, "#{line} = LINE('', #{}, #{vec});", point_ids[a]).unwrap();
+                let edge = id();
+                writeln!(
+                    b,
+                    "#{edge} = EDGE_CURVE('', #{}, #{}, #{line}, .T.);",
+                    vertex_ids[a], vertex_ids[c]
+                )
+                .unwrap();
+                edge_ids.push(edge);
+            }
+
+            let normal = id();
+            writeln!(b, "#{normal} = DIRECTION('', ({nx:.6}, {ny:.6}, {nz:.6}));").unwrap();
+            let placement = id();
+            writeln!(
+                b,
+                "#{placement} = AXIS2_PLACEMENT_3D('', #{}, #{normal}, $);",
+                point_ids[0]
+            )
+            .unwrap();
+            let plane = id();
+            writeln!(b, "#{plane} = PLANE('', #{placement});").unwrap();
+
+            let backwards = reversed.contains(&f);
+            let mut oriented: Vec<u64> = edge_ids
+                .iter()
+                .map(|&edge| {
+                    let oe = id();
+                    let flag = if backwards { ".F." } else { ".T." };
+                    writeln!(b, "#{oe} = ORIENTED_EDGE('', *, *, #{edge}, {flag});").unwrap();
+                    oe
+                })
+                .collect();
+            if backwards {
+                oriented.reverse();
+            }
+            let edge_loop = id();
+            writeln!(
+                b,
+                "#{edge_loop} = EDGE_LOOP('', (#{}, #{}, #{}, #{}));",
+                oriented[0], oriented[1], oriented[2], oriented[3]
+            )
+            .unwrap();
+            let bound = id();
+            writeln!(b, "#{bound} = FACE_OUTER_BOUND('', #{edge_loop}, .T.);").unwrap();
+            let face = id();
+            let same_sense = if backwards { ".F." } else { ".T." };
+            writeln!(
+                b,
+                "#{face} = ADVANCED_FACE('', (#{bound}), #{plane}, {same_sense});"
+            )
+            .unwrap();
+            face_ids.push(face);
+        }
+
+        let shell = id();
+        let refs: Vec<String> = face_ids.iter().map(|f| format!("#{f}")).collect();
+        writeln!(b, "#{shell} = CLOSED_SHELL('', ({}));", refs.join(", ")).unwrap();
+        let solid = id();
+        writeln!(b, "#{solid} = MANIFOLD_SOLID_BREP('block', #{shell});").unwrap();
+        wrap(&b)
+    }
+
+    fn import_with(
+        src: &str,
+        options: &StepReadOptions,
+    ) -> (TopologyStore, GeometryStore, StepImport) {
+        let mut store = TopologyStore::new();
+        let mut geo = GeometryStore::new();
+        let result = read_step(src, &mut store, &mut geo, options).expect("fixture parses");
+        (store, geo, result)
+    }
+
+    /// The defect that motivates the healer: an unsewn shell maps cleanly but
+    /// every edge ends up with one fin, so `check` rejects the body.
+    #[test]
+    fn unsewn_block_needs_healing_to_import_exactly() {
+        let src = unsewn_block_step(2.0, 3.0, 4.0, 0.0, &[]);
+        let (_store, _geo, report) = import_with(
+            &src,
+            &StepReadOptions {
+                heal: HealOptions {
+                    strategy: HealStrategy::Off,
+                    ..HealOptions::default()
+                },
+                ..StepReadOptions::default()
+            },
+        );
+        assert!(
+            matches!(report.solids[0].outcome, SolidOutcome::Mesh { .. }),
+            "unhealed, the exact path must fail: {:?}",
+            report.solids[0].outcome
+        );
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("must be closed but has open")),
+            "the open edges are reported: {:?}",
+            report.diagnostics
+        );
+        assert_eq!(report.heal_operations, 0);
+    }
+
+    /// The same file with healing on (the default) imports as an exact
+    /// B-Rep: 24 private corners sew to 8, 24 half-edges weld to 12.
+    #[test]
+    fn healing_promotes_an_unsewn_block_to_exact_brep() {
+        let src = unsewn_block_step(2.0, 3.0, 4.0, 0.0, &[]);
+        let (store, geo, report) = import(&src);
+        no_error_diagnostics(&report);
+        let body = brep_body(&report.solids[0].outcome);
+        assert_eq!(store.check(body), vec![]);
+
+        let counts = store.euler_counts(body);
+        assert_eq!((counts.vertices, counts.edges, counts.faces), (8, 12, 6));
+        assert_eq!(counts.genus, 0);
+        assert!(report.heal_operations > 0);
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|d| d.severity == Severity::Info && d.message.starts_with("healed:")),
+            "per-fix diagnostics: {:?}",
+            report.diagnostics
+        );
+
+        let mesh = tessellate_body(&store, &geo, body, &TessellationOptions::default()).unwrap();
+        assert!(mesh.is_closed_manifold());
+        assert!((signed_volume(&mesh) - 24.0).abs() < 1e-9);
+    }
+
+    /// Gaps at the last written decimal are closed and carried as tolerance,
+    /// not snapped away silently.
+    #[test]
+    fn healing_closes_written_precision_gaps() {
+        let src = unsewn_block_step(2.0, 3.0, 4.0, 1e-6, &[]);
+        let (store, geo, report) = import(&src);
+        no_error_diagnostics(&report);
+        let body = brep_body(&report.solids[0].outcome);
+        assert_eq!(store.check(body), vec![]);
+        assert!(
+            store
+                .faces_of_body(body)
+                .iter()
+                .flat_map(|&f| store.edges_of_face(f))
+                .any(|e| store.edge(e).unwrap().is_tolerant()),
+            "the closed gap must live on as edge tolerance"
+        );
+        let mesh = tessellate_body(&store, &geo, body, &TessellationOptions::default()).unwrap();
+        assert!((signed_volume(&mesh) - 24.0).abs() < 1e-4);
+    }
+
+    /// Unsewn *and* misoriented: gap closure makes the shell shareable, then
+    /// orientation repair rights the two faces authored backwards.
+    #[test]
+    fn healing_repairs_orientation_after_sewing() {
+        let src = unsewn_block_step(2.0, 3.0, 4.0, 0.0, &[2, 5]);
+        let (store, geo, report) = import(&src);
+        no_error_diagnostics(&report);
+        let body = brep_body(&report.solids[0].outcome);
+        assert_eq!(store.check(body), vec![]);
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("to match its neighbours")),
+            "the reoriented faces are reported: {:?}",
+            report.diagnostics
+        );
+        let mesh = tessellate_body(&store, &geo, body, &TessellationOptions::default()).unwrap();
+        assert!(mesh.is_closed_manifold());
+        assert!(
+            (signed_volume(&mesh) - 24.0).abs() < 1e-9,
+            "outward, not inside out: {}",
+            signed_volume(&mesh)
+        );
+    }
+
+    /// An inside-out file — every face authored backwards — is consistently
+    /// oriented, so `check` alone cannot see it. The healer's volume-sign
+    /// pass must.
+    #[test]
+    fn healing_uprights_a_wholly_inverted_block() {
+        let src = unsewn_block_step(2.0, 3.0, 4.0, 0.0, &[0, 1, 2, 3, 4, 5]);
+        let (store, geo, report) = import(&src);
+        no_error_diagnostics(&report);
+        let body = brep_body(&report.solids[0].outcome);
+        assert_eq!(store.check(body), vec![]);
+        let mesh = tessellate_body(&store, &geo, body, &TessellationOptions::default()).unwrap();
+        assert!((signed_volume(&mesh) - 24.0).abs() < 1e-9);
+    }
+
+    /// `ReportOnly` says what it would fix and changes nothing: the import
+    /// still degrades to the mesh fallback.
+    #[test]
+    fn report_only_healing_reports_but_does_not_promote() {
+        let src = unsewn_block_step(2.0, 3.0, 4.0, 0.0, &[]);
+        let (_store, _geo, report) = import_with(
+            &src,
+            &StepReadOptions {
+                heal: HealOptions {
+                    strategy: HealStrategy::ReportOnly,
+                    ..HealOptions::default()
+                },
+                ..StepReadOptions::default()
+            },
+        );
+        assert!(matches!(
+            report.solids[0].outcome,
+            SolidOutcome::Mesh { .. }
+        ));
+        assert_eq!(
+            report.heal_operations, 20,
+            "8 vertex merges + 12 edge welds"
+        );
+    }
+
+    /// Files that were already valid must not acquire heal operations —
+    /// healing runs only for bodies `check` rejected.
+    #[test]
+    fn a_clean_file_is_never_healed() {
+        let (_store, _geo, report) = import(&block_step(2.0, 3.0, 4.0));
+        assert_eq!(report.heal_operations, 0);
+        let (_store, _geo, report) = import(&cylinder_step(1.5, 4.0));
+        assert_eq!(report.heal_operations, 0);
     }
 }
