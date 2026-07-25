@@ -53,6 +53,19 @@
 //! why. A failed or fallen-back solid leaves no partial entities in the
 //! stores.
 //!
+//! # Assemblies
+//!
+//! The solid list above is *per authored part*. Where a file also carries
+//! product structure — `NEXT_ASSEMBLY_USAGE_OCCURRENCE` /
+//! `CONTEXT_DEPENDENT_SHAPE_REPRESENTATION` placements, or `MAPPED_ITEM`
+//! instancing — the [`product`](super::product) submodule resolves it into
+//! [`StepImport::instances`]: one [`PlacedSolid`] per *occurrence*, with
+//! the rigid transform composed down the assembly tree. Geometry is never
+//! duplicated for an instance, so a bolt used ten times is one imported
+//! body and ten transforms. A file with no product structure yields one
+//! identity-placed occurrence per solid, which is the same picture a
+//! caller ignoring assemblies already had.
+//!
 //! # Units
 //!
 //! The declared length unit is honoured: the reader resolves the

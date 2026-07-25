@@ -280,7 +280,20 @@ and independently testable.
 - **Exploded views, BOM, and interference *animation*.**
 - **Belt/chain, path, and slot mates.**
 - **In-context (top-down) editing** — editing a part from within the assembly.
-- **STEP assembly import/export** (assembly structure, not just per-part solids).
+
+**Landed since (of-3qy.13):**
+
+- **STEP assembly import/export.** The importer resolves product structure —
+  `NEXT_ASSEMBLY_USAGE_OCCURRENCE` + `CONTEXT_DEPENDENT_SHAPE_REPRESENTATION`
+  placements, `MAPPED_ITEM` instancing, and transformation-free
+  `SHAPE_REPRESENTATION_RELATIONSHIP` aliasing — into
+  `StepImport::instances`: one `PlacedSolid` *(solid index, `Transform3`,
+  occurrence path, product name)* per instance, composed down arbitrarily
+  nested sub-assemblies. This is exactly the §1 model — an instance is
+  *(part ref, transform)*, geometry never duplicated — so the AS1 corpus file
+  imports as 5 parts in 18 places rather than 5 solids piled at the origin.
+  `write_step_assembly` writes the export side as a flat single-level
+  assembly (nested trees flatten into world-space placements).
 
 ## 9. Child beads
 

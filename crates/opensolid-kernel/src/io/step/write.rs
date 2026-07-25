@@ -37,6 +37,19 @@
 //! adjusted to Part 21 grammar (mandatory decimal point, upper-case `E`),
 //! so every coordinate re-reads to the identical `f64`.
 //!
+//! # Assemblies
+//!
+//! [`write_step_assembly`] writes a **flat (single-level) assembly**
+//! instead of one product: a root `PRODUCT` and one
+//! `NEXT_ASSEMBLY_USAGE_OCCURRENCE` per [`AssemblyComponent`], each placed
+//! by a `CONTEXT_DEPENDENT_SHAPE_REPRESENTATION` /
+//! `ITEM_DEFINED_TRANSFORMATION` pair — the structure the
+//! [reader](super::product) resolves back into placements. Each distinct
+//! body is emitted once however many times it occurs, so the file, like
+//! the kernel, stores a repeated part as *(one part, many transforms)*.
+//! Nested sub-assemblies are not emitted; a deeper tree exports flattened
+//! into world-space placements.
+//!
 //! # What is supported
 //!
 //! Solid bodies ([`BodyType::Solid`]) with exactly one closed shell, whose

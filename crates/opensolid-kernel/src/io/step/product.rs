@@ -8,8 +8,8 @@
 //! structure. Without resolving that structure a five-part assembly
 //! imports as five bodies piled on top of each other at the origin.
 //!
-//! This module resolves it. [`resolve_instances`] walks the product graph
-//! and returns one [`PlacedSolid`] per *occurrence*: the solid's index,
+//! This module resolves it: the resolver walks the product graph and
+//! returns one [`PlacedSolid`] per *occurrence* — the solid's index,
 //! the rigid [`Transform3`] that places it in root-assembly space, and the
 //! occurrence path that got it there. Geometry is never duplicated — an
 //! instance is *(part, transform)*, exactly the model
@@ -58,8 +58,8 @@
 //! once at minimum.
 //!
 //! Cyclic assemblies (a product transitively containing itself) are
-//! reported and cut rather than followed, and nesting is capped at
-//! [`MAX_DEPTH`].
+//! reported and cut rather than followed, and nesting is capped at a fixed
+//! depth well beyond anything a real file uses.
 
 use std::collections::{HashMap, HashSet};
 
@@ -82,7 +82,8 @@ const MAX_DEPTH: usize = 64;
 ///
 /// The geometry itself stays in its authored (part-local) coordinates —
 /// [`transform`](Self::transform) is the placement, applied by the caller
-/// however it likes: [`transform_body`](opensolid_brep::transform_body)
+/// however it likes:
+/// [`transform_body`](opensolid_brep::transform::transform_body)
 /// for an exact B-Rep import, or an F-Rep
 /// [`Transformed`](opensolid_frep::transform::Transformed) wrapper for a
 /// mesh-fallback one. A part used twice yields two `PlacedSolid`s sharing
