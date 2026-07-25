@@ -156,9 +156,9 @@ analytically into exact `Curve3` geometry (`ssi::intersect`,
 `crates/opensolid-brep/src/ssi/analytic.rs:90`). The analytic kernel handles
 plane×plane, plane×sphere, plane×cylinder, plane×cone, plane×torus, and
 equal-radius cylinder×cylinder (Steinmetz); other pairs return
-`NotImplemented` (`analytic.rs:96-111`). A separate numeric marcher for NURBS
-surfaces exists (`ssi/marching.rs:435`) but is not wired into the boolean
-driver yet.
+`NotImplemented` (`analytic.rs:96-111`) and route to the numeric marcher
+(`ssi/marching.rs:435`), which every NURBS pair takes through the bounded entry
+point (of-37i.4).
 
 **3. Imprint.** Intersection curves are clipped to the trimmed regions of
 *both* faces (`clip_imprint`, `boolean.rs:921`), then imprint curves and
@@ -197,8 +197,10 @@ resulting body carries a validated `TopologyStore` and a tessellation payload.
 **Transversal only.** Coincident faces, tangent contacts, and single-point
 tangencies are rejected with a structured `NotImplemented`
 (`boolean.rs:33-38`) — exactly the cases the hybrid fallback rescues. Face
-charts today are **plane and cylinder**; cone/sphere/torus charts return
-`NotImplemented` (`Chart::new`, `boolean.rs:411-444`).
+charts today cover **plane, cylinder, sphere, torus, cone, and NURBS**
+(`Chart::build`, `boolean.rs:586`); the one chart `NotImplemented` left is a
+NURBS patch with a degenerate (collapsed) edge, which has no pole analogue
+(of-37i.7).
 
 ---
 
@@ -294,11 +296,12 @@ checker rules, so the same class of error cannot silently return `Ok` twice.
 `clippy -D warnings`, `build`, and `test` on every push
 (`.github/workflows/ci.yml`). Five tests are `#[ignore]`d: three are on-demand
 perf measurements (wall-clock probes, too load-sensitive to gate CI), and two
-are known-broken cases held as executable bug reports — each names the open
-bead blocking it (of-9ia non-coaxial cone–cone hosting, of-kb8 STEP shared
-geometry), per the stress-suite-first policy of never softening a test to make
-it pass. When a bead closes, its tests are un-ignored rather than deleted: the
-sphere-cap refinement fix (of-s89) returned three such tests to the suite.
+are known-broken cases held as executable bug reports naming the open bead
+blocking each (of-kb8 STEP shared geometry, of-dvj curved NURBS input bodies),
+per the stress-suite-first policy of never softening a test to make it pass. When a bead closes, its tests are
+un-ignored rather than deleted: the sphere-cap refinement fix (of-s89)
+returned three such tests to the suite, and the NURBS promotion gate's three
+(of-hqb, of-bd3) went live for of-ew7.
 
 ---
 
@@ -310,12 +313,13 @@ sphere-cap refinement fix (of-s89) returned three such tests to the suite.
 | Cylinders | ✅ today | ✅ |
 | Spheres / tori | ✅ today (of-7ld) | ✅ |
 | Cones | ✅ today (of-dtj); non-coaxial cone–cone → of-9ia | ✅ |
+| NURBS patches | ✅ today (of-ew7); curved NURBS *input* bodies → of-dvj | ✅ |
 | Coincident / tangent contacts | rejected → fallback | ✅ |
 | Organic blends, offsets, shells | — | ✅ |
 | STEP (AP203) read/write | ✅ today (of-3qy); shared geometry re-imports duplicated → of-kb8 | mesh fallback on read |
 
-The exact analytic pipeline covers **plane, cylinder, sphere, torus, and
-cone** faces today: the sphere/torus stress campaign (bead of-7ld) promoted
+The exact pipeline covers **plane, cylinder, sphere, torus, cone, and NURBS**
+faces today: the sphere/torus stress campaign (bead of-7ld) promoted
 both classes through the stress-suite-first policy, and marched SSI curves
 carry the oblique plane–torus and torus–torus configurations. **Cones** have
 since been promoted the same way (of-dtj): every **plane–cone** boolean is
@@ -326,7 +330,32 @@ partner (of-dtj.2), and **coaxial cone–cone** overlaps take the exact path
 through the analytic cone–cone SSI. The one remaining cone gap is
 **non-coaxial cone–cone**: the SSI itself marches correctly, but hosting the
 marched imprint on the two curved cone faces leaves an open chain (of-9ia), so
-those configurations fall to the F-Rep path. **STEP (AP203)
+those configurations fall to the F-Rep path.
+
+**NURBS** was promoted last, on the same rule (of-ew7). The FREEFORM §9 gate —
+section 14 of `boolean_stress.rs`, a randomized campaign written before the
+pipeline was enabled — went green, and NURBS operands now take the exact path
+through the public kernel entry point rather than routing to F-Rep as a class.
+Promotion cost one thing the gate suite structurally could not see, because
+its cases call the boolean driver directly: `tessellate_face` had no NURBS arm,
+so `hybrid::boolean` could build neither the classification sign test the exact
+path needs for a NURBS operand *nor* the F-Rep fallback's own operand field —
+a NURBS boolean through the kernel API failed **both** ways rather than falling
+back, which is the opposite of what the phasing plan had assumed. Untrimmed
+patches now grid off how far the surface normal turns per knot span, which is
+domain-invariant where a parameter-priced pitch would not be.
+
+Two gaps are open and worth stating precisely, because the promotion's reach is
+narrower than "NURBS works". **Curved NURBS *input* bodies** still cannot be
+tessellated watertight: a curved patch and its neighbouring face sample their
+shared edge differently — the neighbour by the edge curve's angle, the patch by
+its own rational parameter — so the rims do not weld and the body has no path
+at all (of-dvj, held as an `#[ignore]`d repro). Planar-patch NURBS solids do
+take the exact path end to end. And **trimmed NURBS faces on input bodies**
+defer to the CDT, as non-rectangular quadric trims do (of-37i.6); a trimmed
+NURBS face arising from a boolean *result* already meshes correctly, since
+those go through `BooleanOutput::tessellate`'s CDT rather than this path.
+**STEP (AP203)
 interchange** shipped (bead of-3qy): analytic parts round-trip through
 `write_step`/`read_step` as exact B-Reps — byte-identical on re-export for
 primitive-derived geometry, with one open gap: when faces share a surface (or

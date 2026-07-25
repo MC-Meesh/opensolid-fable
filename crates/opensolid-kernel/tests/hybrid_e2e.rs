@@ -4,12 +4,13 @@
 //! round-trip stability. These exercise only the public kernel API — they
 //! are the "kernel MVP is actually done" gate.
 
-use std::f64::consts::PI;
+use std::f64::consts::{FRAC_1_SQRT_2, FRAC_PI_2, PI};
 
 use opensolid_kernel::brep::boolean::{subtract as brep_subtract, unite as brep_unite};
 use opensolid_kernel::brep::{
-    Body, GeometryStore, TessellationOptions, TopologyStore, primitives, tessellate_body,
-    translate_body,
+    Body, BodyType, Curve3, FaceSense, FinSense, GeometryStore, KnotVector, LoopType, NurbsSurface,
+    SYSTEM_RESOLUTION, ShellOrientation, Surface3, TessellationOptions, TopologyStore, primitives,
+    tessellate_body, translate_body,
 };
 use opensolid_kernel::builder::shape;
 use opensolid_kernel::core::EntityId;
@@ -353,6 +354,431 @@ fn brep_sdf_round_trip_preserves_volume_across_two_cycles() {
     assert!(
         (v2 - v1).abs() / v1 < 0.01,
         "round-trip drift: cycle 1 volume {v1} vs cycle 2 volume {v2}"
+    );
+}
+
+// =====================================================================
+// FREEFORM §9 promotion: NURBS operands on the exact path (of-ew7)
+// =====================================================================
+//
+// The §9 promotion gate is the section-(14) campaign in
+// `crates/opensolid-brep/tests/boolean_stress.rs`, and it is green. But
+// that suite calls `boolean_with_inside_tests` directly, handing each
+// NURBS operand a hand-written closed-form inside test — it proves the
+// *pipeline* classifies and reconstructs NURBS-hosted solids correctly,
+// not that a caller of the kernel gets the exact path.
+//
+// These tests close that gap: they go through the public
+// [`hybrid::boolean`] entry point with no inside tests supplied, so the
+// kernel must build the of-3oj `MeshSdf` sign crutch itself, run the
+// exact pipeline, and clear all three acceptance gates (closed manifold,
+// chordal deviation within an F-Rep cell, and the `validate_exact`
+// volume cross-check) before it may return [`HybridPath::Brep`]. An
+// assertion of `Brep` here is therefore the promotion itself: NURBS
+// operands are no longer routed to the F-Rep fallback as a class.
+//
+// The router keeps the exact-or-fallback deviation check regardless —
+// promotion removes the *class* divert, not the per-result quality bar.
+// Curved NURBS walls still tessellate at the angular pitch, so their
+// deviation is a phase-4 accuracy question (of-37i.6), not a phase-3
+// one; the operands here are planar-patch hexahedra, whose chords are
+// exact.
+
+/// The 8 corners of the axis-aligned box `min..max` in `primitives::block`
+/// corner order: bottom ring (`z = min`) counterclockwise from
+/// `(min, min)`, then the top ring above it.
+fn box_corners(min: [f64; 3], max: [f64; 3]) -> [Point3; 8] {
+    [
+        Point3::new(min[0], min[1], min[2]),
+        Point3::new(max[0], min[1], min[2]),
+        Point3::new(max[0], max[1], min[2]),
+        Point3::new(min[0], max[1], min[2]),
+        Point3::new(min[0], min[1], max[2]),
+        Point3::new(max[0], min[1], max[2]),
+        Point3::new(max[0], max[1], max[2]),
+        Point3::new(min[0], max[1], max[2]),
+    ]
+}
+
+/// Hexahedral solid whose six faces are all degree-1 B-spline patches over
+/// the unit knot domain — the same construction as
+/// `boolean_stress.rs`'s `Scene::nurbs_hexahedron` at `spans = 1`, reduced
+/// to the axis-aligned case this file needs. Geometrically identical to
+/// `primitives::block`, but every surface the pipeline sees is
+/// [`Surface3::Nurbs`], so `body_has_nurbs_face` is true and the exact
+/// path cannot classify it by ray parity.
+///
+/// Control points are ordered so each patch's `du × dv` points out of the
+/// solid, matching `FaceSense::Positive` + `ShellOrientation::Outward`.
+fn nurbs_block(
+    store: &mut TopologyStore,
+    geo: &mut GeometryStore,
+    min: [f64; 3],
+    max: [f64; 3],
+) -> EntityId<Body> {
+    /// Undirected edges as (low, high) corner-index pairs: bottom ring,
+    /// top ring, then the four verticals.
+    const EDGE_PAIRS: [(usize, usize); 12] = [
+        (0, 1),
+        (1, 2),
+        (2, 3),
+        (3, 0),
+        (4, 5),
+        (5, 6),
+        (6, 7),
+        (7, 4),
+        (0, 4),
+        (1, 5),
+        (2, 6),
+        (3, 7),
+    ];
+    /// Vertex cycles counterclockwise viewed from outside, identical to
+    /// `primitives::block`'s `face_specs`.
+    const FACE_CYCLES: [[usize; 4]; 6] = [
+        [0, 3, 2, 1], // bottom (−Z)
+        [4, 5, 6, 7], // top (+Z)
+        [0, 1, 5, 4], // front (−Y)
+        [1, 2, 6, 5], // right (+X)
+        [2, 3, 7, 6], // back (+Y)
+        [3, 0, 4, 7], // left (−X)
+    ];
+
+    let corners = box_corners(min, max);
+    let body = store.create_body(BodyType::Solid);
+    let shell = store.create_shell(body, true, ShellOrientation::Outward);
+    let vertices = corners.map(|p| store.create_vertex(p, SYSTEM_RESOLUTION));
+
+    let edges: Vec<_> = EDGE_PAIRS
+        .iter()
+        .map(|&(a, b)| {
+            let line = Curve3::line(corners[a], corners[b] - corners[a]).expect("distinct corners");
+            let length = (corners[b] - corners[a]).norm();
+            let curve = geo.add_curve(line);
+            store.create_edge_with_curve(
+                vertices[a],
+                vertices[b],
+                SYSTEM_RESOLUTION,
+                curve,
+                0.0,
+                length,
+            )
+        })
+        .collect();
+
+    let directed_edge = |from: usize, to: usize| -> (EntityId<_>, FinSense) {
+        let (index, &(a, _)) = EDGE_PAIRS
+            .iter()
+            .enumerate()
+            .find(|&(_, &(a, b))| (a, b) == (from, to) || (a, b) == (to, from))
+            .expect("face cycles only use listed edges");
+        let sense = if a == from {
+            FinSense::Forward
+        } else {
+            FinSense::Reversed
+        };
+        (edges[index], sense)
+    };
+
+    // Clamped degree-1 knots over [0, 1] for a 2x2 control grid.
+    let knots = || KnotVector::new(1, vec![0.0, 0.0, 1.0, 1.0]).expect("valid clamped deg-1 knots");
+
+    for cycle in FACE_CYCLES {
+        // Row-major `[i][j]` with `i↔u`, `j↔v`: row u=0 is (c0, c3), row
+        // u=1 is (c1, c2), so `(u,v)=(0,0)→c0`, `(1,0)→c1`, `(1,1)→c2`,
+        // `(0,1)→c3` and the normal at the origin is `(c1−c0)×(c3−c0)`.
+        let grid = vec![
+            vec![corners[cycle[0]], corners[cycle[3]]],
+            vec![corners[cycle[1]], corners[cycle[2]]],
+        ];
+        let patch = NurbsSurface::bspline(grid, knots(), knots()).expect("rectangular 2x2 grid");
+        let surface = geo.add_surface(Surface3::nurbs(patch));
+        let face = store.create_face(shell, FaceSense::Positive);
+        store.faces.get_mut(face).expect("just created").surface = Some(surface);
+        let loop_edges: Vec<_> = (0..4)
+            .map(|i| directed_edge(cycle[i], cycle[(i + 1) % 4]))
+            .collect();
+        store.create_loop(face, LoopType::Outer, &loop_edges);
+    }
+    body
+}
+
+/// Promotion, half of it: a NURBS-hosted solid subtracted from an
+/// **analytic** block through the public hybrid API must land on the exact
+/// path. Only operand A is NURBS, so the kernel builds one `MeshSdf` sign
+/// test and B still classifies by exact ray parity — the mixed case, and
+/// the one that would silently regress first if `body_has_nurbs_face`
+/// stopped firing.
+///
+/// Volumes: the NURBS box is `2³ = 8` and the analytic tool covers its
+/// `x ≥ 1` half, so `A − B = 4`. Planar patches tessellate exactly, so
+/// this is checked at the planar tolerance, not a curved one.
+#[test]
+fn nurbs_operand_against_analytic_takes_the_exact_path() {
+    let mut store = TopologyStore::new();
+    let mut geo = GeometryStore::new();
+    let a = nurbs_block(&mut store, &mut geo, [0.0, 0.0, 0.0], [2.0, 2.0, 2.0]);
+    let b = primitives::block(&mut store, &mut geo, 2.0, 4.0, 4.0).unwrap();
+    translate_body(&mut store, &mut geo, b, Vector3::new(2.0, 1.0, 1.0)).unwrap();
+
+    let out = hybrid::subtract(
+        &HybridBody::brep(&store, &geo, a),
+        &HybridBody::brep(&store, &geo, b),
+        &opts(),
+    )
+    .expect("NURBS minus analytic block");
+
+    assert!(
+        matches!(out.path, HybridPath::Brep(_)),
+        "FREEFORM §9 promotion (of-ew7): a NURBS operand must take the \
+         exact B-Rep path, not the F-Rep fallback — got {:?}",
+        out.diagnostic
+    );
+    assert!(out.mesh.is_closed_manifold());
+    assert_volume_within(&out.mesh, 4.0, 1e-9, "NURBS box minus analytic block");
+}
+
+/// Promotion, the rest of it: **both** operands NURBS — every cut is a
+/// NURBS patch meeting a NURBS patch, so the kernel builds two `MeshSdf`
+/// sign tests and the whole boolean runs through NURBS↔NURBS SSI and
+/// NURBS-on-NURBS region tracing with no analytic surface anywhere.
+#[test]
+fn nurbs_pair_boolean_takes_the_exact_path() {
+    let mut store = TopologyStore::new();
+    let mut geo = GeometryStore::new();
+    let a = nurbs_block(&mut store, &mut geo, [0.0, 0.0, 0.0], [2.0, 2.0, 2.0]);
+    let b = nurbs_block(&mut store, &mut geo, [1.0, -1.0, -1.0], [3.0, 3.0, 3.0]);
+    let (ha, hb) = (
+        HybridBody::brep(&store, &geo, a),
+        HybridBody::brep(&store, &geo, b),
+    );
+
+    // vol(A) = 8, vol(B) = 2·4·4 = 32, overlap = A's +x half = 4.
+    for (op, expected, context) in [
+        (
+            hybrid::subtract(&ha, &hb, &opts()),
+            4.0,
+            "NURBS box minus NURBS box",
+        ),
+        (
+            hybrid::intersect(&ha, &hb, &opts()),
+            4.0,
+            "NURBS box meet NURBS box",
+        ),
+        (
+            hybrid::unite(&ha, &hb, &opts()),
+            36.0,
+            "NURBS box union NURBS box",
+        ),
+    ] {
+        let out = op.unwrap_or_else(|e| panic!("{context}: {e}"));
+        assert!(
+            matches!(out.path, HybridPath::Brep(_)),
+            "FREEFORM §9 promotion (of-ew7): {context} must take the exact \
+             B-Rep path — got {:?}",
+            out.diagnostic
+        );
+        assert!(out.mesh.is_closed_manifold(), "{context}: not watertight");
+        assert_volume_within(&out.mesh, expected, 1e-9, context);
+    }
+}
+
+/// The promotion does not disable the safety net. `validate_exact` is on
+/// by default and the deviation gate is unconditional, so a NURBS result
+/// that clears them carries `diagnostic: None` — the gates ran and stayed
+/// silent, rather than being skipped for NURBS operands.
+#[test]
+fn promoted_nurbs_result_still_passes_the_validation_gate() {
+    let mut store = TopologyStore::new();
+    let mut geo = GeometryStore::new();
+    let a = nurbs_block(&mut store, &mut geo, [0.0, 0.0, 0.0], [2.0, 2.0, 2.0]);
+    let b = nurbs_block(&mut store, &mut geo, [0.5, 0.5, -0.5], [1.5, 1.5, 2.5]);
+
+    let options = opts();
+    assert!(
+        options.validation.is_some(),
+        "the validation gate must be on by default for this to mean anything"
+    );
+    let out = hybrid::subtract(
+        &HybridBody::brep(&store, &geo, a),
+        &HybridBody::brep(&store, &geo, b),
+        &options,
+    )
+    .expect("NURBS box bored by a NURBS bar");
+
+    assert!(matches!(out.path, HybridPath::Brep(_)));
+    assert!(
+        out.diagnostic.is_none(),
+        "an accepted exact result must carry no discard diagnostic: {:?}",
+        out.diagnostic
+    );
+    // Box 2³ = 8 minus the 1×1×2 through-bore = 6.
+    assert_volume_within(&out.mesh, 6.0, 1e-9, "NURBS box bored by NURBS bar");
+}
+
+/// Solid cylinder whose wall is four **exact** rational quadratic NURBS
+/// quarter patches (the of-pb7.3 construction: 90° arcs with the middle
+/// control point at the tangent intersection, weight `1/√2`) swept linearly
+/// in `v`, with planar caps. Geometrically identical to
+/// `primitives::cylinder`, but the walls the pipeline sees are *curved*
+/// NURBS — the §9 gate's "NURBS patch of exact analytic form", and the
+/// operand that separates a promotion that covers freeform geometry from one
+/// that only covers planar patches.
+fn nurbs_cylinder(
+    store: &mut TopologyStore,
+    geo: &mut GeometryStore,
+    r: f64,
+    h: f64,
+) -> EntityId<Body> {
+    let axis = Vector3::z();
+    let dirs = [
+        Vector3::new(1.0, 0.0, 0.0),
+        Vector3::new(0.0, 1.0, 0.0),
+        Vector3::new(-1.0, 0.0, 0.0),
+        Vector3::new(0.0, -1.0, 0.0),
+    ];
+    let (bottom, top) = (Point3::origin(), Point3::new(0.0, 0.0, h));
+    let body = store.create_body(BodyType::Solid);
+    let shell = store.create_shell(body, true, ShellOrientation::Outward);
+
+    let v_bot: Vec<_> = dirs
+        .iter()
+        .map(|d| store.create_vertex(bottom + d * r, SYSTEM_RESOLUTION))
+        .collect();
+    let v_top: Vec<_> = dirs
+        .iter()
+        .map(|d| store.create_vertex(top + d * r, SYSTEM_RESOLUTION))
+        .collect();
+
+    // Quarter-arc `k` spans `[kπ/2, (k+1)π/2]`: `Curve3::circle`'s parameter
+    // origin is `+X`, so the arc parameter ranges line up with `dirs`.
+    let mut arc = |center: Point3, verts: &[EntityId<_>], k: usize, geo: &mut GeometryStore| {
+        let curve = geo.add_curve(Curve3::circle(center, axis, r).expect("valid circle"));
+        store.create_edge_with_curve(
+            verts[k],
+            verts[(k + 1) % 4],
+            SYSTEM_RESOLUTION,
+            curve,
+            k as f64 * FRAC_PI_2,
+            (k + 1) as f64 * FRAC_PI_2,
+        )
+    };
+    let e_bot: Vec<_> = (0..4).map(|k| arc(bottom, &v_bot, k, geo)).collect();
+    let e_top: Vec<_> = (0..4).map(|k| arc(top, &v_top, k, geo)).collect();
+    let e_seam: Vec<_> = (0..4)
+        .map(|k| {
+            let curve =
+                geo.add_curve(Curve3::line(bottom + dirs[k] * r, axis).expect("valid seam"));
+            store.create_edge_with_curve(v_bot[k], v_top[k], SYSTEM_RESOLUTION, curve, 0.0, h)
+        })
+        .collect();
+
+    // Bottom cap looks along −Z, so its arcs run reversed in reversed order.
+    let cap = |store: &mut TopologyStore,
+               geo: &mut GeometryStore,
+               center: Point3,
+               normal: Vector3,
+               fins: Vec<(EntityId<_>, FinSense)>| {
+        let face = store.create_face(shell, FaceSense::Positive);
+        store.faces.get_mut(face).expect("just created").surface =
+            Some(geo.add_surface(Surface3::plane(center, normal).expect("valid plane")));
+        store.create_loop(face, LoopType::Outer, &fins);
+    };
+    cap(
+        store,
+        geo,
+        bottom,
+        -axis,
+        (0..4)
+            .rev()
+            .map(|k| (e_bot[k], FinSense::Reversed))
+            .collect(),
+    );
+    cap(
+        store,
+        geo,
+        top,
+        axis,
+        (0..4).map(|k| (e_top[k], FinSense::Forward)).collect(),
+    );
+
+    let knots_u = KnotVector::clamped_uniform(2, 3).expect("degree-2 knots, 3 controls");
+    let knots_v = KnotVector::clamped_uniform(1, 2).expect("degree-1 knots, 2 controls");
+    for k in 0..4 {
+        let (d0, d1) = (dirs[k], dirs[(k + 1) % 4]);
+        // Middle control point sits at the tangent intersection (radius r√2).
+        let control_points: Vec<Vec<Point3>> = [d0, d0 + d1, d1]
+            .iter()
+            .map(|d| vec![bottom + d * r, top + d * r])
+            .collect();
+        let weights: Vec<Vec<f64>> = [1.0, FRAC_1_SQRT_2, 1.0]
+            .iter()
+            .map(|&w| vec![w, w])
+            .collect();
+        let patch = NurbsSurface::new(control_points, weights, knots_u.clone(), knots_v.clone())
+            .expect("valid rational quarter-cylinder patch");
+        let face = store.create_face(shell, FaceSense::Positive);
+        store.faces.get_mut(face).expect("just created").surface =
+            Some(geo.add_surface(Surface3::nurbs(patch)));
+        store.create_loop(
+            face,
+            LoopType::Outer,
+            &[
+                (e_bot[k], FinSense::Forward),
+                (e_seam[(k + 1) % 4], FinSense::Forward),
+                (e_top[k], FinSense::Reversed),
+                (e_seam[k], FinSense::Reversed),
+            ],
+        );
+    }
+    body
+}
+
+/// How far the promotion reaches on **curved** NURBS — held as an executable
+/// bug report for of-dvj, not softened to pass.
+///
+/// The planar-patch tests above cannot speak for curved operands, and this
+/// one fails: the tool's wall patch and its planar cap share a circular edge
+/// and sample it *differently* — the cap ear-clips the curve at uniform
+/// angles (11.25° steps), the NURBS wall grids uniformly in its own rational
+/// parameter, which is not angle-uniform. The rims do not weld (128 open
+/// edges on a 124-triangle mesh), `MeshSdf::new` rejects the operand, and so
+/// neither the exact path's inside-test crutch nor the F-Rep fallback's field
+/// can be built. It is the of-2i3 lesson in a new place: adjacent faces must
+/// sample a shared edge at the same positions, which the quadric path gets
+/// for free by parameterizing both sides by angle.
+///
+/// Note what this does *not* say. A curved NURBS face arising from a boolean
+/// *result* tessellates fine — those go through the CDT
+/// (`BooleanOutput::tessellate`). The gap is curved NURBS as an **input
+/// body**. The assertion is deliberately weak — succeeds, watertight,
+/// volume-accurate on *whichever* path — because diverting to F-Rep on the
+/// deviation gate would be a legitimate outcome; only the hard error is not.
+#[test]
+#[ignore = "of-dvj: curved NURBS input bodies tessellate non-watertight"]
+fn curved_nurbs_operand_produces_a_correct_result_on_whichever_path() {
+    let (r, h) = (1.0, 4.0);
+    let mut store = TopologyStore::new();
+    let mut geo = GeometryStore::new();
+    let block = primitives::block(&mut store, &mut geo, 4.0, 4.0, 2.0).unwrap();
+    let tool = nurbs_cylinder(&mut store, &mut geo, r, h);
+    translate_body(&mut store, &mut geo, tool, Vector3::new(0.0, 0.0, -h / 2.0)).unwrap();
+
+    let out = hybrid::subtract(
+        &HybridBody::brep(&store, &geo, block),
+        &HybridBody::brep(&store, &geo, tool),
+        &opts(),
+    )
+    .expect("a NURBS-walled tool must have *some* path through the kernel");
+
+    assert!(out.mesh.is_closed_manifold(), "result is not watertight");
+    // Block 4×4×2 minus the through-bore π r² · 2. The F-Rep path pays dual
+    // contouring's cell error on top of the tessellation's, so the bar is the
+    // fallback's accuracy, not the exact path's.
+    assert_volume_within(
+        &out.mesh,
+        4.0 * 4.0 * 2.0 - PI * r * r * 2.0,
+        0.05,
+        "block bored by a NURBS-walled cylinder",
     );
 }
 

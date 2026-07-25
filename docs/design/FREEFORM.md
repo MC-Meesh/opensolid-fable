@@ -588,7 +588,9 @@ mismatch. Each item below is therefore a *deliberate* fallback, not a bug:
 
 | Configuration | Path | Why |
 |---|---|---|
-| NURBS ↔ NURBS/analytic, transversal, clamped, non-degenerate | **exact** (phase 3) | the target |
+| NURBS ↔ NURBS/analytic, transversal, clamped, non-degenerate | **exact** — DELIVERED (of-ew7) for planar-patch operands | the target |
+| *Curved* NURBS face on an **input** body | **neither** — hard error | patch and neighbour sample their shared edge differently, so the body will not weld watertight; with no operand mesh there is no SDF, hence no fallback either (of-dvj) |
+| *Trimmed* NURBS face on an **input** body | **F-Rep** | `tessellate_face` grids untrimmed patches only; boolean *results* carry trimmed NURBS faces through the CDT already (of-37i.6) |
 | Tangential or coincident NURBS contact | **F-Rep** | `NEAR_TANGENCY_SIN` bail; matches the analytic MVP's own limit |
 | NURBS with degenerate edges (collapsed rows) | **F-Rep** | pole machinery has no analogue (§2) |
 | Periodic/unclamped NURBS | **F-Rep** (or rejected at construction) | seams belong in topology, not the chart (§1) |
@@ -658,7 +660,8 @@ Three corrections this phase made to the plan above, worth carrying forward:
    share-don't-rewrite the plan intended: it is exactly what `march_boxed` already
    seeds its grid with.
 
-**Phase 3 — imprint, region split, classification (`of-37i.5`).**
+**Phase 3 — imprint, region split, classification (`of-37i.5`). DELIVERED;
+promoted by `of-ew7`.**
 Carry `MarchedCurve::params_a/params_b` into `Imprint` instead of re-projecting;
 `marched_polylines` de-`Surface3`-ified; classification via the F-Rep sign test
 for NURBS operands (§5). of-9ia **did** bite and is now closed — it was two
@@ -694,11 +697,31 @@ gates the promotion.
 - Closed manifold + `check()` + genus on every output.
 - Trim regions abutting the knot-domain boundary.
 
-**Phase 4 — tessellation quality (`of-37i.6`).** Curvature-derived lattice pitch
-replacing the angular pitch; a NURBS arm in `tessellate.rs` for untrimmed
-patches. **Gate:** worst chord deviation `≤` F-Rep cell on the stress corpus, so
-NURBS booleans stop diverting to F-Rep on the deviation gate. *Accuracy only —
-must not gate phase 3.*
+**Phase 4 — tessellation quality (`of-37i.6`). PARTLY PULLED FORWARD by
+`of-ew7`.** The untrimmed-patch arm in `tessellate.rs` landed with the
+promotion, its lattice priced off the normal's turning per knot span. What
+remains is **trimmed** NURBS faces on input bodies (boundary-conforming
+refinement and hole bridging — the CDT pass) and the corpus-wide accuracy bar,
+plus the watertightness gap the promotion exposed: a **curved** untrimmed patch
+and its neighbour sample their shared edge by different rules (the neighbour by
+the curve's angle, the patch by its own rational parameter), so curved NURBS
+*input* bodies do not weld — `of-dvj`, the of-2i3 lesson recurring on a surface
+class that has no parameterization to share.
+**Gate:** worst chord deviation `≤` F-Rep cell on the stress corpus, so NURBS
+booleans stop diverting to F-Rep on the deviation gate.
+
+*Correction to the original plan, recorded because it cost the promotion a
+round-trip:* this phase was scheduled as "accuracy only — must not gate phase
+3", on the reasoning that an under-refined NURBS face merely fails
+`deviation ≤ cell_size` and diverts to F-Rep, so bad tessellation costs
+accuracy and not correctness. **That is false, and it did gate phase 3.** The
+F-Rep fallback builds its operand fields with the *same* `tessellate_body`, so
+with no NURBS arm at all there was nothing to divert *to*: `hybrid::boolean` on
+a NURBS body returned `NotImplemented` outright, and the of-3oj `MeshSdf` sign
+crutch the exact path needs could not be built either, so neither path ran. A
+missing tessellator is not an accuracy gap — it is a hard stop on both sides of
+the router. The general lesson: a fallback that shares a dependency with the
+path it is backing is not a fallback for failures of that dependency.
 
 **Phase 5 — hardening campaigns (`of-37i.7`; split into separate beads when
 scheduled).** Degenerate-edge (collapsed

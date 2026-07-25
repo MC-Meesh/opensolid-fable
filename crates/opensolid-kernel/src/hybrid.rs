@@ -21,6 +21,18 @@
 //!   [`HybridPath::Frep`] for further composition or faceted B-Rep
 //!   recovery ([`HybridBoolean::faceted_brep`] via [`sdf_to_brep`]).
 //!
+//! Routing is by *representation and outcome*, never by surface class: no
+//! surface kind is diverted to the fallback for being what it is. NURBS was
+//! the last class to earn that (of-ew7, the FREEFORM §9 promotion) — a NURBS
+//! operand runs the exact pipeline and is kept or discarded on the same three
+//! gates as any other. What that promotion reaches is operands whose faces
+//! tessellate: planar-patch NURBS solids today, curved ones once they weld
+//! watertight (of-dvj). Note what the fallback is *not*: it shares
+//! [`tessellate_body`] with the operand-SDF crutch below, so it cannot rescue
+//! a body that will not tessellate. Such a body has no path at all and the
+//! error propagates, which is why a surface class needs a tessellator arm
+//! before it can be promoted — the F-Rep path does not stand in for one.
+//!
 //! The fallback trades exactness for robustness: the result boundary
 //! deviates from the true boolean by at most the operand tessellation's
 //! chordal error plus the dual-contouring cell size, but it exists for any

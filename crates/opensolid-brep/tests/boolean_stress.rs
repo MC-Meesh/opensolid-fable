@@ -41,9 +41,15 @@
 //! planar-NURBS campaigns) — its whole promotion gate is live.
 //!
 //! Section (14) is the FREEFORM §9 NURBS promotion-gate campaign
-//! (of-37i.5), written stress-suite-first per the same policy: until it is
-//! green, the hybrid kernel keeps routing NURBS operands to the F-Rep
-//! fallback.
+//! (of-37i.5), written stress-suite-first per the same policy. It is green,
+//! and NURBS was promoted on it (of-ew7): the hybrid kernel no longer
+//! routes NURBS operands to the F-Rep fallback as a class. What it kept is
+//! the per-result quality bar every surface class faces — closed manifold,
+//! chordal deviation within an F-Rep cell, and the `validate_exact` volume
+//! cross-check. The kernel-side proof lives in
+//! `crates/opensolid-kernel/tests/hybrid_e2e.rs`, which asserts
+//! `HybridPath::Brep` for NURBS operands through the public entry point;
+//! this section proves the pipeline underneath it.
 
 use nalgebra::{Rotation3, Unit};
 use opensolid_brep::boolean::{InsideTest, boolean_with_inside_tests, intersect, subtract, unite};
@@ -3477,8 +3483,9 @@ fn corner_touching_blocks_unite_is_not_implemented() {
 // wholly inside the tool, and no face pair is coincident (coincident NURBS
 // faces are a separate, still-`NotImplemented` tangential-SSI path). A tool
 // that instead *bores* the box — protruding both ends — leaves an annular
-// (holed) region on the NURBS caps, which currently fails classification
-// (of-l69); that case is the `#[ignore]`d repro at the end of this section.
+// (holed) region on the NURBS caps, which once failed classification
+// (of-l69); that case is `nurbs_box_bored_by_analytic_bar` below, live since
+// the region-of-interest seeding fix its docstring records.
 //
 // Booleans on a NURBS body go through `boolean_with_inside_tests` because
 // `ray_surface_hits` has no NURBS arm (of-3oj): the injected test replaces
@@ -3756,8 +3763,28 @@ fn nurbs_box_bored_by_analytic_bar() {
 // marcher's landing tolerance, and geometrically straight marched runs
 // get the same interior-sample drop as Line-sourced darts, so the ear
 // clippers of adjacent faces no longer disagree along shared junction
-// lines). Retiring the hybrid kernel's F-Rep fallback routing for NURBS
-// operands is of-ew7 (the §9 promotion).
+// lines).
+//
+// PROMOTED (of-ew7). NURBS operands take the exact path through the public
+// kernel entry point, asserted in `opensolid-kernel/tests/hybrid_e2e.rs`.
+// The promotion needed one thing this section could not see, because every
+// case here calls `boolean_with_inside_tests` directly: `tessellate_face`
+// had no NURBS arm, so `hybrid::boolean` could build neither the of-3oj
+// `MeshSdf` sign crutch (leaving the exact path unable to classify) *nor*
+// the F-Rep fallback's own operand field — a NURBS boolean through the
+// kernel failed both ways rather than falling back. of-ew7 added an
+// untrimmed-patch arm whose lattice is priced off how far the normal
+// turns.
+//
+// Two limits that arm did not lift, and that this section structurally
+// cannot see because it never tessellates an input *body*: trimmed NURBS
+// faces on input bodies still defer to the CDT pass (of-37i.6), and a
+// *curved* untrimmed patch does not weld to its neighbour, because the two
+// sample their shared edge by different rules (of-dvj). So the kernel-level
+// promotion is real for planar-patch NURBS solids and still blocked for
+// curved ones. That does not weaken the cases here: every operand is
+// booleaned directly, and the curved bore below still checks the exact path
+// against the closed-form analytic answer.
 
 /// Exact strict interior predicate for the finite solid cylinder (axis
 /// `+Z` through `(cx, cy)`, radius `r`, `z ∈ (z0, z1)`), to inject via
