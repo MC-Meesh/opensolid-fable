@@ -553,9 +553,11 @@ enum Chart {
     /// no-op, `seam_crossings` yields nothing. A geometrically closed
     /// spline body carries its wrap as a topology seam **edge** instead.
     ///
-    /// The chart has no poles by construction — [`Chart::build`] rejects
-    /// patches with a degenerate (collapsed) edge, which are the only NURBS
-    /// analogue of one, so `pole_v`/`apex`/`pole_points` are all empty.
+    /// The chart's poles are its collapsed `v`-domain boundary rows — the
+    /// lofted-to-a-point tip (of-37i.7). A patch with no such row (the
+    /// common case) has no poles and every pole mechanism sits idle, as it
+    /// does for the plane. `apex` stays cone-only: it names the *cone's*
+    /// lone apex specifically, whereas a patch can carry two poles.
     ///
     /// Its inverse ([`Chart::param`]) is the pipeline's only iterative one.
     Nurbs {
@@ -565,6 +567,11 @@ enum Chart {
         /// `p`, and has no other source for one. Every analytic chart
         /// inverts in closed form and needs no such bound.
         tol: ToleranceContext,
+        /// The collapsed boundary rows' points, `[at v_min, at v_max]` —
+        /// see [`NurbsSurface::v_boundary_poles`]. Resolved once at build
+        /// time because every pole query is a distance test against them
+        /// and re-deriving them per call would re-scan the control grid.
+        poles: [Option<Point3>; 2],
     },
 }
 
@@ -576,26 +583,32 @@ impl Chart {
     /// whose SSI is still unsupported simply falls back to F-Rep from a
     /// later stage.
     ///
+    /// A NURBS patch with a **collapsed `v`-boundary row** — the
+    /// lofted-to-a-point tip — is admitted as of of-37i.7, with that row as
+    /// a pole. The pole machinery needs a *known* pole location and a limit
+    /// normal there; a collapsed `v`-boundary supplies both (the row is a
+    /// domain edge, and the limit is taken along constant `u` by
+    /// [`NurbsSurface::normal_limit`]), which makes it the same shape as
+    /// `Chart::Cone`'s apex rather than a new one. Degeneracies of any
+    /// other shape still have neither and are still refused — see
+    /// [`NurbsSurface::v_boundary_poles`].
+    ///
     /// # Errors
-    /// [`CoreError::NotImplemented`] for a NURBS patch with a degenerate
-    /// (collapsed) edge. The pole machinery — `pole_v`, the `CoverEmbedder`
-    /// pole rows — relies on a *known* pole location and on a limit normal
-    /// there, both of which a sphere has and a collapsed control row does
-    /// not ([`SurfaceEval::normal`] returns `None` at one). Rejecting the
-    /// patch here routes it to F-Rep intact; degenerate tips are their own
-    /// campaign (of-37i.7).
+    /// [`CoreError::NotImplemented`] for a NURBS patch whose degeneracy is
+    /// not a collapsed `v`-boundary row: a collapsed *`u`*-boundary (which
+    /// would need a `pole_u` the pipeline does not have) or an interior
+    /// singularity (whose location is not known in closed form). Rejecting
+    /// the patch here routes it to F-Rep intact.
     fn build(surface: &Surface3, tol: &ToleranceContext) -> CoreResult<Self> {
         match surface {
             Surface3::Nurbs(nurbs) => {
-                if nurbs.has_degenerate_edge() {
-                    return Err(CoreError::NotImplemented {
-                        feature: "boolean on a NURBS patch with a degenerate (collapsed) edge \
-                                  (of-37i.7); the chart has no pole analogue for one",
-                    });
-                }
+                let poles = nurbs
+                    .v_boundary_poles()
+                    .map_err(|feature| CoreError::NotImplemented { feature })?;
                 Ok(Chart::Nurbs {
                     surface: nurbs.clone(),
                     tol: *tol,
+                    poles,
                 })
             }
             Surface3::Plane { origin, normal } => {
@@ -708,7 +721,11 @@ impl Chart {
     /// spawn a zero-width UV wedge (a degenerate region) at the pole.
     fn param(&self, p: &Point3, hint: Option<(f64, f64)>) -> CoreResult<(f64, f64)> {
         Ok(match self {
-            Chart::Nurbs { surface, tol } => return nurbs_param(surface, p, hint, tol),
+            Chart::Nurbs {
+                surface,
+                tol,
+                poles,
+            } => return nurbs_param(surface, poles, p, hint, tol),
             Chart::Plane {
                 origin, e_u, e_v, ..
             } => {
@@ -821,9 +838,16 @@ impl Chart {
         hint: Option<(f64, f64)>,
         band: f64,
     ) -> CoreResult<(f64, f64)> {
-        let Chart::Nurbs { surface, .. } = self else {
+        let Chart::Nurbs { surface, poles, .. } = self else {
             return self.param(p, hint);
         };
+        // A point *on* a pole has no meridian to project for, and Newton on
+        // the collapsed row is rank-deficient in `u` — take the pole
+        // convention here too rather than let the solver pick a `u` out of
+        // the noise.
+        if let Some(vp) = surface.pole_v_at(poles, p) {
+            return Ok((nurbs_pole_u(surface, hint), vp));
+        }
         let proj = nurbs_project(surface, p, hint)?;
         if proj.distance > band {
             return Err(CoreError::Degenerate {
@@ -863,11 +887,15 @@ impl Chart {
                 let (sin_a, cos_a) = half_angle.sin_cos();
                 radial * cos_a - axis * sin_a
             }
-            // `Chart::build` rejects degenerate-edge patches, so a normal
-            // exists everywhere on an admitted one.
+            // On a collapsed `v`-boundary row `|S_u x S_v|` vanishes and
+            // `SurfaceEval::normal` gives up; `normal_limit` answers with
+            // the limit along constant `u`, which is what the cone arm above
+            // states in closed form for its apex. Every *other* singularity
+            // is refused at `Chart::build`, so this only ever fails on a
+            // patch that is degenerate everywhere.
             Chart::Nurbs { surface, .. } => surface
-                .normal(u, v)
-                .expect("Chart::build rejects NURBS patches with a degenerate edge"),
+                .normal_limit(u, v)
+                .expect("Chart::build admits only patches with a normal off the pole rows"),
         }
     }
 
@@ -1047,13 +1075,28 @@ impl Chart {
                 (d.dot(e_u).hypot(d.dot(e_v)) <= radius.abs() * POLE_REL_EPS)
                     .then(|| -radius / half_angle.tan())
             }
-            // NURBS has no pole *by construction*: the only analogue is a
-            // collapsed control row, and `Chart::build` rejects patches
-            // with one. Plane/cylinder/torus never collapse a point.
+            // A collapsed `v`-boundary row: `v_min`/`v_max` rather than a
+            // hemisphere sign, since a knot domain has no sign convention
+            // to read one off (of-37i.7).
+            Chart::Nurbs { surface, poles, .. } => surface.pole_v_at(poles, p),
+            // Plane/cylinder/torus never collapse a point.
+            Chart::Plane { .. } | Chart::Cylinder { .. } | Chart::Torus { .. } => None,
+        }
+    }
+
+    /// The `u` a point standing on a pole takes when nothing upstream has
+    /// supplied one. `0` for the angular charts — an arbitrary but
+    /// canonical meridian, and their `u` domain's low end. A NURBS knot
+    /// domain's low end is `u_min`, which need not be `0`; picking `0`
+    /// there could land outside the domain entirely.
+    fn pole_u_default(&self) -> f64 {
+        match self {
+            Chart::Nurbs { surface, .. } => surface.domain_u().0,
             Chart::Plane { .. }
             | Chart::Cylinder { .. }
+            | Chart::Sphere { .. }
             | Chart::Torus { .. }
-            | Chart::Nurbs { .. } => None,
+            | Chart::Cone { .. } => 0.0,
         }
     }
 
@@ -1075,9 +1118,10 @@ impl Chart {
     }
 
     /// The chart's singular pole points — the sphere's `[south, north]`
-    /// (`v = -π/2, +π/2`) and the cone's lone apex — where the `u`-circle
-    /// collapses to a point. Empty for charts with no such degeneracy
-    /// (plane, cylinder, torus).
+    /// (`v = -π/2, +π/2`), the cone's lone apex, and a NURBS patch's
+    /// collapsed `v`-boundary rows (`[v_min, v_max]`, either or both
+    /// present) — where the `u`-line collapses to a point. Empty for charts
+    /// with no such degeneracy (plane, cylinder, torus).
     fn pole_points(&self) -> Vec<Point3> {
         match self {
             Chart::Sphere {
@@ -1087,12 +1131,8 @@ impl Chart {
                 ..
             } => vec![center - axis * *radius, center + axis * *radius],
             Chart::Cone { .. } => self.apex().into_iter().collect(),
-            // See `pole_v`: no analogue, and the degenerate-edge patches
-            // that would be one never reach a chart.
-            Chart::Plane { .. }
-            | Chart::Cylinder { .. }
-            | Chart::Torus { .. }
-            | Chart::Nurbs { .. } => Vec::new(),
+            Chart::Nurbs { poles, .. } => poles.iter().flatten().copied().collect(),
+            Chart::Plane { .. } | Chart::Cylinder { .. } | Chart::Torus { .. } => Vec::new(),
         }
     }
 }
@@ -1111,12 +1151,25 @@ const POLE_REL_EPS: f64 = 1e-9;
 /// rather than a best guess, because the caller cannot tell a wrong uv from
 /// a right one — it just embeds it in a region polygon and produces a solid
 /// with silently wrong parity.
+///
+/// **Pole convention.** On a collapsed `v`-boundary row the whole `u`-line
+/// is one point, so `u` is undefined there and the projection's normal
+/// equation is rank-deficient in it. A point within the pole floor of such
+/// a row therefore *inherits* `hint`'s `u` — exactly the sphere's and
+/// cone's convention (§`Chart::param`), and for the same reason: an
+/// imprint threaded through the tip keeps a continuous `u` instead of
+/// taking whatever the solver's last iterate happened to be, which would
+/// spawn a zero-width uv wedge at the tip.
 fn nurbs_param(
     surface: &NurbsSurface,
+    poles: &[Option<Point3>; 2],
     p: &Point3,
     hint: Option<(f64, f64)>,
     tol: &ToleranceContext,
 ) -> CoreResult<(f64, f64)> {
+    if let Some(vp) = surface.pole_v_at(poles, p) {
+        return Ok((nurbs_pole_u(surface, hint), vp));
+    }
     let proj = nurbs_project(surface, p, hint)?;
     // `points_approx_eq` keeps the bound absolute for unit-scale geometry
     // and relative for large models, so a patch does not fail this check
@@ -1132,6 +1185,13 @@ fn nurbs_param(
         });
     }
     Ok((proj.u, proj.v))
+}
+
+/// The `u` a point on a pole row inherits: `hint`'s, or the domain's low
+/// end when there is none. The sphere and cone fall back to `0`, which is
+/// their `u` domain's low end; a knot domain's is `u_min`.
+fn nurbs_pole_u(surface: &NurbsSurface, hint: Option<(f64, f64)>) -> f64 {
+    hint.map_or_else(|| surface.domain_u().0, |(u, _)| u)
 }
 
 /// The seeded closest-point projection both [`nurbs_param`] gates share.
@@ -1424,7 +1484,9 @@ impl<'c> CoverEmbedder<'c> {
     /// Propagates [`Chart::param`]'s failure to invert `p` (NURBS only).
     fn push(&mut self, p: Point3, out: &mut Vec<CoverPoint>) -> CoreResult<()> {
         if let Some(vp) = self.chart.pole_v(&p) {
-            let u = self.last_uv.map_or(0.0, |(u, _)| u);
+            let u = self
+                .last_uv
+                .map_or_else(|| self.chart.pole_u_default(), |(u, _)| u);
             out.push(((u, vp), p));
             self.last_uv = Some((u, vp));
             self.at_pole = Some((vp, p));
@@ -1434,8 +1496,10 @@ impl<'c> CoverEmbedder<'c> {
             let (u_in, _) = self.last_uv.expect("standing on a pole implies a uv");
             // No hint: leaving a pole, the previous uv's longitude is the
             // arrival meridian, which is precisely what must not bias the
-            // departure meridian being recovered here. Only pole-bearing
-            // charts reach this branch, and none of them are NURBS.
+            // departure meridian being recovered here. That holds for the
+            // NURBS arm too (of-37i.7), where unseeded `param` is the
+            // per-span global search — slower than a seeded Newton, but the
+            // seed on offer is the very meridian that must not bias this.
             let (raw_u, v) = self.chart.param(&p, None)?;
             let u_out = self.pole_row_u_out(u_in, raw_u, vp);
             out.push(((u_out, vp), pole_pt));
@@ -1455,7 +1519,18 @@ impl<'c> CoverEmbedder<'c> {
     /// when `ccw` is false). A cone apex always has `vp < 0`, so it sweeps
     /// like a south pole. A departure within [`POLE_TURN_EPS`] of the
     /// arrival is a doubling-back (a seam tip) and sweeps the full period.
+    ///
+    /// **A chart whose `u` does not wrap has no such choice** — the only
+    /// pole-bearing one is NURBS, whose `u` is a clamped knot domain
+    /// (of-37i.7). Its pole row runs straight from `u_in` to `target_u`
+    /// along the collapsed boundary: there is no long way round to reject,
+    /// and no full period to fall back on when the two coincide. Deciding
+    /// direction off `vp`'s sign would be wrong there anyway — a knot value
+    /// carries no hemisphere.
     fn pole_row_u_out(&self, u_in: f64, target_u: f64, vp: f64) -> f64 {
+        if self.chart.period_u().is_none() {
+            return target_u;
+        }
         let toward_neg_u = self.ccw == (vp > 0.0);
         let turn = if toward_neg_u {
             (u_in - target_u).rem_euclid(TWO_PI)
@@ -10819,12 +10894,13 @@ mod tests {
         );
     }
 
-    /// Degenerate-edge patches are rejected at chart-build time and fall to
-    /// F-Rep: the pole machinery needs a known pole location and a limit
-    /// normal, and a collapsed control row supplies neither.
-    #[test]
-    fn chart_build_rejects_a_nurbs_patch_with_a_collapsed_edge() {
-        // A lofted-to-a-point tip: the whole v = 0 row sits on one point.
+    // -----------------------------------------------------------------
+    // Degenerate-edge patches: the collapsed v-boundary row as a pole
+    // (of-37i.7)
+    // -----------------------------------------------------------------
+
+    /// A lofted-to-a-point tip: the whole `v = v_min` row sits on `apex`.
+    fn tip_patch() -> NurbsSurface {
         let apex = Point3::new(0.5, 0.5, 1.0);
         let grid = vec![
             vec![apex, Point3::new(0.0, 0.0, 0.0), Point3::new(0.0, 1.0, 0.0)],
@@ -10832,14 +10908,202 @@ mod tests {
             vec![apex, Point3::new(1.0, 0.0, 0.0), Point3::new(1.0, 1.0, 0.0)],
         ];
         let knots = KnotVector::clamped_uniform(2, 3).expect("valid");
-        let patch = NurbsSurface::bspline(grid, knots.clone(), knots).expect("valid patch");
+        NurbsSurface::bspline(grid, knots.clone(), knots).expect("valid patch")
+    }
+
+    /// The **exact** quarter nappe of a 45° circular cone: apex at
+    /// `(0, 0, 1)`, base the rational-quadratic quarter circle of radius 1
+    /// at `z = 0`. Degree 1 in `v` with matched weights makes every
+    /// `v`-line the straight ruling apex→base, so this patch *is* a cone,
+    /// not an approximation of one — which is what lets a test check the
+    /// pole's limit normal against an answer known in closed form.
+    ///
+    /// `apex_last` puts the collapsed row at `v_max` instead of `v_min`,
+    /// which is the sign case the limit has to get right on its own.
+    fn cone_tip_patch_at(apex_last: bool) -> NurbsSurface {
+        let apex = Point3::new(0.0, 0.0, 1.0);
+        let base = [
+            Point3::new(1.0, 0.0, 0.0),
+            Point3::new(1.0, 1.0, 0.0),
+            Point3::new(0.0, 1.0, 0.0),
+        ];
+        let w = [1.0, std::f64::consts::FRAC_1_SQRT_2, 1.0];
+        let grid = base
+            .iter()
+            .map(|&b| {
+                if apex_last {
+                    vec![b, apex]
+                } else {
+                    vec![apex, b]
+                }
+            })
+            .collect();
+        // The apex column repeats each ruling's own weight: equal weights
+        // across a rational-linear segment keep it a straight line.
+        let weights = w.iter().map(|&w| vec![w, w]).collect();
+        NurbsSurface::new(
+            grid,
+            weights,
+            KnotVector::clamped_uniform(2, 3).expect("valid"),
+            KnotVector::clamped_uniform(1, 2).expect("valid"),
+        )
+        .expect("valid cone patch")
+    }
+
+    /// A collapsed `v`-boundary row is admitted and becomes a pole: it has
+    /// the one shape the pole machinery needs — a *known* location (a
+    /// domain edge) and a limit normal — which is what a sphere pole and a
+    /// cone apex have and an arbitrary singularity does not.
+    #[test]
+    fn chart_gives_a_collapsed_v_row_a_pole() {
+        let patch = tip_patch();
         assert!(patch.has_degenerate_edge(), "the v=0 row is collapsed");
+        let apex = Point3::new(0.5, 0.5, 1.0);
+
+        let chart = build_chart(&Surface3::nurbs(patch)).expect("a v-boundary tip is admitted");
+        assert_eq!(chart.pole_points(), vec![apex]);
+        assert_eq!(chart.pole_v(&apex), Some(0.0), "the pole is the v=0 row");
+        assert_eq!(
+            chart.pole_v(&chart_point(&chart, (0.5, 0.7))),
+            None,
+            "an interior point is not on a pole"
+        );
+        // `apex()` stays cone-only: it names *the* apex, and a patch can
+        // carry two poles.
+        assert_eq!(chart.apex(), None);
+    }
+
+    /// A patch collapsed at **both** `v` ends (a bicone) carries two poles,
+    /// one per end — the sphere's shape, not the cone's.
+    #[test]
+    fn chart_gives_a_patch_collapsed_at_both_v_ends_two_poles() {
+        let (top, bottom) = (Point3::new(0.0, 0.0, 1.0), Point3::new(0.0, 0.0, -1.0));
+        let ring = [
+            Point3::new(1.0, 0.0, 0.0),
+            Point3::new(1.0, 1.0, 0.0),
+            Point3::new(0.0, 1.0, 0.0),
+        ];
+        let grid = ring.iter().map(|&r| vec![top, r, bottom]).collect();
+        let patch = NurbsSurface::bspline(
+            grid,
+            KnotVector::clamped_uniform(2, 3).expect("valid"),
+            KnotVector::clamped_uniform(1, 3).expect("valid"),
+        )
+        .expect("valid bicone patch");
+
+        let chart = build_chart(&Surface3::nurbs(patch)).expect("both tips are v-boundary rows");
+        assert_eq!(chart.pole_points(), vec![top, bottom]);
+        assert_eq!(chart.pole_v(&top), Some(0.0));
+        assert_eq!(chart.pole_v(&bottom), Some(1.0));
+    }
+
+    /// The pole's normal is the **directional limit** along the meridian,
+    /// not a refusal. Checked against an answer known in closed form: on a
+    /// cone the normal is constant along each ruling, so the limit at the
+    /// apex must equal the normal at that ruling's midpoint, to float
+    /// noise. `SurfaceEval::normal` itself still says `None` there — the
+    /// limit is the chart's contribution, not a change to the surface.
+    ///
+    /// Run at **both** ends of the `v` domain, because the limit is taken
+    /// along a step that points into the domain and so changes sign
+    /// between them. Getting that wrong yields an inward normal at one end
+    /// and an outward one at the other, on the same patch — a difference
+    /// nothing downstream would flag, since both are unit vectors normal to
+    /// the surface.
+    #[test]
+    fn nurbs_pole_normal_is_the_meridian_limit() {
+        for apex_last in [false, true] {
+            let patch = cone_tip_patch_at(apex_last);
+            let v_pole = if apex_last { 1.0 } else { 0.0 };
+            let chart =
+                build_chart(&Surface3::nurbs(patch.clone())).expect("a cone tip is admitted");
+            for i in 0..=4 {
+                let u = 0.25 * i as f64;
+                assert!(
+                    patch.normal(u, v_pole).is_none(),
+                    "the collapsed row has no surface normal at u={u}"
+                );
+                let limit = chart.normal(u, v_pole);
+                let along_ruling = patch
+                    .normal(u, 0.5)
+                    .expect("the ruling's midpoint is a regular point");
+                assert!(
+                    (limit - along_ruling).norm() < 1e-12,
+                    "at u={u} (apex_last={apex_last}) the apex limit {limit:?} must match \
+                     the ruling normal {along_ruling:?}: a cone's normal is constant \
+                     along its ruling"
+                );
+            }
+        }
+    }
+
+    /// On a pole the `u`-line is one point, so `u` is undefined and the
+    /// projection's normal equation is rank-deficient in it. `param`
+    /// therefore inherits the hint's `u` — the sphere/cone convention —
+    /// rather than returning whatever the solver's last iterate held, which
+    /// would spawn a zero-width uv wedge at the tip. With no hint it takes
+    /// the knot domain's low end, *not* `0`: a knot domain need not contain
+    /// `0` at all.
+    #[test]
+    fn nurbs_pole_param_inherits_the_hint_meridian() {
+        let tip = tip_patch();
+        // Shift the u knot domain off zero so a hard-coded `0` fallback shows.
+        let patch = NurbsSurface::bspline(
+            (0..3)
+                .map(|i| (0..3).map(|j| tip.control_point(i, j)).collect())
+                .collect(),
+            scaled_knots(2, 3, 5.0, 2.0),
+            KnotVector::clamped_uniform(2, 3).expect("valid"),
+        )
+        .expect("valid patch");
+        assert_eq!(patch.domain_u(), (5.0, 7.0));
+        let apex = Point3::new(0.5, 0.5, 1.0);
+        let chart = build_chart(&Surface3::nurbs(patch)).expect("a v-boundary tip is admitted");
+
+        assert_eq!(
+            chart
+                .param(&apex, Some((6.1, 0.4)))
+                .expect("the pole inverts"),
+            (6.1, 0.0),
+            "the pole inherits the hint's meridian"
+        );
+        assert_eq!(
+            chart.param(&apex, None).expect("the pole inverts unseeded"),
+            (5.0, 0.0),
+            "with no hint the pole takes the knot domain's low end"
+        );
+        // The clip-predicate inverse takes the same convention: it must not
+        // let a rank-deficient Newton pick the meridian either.
+        assert_eq!(
+            chart
+                .param_within(&apex, Some((6.1, 0.4)), 0.1)
+                .expect("the pole inverts")
+                .0,
+            6.1
+        );
+    }
+
+    /// A collapsed **`u`**-boundary is the same geometry transposed, and
+    /// the pipeline has no `pole_u` to carry it: `pole_v` answers with a
+    /// `v`, and `param` recovers the collapsed axis by inheriting the
+    /// hint's `u`. Admitting it would mean inventing a second pole axis, so
+    /// it is refused and routes to F-Rep intact.
+    #[test]
+    fn chart_build_rejects_a_nurbs_patch_with_a_collapsed_u_boundary() {
+        let tip = tip_patch();
+        // Transpose: the collapsed column becomes a collapsed row.
+        let grid = (0..3)
+            .map(|j| (0..3).map(|i| tip.control_point(i, j)).collect())
+            .collect();
+        let knots = KnotVector::clamped_uniform(2, 3).expect("valid");
+        let patch = NurbsSurface::bspline(grid, knots.clone(), knots).expect("valid patch");
+        assert!(patch.has_degenerate_edge(), "the u=0 row is collapsed");
 
         let err = build_chart(&Surface3::nurbs(patch))
-            .expect_err("a collapsed-row patch has no chart in phase 1");
+            .expect_err("a u-boundary collapse has no chart analogue");
         assert!(
-            matches!(err, CoreError::NotImplemented { feature } if feature.contains("degenerate")),
-            "expected a NotImplemented naming the degeneracy, got {err:?}"
+            matches!(err, CoreError::NotImplemented { feature } if feature.contains("u-domain")),
+            "expected a NotImplemented naming the u-domain collapse, got {err:?}"
         );
     }
 

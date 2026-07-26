@@ -639,9 +639,9 @@ mismatch. Each item below is therefore a *deliberate* fallback, not a bug:
 | NURBS ↔ NURBS/analytic, transversal, clamped, non-degenerate | **exact** — DELIVERED (of-ew7) for planar-patch operands | the target |
 | *Curved* NURBS face on an **input** body | **exact** — DELIVERED (of-37i.6) | was a hard error: patch and neighbour sampled their shared edge differently, so the body would not weld and with no operand mesh there was no SDF and hence no fallback either (of-dvj). The face's boundary now comes from the edge curves, so it welds by construction |
 | *Trimmed* NURBS face on an **input** body | **exact** — DELIVERED (of-37i.6) | input bodies take the same CDT boolean *results* always did; nothing requires the boundary to be an iso-rectangle |
-| NURBS face with a **collapsed control row** on an input body | **F-Rep** (untrimmed) / rejected (trimmed) | it has no chart, so it cannot take the CDT; untrimmed it still grids (of-37i.7) |
+| NURBS face with a **collapsed `v`-boundary row** on an input body | **charted + tessellates** (of-37i.7); boolean still **F-Rep** | it now has a chart — the row *is* the pole (§8.1) — and takes the CDT, so a tip body welds and both paths have an operand mesh at last. The exact boolean on one does not yet run: the closest-point projection is not pole-robust, and the tip fan carries 3D-collinear triangles that `MeshSdf::new` refuses |
+| NURBS face with a collapsed **`u`**-boundary row, or an interior singularity | **F-Rep** (untrimmed grids) / rejected (trimmed) | no pole: the machinery is `v`-indexed, and an interior singularity has no known location (§8.1) |
 | Tangential or coincident NURBS contact | **F-Rep** | `NEAR_TANGENCY_SIN` bail; matches the analytic MVP's own limit |
-| NURBS with degenerate edges (collapsed rows) | **F-Rep** | pole machinery has no analogue (§2) |
 | Periodic/unclamped NURBS | **F-Rep** (or rejected at construction) | seams belong in topology, not the chart (§1) |
 | Self-intersecting / self-approaching patches | **F-Rep** | multi-sheet projection is unreliable |
 | Chart inversion non-convergent | **F-Rep** | never guess a uv (§2.2) |
@@ -658,6 +658,85 @@ Two properties this preserves, and they are why the phasing is safe:
   is discarded rather than returned. That is exactly the safety net that lets us
   promote incrementally — but per the README's stress-suite-first policy, it is
   a *net*, not a gate. The gate is the stress suite.
+
+### 8.1 The collapsed row *is* a pole (of-37i.7 item 1)
+
+Phase 1 rejected every degenerate-edge patch at `Chart::build`, on the
+reading that a collapsed control row supplies neither of the two things the
+pole machinery needs: a **known pole location** and a **limit normal**.
+That reading was half right, and the half it got wrong is the useful half.
+
+The pole machinery is **`v`-indexed** — `Chart::pole_v` answers with a `v`,
+and `Chart::param` recovers the collapsed axis by inheriting the hint's
+`u`. A row collapsed at a **`v`-domain boundary** (the lofted-to-a-point
+tip) has exactly that shape:
+
+- **Its location is known**: the row is a domain edge, `v_min` or `v_max`.
+  Detection is *structural*, not derivative-based — a boundary row of
+  identical control points evaluates to that one point exactly, whatever
+  the weights, because the basis functions are a partition of unity. That
+  gives the pole's position exactly, which `is_singular` cannot.
+- **Its limit normal exists, per meridian**, which is what `Chart::Cone`'s
+  apex normal already is. It is not `S_u × S_v` — that vanishes — but the
+  L'Hôpital limit `normalize(S_uv × S_v)`, since `S_u(u, v₀) = 0` makes
+  `S_u(u, v₀ + δ) = δ·S_uv + O(δ²)`. Evaluating at a small offset instead
+  recovers the direction only to `ε_machine/δ`: the offset small enough to
+  *be* the limit is the one whose cancellation is worst. There is no good
+  `δ`. The `δ` also carries a **sign** — it points into the domain — so the
+  limit at a `v_max` pole is the negated cross product, and getting that
+  wrong yields an inward normal at one end of a patch and an outward one at
+  the other, which nothing downstream would flag.
+
+So a collapsed `v`-row is not a new shape; it is the cone apex again. What
+genuinely has no analogue is a collapsed **`u`**-boundary (it would need a
+`pole_u` the pipeline does not have) and an *interior* singularity (no
+known location), and those are still refused.
+
+**Two corrections this item made to the plan, worth carrying forward.**
+
+1. *Two constants in the pole row were angular and had to be generalized.*
+   `CoverEmbedder::pole_row_u_out` swept `TWO_PI` and chose its direction
+   from `vp > 0.0` — a hemisphere sign. A knot domain has neither: its `u`
+   does not wrap, so its pole row runs straight from the arrival meridian
+   to the departure one, with no long way round to reject and no full
+   period to fall back on. The general statement is *a chart whose `u` does
+   not wrap has no direction to choose*, which reads off `period_u`.
+   Likewise the pole's no-hint `u` fallback was a hard-coded `0`, which is
+   the angular charts' domain low end but need not be inside a knot domain
+   at all.
+2. *The chart was necessary and not sufficient, and tessellation was the
+   binding half.* Admitting the patch does not by itself let a tip body
+   through: the grid arm cannot weld a curved patch to its neighbours
+   (of-dvj), so a tip body had **no path at all** — §7.1's lesson recurring
+   verbatim, since the F-Rep fallback builds its operand field with the
+   same tessellator the exact path needs. The CDT therefore takes these
+   patches too, with the pole row opened the way `CoverEmbedder` opens it
+   for an imprint walk: a boundary sample standing on the pole carries no
+   `u` of its own, so it becomes the row's *two* ends, `(u_in, v_pole)` and
+   `(u_out, v_pole)`, read off its neighbours. Projecting it anyway pinches
+   the uv polygon to a point at the tip, and the polygon then covers a
+   wedge of the domain rather than the domain — the triangulation silently
+   misses most of the patch. On the mesh side every parameter point on the
+   row lifts to the same 3D point and so must share one vertex, which is
+   what `emit_grid` does structurally by giving a singular row a single
+   column.
+
+**Where it stops, precisely.** A tip body now welds and its volume brackets
+the analytic cone's (`boolean_stress::nurbs_tip_body_is_admitted_and_tessellates_watertight`).
+Two things still keep the *boolean* on F-Rep, and they are separate
+follow-ups, not one:
+
+- **`of-37i.7.1`** — the closest-point projection does not converge near a
+  tip, so `Chart::param` fails on points the pipeline legitimately inverts
+  there. `|S_u| → 0` makes the 2×2 normal system singular in `u`.
+- **`of-37i.7.2`** — the tip fan carries triangles that are **collinear in
+  3D**: the apex and two lattice points at one `u` all sit on that ruling.
+  `MeshSdf::new` refuses the operand over them. They are *not* degenerate
+  in uv, and dropping them would leave each of their edges with one
+  incident face and open the mesh, so the fix belongs in what the
+  triangulation emits near a pole, not in a post-filter.
+
+Items 2–6 of the campaign are `of-37i.7.3` … `of-37i.7.6`.
 
 ## 9. Phasing and gates
 
@@ -782,6 +861,12 @@ row) patches; tangential/coincident NURBS contact; ray–NURBS via Bézier clipp
 to replace the F-Rep classification crutch; NURBS curve fitting of marched
 polylines (the deferral recorded at `src/curve.rs:57`); `Curve3::Nurbs` and real
 SP-curves.
+
+*Item 1 (degenerate edges) has landed as far as the chart and the
+tessellator: a collapsed `v`-boundary row is now a pole, and a tip body
+welds. §8.1 records what that took, the two places the pole row was
+angular, and the two things that still keep the boolean itself on F-Rep.
+Items 2–6 remain.*
 
 ## 10. Open questions
 

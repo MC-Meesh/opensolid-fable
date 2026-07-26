@@ -687,6 +687,126 @@ impl Scene {
         body
     }
 
+    /// Solid cone about `+Z` whose wall is four **exact** rational
+    /// quadratic NURBS quarter patches, each with its `v = 1` control
+    /// column collapsed onto the apex — the degenerate-edge shape of
+    /// of-37i.7, in the one form whose right answer is known in closed
+    /// form. Base circle of radius `r` at `z = z0`, apex at `z0 + h`.
+    ///
+    /// Exactly a cone, not an approximation of one: `v` is degree 1 with
+    /// each ruling's two weights equal, which makes every `v`-line the
+    /// straight segment base→apex, and the base is the of-pb7.3 exact
+    /// quarter arc. So its volume is `π r² h / 3` and its wall normals are
+    /// the analytic cone's, which is what lets a test on it fail loudly
+    /// rather than merely differ.
+    ///
+    /// Topology is [`Scene::nurbs_cylinder`] with the top ring collapsed:
+    /// one apex vertex instead of four, so each wall loop is a triangle
+    /// (base arc, up the far seam, down the near seam) and there is no top
+    /// cap.
+    fn nurbs_cone(&mut self, cx: f64, cy: f64, r: f64, z0: f64, h: f64) -> EntityId<Body> {
+        let axis = Vector3::z();
+        let dirs: [Vector3; 4] = [
+            Vector3::new(1.0, 0.0, 0.0),
+            Vector3::new(0.0, 1.0, 0.0),
+            Vector3::new(-1.0, 0.0, 0.0),
+            Vector3::new(0.0, -1.0, 0.0),
+        ];
+        let base_center = Point3::new(cx, cy, z0);
+        let apex = Point3::new(cx, cy, z0 + h);
+
+        let store = &mut self.store;
+        let geo = &mut self.geo;
+        let body = store.create_body(BodyType::Solid);
+        let shell = store.create_shell(body, true, ShellOrientation::Outward);
+
+        let v_base: Vec<_> = dirs
+            .iter()
+            .map(|d| store.create_vertex(base_center + d * r, SYSTEM_RESOLUTION))
+            .collect();
+        let v_apex = store.create_vertex(apex, SYSTEM_RESOLUTION);
+
+        let e_base: Vec<_> = (0..4)
+            .map(|k| {
+                let circle = Curve3::circle(base_center, axis, r).expect("valid circle");
+                let curve = geo.add_curve(circle);
+                store.create_edge_with_curve(
+                    v_base[k],
+                    v_base[(k + 1) % 4],
+                    SYSTEM_RESOLUTION,
+                    curve,
+                    k as f64 * FRAC_PI_2,
+                    (k + 1) as f64 * FRAC_PI_2,
+                )
+            })
+            .collect();
+        let e_seam: Vec<_> = (0..4)
+            .map(|k| {
+                let from = base_center + dirs[k] * r;
+                let slant = apex - from;
+                let length = slant.norm();
+                let line = Curve3::line(from, slant / length).expect("valid seam");
+                let curve = geo.add_curve(line);
+                store.create_edge_with_curve(
+                    v_base[k],
+                    v_apex,
+                    SYSTEM_RESOLUTION,
+                    curve,
+                    0.0,
+                    length,
+                )
+            })
+            .collect();
+
+        // Base cap looks along -Z, so its arcs run reversed in reversed
+        // order — the `nurbs_cylinder` bottom cap exactly.
+        let f_base = store.create_face(shell, FaceSense::Positive);
+        store.faces.get_mut(f_base).expect("just created").surface =
+            Some(geo.add_surface(Surface3::plane(base_center, -axis).expect("valid plane")));
+        store.create_loop(
+            f_base,
+            LoopType::Outer,
+            &[
+                (e_base[3], FinSense::Reversed),
+                (e_base[2], FinSense::Reversed),
+                (e_base[1], FinSense::Reversed),
+                (e_base[0], FinSense::Reversed),
+            ],
+        );
+
+        let knots_u = KnotVector::clamped_uniform(2, 3).expect("degree-2 knots, 3 controls");
+        let knots_v = KnotVector::clamped_uniform(1, 2).expect("degree-1 knots, 2 controls");
+        for k in 0..4 {
+            let d0 = dirs[k];
+            let d1 = dirs[(k + 1) % 4];
+            let ring = [d0, d0 + d1, d1];
+            let control_points: Vec<Vec<Point3>> = ring
+                .iter()
+                .map(|d| vec![base_center + d * r, apex])
+                .collect();
+            let weights: Vec<Vec<f64>> = [1.0, FRAC_1_SQRT_2, 1.0]
+                .iter()
+                .map(|&w| vec![w, w])
+                .collect();
+            let patch =
+                NurbsSurface::new(control_points, weights, knots_u.clone(), knots_v.clone())
+                    .expect("valid rational quarter-cone patch");
+            let face = store.create_face(shell, FaceSense::Positive);
+            store.faces.get_mut(face).expect("just created").surface =
+                Some(geo.add_surface(Surface3::nurbs(patch)));
+            store.create_loop(
+                face,
+                LoopType::Outer,
+                &[
+                    (e_base[k], FinSense::Forward),
+                    (e_seam[(k + 1) % 4], FinSense::Forward),
+                    (e_seam[k], FinSense::Reversed),
+                ],
+            );
+        }
+        body
+    }
+
     /// Solid cylinder about `+Z` whose wall is four **exact** rational
     /// quadratic NURBS quarter patches — the of-pb7.3 construction (90°
     /// arcs with middle control point at the tangent intersection, weight
@@ -4042,6 +4162,62 @@ fn curved_nurbs_input_body_tessellates_watertight() {
         "NURBS-walled cylinder volume {volume} must sit between the inscribed \
          {segments}-gon prism {prism} and the exact cylinder {}",
         PI * r * r * h
+    );
+}
+
+/// of-37i.7 item 1: a NURBS body whose wall patches carry a **collapsed
+/// control row** — the lofted-to-a-point tip — is admitted by `Chart` and
+/// tessellates **watertight**. Before of-37i.7 `Chart::build` refused every
+/// such patch outright and the tip gridded, which is of-dvj's shape: the
+/// wall sampled the shared base circle by its own rational parameter while
+/// the cap sampled the *edge curve* by angle, the rims missed each other,
+/// and the body came out with open edges. That is not merely an accuracy
+/// loss — with no welded mesh there is no operand SDF, so `hybrid::boolean`
+/// can build neither the exact path's of-3oj sign crutch nor the F-Rep
+/// fallback's field, and *both* paths stop (FREEFORM.md §7.1's lesson).
+///
+/// This is `curved_nurbs_input_body_tessellates_watertight` for the
+/// degenerate case, and deliberately the same cheapest possible statement:
+/// no boolean, just `tessellate_body`. The body is an exact cone, so the
+/// volume bar is known in closed form rather than self-consistent.
+#[test]
+fn nurbs_tip_body_is_admitted_and_tessellates_watertight() {
+    let (r, h) = (1.0, 2.0);
+    let mut scene = Scene::new();
+    let body = scene.nurbs_cone(0.0, 0.0, r, 0.0, h);
+    let failures = scene.store.check(body);
+    assert!(
+        failures.is_empty(),
+        "a collapsed-row NURBS body must pass topology checks, got {failures:?}"
+    );
+
+    let mesh = tessellate_body(
+        &scene.store,
+        &scene.geo,
+        body,
+        &TessellationOptions::default(),
+    )
+    .expect("a collapsed-row NURBS body tessellates");
+    assert!(
+        mesh.is_closed_manifold(),
+        "a NURBS tip body must weld watertight, got {} triangles that do not",
+        mesh.triangle_count()
+    );
+
+    // Bracketed, not approximated, exactly as the cylinder case is: the
+    // base rim is an inscribed polygon at the default `angular_step`, so
+    // the body holds less than the exact cone and more than the pyramid on
+    // that polygon.
+    let volume = mass_properties(&mesh)
+        .expect("closed manifold has mass properties")
+        .volume;
+    let exact = PI * r * r * h / 3.0;
+    let segments = 4.0 * (FRAC_PI_2 / (std::f64::consts::TAU / 32.0)).ceil();
+    let pyramid = 0.5 * segments * r * r * (std::f64::consts::TAU / segments).sin() * h / 3.0;
+    assert!(
+        volume > pyramid && volume < exact,
+        "the tip body's volume {volume} must sit between the inscribed \
+         {segments}-gon pyramid {pyramid} and the exact cone {exact}"
     );
 }
 

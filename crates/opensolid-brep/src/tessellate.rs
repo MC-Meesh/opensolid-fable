@@ -408,11 +408,21 @@ fn tessellate_face_into(
         // priced off how far the normal turns. That covers trimmed faces and
         // inner loops as well, which a grid cannot represent at all.
         //
-        // The one patch that cannot take it is one with a collapsed control
-        // row, which has no chart (`Chart::build` rejects it — the pole
-        // machinery has no analogue for one). Untrimmed, it still grids
-        // correctly off the same turning measure, so it keeps that path.
-        Surface3::Nurbs(nurbs) if nurbs.has_degenerate_edge() => {
+        // A patch with a collapsed *v*-boundary row — the lofted-to-a-point
+        // tip — takes it too as of of-37i.7, with the pole-row treatment in
+        // `nurbs_face_cdt`. It has to: the grid arm below cannot weld a
+        // curved patch to its neighbours (of-dvj), and for a tip body that
+        // is not merely an accuracy loss but a hard stop on *both* paths,
+        // since the F-Rep fallback builds its operand field with this same
+        // tessellator (§7.1's lesson, recurring).
+        //
+        // What still grids is a patch whose degeneracy `Chart` refuses — a
+        // collapsed *u*-boundary or an interior singularity. Those have no
+        // pole, so the CDT has nothing to collapse the row onto. Untrimmed
+        // they grid correctly off the turning measure; trimmed they are
+        // refused by `nurbs_lattice` and fall to F-Rep, which is what the
+        // FREEFORM.md §8 table records.
+        Surface3::Nurbs(nurbs) if nurbs.v_boundary_poles().is_err() => {
             let (us, vs) = nurbs_lattice(store, geo, face_id, face, surface, nurbs, options)?;
             let v_range = (vs[0], vs[vs.len() - 1]);
             emit_grid(surface, &us, &vs, v_range, false, false, flip, mesh);
@@ -473,7 +483,15 @@ fn nurbs_face_cdt(
     for &inner_id in &face.inner_loops {
         rings_p.push(sample_loop(store, geo, face_id, inner_id, options)?);
     }
-    let rings_uv: Vec<Vec<(f64, f64)>> = rings_p
+    // A collapsed `v`-boundary row is one 3D point for the whole `u` span,
+    // so a boundary sample landing on it has no `u` to project for. Both
+    // rings get the pole-row treatment before triangulation; for a patch
+    // with no collapsed row (the common case) this is a no-op.
+    let poles = match surface {
+        Surface3::Nurbs(nurbs) => nurbs.collapsed_v_rows(),
+        _ => [None, None],
+    };
+    let mut rings_uv: Vec<Vec<(f64, f64)>> = rings_p
         .iter()
         .map(|ring| {
             ring.iter()
@@ -484,6 +502,20 @@ fn nurbs_face_cdt(
                 .collect()
         })
         .collect();
+    if poles.iter().any(Option::is_some) {
+        let Surface3::Nurbs(nurbs) = surface else {
+            unreachable!("only a NURBS patch reports collapsed rows")
+        };
+        for (ring_uv, ring_p) in rings_uv.iter_mut().zip(rings_p.iter_mut()) {
+            open_pole_rows(nurbs, &poles, ring_uv, ring_p);
+        }
+        if rings_uv[0].len() < 3 {
+            return Err(invalid_face(
+                face_id,
+                "outer loop degenerates to fewer than 3 parameter points at a pole",
+            ));
+        }
+    }
 
     // The tolerance only feeds `Chart::param`'s iterative inverse, which
     // this path never reaches — every boundary uv is already in hand.
@@ -495,28 +527,132 @@ fn nurbs_face_cdt(
         &rings_p,
     )?;
 
-    let base = mesh.positions.len();
+    // Every parameter point on a pole row lifts to the *same* 3D point, so
+    // they must share one mesh vertex — otherwise the tip carries a fan of
+    // coincident vertices and the triangles between them are zero-area
+    // slivers that no index test can spot. `emit_grid` does the same thing
+    // structurally by giving a singular row a single column; here the row
+    // is discovered rather than gridded, so the sharing is by lookup.
+    let mut pole_vertex: [Option<usize>; 2] = [None, None];
+    let mut index_of: Vec<usize> = Vec::with_capacity(uv.len());
     for (&(u, v), &p) in uv.iter().zip(&points) {
+        let slot = pole_slot(surface, &poles, v);
+        if let Some(existing) = slot.and_then(|s| pole_vertex[s]) {
+            index_of.push(existing);
+            continue;
+        }
+        index_of.push(mesh.positions.len());
+        if let Some(s) = slot {
+            pole_vertex[s] = Some(mesh.positions.len());
+        }
         mesh.positions.push(p);
-        // `Chart::build` admitted this patch, so it has a normal
-        // everywhere — a collapsed control row is the only NURBS analogue
-        // of a pole and it is rejected there, before this point.
-        let normal = surface.normal(u, v).unwrap_or_else(Vector3::zeros);
+        // On a pole row `du × dv` vanishes, so the normal is the meridian
+        // limit. The shared pole vertex keeps whichever meridian reached it
+        // first — a shading choice, and the only one available once the row
+        // is one vertex.
+        let normal = normal_or_limit(surface, u, v).unwrap_or_else(Vector3::zeros);
         mesh.normals.push(if flip { -normal } else { normal });
     }
     // Triangles come out counter-clockwise in parameter space, which is the
     // `du × dv` side; a Negative-sense face's outward direction opposes it.
     for t in tris {
-        let tri = if flip {
-            [base + t[0], base + t[2], base + t[1]]
-        } else {
-            [base + t[0], base + t[1], base + t[2]]
-        };
+        let (a, b, c) = (index_of[t[0]], index_of[t[1]], index_of[t[2]]);
+        let tri = if flip { [a, c, b] } else { [a, b, c] };
         if tri[0] != tri[1] && tri[1] != tri[2] && tri[0] != tri[2] {
             mesh.indices.push(tri);
         }
     }
     Ok(())
+}
+
+/// The surface normal at `(u, v)`, falling back to the meridian limit on a
+/// NURBS patch's collapsed row where `du × dv` vanishes. Only the NURBS arm
+/// is reachable — this serves [`nurbs_face_cdt`] alone — but taking a
+/// `Surface3` keeps the caller from having to carry both forms of the same
+/// surface just for the normal.
+fn normal_or_limit(surface: &Surface3, u: f64, v: f64) -> Option<Vector3> {
+    match surface {
+        Surface3::Nurbs(nurbs) => nurbs.normal_limit(u, v),
+        _ => surface.normal(u, v),
+    }
+}
+
+/// Which pole row (`0` for `v_min`, `1` for `v_max`) the parameter `v` sits
+/// on, or `None` when it sits on neither. Keyed on `v` alone: a pole row
+/// *is* a domain boundary, so no distance test is needed once the row is
+/// known to be collapsed.
+fn pole_slot(surface: &Surface3, poles: &[Option<Point3>; 2], v: f64) -> Option<usize> {
+    let (v0, v1) = surface.domain_v();
+    let eps = 1e-9 * (v1 - v0);
+    [(0usize, v0), (1, v1)]
+        .into_iter()
+        .find(|&(s, vp)| poles[s].is_some() && (v - vp).abs() <= eps)
+        .map(|(s, _)| s)
+}
+
+/// Rewrite a boundary ring so each run of samples standing on a pole
+/// becomes the pole row's two ends — `(u_in, v_pole)` and `(u_out, v_pole)`
+/// — instead of one point with an arbitrary `u`.
+///
+/// This is [`crate::boolean`]'s `CoverEmbedder` pole row, applied to a
+/// tessellation ring rather than an imprint walk, and for the same reason:
+/// the collapsed row is *one 3D point* spanning the whole `u` domain, so a
+/// ring that visits it carries no `u` of its own there. Projecting anyway
+/// yields whatever `u` the solver's last iterate held, which pinches the uv
+/// polygon to a point at the tip — and the polygon then covers a wedge of
+/// the domain rather than the domain, so the triangulation silently misses
+/// most of the patch.
+///
+/// The `u` ends come from the ring's neighbours on either side of the run,
+/// cyclically, which are the meridians the boundary actually arrives and
+/// departs on. The 3D ring gains the pole's point for each new entry, so
+/// the two rings stay index-aligned.
+fn open_pole_rows(
+    nurbs: &NurbsSurface,
+    poles: &[Option<Point3>; 2],
+    ring_uv: &mut Vec<(f64, f64)>,
+    ring_p: &mut Vec<Point3>,
+) {
+    let mut on_pole: Vec<Option<f64>> = ring_p.iter().map(|p| nurbs.pole_v_at(poles, p)).collect();
+    if on_pole.iter().all(Option::is_none) {
+        return;
+    }
+    // A ring *entirely* on a pole has no meridian to read from either side;
+    // leave it for the caller's minimum-length check to reject.
+    let Some(start) = on_pole.iter().position(Option::is_none) else {
+        return;
+    };
+    // Rotate a non-pole sample to the front so no run straddles the ring's
+    // wrap point, which would make a run's own members its neighbours.
+    on_pole.rotate_left(start);
+    ring_uv.rotate_left(start);
+    ring_p.rotate_left(start);
+
+    let n = on_pole.len();
+    let (mut uv_out, mut p_out) = (Vec::with_capacity(n + 2), Vec::with_capacity(n + 2));
+    let mut i = 0;
+    while i < n {
+        let Some(vp) = on_pole[i] else {
+            uv_out.push(ring_uv[i]);
+            p_out.push(ring_p[i]);
+            i += 1;
+            continue;
+        };
+        // The whole run collapses to the same point; find its extent.
+        let mut end = i;
+        while on_pole[(end + 1) % n].is_some() && end + 1 - i < n {
+            end += 1;
+        }
+        let before = (i + n - 1) % n;
+        let after = (end + 1) % n;
+        for u in [ring_uv[before].0, ring_uv[after].0] {
+            uv_out.push((u, vp));
+            p_out.push(ring_p[i]);
+        }
+        i = end + 1;
+    }
+    *ring_uv = uv_out;
+    *ring_p = p_out;
 }
 
 /// Ear-clip triangulate a planar face, bridging any inner loops (holes) into

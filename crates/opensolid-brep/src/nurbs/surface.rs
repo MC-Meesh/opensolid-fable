@@ -163,11 +163,22 @@ impl NurbsSurface {
     /// collapsed control row/column (the classic lofted-to-a-point tip),
     /// where `|S_u × S_v|` vanishes and no limit normal exists.
     ///
-    /// Tested at the four domain corners and the midpoint of each domain
-    /// edge, which is where a collapsed boundary row shows up. The chart
-    /// rejects such patches (they have no pole machinery analogue), so this
-    /// is a conservative gate, not a geometric classification.
+    /// Tested at the domain corners, edge midpoints and center, which is
+    /// where a collapsed boundary row shows up. This is a conservative
+    /// *detector*, not a geometric classification — [`Self::v_boundary_poles`]
+    /// is the one that decides whether a given degeneracy has a chart.
     pub fn has_degenerate_edge(&self) -> bool {
+        self.singularity_probes()
+            .into_iter()
+            .any(|(u, v)| self.is_singular(u, v))
+    }
+
+    /// The parameter pairs [`Self::has_degenerate_edge`] probes: the four
+    /// domain corners, the midpoint of each domain edge, and the center. A
+    /// collapsed boundary row is singular along its whole length, so a
+    /// corner-plus-midpoint sweep of each boundary catches every one; the
+    /// center catches the (unsupported) interior singularity.
+    fn singularity_probes(&self) -> [(f64, f64); 9] {
         let (u0, u1) = self.knots_u.domain();
         let (v0, v1) = self.knots_v.domain();
         let (um, vm) = (0.5 * (u0 + u1), 0.5 * (v0 + v1));
@@ -176,13 +187,209 @@ impl NurbsSurface {
             (u0, vm),
             (u0, v1),
             (um, v0),
+            (um, vm),
             (um, v1),
             (u1, v0),
             (u1, vm),
             (u1, v1),
         ]
-        .into_iter()
-        .any(|(u, v)| self.is_singular(u, v))
+    }
+
+    /// The patch's collapsed **`v`-domain boundary** rows — the classic
+    /// lofted-to-a-point tip — as `[at v_min, at v_max]`, or `Err` naming
+    /// the reason when the patch carries a degeneracy of any *other* shape.
+    ///
+    /// This is the chart's admission test (of-37i.7). The pole machinery in
+    /// `boolean.rs` is **`v`-indexed**: `Chart::pole_v` answers with a `v`,
+    /// and `Chart::param` recovers the collapsed axis by inheriting the
+    /// hint's `u`. A collapsed `u`-line at `v = v_min`/`v_max` has exactly
+    /// that shape — a known pole location plus a `u`-dependent limit
+    /// normal, which is what `Chart::Cone`'s apex already is. A collapsed
+    /// **`u`-boundary** (the `v`-line at `u = u_min`/`u_max`) is the same
+    /// geometry transposed and would need a `pole_u` the pipeline does not
+    /// have, and an *interior* singularity has no known location at all, so
+    /// both are refused here and route to F-Rep intact.
+    ///
+    /// Detection is **structural**, not derivative-based: a boundary row of
+    /// identical control points evaluates to that one point *exactly*,
+    /// whatever the weights, because the basis functions are a partition of
+    /// unity and a weighted average of identical points is that point. That
+    /// yields the pole's position exactly, which the derivative test
+    /// ([`SurfaceEval::is_singular`]) cannot. The two are then cross-checked:
+    /// every singular probe must be explained by a structurally collapsed
+    /// row, so a patch that is singular for some subtler reason (a
+    /// vanishing-but-not-collapsed row, parallel partials in the interior)
+    /// is refused rather than mistaken for a tip.
+    ///
+    /// # Errors
+    /// A collapsed `u`-boundary, or a singularity that no collapsed
+    /// `v`-boundary row explains.
+    pub fn v_boundary_poles(&self) -> Result<[Option<Point3>; 2], &'static str> {
+        let (u0, u1) = self.knots_u.domain();
+        let (v0, v1) = self.knots_v.domain();
+        let (rows, cols) = self.grid_size();
+        let eps = self.collapse_eps();
+
+        let [v_min, v_max] = self.collapsed_v_rows();
+        let row = |i: usize| (0..cols).map(move |j| self.control_point(i, j));
+        let um = 0.5 * (u0 + u1);
+        let u_min = collapsed_to_a_point(row(0), eps).is_some();
+        let u_max = collapsed_to_a_point(row(rows - 1), eps).is_some();
+
+        if u_min || u_max {
+            return Err(
+                "boolean on a NURBS patch whose u-domain boundary collapses to a point \
+                 (of-37i.7): the pole machinery is v-indexed, so only a collapsed \
+                 v-boundary row has a chart analogue",
+            );
+        }
+        for (u, v) in self.singularity_probes() {
+            if !self.is_singular(u, v) {
+                continue;
+            }
+            let explained = (v == v0 && v_min.is_some()) || (v == v1 && v_max.is_some());
+            if !explained {
+                return Err(
+                    "boolean on a NURBS patch with a parameterization singularity that is \
+                     not a collapsed v-boundary row (of-37i.7): its location is not known \
+                     in closed form, so the chart has no pole for it",
+                );
+            }
+        }
+        // `is_singular` is a *relative* test on |S_u x S_v|, so a genuinely
+        // collapsed row always trips it. Structure claiming a collapse the
+        // derivatives do not see would mean the two disagree about the same
+        // patch; refuse rather than build a pole nothing else believes in.
+        if (v_min.is_some() && !self.is_singular(um, v0))
+            || (v_max.is_some() && !self.is_singular(um, v1))
+        {
+            return Err(
+                "boolean on a NURBS patch whose control row is collapsed but whose \
+                 partials are not (of-37i.7): structure and derivatives disagree",
+            );
+        }
+        Ok([v_min, v_max])
+    }
+
+    /// The patch's structurally collapsed `v`-boundary rows as
+    /// `[at v_min, at v_max]` — the *detection* half of
+    /// [`Self::v_boundary_poles`], without its admission checks.
+    ///
+    /// Each entry is the **evaluated surface point** at that boundary's
+    /// midpoint, not the shared control point: the two agree to float noise
+    /// on a collapsed row, and returning the evaluated one guarantees the
+    /// pole coincides with what `surface.point` produces for any uv on the
+    /// row, which is what a triangulation lifting a pole row needs.
+    pub fn collapsed_v_rows(&self) -> [Option<Point3>; 2] {
+        let (u0, u1) = self.knots_u.domain();
+        let (v0, v1) = self.knots_v.domain();
+        let (rows, cols) = self.grid_size();
+        let eps = self.collapse_eps();
+        let um = 0.5 * (u0 + u1);
+        let column = |j: usize| (0..rows).map(move |i| self.control_point(i, j));
+        [
+            collapsed_to_a_point(column(0), eps).map(|_| self.point(um, v0)),
+            collapsed_to_a_point(column(cols - 1), eps).map(|_| self.point(um, v1)),
+        ]
+    }
+
+    /// The domain `v` of the collapsed boundary row that `p` stands on, or
+    /// `None` when `p` is off both (and at once for a patch with no
+    /// collapsed row, which is the common case).
+    ///
+    /// `poles` is passed in rather than recomputed so a caller holding them
+    /// — the chart caches them at build time — does not rescan the control
+    /// grid per query.
+    ///
+    /// The floor is [`Self::pole_floor`]: a distance to the pole *point*,
+    /// not to an axis, because a knot domain has no axis. Near a tip the
+    /// two agree to first order, which is what makes this the same test the
+    /// sphere and cone charts apply.
+    pub fn pole_v_at(&self, poles: &[Option<Point3>; 2], p: &Point3) -> Option<f64> {
+        let [at_v_min, at_v_max] = poles;
+        if at_v_min.is_none() && at_v_max.is_none() {
+            return None;
+        }
+        let floor = self.pole_floor();
+        let (v0, v1) = self.knots_v.domain();
+        // Nearest wins, so a patch collapsed at both ends whose two tips
+        // coincide still answers with one of them rather than the first.
+        [(at_v_min, v0), (at_v_max, v1)]
+            .into_iter()
+            .filter_map(|(pole, v)| pole.map(|q| ((q - p).norm(), v)))
+            .filter(|(d, _)| *d <= floor)
+            .min_by(|(a, _), (b, _)| a.total_cmp(b))
+            .map(|(_, v)| v)
+    }
+
+    /// Distance from a pole point within which a point counts as standing
+    /// *on* that pole: [`POLE_REL_EPS`] relative to the control hull's
+    /// diagonal — the patch's own size, standing in for the sphere chart's
+    /// radius.
+    pub fn pole_floor(&self) -> f64 {
+        POLE_REL_EPS * self.hull_diagonal().max(1.0)
+    }
+
+    /// Absolute distance below which two control points count as the same
+    /// point: [`SYSTEM_RESOLUTION`] relative to the control hull's diagonal,
+    /// so the test does not tighten or loosen with the model's units. A row
+    /// that is merely *nearly* collapsed fails this and the patch routes to
+    /// F-Rep, which is the safe direction.
+    fn collapse_eps(&self) -> f64 {
+        SYSTEM_RESOLUTION * self.hull_diagonal().max(1.0)
+    }
+
+    fn hull_diagonal(&self) -> f64 {
+        self.control_hull_box()
+            .map(|b| (b.max - b.min).norm())
+            .unwrap_or(0.0)
+    }
+
+    /// Unit normal at `(u, v)`, taking the **directional limit** along the
+    /// constant-`u` line where the patch's parameterization collapses.
+    ///
+    /// [`SurfaceEval::normal`] returns `None` on a collapsed row and is
+    /// right to: `|S_u × S_v|` vanishes there and the surface normal is not
+    /// a single vector — a lofted-to-a-point tip is a cone apex, whose
+    /// normal depends on which meridian you arrive along. That is not a
+    /// defect to paper over; it is the same shape `Chart::Cone`'s apex
+    /// normal already has, and that arm answers with the `u`-dependent
+    /// limit rather than refusing. This answers with the same thing, for
+    /// the same reason.
+    ///
+    /// The limit is taken **by L'Hôpital, not by stepping off the row**,
+    /// and that distinction is the whole of this function's accuracy. On a
+    /// collapsed `v`-row `S_u(u, v₀) = 0`, so
+    /// `S_u(u, v₀ + δ) = δ·S_uv(u, v₀) + O(δ²)` and the unit normal tends to
+    /// `normalize(S_uv × S_v)` — an exact expression in derivatives the
+    /// patch already computes. Evaluating at a small offset instead
+    /// recovers the same direction only to `ε_machine/δ`: it asks for a
+    /// quantity of size `δ` from a difference of `O(1)` terms, so the
+    /// offset that is small enough to be the limit is the one whose
+    /// cancellation is worst (`δ = 1e-9` costs ~7 digits of the direction).
+    /// There is no good `δ`, which is why there is none here.
+    ///
+    /// Falls back to the transposed form on a collapsed `u`-row, and
+    /// returns `None` when the second-order term vanishes too (a
+    /// higher-order tangency, which no admitted patch has).
+    pub fn normal_limit(&self, u: f64, v: f64) -> Option<Vector3> {
+        if let Some(n) = self.normal(u, v) {
+            return Some(n);
+        }
+        let ders = self.derivatives(u, v, 2);
+        let (su, sv, suv) = (ders[1][0], ders[0][1], ders[1][1]);
+        // Whichever partial collapsed is the one L'Hôpital replaces. The
+        // offset `δ` it stands for points *into* the domain, so it is
+        // negative at an upper boundary — and `S_u x S_v` scales by `δ`, so
+        // dropping that sign would hand back an inward normal at a `v_max`
+        // pole and an outward one at `v_min`, on the same patch.
+        let cross = if su.norm() <= sv.norm() {
+            (suv * inward(v, self.knots_v.domain())).cross(&sv)
+        } else {
+            su.cross(&(suv * inward(u, self.knots_u.domain())))
+        };
+        let norm = cross.norm();
+        (norm > SYSTEM_RESOLUTION * suv.norm() * su.norm().max(sv.norm())).then(|| cross / norm)
     }
 
     /// Homogeneous control point `(w·P, w)` at grid position `(i, j)`.
@@ -254,6 +461,32 @@ impl NurbsSurface {
         }
         ders
     }
+}
+
+/// Relative floor (a fraction of the control hull's diagonal) on a point's
+/// distance from a collapsed row below which it stands *on* that pole.
+/// Mirrors the `boolean::POLE_REL_EPS` the sphere and cone charts apply to
+/// their own radii.
+const POLE_REL_EPS: f64 = 1e-9;
+
+/// The direction that steps from `t` *into* the domain `(lo, hi)`: `+1` at
+/// the lower boundary, `-1` at the upper. Ties go to `+1`, which only
+/// arises on a domain of zero width where no direction is meaningful.
+fn inward(t: f64, (lo, hi): (f64, f64)) -> f64 {
+    if (t - lo).abs() <= (hi - t).abs() {
+        1.0
+    } else {
+        -1.0
+    }
+}
+
+/// The single point a run of control points collapses to, or `None` when
+/// any of them is further than `eps` from the first. An empty run is not a
+/// collapse.
+fn collapsed_to_a_point(points: impl Iterator<Item = Point3>, eps: f64) -> Option<Point3> {
+    let mut points = points.peekable();
+    let first = *points.peek()?;
+    points.all(|p| (p - first).norm() <= eps).then_some(first)
 }
 
 impl SurfaceEval for NurbsSurface {
@@ -664,6 +897,91 @@ mod tests {
         // Away from the collapsed edge the patch is regular.
         assert!(!patch.is_singular(0.5, 0.5));
         assert!(patch.normal(0.5, 0.5).is_some());
+    }
+
+    /// The triangle patch of `collapsed_edge_is_singular` — a flat one, so
+    /// its limit normal is known exactly: the plane's own.
+    fn triangle_patch() -> NurbsSurface {
+        let apex = Point3::new(0.0, 0.0, 0.0);
+        let control_points = vec![
+            vec![apex, Point3::new(0.0, 1.0, 0.0)],
+            vec![apex, Point3::new(1.0, 1.0, 0.0)],
+        ];
+        let knots = KnotVector::clamped_uniform(1, 2).unwrap();
+        NurbsSurface::bspline(control_points, knots.clone(), knots).unwrap()
+    }
+
+    /// `normal_limit` steps off the collapsed row along constant `u` and
+    /// answers where `normal` gives up. On a *flat* triangle patch every
+    /// meridian's limit is the plane's normal, so the value is known in
+    /// closed form and a plausible-looking wrong direction cannot pass.
+    #[test]
+    fn normal_limit_recovers_the_collapsed_row() {
+        let patch = triangle_patch();
+        assert_eq!(patch.normal(0.5, 0.0), None, "no normal on the row itself");
+        for i in 0..=4 {
+            let u = 0.25 * i as f64;
+            let n = patch
+                .normal_limit(u, 0.0)
+                .expect("the limit exists off the row");
+            assert!((n.z.abs() - 1.0).abs() < TIGHT, "at u={u}: got {n:?}");
+        }
+        // Off the row it is exactly `normal`, not an offset evaluation.
+        assert_eq!(patch.normal_limit(0.5, 0.5), patch.normal(0.5, 0.5));
+    }
+
+    /// The admission test reports *which* boundary collapsed, and the pole
+    /// point it reports is the evaluated surface point — the one
+    /// `chart_point` produces — not merely a control point that happens to
+    /// coincide with it.
+    #[test]
+    fn v_boundary_poles_reports_the_collapsed_row() {
+        let patch = triangle_patch();
+        let poles = patch
+            .v_boundary_poles()
+            .expect("a v-boundary tip is admitted");
+        assert_eq!(poles, [Some(patch.point(0.5, 0.0)), None]);
+        assert_eq!(poles[0], Some(Point3::new(0.0, 0.0, 0.0)));
+
+        // A regular patch has no pole and is admitted just the same.
+        let regular = generic_rational_patch();
+        assert!(!regular.has_degenerate_edge());
+        assert_eq!(regular.v_boundary_poles(), Ok([None, None]));
+    }
+
+    /// A collapsed `u`-boundary is refused: the pipeline's pole machinery
+    /// is `v`-indexed, and there is no `pole_u` to carry the transpose.
+    #[test]
+    fn v_boundary_poles_rejects_a_collapsed_u_boundary() {
+        let apex = Point3::new(0.0, 0.0, 0.0);
+        let control_points = vec![
+            vec![apex, apex],
+            vec![Point3::new(0.0, 1.0, 0.0), Point3::new(1.0, 1.0, 0.0)],
+        ];
+        let knots = KnotVector::clamped_uniform(1, 2).unwrap();
+        let patch = NurbsSurface::bspline(control_points, knots.clone(), knots).unwrap();
+        assert!(patch.has_degenerate_edge());
+        let err = patch
+            .v_boundary_poles()
+            .expect_err("a u-boundary collapse has no pole analogue");
+        assert!(err.contains("u-domain"), "got {err}");
+    }
+
+    /// A row that is *nearly* collapsed is not collapsed: the structural
+    /// test is exact-to-[`SYSTEM_RESOLUTION`], so a patch that merely
+    /// pinches is refused rather than given a pole it does not have. Being
+    /// refused routes it to F-Rep, which is the safe direction — inventing
+    /// a pole where the surface still has a finite `u`-extent would put a
+    /// zero-width wedge into a region polygon.
+    #[test]
+    fn a_nearly_collapsed_row_is_not_a_pole() {
+        let control_points = vec![
+            vec![Point3::new(0.0, 0.0, 0.0), Point3::new(0.0, 1.0, 0.0)],
+            vec![Point3::new(1e-7, 0.0, 0.0), Point3::new(1.0, 1.0, 0.0)],
+        ];
+        let knots = KnotVector::clamped_uniform(1, 2).unwrap();
+        let patch = NurbsSurface::bspline(control_points, knots.clone(), knots).unwrap();
+        assert_eq!(patch.v_boundary_poles(), Ok([None, None]));
     }
 
     // --- Constructor validation ---
