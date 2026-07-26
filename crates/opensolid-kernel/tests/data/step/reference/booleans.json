@@ -1,0 +1,429 @@
+{
+  "schema": "opensolid-occ-boolean-reference/1",
+  "generator": "scripts/occ_reference.py",
+  "occ": "cadquery-ocp 7.9.3.1.1",
+  "note": "BRepAlgoAPI results for a fixed operand set. Operands follow opensolid_kernel::brep::primitives conventions: built centered on the origin, then translated by `at`.",
+  "cases": [
+    {
+      "name": "blocks-union-corner",
+      "op": "unite",
+      "a": {
+        "kind": "block",
+        "size": [
+          20.0,
+          20.0,
+          20.0
+        ],
+        "at": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "b": {
+        "kind": "block",
+        "size": [
+          20.0,
+          20.0,
+          20.0
+        ],
+        "at": [
+          10.0,
+          10.0,
+          10.0
+        ]
+      },
+      "result": {
+        "volume": 15000.0,
+        "area": 4200.0,
+        "centroid": [
+          5.0,
+          5.0,
+          5.0
+        ],
+        "faces": 12,
+        "edges": 30,
+        "vertices": 20,
+        "shells": 1,
+        "valid": true,
+        "solids": 1
+      }
+    },
+    {
+      "name": "blocks-intersect-corner",
+      "op": "intersect",
+      "a": {
+        "kind": "block",
+        "size": [
+          20.0,
+          20.0,
+          20.0
+        ],
+        "at": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "b": {
+        "kind": "block",
+        "size": [
+          20.0,
+          20.0,
+          20.0
+        ],
+        "at": [
+          10.0,
+          10.0,
+          10.0
+        ]
+      },
+      "result": {
+        "volume": 1000.0,
+        "area": 600.0,
+        "centroid": [
+          5.0,
+          5.0,
+          5.0
+        ],
+        "faces": 6,
+        "edges": 12,
+        "vertices": 8,
+        "shells": 1,
+        "valid": true,
+        "solids": 1
+      }
+    },
+    {
+      "name": "blocks-subtract-l-shape",
+      "op": "subtract",
+      "a": {
+        "kind": "block",
+        "size": [
+          20.0,
+          20.0,
+          20.0
+        ],
+        "at": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "b": {
+        "kind": "block",
+        "size": [
+          20.0,
+          20.0,
+          20.0
+        ],
+        "at": [
+          10.0,
+          10.0,
+          10.0
+        ]
+      },
+      "result": {
+        "volume": 7000.0,
+        "area": 2400.0,
+        "centroid": [
+          -0.714285714286,
+          -0.714285714286,
+          -0.714285714286
+        ],
+        "faces": 9,
+        "edges": 21,
+        "vertices": 14,
+        "shells": 1,
+        "valid": true,
+        "solids": 1
+      }
+    },
+    {
+      "name": "block-union-cylinder",
+      "op": "unite",
+      "a": {
+        "kind": "block",
+        "size": [
+          40.0,
+          40.0,
+          20.0
+        ],
+        "at": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "b": {
+        "kind": "cylinder",
+        "radius": 8.0,
+        "height": 60.0,
+        "at": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "result": {
+        "volume": 40042.4771932,
+        "area": 8410.6192983,
+        "centroid": [
+          -1.35143823631e-15,
+          -4.89817991966e-16,
+          -1.81705981353e-16
+        ],
+        "faces": 10,
+        "edges": 18,
+        "vertices": 12,
+        "shells": 1,
+        "valid": true,
+        "solids": 1
+      }
+    },
+    {
+      "name": "block-through-hole",
+      "op": "subtract",
+      "a": {
+        "kind": "block",
+        "size": [
+          40.0,
+          40.0,
+          20.0
+        ],
+        "at": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "b": {
+        "kind": "cylinder",
+        "radius": 8.0,
+        "height": 60.0,
+        "at": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "result": {
+        "volume": 27978.7614034,
+        "area": 7003.18578949,
+        "centroid": [
+          -1.69034375076e-15,
+          -2.14807729051e-16,
+          -4.50553379077e-17
+        ],
+        "faces": 7,
+        "edges": 15,
+        "vertices": 10,
+        "shells": 1,
+        "valid": true,
+        "solids": 1
+      }
+    },
+    {
+      "name": "block-offset-hole",
+      "op": "subtract",
+      "a": {
+        "kind": "block",
+        "size": [
+          40.0,
+          40.0,
+          20.0
+        ],
+        "at": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "b": {
+        "kind": "cylinder",
+        "radius": 6.0,
+        "height": 60.0,
+        "at": [
+          7.0,
+          -5.0,
+          0.0
+        ]
+      },
+      "result": {
+        "volume": 29738.0532894,
+        "area": 6927.7875658,
+        "centroid": [
+          -0.532436566039,
+          0.380311832885,
+          -4.29657701812e-17
+        ],
+        "faces": 7,
+        "edges": 15,
+        "vertices": 10,
+        "shells": 1,
+        "valid": true,
+        "solids": 1
+      }
+    },
+    {
+      "name": "block-intersect-cylinder",
+      "op": "intersect",
+      "a": {
+        "kind": "block",
+        "size": [
+          40.0,
+          40.0,
+          20.0
+        ],
+        "at": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "b": {
+        "kind": "cylinder",
+        "radius": 8.0,
+        "height": 60.0,
+        "at": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "result": {
+        "volume": 4021.23859659,
+        "area": 1407.43350881,
+        "centroid": [
+          -1.24395027542e-15,
+          6.81515979494e-17,
+          2.26172777349e-16
+        ],
+        "faces": 3,
+        "edges": 3,
+        "vertices": 2,
+        "shells": 1,
+        "valid": true,
+        "solids": 1
+      }
+    },
+    {
+      "name": "block-subtract-sphere",
+      "op": "subtract",
+      "a": {
+        "kind": "block",
+        "size": [
+          40.0,
+          40.0,
+          40.0
+        ],
+        "at": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "b": {
+        "kind": "sphere",
+        "radius": 15.0,
+        "at": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "result": {
+        "volume": 49862.8330588,
+        "area": 12427.4333882,
+        "centroid": [
+          -1.29186129532e-18,
+          -4.45935114702e-16,
+          -8.86693934969e-17
+        ],
+        "faces": 7,
+        "edges": 15,
+        "vertices": 10,
+        "shells": 2,
+        "valid": true,
+        "solids": 1
+      }
+    },
+    {
+      "name": "sphere-union-cylinder",
+      "op": "unite",
+      "a": {
+        "kind": "sphere",
+        "radius": 20.0,
+        "at": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "b": {
+        "kind": "cylinder",
+        "radius": 8.0,
+        "height": 60.0,
+        "at": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "result": {
+        "volume": 37862.3981487,
+        "area": 6182.19734556,
+        "centroid": [
+          -8.7436635721e-15,
+          1.00795438323e-15,
+          -3.84336860312e-16
+        ],
+        "faces": 5,
+        "edges": 7,
+        "vertices": 4,
+        "shells": 1,
+        "valid": true,
+        "solids": 1
+      }
+    },
+    {
+      "name": "cylinders-cross-union",
+      "op": "unite",
+      "a": {
+        "kind": "cylinder",
+        "radius": 10.0,
+        "height": 40.0,
+        "at": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "b": {
+        "kind": "cylinder",
+        "radius": 6.0,
+        "height": 60.0,
+        "at": [
+          4.0,
+          0.0,
+          0.0
+        ]
+      },
+      "result": {
+        "volume": 14828.3173249,
+        "area": 3895.57489045,
+        "centroid": [
+          0.610169491525,
+          4.45492671122e-16,
+          -2.4533996187e-16
+        ],
+        "faces": 7,
+        "edges": 9,
+        "vertices": 4,
+        "shells": 1,
+        "valid": true,
+        "solids": 1
+      }
+    }
+  ]
+}

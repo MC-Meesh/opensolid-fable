@@ -1,0 +1,36 @@
+{
+  "schema": "opensolid-occ-reference/1",
+  "generator": "scripts/occ_reference.py",
+  "occ": "cadquery-ocp 7.9.3.1.1",
+  "source": {
+    "file": "occ/periodic/cone_truncated.stp",
+    "bytes": 7269,
+    "fnv1a64": "be910aab3e03fbaa"
+  },
+  "read_status": "IFSelect_RetDone",
+  "totals": {
+    "solids": 1,
+    "faces": 3,
+    "edges": 3,
+    "vertices": 2,
+    "volume": 9189.15851175,
+    "area": 2572.91371171
+  },
+  "solids": [
+    {
+      "volume": 9189.15851175,
+      "area": 2572.91371171,
+      "centroid": [
+        3.49083956823e-13,
+        -3.02579745921e-16,
+        -3.36538461539
+      ],
+      "faces": 3,
+      "edges": 3,
+      "vertices": 2,
+      "shells": 1,
+      "valid": true,
+      "index": 0
+    }
+  ]
+}

@@ -1,0 +1,36 @@
+{
+  "schema": "opensolid-occ-reference/1",
+  "generator": "scripts/occ_reference.py",
+  "occ": "cadquery-ocp 7.9.3.1.1",
+  "source": {
+    "file": "occ/coincident/blocks_partial_overlap.stp",
+    "bytes": 36252,
+    "fnv1a64": "e4de84574d4747fe"
+  },
+  "read_status": "IFSelect_RetDone",
+  "totals": {
+    "solids": 1,
+    "faces": 13,
+    "edges": 29,
+    "vertices": 18,
+    "volume": 14000.0,
+    "area": 4200.0
+  },
+  "solids": [
+    {
+      "volume": 14000.0,
+      "area": 4200.0,
+      "centroid": [
+        -2.77107040091e-17,
+        2.14285714286,
+        8.57142857143
+      ],
+      "faces": 13,
+      "edges": 29,
+      "vertices": 18,
+      "shells": 1,
+      "valid": true,
+      "index": 0
+    }
+  ]
+}

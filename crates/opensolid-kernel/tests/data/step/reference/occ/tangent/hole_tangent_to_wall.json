@@ -1,0 +1,36 @@
+{
+  "schema": "opensolid-occ-reference/1",
+  "generator": "scripts/occ_reference.py",
+  "occ": "cadquery-ocp 7.9.3.1.1",
+  "source": {
+    "file": "occ/tangent/hole_tangent_to_wall.stp",
+    "bytes": 23204,
+    "fnv1a64": "5d46d0b619427b39"
+  },
+  "read_status": "IFSelect_RetDone",
+  "totals": {
+    "solids": 1,
+    "faces": 8,
+    "edges": 17,
+    "vertices": 10,
+    "volume": 29738.0532894,
+    "area": 6927.7875658
+  },
+  "solids": [
+    {
+      "volume": 29738.0532894,
+      "area": 6927.7875658,
+      "centroid": [
+        -1.06487313208,
+        -5.48292458477e-16,
+        -2.1751858734e-19
+      ],
+      "faces": 8,
+      "edges": 17,
+      "vertices": 10,
+      "shells": 1,
+      "valid": true,
+      "index": 0
+    }
+  ]
+}

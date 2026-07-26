@@ -423,6 +423,17 @@ criterion_main!(benches);
 OpenCASCADE (via CadQuery/Python) serves as ground truth for all geometric operations.
 Without this, we're testing against our own assumptions.
 
+> **Implemented (of-ipt.16).** `scripts/occ_reference.py` writes OCC's account
+> of every corpus file — and its `BRepAlgoAPI` results for a fixed operand set
+> — as JSON under `crates/opensolid-kernel/tests/data/step/reference/`. Those
+> files are checked in, so `crates/opensolid-kernel/tests/occ_reference.rs`
+> runs the comparison in the default `cargo test` with no OCC installed; the
+> weekly `external-step-validation` workflow re-checks the data against live
+> OCC. The sketch below is the original design; the shipped script records
+> area, centroid, and vertex counts as well, and the shipped comparison gates
+> edge and vertex counts against a per-file delta because OCC adds seam and
+> degenerate edges that STEP files never spell.
+
 ### 7.1 OCC Comparison Script
 
 ```python
@@ -514,6 +525,15 @@ tests on random primitives give false confidence because they never produce the
 geometry configurations that break real-world algorithms.
 
 ### 8.1 Corpus Structure
+
+> **Partially built (of-ipt.16).** The corpus lives at
+> `crates/opensolid-kernel/tests/data/step/` — 34 files: STEPcode CAx-IF parts,
+> the NIST MBE PMI set, sixteen self-generated `occ/` edge cases covering the
+> periodic / tangent / coincident / thin-feature / high-degree-NURBS / blend
+> families below, and the OCC `reference/` JSONs. Still missing: the ABC
+> Dataset sample (published only as multi-GB chunk archives) and vendor
+> exports whose redistribution terms we can check. See that directory's
+> README for provenance and how to add more.
 
 ```
 tests/corpus/

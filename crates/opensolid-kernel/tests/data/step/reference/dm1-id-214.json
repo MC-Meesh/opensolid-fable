@@ -1,0 +1,126 @@
+{
+  "schema": "opensolid-occ-reference/1",
+  "generator": "scripts/occ_reference.py",
+  "occ": "cadquery-ocp 7.9.3.1.1",
+  "source": {
+    "file": "dm1-id-214.stp",
+    "bytes": 87564,
+    "fnv1a64": "45698f718a48cf29"
+  },
+  "read_status": "IFSelect_RetDone",
+  "totals": {
+    "solids": 7,
+    "faces": 48,
+    "edges": 93,
+    "vertices": 62,
+    "volume": 109069.687139,
+    "area": 31850.9064749
+  },
+  "solids": [
+    {
+      "volume": 96835.90368,
+      "area": 24631.7055119,
+      "centroid": [
+        35.3632504458,
+        20.2035450335,
+        50.0
+      ],
+      "faces": 12,
+      "edges": 30,
+      "vertices": 20,
+      "shells": 1,
+      "valid": true,
+      "index": 0
+    },
+    {
+      "volume": 3415.45479097,
+      "area": 1658.98750853,
+      "centroid": [
+        10.0871751907,
+        -5.38972316349,
+        65.0
+      ],
+      "faces": 5,
+      "edges": 6,
+      "vertices": 4,
+      "shells": 1,
+      "valid": true,
+      "index": 1
+    },
+    {
+      "volume": 3415.45479097,
+      "area": 1658.98750853,
+      "centroid": [
+        10.0871751907,
+        -5.38972316349,
+        35.0
+      ],
+      "faces": 5,
+      "edges": 6,
+      "vertices": 4,
+      "shells": 1,
+      "valid": true,
+      "index": 2
+    },
+    {
+      "volume": 3415.45479097,
+      "area": 1658.98750853,
+      "centroid": [
+        30.0871751907,
+        -5.38972316349,
+        50.0
+      ],
+      "faces": 5,
+      "edges": 6,
+      "vertices": 4,
+      "shells": 1,
+      "valid": true,
+      "index": 3
+    },
+    {
+      "volume": 662.473028793,
+      "area": 747.412812483,
+      "centroid": [
+        10.0551093246,
+        -25.5,
+        35.0009462098
+      ],
+      "faces": 7,
+      "edges": 15,
+      "vertices": 10,
+      "shells": 1,
+      "valid": true,
+      "index": 4
+    },
+    {
+      "volume": 662.473028793,
+      "area": 747.412812483,
+      "centroid": [
+        30.0551093246,
+        -25.5,
+        50.0009462098
+      ],
+      "faces": 7,
+      "edges": 15,
+      "vertices": 10,
+      "shells": 1,
+      "valid": true,
+      "index": 5
+    },
+    {
+      "volume": 662.473028793,
+      "area": 747.412812483,
+      "centroid": [
+        10.0551093246,
+        -25.5,
+        65.0009462098
+      ],
+      "faces": 7,
+      "edges": 15,
+      "vertices": 10,
+      "shells": 1,
+      "valid": true,
+      "index": 6
+    }
+  ]
+}

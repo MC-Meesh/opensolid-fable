@@ -1,0 +1,36 @@
+{
+  "schema": "opensolid-occ-reference/1",
+  "generator": "scripts/occ_reference.py",
+  "occ": "cadquery-ocp 7.9.3.1.1",
+  "source": {
+    "file": "occ/blend/chamfered_box.stp",
+    "bytes": 64283,
+    "fnv1a64": "cdb9c96330c7216d"
+  },
+  "read_status": "IFSelect_RetDone",
+  "totals": {
+    "solids": 1,
+    "faces": 26,
+    "edges": 48,
+    "vertices": 24,
+    "volume": 25524.0,
+    "area": 4740.23434696
+  },
+  "solids": [
+    {
+      "volume": 25524.0,
+      "area": 4740.23434696,
+      "centroid": [
+        -4.18686833797e-16,
+        -3.56329220253e-16,
+        -4.89952677847e-17
+      ],
+      "faces": 26,
+      "edges": 48,
+      "vertices": 24,
+      "shells": 1,
+      "valid": true,
+      "index": 0
+    }
+  ]
+}

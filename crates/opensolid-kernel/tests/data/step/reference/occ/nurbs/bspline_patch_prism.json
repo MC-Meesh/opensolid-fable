@@ -1,0 +1,36 @@
+{
+  "schema": "opensolid-occ-reference/1",
+  "generator": "scripts/occ_reference.py",
+  "occ": "cadquery-ocp 7.9.3.1.1",
+  "source": {
+    "file": "occ/nurbs/bspline_patch_prism.stp",
+    "bytes": 27189,
+    "fnv1a64": "b1ddeff8029e689d"
+  },
+  "read_status": "IFSelect_RetDone",
+  "totals": {
+    "solids": 1,
+    "faces": 6,
+    "edges": 12,
+    "vertices": 8,
+    "volume": 50000.0,
+    "area": 9395.00414957
+  },
+  "solids": [
+    {
+      "volume": 50000.0,
+      "area": 9395.00414957,
+      "centroid": [
+        25.0,
+        25.0,
+        -10.0
+      ],
+      "faces": 6,
+      "edges": 12,
+      "vertices": 8,
+      "shells": 1,
+      "valid": true,
+      "index": 0
+    }
+  ]
+}

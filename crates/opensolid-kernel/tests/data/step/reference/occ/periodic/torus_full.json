@@ -1,0 +1,36 @@
+{
+  "schema": "opensolid-occ-reference/1",
+  "generator": "scripts/occ_reference.py",
+  "occ": "cadquery-ocp 7.9.3.1.1",
+  "source": {
+    "file": "occ/periodic/torus_full.stp",
+    "bytes": 4153,
+    "fnv1a64": "bfeb3ae9894dad8a"
+  },
+  "read_status": "IFSelect_RetDone",
+  "totals": {
+    "solids": 1,
+    "faces": 1,
+    "edges": 2,
+    "vertices": 1,
+    "volume": 37899.2809002,
+    "area": 9474.82022505
+  },
+  "solids": [
+    {
+      "volume": 37899.2809002,
+      "area": 9474.82022505,
+      "centroid": [
+        1.14397380457e-12,
+        -5.26568656483e-16,
+        3.02292894849e-16
+      ],
+      "faces": 1,
+      "edges": 2,
+      "vertices": 1,
+      "shells": 1,
+      "valid": true,
+      "index": 0
+    }
+  ]
+}

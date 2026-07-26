@@ -1,0 +1,36 @@
+{
+  "schema": "opensolid-occ-reference/1",
+  "generator": "scripts/occ_reference.py",
+  "occ": "cadquery-ocp 7.9.3.1.1",
+  "source": {
+    "file": "occ/blend/filleted_box.stp",
+    "bytes": 63580,
+    "fnv1a64": "868e534e9725c260"
+  },
+  "read_status": "IFSelect_RetDone",
+  "totals": {
+    "solids": 1,
+    "faces": 26,
+    "edges": 56,
+    "vertices": 24,
+    "volume": 25849.6044153,
+    "area": 4763.82285093
+  },
+  "solids": [
+    {
+      "volume": 25849.6044153,
+      "area": 4763.82285093,
+      "centroid": [
+        -6.15721502941e-17,
+        8.98953394294e-15,
+        -8.24187211794e-15
+      ],
+      "faces": 26,
+      "edges": 56,
+      "vertices": 24,
+      "shells": 1,
+      "valid": true,
+      "index": 0
+    }
+  ]
+}

@@ -1673,7 +1673,7 @@ mod corpus {
     fn every_vendored_file_imports_structurally() {
         let files = corpus_files();
         assert!(
-            files.len() >= 17,
+            files.len() >= 34,
             "corpus shrank? found only {} files",
             files.len()
         );
@@ -1716,9 +1716,12 @@ mod corpus {
                 );
             }
         }
-        // 2026-07-26 baseline: 16 of 17 — every file but nist_ctc_05, which
-        // still fails on edge geometry that misses its vertex points.
-        const FLOOR: usize = 16;
+        // 2026-07-26 baseline: 31 of 34. Three files fail:
+        // - nist_ctc_05 (of-kwn): edge geometry that misses its vertex points.
+        // - occ/tangent/{cylinder,hole}_tangent_to_wall (of-zdx): a circular
+        //   edge closed on itself by tangency reads as a zero-sweep conic, so
+        //   both the exact path and the mesh fallback refuse the part.
+        const FLOOR: usize = 31;
         assert!(
             passed.len() >= FLOOR,
             "corpus pass count regressed below {FLOOR}: only {passed:?} pass"

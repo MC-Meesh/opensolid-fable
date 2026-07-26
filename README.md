@@ -291,13 +291,15 @@ bounds, and the Euler–Poincaré relation `V − E + F − R = 2(S − H)`
 (`crates/opensolid-brep/src/euler.rs:103`). Bugs found in the field become new
 checker rules, so the same class of error cannot silently return `Ok` twice.
 
-**Every function is tested.** 1187 tests pass across the Rust workspace
+**Every function is tested.** 1593 tests pass across the Rust workspace
 (`cargo test --workspace`), plus the playground's vitest suite. CI runs `fmt`,
 `clippy -D warnings`, `build`, and `test` on every push
 (`.github/workflows/ci.yml`). Five tests are `#[ignore]`d: three are on-demand
-perf measurements (wall-clock probes, too load-sensitive to gate CI), and two
-are known-broken cases held as executable bug reports naming the open bead
-blocking each (of-kb8 STEP shared geometry, of-dvj curved NURBS input bodies),
+perf measurements (wall-clock probes, too load-sensitive to gate CI), one is
+the OCC oracle's corpus-wide measurability scan (a diagnostic that reprints
+the list of files the tessellator can measure), and one is a known-broken case
+held as an executable bug report naming the open bead blocking it (of-kb8,
+STEP shared geometry),
 per the stress-suite-first policy of never softening a test to make it pass. When a bead closes, its tests are
 un-ignored rather than deleted: the sphere-cap refinement fix (of-s89)
 returned three such tests to the suite, and the NURBS promotion gate's three
@@ -366,7 +368,15 @@ byte-identical fixed point from the second write rather than the first
 carries a welded-mesh fallback for files the kernel cannot yet represent
 exactly, unit scaling from the file's declared length unit, and cross-feature
 integration tests chaining STEP with exact booleans, hybrid booleans, and
-sweeps (`crates/opensolid-kernel/tests/integration_e2e.rs`). Meanwhile the F-Rep
+sweeps (`crates/opensolid-kernel/tests/integration_e2e.rs`). What the importer
+reads is checked against **an independent kernel, not just against ourselves**:
+OpenCASCADE's account of all 33 corpus files (per-solid volume, area, centroid,
+face/edge/vertex counts) and its `BRepAlgoAPI` results for a fixed boolean
+operand set are checked into `tests/data/step/reference/` by
+`scripts/occ_reference.py`, and `tests/occ_reference.rs` compares against them
+on every PR without needing OCC installed (of-ipt.16). Face counts agree with
+OCC on every corpus file; the edge and vertex differences are all OCC's own
+seam normalization, recorded per file. Meanwhile the F-Rep
 fallback covers **everything** — any pair of valid inputs produces a
 watertight result, because `min`/`max` on distance fields cannot fail.
 
