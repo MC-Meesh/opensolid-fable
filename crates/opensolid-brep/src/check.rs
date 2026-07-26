@@ -53,16 +53,54 @@
 //!   already failed the closure checks above, so the formula is only ever
 //!   skipped on a body that reports at least one other failure.
 //!
-//! Geometric checks from the spec (edge-on-surface, vertex-on-edge,
-//! self-intersection) are deferred until faces and edges carry real
-//! geometry.
+//! # Geometric checks
+//!
+//! [`TopologyStore::check`] reads only the topology graph, because that is
+//! all a [`TopologyStore`] holds: the curves, surfaces and trim curves live
+//! in a separate [`GeometryStore`], and plenty of callers have a body whose
+//! geometry slots are still empty. The geometric half of the spec's body
+//! validation is therefore a second entry point,
+//! [`TopologyStore::check_geometry`], which takes the geometry store as
+//! well; [`TopologyStore::check_with_geometry`] runs both.
+//!
+//! What it checks (`spec/08-tolerances.md` §7.1, `spec/11-testing.md` §4.1):
+//!
+//! - **Edge on surface** (invariant 1): every point of an edge's curve lies
+//!   within the edge's tolerance of the surface of every face that edge
+//!   bounds. This is also the tolerance-coherence check for edges — a
+//!   tolerance is a *claim* about how far the curve may stray, and the
+//!   claim is measured, not believed.
+//! - **Vertex on edge** (invariant 2): a vertex's point lies within the
+//!   vertex's tolerance of the endpoint of each adjacent edge's curve, at
+//!   the parameter (`t_start`/`t_end`) that endpoint is named by.
+//! - **Pcurve fidelity**: a fin's 2D trim curve tracks its edge's 3D curve,
+//!   `surface.point(pcurve(t)) == curve.point(t)` — the parameterization
+//!   invariant [`crate::pcurve`] is built around, and the thing that goes
+//!   wrong when a pcurve lands on the wrong branch of a periodic surface or
+//!   is left attached across a repair that rewired its fin.
+//! - **Face sense against loop winding**: a face's outer loop runs
+//!   counterclockwise in its surface's `(u, v)` space exactly when the
+//!   face's [`FaceSense`] is `Positive`, since the surface normal is
+//!   `du × dv`. Read from the fins' pcurves, so it applies to bodies that
+//!   carry trim geometry.
+//! - **Edge parameter range**: `[t_start, t_end]` is finite and increasing,
+//!   the precondition every consumer of an edge's curve assumes.
+//!
+//! Self-intersection and face-face clash detection are a separate problem
+//! (a pairwise search rather than a walk) and are not here yet.
 
+use crate::curve::{Curve3, CurveEval};
 use crate::euler::EulerCounts;
+use crate::geometry::GeometryStore;
+use crate::pcurve::{Curve2, Curve2Eval};
+use crate::project::SurfaceProject;
+use crate::surface::{Surface3, SurfaceEval};
 use crate::topology::{
-    Body, BodyType, Edge, Face, Fin, FinSense, Loop, LoopType, SYSTEM_RESOLUTION, Shell,
+    Body, BodyType, Edge, Face, FaceSense, Fin, FinSense, Loop, LoopType, SYSTEM_RESOLUTION, Shell,
     TopologyStore, Vertex,
 };
 use opensolid_core::EntityId;
+use opensolid_core::types::{Point2, Point3, Vector2};
 use thiserror::Error;
 
 /// Maximum allowed tolerance on any entity, from the spec's default
@@ -287,6 +325,70 @@ pub enum CheckFailure {
     /// A vertex whose point has a NaN or infinite coordinate.
     #[error("vertex {0:?} has a non-finite point")]
     NonFinitePoint(EntityId<Vertex>),
+
+    /// An edge whose curve strays further from an adjacent face's surface
+    /// than the edge's tolerance permits (`spec/08-tolerances.md` §7.1
+    /// invariant 1). `allowed` is the edge's tolerance plus round-off slack.
+    #[error(
+        "edge {edge:?} leaves the surface of face {face:?} by {max_deviation} \
+         (allowed {allowed})"
+    )]
+    EdgeOffSurface {
+        edge: EntityId<Edge>,
+        face: EntityId<Face>,
+        max_deviation: f64,
+        allowed: f64,
+    },
+
+    /// A vertex whose point is further from the endpoint of an adjacent
+    /// edge's curve than the vertex's tolerance permits
+    /// (`spec/08-tolerances.md` §7.1 invariant 2).
+    #[error(
+        "vertex {vertex:?} is {deviation} from the endpoint of edge {edge:?} \
+         (allowed {allowed})"
+    )]
+    VertexOffEdge {
+        vertex: EntityId<Vertex>,
+        edge: EntityId<Edge>,
+        deviation: f64,
+        allowed: f64,
+    },
+
+    /// A fin whose pcurve does not track its edge's 3D curve: evaluating the
+    /// face's surface at the pcurve lands somewhere other than the curve
+    /// does at the same parameter (see [`crate::pcurve`]).
+    #[error(
+        "fin {fin:?} pcurve departs from edge {edge:?} by {max_deviation} \
+         (allowed {allowed})"
+    )]
+    PcurveDeviation {
+        fin: EntityId<Fin>,
+        edge: EntityId<Edge>,
+        max_deviation: f64,
+        allowed: f64,
+    },
+
+    /// A face whose outer loop winds the wrong way in its surface's `(u, v)`
+    /// space for the face's [`FaceSense`]: the loop encloses its region with
+    /// the surface normal pointing into the material, not out of it.
+    #[error(
+        "face {face:?} is flagged {sense:?} but its outer loop winds the other \
+         way in parameter space (twice-signed-area {twice_signed_area})"
+    )]
+    FaceSenseContradictsLoop {
+        face: EntityId<Face>,
+        sense: FaceSense,
+        twice_signed_area: f64,
+    },
+
+    /// An edge whose curve parameter range is not a finite increasing
+    /// interval, which every consumer of the edge's geometry assumes.
+    #[error("edge {edge:?} has parameter range [{t_start}, {t_end}]")]
+    InvalidEdgeRange {
+        edge: EntityId<Edge>,
+        t_start: f64,
+        t_end: f64,
+    },
 }
 
 impl CheckFailure {
@@ -294,14 +396,21 @@ impl CheckFailure {
     ///
     /// Structural failures make the Euler–Poincaré counts meaningless, so
     /// [`TopologyStore::check`] skips the formula when any is present.
-    /// Non-structural failures (bad tolerances, non-finite points) leave the
-    /// connectivity intact and do not suppress it.
+    /// Non-structural failures (bad tolerances, non-finite points, and every
+    /// geometric failure from [`TopologyStore::check_geometry`]) leave the
+    /// connectivity intact and do not suppress it — a body can have a
+    /// perfectly sound graph and geometry that misses it.
     pub fn is_structural(&self) -> bool {
         !matches!(
             self,
             CheckFailure::InvalidTolerance { .. }
                 | CheckFailure::ToleranceExceeded { .. }
                 | CheckFailure::NonFinitePoint(_)
+                | CheckFailure::EdgeOffSurface { .. }
+                | CheckFailure::VertexOffEdge { .. }
+                | CheckFailure::PcurveDeviation { .. }
+                | CheckFailure::FaceSenseContradictsLoop { .. }
+                | CheckFailure::InvalidEdgeRange { .. }
         )
     }
 }
@@ -760,6 +869,295 @@ impl TopologyStore {
         let fin = self.fins.get(fin_id)?;
         Some(self.loops.get(fin.loop_ref)?.face)
     }
+
+    // ------------------------------------------------------------------
+    // Geometric validation
+    // ------------------------------------------------------------------
+
+    /// Validate `body`'s *geometry* against its topology, returning every
+    /// defect found (empty means valid). See the [module docs](self) for the
+    /// list of checks.
+    ///
+    /// The geometric counterpart of [`TopologyStore::check`], which reads
+    /// only the topology graph. The two are separate entry points because
+    /// geometry is optional: [`Edge::curve`], [`Face::surface`] and
+    /// [`Fin::pcurve`] are all `Option`, and an entity whose slot is empty
+    /// is simply not measured here — a body under construction is not
+    /// thereby invalid. [`TopologyStore::check_with_geometry`] runs both.
+    ///
+    /// Like `check`, this never panics: it walks as much of the body as it
+    /// can reach and skips (rather than reports) sub-checks blocked by a
+    /// stale reference, which `check` reports.
+    pub fn check_geometry(&self, geo: &GeometryStore, body: EntityId<Body>) -> Vec<CheckFailure> {
+        let mut failures = Vec::new();
+        let Some(b) = self.bodies.get(body) else {
+            return vec![CheckFailure::StaleBody(body)];
+        };
+
+        let mut edges: Vec<EntityId<Edge>> = Vec::new();
+        // (edge, face) pairs already measured. A seam edge is used twice by
+        // the one face, against the one surface, and must not be reported
+        // twice for it.
+        let mut measured: Vec<(EntityId<Edge>, EntityId<Face>)> = Vec::new();
+
+        for &shell_id in &b.shells {
+            let Some(shell) = self.shells.get(shell_id) else {
+                continue;
+            };
+            for &face_id in &shell.faces {
+                let Some(face) = self.faces.get(face_id) else {
+                    continue;
+                };
+                let surface = face.surface.and_then(|id| geo.surface(id));
+                for loop_id in face
+                    .outer_loop
+                    .into_iter()
+                    .chain(face.inner_loops.iter().copied())
+                {
+                    let Some(lp) = self.loops.get(loop_id) else {
+                        continue;
+                    };
+                    for &fin_id in &lp.fins {
+                        let Some(fin) = self.fins.get(fin_id) else {
+                            continue;
+                        };
+                        push_unique(&mut edges, fin.edge);
+                        let Some(edge) = self.edges.get(fin.edge) else {
+                            continue;
+                        };
+                        let Some(curve) = edge.curve.and_then(|id| geo.curve(id)) else {
+                            continue;
+                        };
+                        // A broken range makes every sample below meaningless;
+                        // it is reported once in the per-edge pass.
+                        if !edge_range_is_sane(edge) {
+                            continue;
+                        }
+                        let Some(surface) = surface else {
+                            continue;
+                        };
+
+                        if !measured.contains(&(fin.edge, face_id)) {
+                            measured.push((fin.edge, face_id));
+                            let deviation =
+                                curve_surface_deviation(surface, curve, edge.t_start, edge.t_end);
+                            if let Some((max_deviation, allowed)) =
+                                deviation.exceeding(edge.tolerance)
+                            {
+                                failures.push(CheckFailure::EdgeOffSurface {
+                                    edge: fin.edge,
+                                    face: face_id,
+                                    max_deviation,
+                                    allowed,
+                                });
+                            }
+                        }
+
+                        if let Some(pcurve) = fin.pcurve.and_then(|id| geo.pcurve(id)) {
+                            let deviation =
+                                pcurve_deviation(surface, curve, pcurve, edge.t_start, edge.t_end);
+                            if let Some((max_deviation, allowed)) =
+                                deviation.exceeding(edge.tolerance)
+                            {
+                                failures.push(CheckFailure::PcurveDeviation {
+                                    fin: fin_id,
+                                    edge: fin.edge,
+                                    max_deviation,
+                                    allowed,
+                                });
+                            }
+                        }
+                    }
+                }
+
+                // The winding is only meaningful in a surface's parameter
+                // space, so a face without one has nothing to read it from.
+                if let (Some(surface), Some(outer)) = (surface, face.outer_loop) {
+                    if let Some(twice_signed_area) = self.loop_winding(geo, surface, outer) {
+                        let wound_ccw = twice_signed_area > 0.0;
+                        if wound_ccw != (face.sense == FaceSense::Positive) {
+                            failures.push(CheckFailure::FaceSenseContradictsLoop {
+                                face: face_id,
+                                sense: face.sense,
+                                twice_signed_area,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        for &edge_id in &edges {
+            let Some(edge) = self.edges.get(edge_id) else {
+                continue;
+            };
+            if !edge_range_is_sane(edge) {
+                failures.push(CheckFailure::InvalidEdgeRange {
+                    edge: edge_id,
+                    t_start: edge.t_start,
+                    t_end: edge.t_end,
+                });
+                continue;
+            }
+            let Some(curve) = edge.curve.and_then(|id| geo.curve(id)) else {
+                continue;
+            };
+            for (vertex_id, t) in [
+                (edge.start_vertex, edge.t_start),
+                (edge.end_vertex, edge.t_end),
+            ] {
+                let Some(vertex) = self.vertices.get(vertex_id) else {
+                    continue;
+                };
+                let end = curve.point(t);
+                if !is_finite(&end) || !is_finite(&vertex.point) {
+                    continue;
+                }
+                let mut deviation = Deviation::new();
+                deviation.record((vertex.point - end).norm(), &end);
+                if let Some((gap, allowed)) = deviation.exceeding(vertex.tolerance) {
+                    failures.push(CheckFailure::VertexOffEdge {
+                        vertex: vertex_id,
+                        edge: edge_id,
+                        deviation: gap,
+                        allowed,
+                    });
+                }
+            }
+        }
+
+        failures
+    }
+
+    /// Validate `body` topologically *and* geometrically: the concatenation
+    /// of [`TopologyStore::check`] and [`TopologyStore::check_geometry`],
+    /// topology first.
+    ///
+    /// The two passes are independent — a geometric defect never suppresses
+    /// a topological one or vice versa — so the combined list is exactly
+    /// what running both gives.
+    pub fn check_with_geometry(
+        &self,
+        geo: &GeometryStore,
+        body: EntityId<Body>,
+    ) -> Vec<CheckFailure> {
+        let mut failures = self.check(body);
+        // A stale body is reported once, by `check`; re-reporting it from
+        // the geometric pass would say the same thing twice.
+        if failures == [CheckFailure::StaleBody(body)] {
+            return failures;
+        }
+        failures.extend(self.check_geometry(geo, body));
+        failures
+    }
+
+    /// Twice the signed area a loop encloses in its face's parameter space,
+    /// walked in fin order — positive counterclockwise, which is the sense
+    /// that puts the surface normal (`du × dv`) out of the enclosed region.
+    ///
+    /// `None` whenever the winding is not readable, in which case nothing is
+    /// concluded from it:
+    ///
+    /// - a fin without a pcurve. Trim geometry is the only place a loop's
+    ///   parameter-space path is recorded, and most kernel-built bodies
+    ///   carry none (only the STEP reader attaches them today), which is not
+    ///   a defect.
+    /// - a path that does not close up once branch shifts are taken out
+    ///   (below): the polygon is then not the loop's boundary and its area
+    ///   means nothing.
+    /// - a path enclosing essentially nothing relative to its own extent: a
+    ///   sphere face bounded only by its seam meridian runs up one branch
+    ///   and back down the other, and the sign of that near-zero area is
+    ///   noise. Which branch each of the two runs takes is arbitrary there —
+    ///   the two lifts below disagree — so there is nothing to read.
+    ///
+    /// On a periodic surface the path is lifted to the universal cover
+    /// before its area is taken: each fin's pcurve picks its own branch, so
+    /// a cylinder wall's boundary arrives as four runs that jump a whole
+    /// period between them. Continuing each run from the previous one's end
+    /// unrolls those jumps and recovers the rectangle the wall really is.
+    fn loop_winding(
+        &self,
+        geo: &GeometryStore,
+        surface: &Surface3,
+        loop_id: EntityId<Loop>,
+    ) -> Option<f64> {
+        let lp = self.loops.get(loop_id)?;
+        if lp.fins.is_empty() {
+            return None;
+        }
+        // One sampled run of parameter-space points per fin, in fin order.
+        let mut runs: Vec<Vec<Point2>> = Vec::with_capacity(lp.fins.len());
+        for &fin_id in &lp.fins {
+            let fin = self.fins.get(fin_id)?;
+            let pcurve = geo.pcurve(fin.pcurve?)?;
+            let edge = self.edges.get(fin.edge)?;
+            if !edge_range_is_sane(edge) {
+                return None;
+            }
+            let forward = fin.sense == FinSense::Forward;
+            let run: Vec<Point2> = edge_samples(edge.t_start, edge.t_end)
+                .map(|t| {
+                    // A Reversed fin traverses its edge end → start, so its
+                    // pcurve is walked backwards over the same range.
+                    let t = if forward {
+                        t
+                    } else {
+                        edge.t_start + edge.t_end - t
+                    };
+                    pcurve.point(t)
+                })
+                .collect();
+            if !run.iter().all(|p| p.coords.iter().all(|c| c.is_finite())) {
+                return None;
+            }
+            runs.push(run);
+        }
+
+        // Lift to the universal cover: shift each run by whole periods so it
+        // continues from where the previous one ended.
+        let (period_u, period_v) = (surface.period_u(), surface.period_v());
+        let mut offset = Vector2::zeros();
+        let mut previous_end: Option<Point2> = None;
+        for run in &mut runs {
+            if let Some(previous) = previous_end {
+                offset += branch_shift(previous - (run[0] + offset), period_u, period_v);
+            }
+            for p in run.iter_mut() {
+                *p += offset;
+            }
+            previous_end = Some(*run.last()?);
+        }
+
+        let polygon: Vec<Point2> = runs.iter().flatten().copied().collect();
+        let (mut min, mut max) = (polygon[0], polygon[0]);
+        for p in &polygon {
+            min = Point2::new(min.x.min(p.x), min.y.min(p.y));
+            max = Point2::new(max.x.max(p.x), max.y.max(p.y));
+        }
+        let extent = (max.x - min.x).max(max.y - min.y);
+        if extent <= 0.0 || !extent.is_finite() {
+            return None;
+        }
+
+        // Continuity: each run must now start where the previous one ended,
+        // the last one included — the lift closes a periodic path only if it
+        // was one to begin with.
+        for i in 0..runs.len() {
+            let end = *runs[i].last()?;
+            let start = *runs[(i + 1) % runs.len()].first()?;
+            if (start - end).norm() > WINDING_CONTINUITY_REL * extent {
+                return None;
+            }
+        }
+
+        let mut twice_area = 0.0;
+        for i in 0..polygon.len() {
+            let (a, b) = (polygon[i], polygon[(i + 1) % polygon.len()]);
+            twice_area += a.x * b.y - b.x * a.y;
+        }
+        (twice_area.abs() > WINDING_AREA_REL * extent * extent).then_some(twice_area)
+    }
 }
 
 /// Tolerance sanity: finite, at least the resolution floor, at most the
@@ -774,6 +1172,198 @@ fn check_tolerance(failures: &mut Vec<CheckFailure>, entity: EntityRef, toleranc
             limit: MAX_ALLOWED_TOLERANCE,
         });
     }
+}
+
+// --------------------------------------------------------------------------
+// Geometric measurement
+// --------------------------------------------------------------------------
+
+/// Samples taken along an edge by the geometric checks. One more than a
+/// power of two, so both endpoints and the midpoint are hit exactly.
+const GEOMETRY_SAMPLES: usize = 17;
+
+/// Round-off slack, relative to coordinate magnitude, added to a declared
+/// tolerance before a measured deviation counts as a violation.
+///
+/// Deviations are measured by evaluating and projecting points, whose
+/// absolute error scales with how far from the origin they sit, so the slack
+/// scales with it too (floored at magnitude 1, giving an absolute 1e-11 near
+/// the origin). Without it a body a kilometre from the origin reports
+/// floating-point noise as a precision defect. It sits far above the ~1e-16
+/// relative error the arithmetic carries and far below any tolerance a
+/// producer would set deliberately, so it neither cries wolf nor hides one.
+const PROJECTION_SLACK_REL: f64 = 1e-11;
+
+/// How much of its own extent a loop must enclose in parameter space before
+/// its winding is taken as evidence of a face's orientation.
+const WINDING_AREA_REL: f64 = 1e-6;
+
+/// How closely, relative to the loop's parameter-space extent, consecutive
+/// fins' pcurves must meet for the loop to count as one closed path.
+const WINDING_CONTINUITY_REL: f64 = 1e-6;
+
+/// The whole-period displacement bringing `gap` closest to zero, in each
+/// periodic parameter direction. Non-periodic directions never shift: there
+/// is no other representative of the same point to move to.
+fn branch_shift(gap: Vector2, period_u: Option<f64>, period_v: Option<f64>) -> Vector2 {
+    let along = |gap: f64, period: Option<f64>| match period {
+        Some(period) if period > 0.0 && period.is_finite() => (gap / period).round() * period,
+        _ => 0.0,
+    };
+    Vector2::new(along(gap.x, period_u), along(gap.y, period_v))
+}
+
+/// Whether every coordinate of `p` is finite.
+fn is_finite(p: &Point3) -> bool {
+    p.coords.iter().all(|c| c.is_finite())
+}
+
+/// An edge's parameter range is usable exactly when it is finite and
+/// increasing. NaN-safe: only a strictly increasing finite range passes.
+fn edge_range_is_sane(edge: &Edge) -> bool {
+    edge.t_start.is_finite()
+        && edge.t_end.partial_cmp(&edge.t_start) == Some(std::cmp::Ordering::Greater)
+}
+
+/// The [`GEOMETRY_SAMPLES`] parameters spanning `[t_start, t_end]`, both
+/// endpoints included.
+fn edge_samples(t_start: f64, t_end: f64) -> impl Iterator<Item = f64> {
+    (0..GEOMETRY_SAMPLES)
+        .map(move |i| t_start + (t_end - t_start) * (i as f64) / ((GEOMETRY_SAMPLES - 1) as f64))
+}
+
+/// The largest gap found over a run of samples, together with the coordinate
+/// magnitude the samples sat at — which is what sets the round-off slack the
+/// gap is judged against.
+#[derive(Debug, Clone, Copy)]
+struct Deviation {
+    max: f64,
+    scale: f64,
+}
+
+impl Deviation {
+    fn new() -> Self {
+        Deviation {
+            max: 0.0,
+            scale: 1.0,
+        }
+    }
+
+    /// Record a gap of `gap` measured at `at`.
+    fn record(&mut self, gap: f64, at: &Point3) {
+        // `>` is NaN-safe in the direction that matters: a NaN gap is not
+        // recorded rather than poisoning the maximum.
+        if gap > self.max {
+            self.max = gap;
+        }
+        self.scale = self
+            .scale
+            .max(at.coords.iter().fold(0.0f64, |acc, &c| acc.max(c.abs())));
+    }
+
+    /// `Some((max, allowed))` when the largest gap exceeds what `tolerance`
+    /// permits, `None` when it is within it.
+    fn exceeding(&self, tolerance: f64) -> Option<(f64, f64)> {
+        // A tolerance that is itself nonsense is reported by `check`; here it
+        // falls back to the resolution floor rather than compounding into a
+        // second, misleading failure (an infinite tolerance permitting
+        // everything, a negative one permitting nothing).
+        let claimed = if tolerance.is_finite() && tolerance > SYSTEM_RESOLUTION {
+            tolerance
+        } else {
+            SYSTEM_RESOLUTION
+        };
+        let allowed = claimed + PROJECTION_SLACK_REL * self.scale;
+        (self.max > allowed).then_some((self.max, allowed))
+    }
+}
+
+/// Largest distance from `curve`, over `[t_start, t_end]`, to `surface`.
+///
+/// Each sample is projected with [`SurfaceProject::project_point`], never
+/// with the seeded variant. A seed picks a *branch*, and the question here
+/// is not which branch the curve is nearest — it is how far the curve is
+/// from the surface at all, which is the global minimum. Seeding from the
+/// previous sample is faster and correct for walking a known curve, but on a
+/// surface that closes on itself (a rational-quadratic full circle extruded
+/// into a ruled patch, all over the STEP corpus) the seeded iteration can
+/// settle on a stationary point that is not the nearest one and report a
+/// curve lying exactly on its surface as a whole diameter off it.
+///
+/// Samples whose projection did not converge are skipped: a projection
+/// returns a point that genuinely is on the surface, so its distance is an
+/// *upper* bound on the true one, and a stalled iteration can only
+/// over-report.
+fn curve_surface_deviation(
+    surface: &Surface3,
+    curve: &Curve3,
+    t_start: f64,
+    t_end: f64,
+) -> Deviation {
+    let mut deviation = Deviation::new();
+    for t in edge_samples(t_start, t_end) {
+        let p = curve.point(t);
+        if !is_finite(&p) {
+            continue;
+        }
+        let projection = surface.project_point(&p);
+        if projection.converged {
+            deviation.record(projection.distance, &p);
+        }
+    }
+    deviation
+}
+
+/// Largest gap between `surface.point(pcurve(t))` and `curve.point(t)` — the
+/// parameterization invariant [`crate::pcurve`] is built around.
+fn pcurve_deviation(
+    surface: &Surface3,
+    curve: &Curve3,
+    pcurve: &Curve2,
+    t_start: f64,
+    t_end: f64,
+) -> Deviation {
+    let mut deviation = Deviation::new();
+    for t in pcurve_check_params(pcurve, t_start, t_end) {
+        let uv = pcurve.point(t);
+        if !uv.coords.iter().all(|c| c.is_finite()) {
+            continue;
+        }
+        let (on_surface, on_curve) = (surface.point(uv.x, uv.y), curve.point(t));
+        if !is_finite(&on_surface) || !is_finite(&on_curve) {
+            continue;
+        }
+        deviation.record((on_surface - on_curve).norm(), &on_curve);
+    }
+    deviation
+}
+
+/// Parameters at which a pcurve is held to the invariant.
+///
+/// [`Curve2::Line`] and [`Curve2::Circle`] are exact fits, so they are
+/// sampled evenly across the edge's range. A [`Curve2::Polyline`] only
+/// claims to lie on the surface *at its own vertices*: between them it is a
+/// chord, and the error there is bounded by the sample spacing — the
+/// documented, deliberate approximation of freeform trim (see
+/// [`crate::pcurve`]), not a defect. Its vertices are where a pcurve on the
+/// wrong branch, running backwards, or fitted against a different edge shows
+/// up anyway.
+///
+/// A polyline whose parameters miss the edge's range is not that edge's
+/// pcurve at all, so there the range itself is sampled and the mismatch
+/// measured rather than quietly skipped.
+fn pcurve_check_params(pcurve: &Curve2, t_start: f64, t_end: f64) -> Vec<f64> {
+    if let Curve2::Polyline { params, .. } = pcurve {
+        let inside: Vec<f64> = params
+            .iter()
+            .copied()
+            .filter(|&t| t >= t_start && t <= t_end)
+            .collect();
+        if inside.len() >= 2 {
+            return inside;
+        }
+    }
+    edge_samples(t_start, t_end).collect()
 }
 
 #[cfg(test)]
@@ -1481,5 +2071,580 @@ mod tests {
         }
         assert!(failures.contains(&CheckFailure::NonManifoldEdge { edge, fins: 3 }));
         assert_eq!(failures.len(), 4);
+    }
+
+    // ------------------------------------------------------------------
+    // Geometric checks
+    // ------------------------------------------------------------------
+
+    mod geometry {
+        use super::*;
+        use crate::curve::Curve3;
+        use crate::pcurve::{Curve2, attach_body_pcurves};
+        use crate::primitives;
+        use crate::surface::Surface3;
+        use opensolid_core::Vector3;
+        use opensolid_core::types::{Point2, Vector2};
+
+        /// Every primitive, with and without trim geometry attached. The
+        /// builders promise exact geometry, so nothing here has any slack to
+        /// spend: this is the baseline the defect tests perturb.
+        fn primitive_bodies() -> Vec<(&'static str, TopologyStore, GeometryStore, EntityId<Body>)> {
+            let mut out = Vec::new();
+            for (name, build) in [
+                (
+                    "block",
+                    (|s: &mut TopologyStore, g: &mut GeometryStore| {
+                        primitives::block(s, g, 2.0, 3.0, 4.0)
+                    }) as fn(&mut TopologyStore, &mut GeometryStore) -> _,
+                ),
+                ("cylinder", |s, g| primitives::cylinder(s, g, 1.5, 4.0)),
+                ("sphere", |s, g| primitives::sphere(s, g, 2.0)),
+                ("torus", |s, g| primitives::torus(s, g, 3.0, 1.0)),
+                ("cone", |s, g| primitives::cone(s, g, 2.0, 0.0, 3.0)),
+                ("frustum", |s, g| primitives::cone(s, g, 2.0, 1.0, 3.0)),
+            ] {
+                let (mut store, mut geo) = (TopologyStore::new(), GeometryStore::new());
+                let body = build(&mut store, &mut geo).expect("valid primitive");
+                out.push((name, store, geo, body));
+            }
+            out
+        }
+
+        /// A block with trim geometry on every fin — the fixture the pcurve
+        /// and face-sense checks need, since only bodies carrying pcurves
+        /// have a readable parameter-space winding.
+        fn block_with_pcurves() -> (TopologyStore, GeometryStore, EntityId<Body>) {
+            let (mut store, mut geo) = (TopologyStore::new(), GeometryStore::new());
+            let body = primitives::block(&mut store, &mut geo, 2.0, 3.0, 4.0).expect("valid block");
+            let attached = attach_body_pcurves(&mut store, &mut geo, body);
+            assert_eq!(attached, 24, "a block has 24 fins, all of them fittable");
+            (store, geo, body)
+        }
+
+        fn first_face(store: &TopologyStore, body: EntityId<Body>) -> EntityId<Face> {
+            store.faces_of_body(body)[0]
+        }
+
+        #[test]
+        fn primitives_pass_the_geometric_check() {
+            for (name, store, geo, body) in primitive_bodies() {
+                assert_eq!(
+                    store.check_geometry(&geo, body),
+                    Vec::new(),
+                    "{name} must pass the geometric check"
+                );
+                assert_eq!(
+                    store.check_with_geometry(&geo, body),
+                    Vec::new(),
+                    "{name} must pass both checks"
+                );
+            }
+        }
+
+        /// The same primitives once trim geometry is derived for them: the
+        /// pcurve and face-sense checks now have something to read, and must
+        /// still find nothing.
+        #[test]
+        fn primitives_with_pcurves_pass_the_geometric_check() {
+            for (name, mut store, mut geo, body) in primitive_bodies() {
+                let attached = attach_body_pcurves(&mut store, &mut geo, body);
+                assert!(attached > 0, "{name} must get some trim geometry");
+                assert_eq!(
+                    store.check_geometry(&geo, body),
+                    Vec::new(),
+                    "{name} with pcurves must pass the geometric check"
+                );
+            }
+        }
+
+        /// Coverage of the face-sense check across the primitives, and that
+        /// it covers the *right* faces: flipping every sense flag on a body
+        /// must be caught on exactly those faces whose loop has a readable
+        /// winding, and that has to be nearly all of them or the check is
+        /// only nominally there.
+        ///
+        /// The two it cannot read fail for one reason: an outer loop that is
+        /// a seam run twice, with a parameterization singularity in between.
+        /// The sphere's face is bounded only by its pole-to-pole meridian
+        /// and the apex-capped cone's wall only by its apex-to-rim
+        /// generator; either encloses nothing in parameter space, and the
+        /// two ways to lift it disagree about which branch each run takes.
+        #[test]
+        fn face_sense_check_covers_the_primitives_it_can_read() {
+            let readable: Vec<(&str, usize, usize)> = primitive_bodies()
+                .into_iter()
+                .map(|(name, mut store, mut geo, body)| {
+                    attach_body_pcurves(&mut store, &mut geo, body);
+                    let faces = store.faces_of_body(body);
+                    for &face in &faces {
+                        let face = store.faces.get_mut(face).expect("live face");
+                        face.sense = match face.sense {
+                            FaceSense::Positive => FaceSense::Negative,
+                            FaceSense::Negative => FaceSense::Positive,
+                        };
+                    }
+                    let caught = store
+                        .check_geometry(&geo, body)
+                        .iter()
+                        .filter(|f| matches!(f, CheckFailure::FaceSenseContradictsLoop { .. }))
+                        .count();
+                    (name, faces.len(), caught)
+                })
+                .collect();
+            assert_eq!(
+                readable,
+                vec![
+                    ("block", 6, 6),
+                    ("cylinder", 3, 3),
+                    ("sphere", 1, 0),
+                    ("torus", 1, 1),
+                    ("cone", 2, 1),
+                    ("frustum", 3, 3),
+                ]
+            );
+        }
+
+        /// The periodic lift, on the face that needs it: a cylinder wall's
+        /// four boundary runs each pick their own branch of `u`, and only
+        /// after they are unrolled does the loop read as the full
+        /// `[0, 2π] × [0, height]` rectangle its face really is.
+        #[test]
+        fn a_seam_crossing_loop_winds_over_the_whole_period() {
+            let (mut store, mut geo) = (TopologyStore::new(), GeometryStore::new());
+            let (radius, height) = (1.5, 4.0);
+            let body = primitives::cylinder(&mut store, &mut geo, radius, height).expect("valid");
+            attach_body_pcurves(&mut store, &mut geo, body);
+            let wall = store
+                .faces_of_body(body)
+                .into_iter()
+                .find(|&f| {
+                    let face = store.faces.get(f).expect("live face");
+                    matches!(
+                        geo.surface(face.surface.expect("surface")),
+                        Some(Surface3::Cylinder { .. })
+                    )
+                })
+                .expect("a cylinder has a wall");
+            let face = store.faces.get(wall).expect("live face");
+            let surface = geo.surface(face.surface.expect("surface")).expect("live");
+            let winding = store
+                .loop_winding(&geo, surface, face.outer_loop.expect("outer loop"))
+                .expect("the wall's winding is readable");
+            let expected = 2.0 * std::f64::consts::TAU * height;
+            assert!(
+                (winding - expected).abs() < 1e-9,
+                "expected twice the parameter rectangle {expected}, got {winding}"
+            );
+        }
+
+        /// A body whose geometry slots are empty is under construction, not
+        /// invalid: the Euler-built cube carries no curves or surfaces at all
+        /// and has nothing to measure.
+        #[test]
+        fn geometry_free_body_has_nothing_to_report() {
+            let (store, body, _shell) = build_cube();
+            let geo = GeometryStore::new();
+            assert_eq!(store.check_geometry(&geo, body), Vec::new());
+        }
+
+        #[test]
+        fn stale_body_reported_once_by_the_combined_check() {
+            let (mut store, geo, body) = block_with_pcurves();
+            store.bodies.remove(body);
+            assert_eq!(
+                store.check_with_geometry(&geo, body),
+                vec![CheckFailure::StaleBody(body)]
+            );
+        }
+
+        /// Sliding a face's plane off its own boundary puts all four of that
+        /// face's edges off its surface — and only that face's, since each
+        /// edge still lies on the neighbour it shares.
+        #[test]
+        fn edge_off_surface_detected() {
+            let (mut store, mut geo, body) = block_with_pcurves();
+            let face_id = first_face(&store, body);
+            let face = store.faces.get(face_id).expect("live face");
+            let old = geo
+                .surface(face.surface.expect("block faces carry surfaces"))
+                .expect("live surface")
+                .clone();
+            let Surface3::Plane { origin, normal } = old else {
+                panic!("a block's faces are planar");
+            };
+            let moved = geo
+                .add_surface(Surface3::plane(origin + normal * 0.1, normal).expect("valid plane"));
+            store.faces.get_mut(face_id).expect("live face").surface = Some(moved);
+
+            let failures = store.check_geometry(&geo, body);
+            let off: Vec<_> = failures
+                .iter()
+                .filter_map(|f| match f {
+                    CheckFailure::EdgeOffSurface {
+                        edge,
+                        face,
+                        max_deviation,
+                        ..
+                    } => Some((*edge, *face, *max_deviation)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(off.len(), 4, "one per edge of the moved face: {failures:?}");
+            for (_, face, deviation) in &off {
+                assert_eq!(*face, face_id);
+                assert!(
+                    (deviation - 0.1).abs() < 1e-9,
+                    "the measured gap is the offset, got {deviation}"
+                );
+            }
+        }
+
+        /// The declared tolerance is what the deviation is judged against:
+        /// the same displaced surface passes once every edge on it claims a
+        /// tolerance that covers the gap.
+        #[test]
+        fn edge_tolerance_that_covers_the_gap_is_accepted() {
+            let (mut store, mut geo, body) = block_with_pcurves();
+            let face_id = first_face(&store, body);
+            let face = store.faces.get(face_id).expect("live face");
+            let Surface3::Plane { origin, normal } = geo
+                .surface(face.surface.expect("surface"))
+                .expect("live surface")
+                .clone()
+            else {
+                panic!("a block's faces are planar");
+            };
+            // Well inside MAX_ALLOWED_TOLERANCE, so `check` stays quiet too.
+            let gap = 1e-3;
+            let moved =
+                geo.add_surface(Surface3::plane(origin + normal * gap, normal).expect("plane"));
+            store.faces.get_mut(face_id).expect("live face").surface = Some(moved);
+            for edge in store.edges_of_face(face_id) {
+                store.edges.get_mut(edge).expect("live edge").tolerance = gap * 2.0;
+            }
+
+            let failures = store.check_geometry(&geo, body);
+            assert!(
+                !failures
+                    .iter()
+                    .any(|f| matches!(f, CheckFailure::EdgeOffSurface { .. })),
+                "a tolerance covering the gap admits it: {failures:?}"
+            );
+        }
+
+        #[test]
+        fn vertex_off_edge_detected() {
+            let (mut store, geo, body) = block_with_pcurves();
+            let vertex_id = store.vertices_of_face(first_face(&store, body))[0];
+            let vertex = store.vertices.get_mut(vertex_id).expect("live vertex");
+            vertex.point += Vector3::new(0.05, 0.0, 0.0);
+
+            let failures = store.check_geometry(&geo, body);
+            let off: Vec<_> = failures
+                .iter()
+                .filter_map(|f| match f {
+                    CheckFailure::VertexOffEdge {
+                        vertex, deviation, ..
+                    } => Some((*vertex, *deviation)),
+                    _ => None,
+                })
+                .collect();
+            // Three edges meet at a block corner, and the vertex has moved
+            // off the endpoint of every one of them.
+            assert_eq!(off.len(), 3, "{failures:?}");
+            for (vertex, deviation) in &off {
+                assert_eq!(*vertex, vertex_id);
+                assert!((deviation - 0.05).abs() < 1e-9, "got {deviation}");
+            }
+        }
+
+        /// A moved vertex that declares a tolerance covering the move is a
+        /// tolerant vertex, not a broken one — that is what the tolerance is
+        /// for (`spec/08-tolerances.md` §7.1 invariant 2).
+        #[test]
+        fn vertex_tolerance_that_covers_the_move_is_accepted() {
+            let (mut store, geo, body) = block_with_pcurves();
+            let vertex_id = store.vertices_of_face(first_face(&store, body))[0];
+            let vertex = store.vertices.get_mut(vertex_id).expect("live vertex");
+            vertex.point += Vector3::new(1e-3, 0.0, 0.0);
+            vertex.tolerance = 2e-3;
+
+            assert!(
+                !store
+                    .check_geometry(&geo, body)
+                    .iter()
+                    .any(|f| matches!(f, CheckFailure::VertexOffEdge { .. }))
+            );
+        }
+
+        /// A pcurve pointing somewhere else in parameter space no longer
+        /// tracks its edge, however well-formed it is in itself.
+        #[test]
+        fn pcurve_deviation_detected() {
+            let (mut store, mut geo, body) = block_with_pcurves();
+            let face_id = first_face(&store, body);
+            let loop_id = store.loops_of_face(face_id)[0];
+            let fin_id = store.fins_of_loop(loop_id)[0];
+            let edge_id = store.fin_edge(fin_id);
+            let wrong = geo.add_pcurve(
+                Curve2::line(Point2::new(10.0, 10.0), Vector2::x()).expect("valid pcurve"),
+            );
+            store.fins.get_mut(fin_id).expect("live fin").pcurve = Some(wrong);
+
+            let failures = store.check_geometry(&geo, body);
+            assert!(
+                failures.iter().any(|f| matches!(
+                    f,
+                    CheckFailure::PcurveDeviation { fin, edge, .. }
+                        if *fin == fin_id && *edge == edge_id
+                )),
+                "{failures:?}"
+            );
+        }
+
+        /// A pcurve that traces the right path backwards satisfies neither
+        /// the parameterization invariant nor the loop's winding.
+        #[test]
+        fn reversed_pcurve_detected() {
+            let (mut store, mut geo, body) = block_with_pcurves();
+            let face_id = first_face(&store, body);
+            let loop_id = store.loops_of_face(face_id)[0];
+            let fin_id = store.fins_of_loop(loop_id)[0];
+            let edge_id = store.fin_edge(fin_id);
+            let edge = store.edges.get(edge_id).expect("live edge");
+            let (t_start, t_end) = (edge.t_start, edge.t_end);
+            let original = geo
+                .pcurve(
+                    store
+                        .fins
+                        .get(fin_id)
+                        .expect("live fin")
+                        .pcurve
+                        .expect("pcurve"),
+                )
+                .expect("live pcurve")
+                .clone();
+            // Same geometric path, run the other way over the same range.
+            let reversed = Curve2::polyline(
+                vec![t_start, t_end],
+                vec![original.point(t_end), original.point(t_start)],
+            )
+            .expect("valid pcurve");
+            let reversed = geo.add_pcurve(reversed);
+            store.fins.get_mut(fin_id).expect("live fin").pcurve = Some(reversed);
+
+            let failures = store.check_geometry(&geo, body);
+            assert!(
+                failures.iter().any(
+                    |f| matches!(f, CheckFailure::PcurveDeviation { fin, .. } if *fin == fin_id)
+                ),
+                "{failures:?}"
+            );
+        }
+
+        /// Flipping a face's sense flag without touching its geometry makes
+        /// the flag disagree with the direction its own boundary runs.
+        #[test]
+        fn face_sense_contradicting_the_loop_winding_detected() {
+            let (mut store, geo, body) = block_with_pcurves();
+            let face_id = first_face(&store, body);
+            store.faces.get_mut(face_id).expect("live face").sense = FaceSense::Negative;
+
+            let failures = store.check_geometry(&geo, body);
+            assert_eq!(
+                failures
+                    .iter()
+                    .filter(|f| matches!(
+                        f,
+                        CheckFailure::FaceSenseContradictsLoop { face, sense, .. }
+                            if *face == face_id && *sense == FaceSense::Negative
+                    ))
+                    .count(),
+                1,
+                "{failures:?}"
+            );
+            assert_eq!(failures.len(), 1, "nothing else moved: {failures:?}");
+        }
+
+        /// A face genuinely built the other way round — sense flag *and*
+        /// boundary direction — is consistent, and reads as such.
+        #[test]
+        fn negative_sense_with_a_clockwise_loop_is_consistent() {
+            let (mut store, mut geo) = (TopologyStore::new(), GeometryStore::new());
+            let body = store.create_body(BodyType::Sheet);
+            let shell = store.create_shell(body, false, ShellOrientation::Outward);
+            // A unit square in the z = 0 plane, whose surface normal is -Z:
+            // walking the square counterclockwise seen from +Z therefore
+            // walks it *clockwise* in the surface's own (u, v) frame.
+            let face = store.create_face(shell, FaceSense::Negative);
+            let plane =
+                geo.add_surface(Surface3::plane(p(0.0, 0.0, 0.0), -Vector3::z()).expect("plane"));
+            store.faces.get_mut(face).expect("live face").surface = Some(plane);
+            let corners = [
+                p(0.0, 0.0, 0.0),
+                p(1.0, 0.0, 0.0),
+                p(1.0, 1.0, 0.0),
+                p(0.0, 1.0, 0.0),
+            ];
+            let v: Vec<_> = corners
+                .iter()
+                .map(|&pt| store.create_vertex(pt, SYSTEM_RESOLUTION))
+                .collect();
+            let mut directed = Vec::new();
+            for i in 0..4 {
+                let (a, b) = (corners[i], corners[(i + 1) % 4]);
+                let curve = geo.add_curve(Curve3::line(a, b - a).expect("valid line"));
+                let edge = store.create_edge_with_curve(
+                    v[i],
+                    v[(i + 1) % 4],
+                    SYSTEM_RESOLUTION,
+                    curve,
+                    0.0,
+                    (b - a).norm(),
+                );
+                directed.push((edge, FinSense::Forward));
+            }
+            store.create_loop(face, LoopType::Outer, &directed);
+            assert_eq!(attach_body_pcurves(&mut store, &mut geo, body), 4);
+
+            assert_eq!(store.check_geometry(&geo, body), Vec::new());
+
+            // ...and the same body with the flag alone flipped does not.
+            store.faces.get_mut(face).expect("live face").sense = FaceSense::Positive;
+            assert!(
+                store
+                    .check_geometry(&geo, body)
+                    .iter()
+                    .any(|f| matches!(f, CheckFailure::FaceSenseContradictsLoop { .. }))
+            );
+        }
+
+        /// A fin without trim geometry leaves its loop's winding unreadable,
+        /// and nothing is concluded from the fins that do have it.
+        #[test]
+        fn face_sense_is_not_judged_without_full_trim_geometry() {
+            let (mut store, geo, body) = block_with_pcurves();
+            let face_id = first_face(&store, body);
+            let fin = store.fins_of_loop(store.loops_of_face(face_id)[0])[0];
+            store.fins.get_mut(fin).expect("live fin").pcurve = None;
+            store.faces.get_mut(face_id).expect("live face").sense = FaceSense::Negative;
+
+            assert_eq!(store.check_geometry(&geo, body), Vec::new());
+        }
+
+        #[test]
+        fn invalid_edge_range_detected() {
+            let (mut store, geo, body) = block_with_pcurves();
+            let edge_id = store.edges_of_face(first_face(&store, body))[0];
+            let edge = store.edges.get_mut(edge_id).expect("live edge");
+            let t_start = edge.t_start;
+            edge.t_end = t_start;
+
+            let failures = store.check_geometry(&geo, body);
+            assert!(
+                failures.contains(&CheckFailure::InvalidEdgeRange {
+                    edge: edge_id,
+                    t_start,
+                    t_end: t_start,
+                }),
+                "{failures:?}"
+            );
+            // A range that cannot be sampled suppresses the measurements
+            // that would sample it, rather than reporting garbage from them.
+            assert!(
+                !failures.iter().any(|f| matches!(
+                    f,
+                    CheckFailure::EdgeOffSurface { edge, .. } if *edge == edge_id
+                )),
+                "{failures:?}"
+            );
+        }
+
+        /// The two passes are independent: a body with both a topological
+        /// and a geometric defect reports both.
+        #[test]
+        fn combined_check_reports_topology_and_geometry_together() {
+            let (mut store, geo, body) = block_with_pcurves();
+            let face_id = first_face(&store, body);
+            // Topological: a tolerance below the resolution floor.
+            let edge_id = store.edges_of_face(face_id)[0];
+            store.edges.get_mut(edge_id).expect("live edge").tolerance = 0.0;
+            // Geometric: a sense flag disagreeing with the boundary.
+            store.faces.get_mut(face_id).expect("live face").sense = FaceSense::Negative;
+
+            let failures = store.check_with_geometry(&geo, body);
+            assert!(failures.iter().any(|f| matches!(
+                f,
+                CheckFailure::InvalidTolerance {
+                    entity: EntityRef::Edge(e),
+                    ..
+                } if *e == edge_id
+            )));
+            assert!(
+                failures
+                    .iter()
+                    .any(|f| matches!(f, CheckFailure::FaceSenseContradictsLoop { .. }))
+            );
+        }
+
+        /// Every geometric failure leaves the connectivity intact, so none of
+        /// them suppresses the Euler–Poincaré formula.
+        #[test]
+        fn geometric_failures_are_not_structural() {
+            let (store, _geo, body) = block_with_pcurves();
+            let face = first_face(&store, body);
+            let edge = store.edges_of_face(face)[0];
+            let vertex = store.vertices_of_face(face)[0];
+            let fin = store.fins_of_loop(store.loops_of_face(face)[0])[0];
+            for failure in [
+                CheckFailure::EdgeOffSurface {
+                    edge,
+                    face,
+                    max_deviation: 1.0,
+                    allowed: 0.0,
+                },
+                CheckFailure::VertexOffEdge {
+                    vertex,
+                    edge,
+                    deviation: 1.0,
+                    allowed: 0.0,
+                },
+                CheckFailure::PcurveDeviation {
+                    fin,
+                    edge,
+                    max_deviation: 1.0,
+                    allowed: 0.0,
+                },
+                CheckFailure::FaceSenseContradictsLoop {
+                    face,
+                    sense: FaceSense::Positive,
+                    twice_signed_area: -1.0,
+                },
+                CheckFailure::InvalidEdgeRange {
+                    edge,
+                    t_start: 1.0,
+                    t_end: 0.0,
+                },
+            ] {
+                assert!(!failure.is_structural(), "{failure:?}");
+            }
+        }
+
+        /// A `Curve2::Polyline` is only held to the invariant at its own
+        /// vertices — between them it is a chord, a documented approximation
+        /// of freeform trim rather than a defect.
+        #[test]
+        fn polyline_pcurve_is_checked_at_its_own_vertices() {
+            let pcurve =
+                Curve2::polyline(vec![0.0, 0.5, 1.0], vec![Point2::origin(); 3]).expect("polyline");
+            assert_eq!(pcurve_check_params(&pcurve, 0.0, 1.0), vec![0.0, 0.5, 1.0]);
+            // ...unless its parameters do not reach the edge's range at all,
+            // where the mismatch is the thing worth measuring.
+            assert_eq!(
+                pcurve_check_params(&pcurve, 10.0, 11.0),
+                edge_samples(10.0, 11.0).collect::<Vec<_>>()
+            );
+        }
     }
 }

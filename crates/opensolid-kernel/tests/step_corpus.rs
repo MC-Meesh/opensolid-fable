@@ -1725,6 +1725,57 @@ mod corpus {
         );
     }
 
+    /// The geometric counterpart of the pass-rate floor (of-ipt.13). A file
+    /// passes when every B-Rep solid in it also survives
+    /// [`TopologyStore::check_geometry`]: edges on their faces' surfaces
+    /// within the tolerance they claim, vertices on their edges' endpoints,
+    /// pcurves tracking their edges, face senses agreeing with their
+    /// boundaries.
+    ///
+    /// This is a much harder gate than `check` and most of the corpus does
+    /// not clear it yet. That is the point of pinning it: the four files
+    /// that do are a floor a reader or checker regression cannot quietly
+    /// drop below, and the twelve that do not are the campaign's work list
+    /// (of-he8 outer-bound designation, of-fid pcurve branch selection,
+    /// of-bb6 unmeasured import tolerances). Raise the floor as those land.
+    #[test]
+    fn corpus_geometric_pass_rate_does_not_regress() {
+        let mut clean = Vec::new();
+        for file in &corpus_files() {
+            let bytes = std::fs::read(file).unwrap_or_else(|e| panic!("read {file:?}: {e}"));
+            let (store, geo, report) = import_bytes(&bytes);
+            let breps: Vec<EntityId<Body>> = report
+                .solids
+                .iter()
+                .filter_map(|s| match &s.outcome {
+                    SolidOutcome::BRep(body) => Some(*body),
+                    _ => None,
+                })
+                .collect();
+            // A file with no exact solid clears this vacuously; only files
+            // that actually produce B-Reps count as geometrically clean.
+            if !breps.is_empty()
+                && breps
+                    .iter()
+                    .all(|&body| store.check_geometry(&geo, body).is_empty())
+            {
+                clean.push(
+                    file.file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+        }
+        // 2026-07-26 baseline: io1-cm-214, nist_ctc_03_asme1_ap242-e2,
+        // nist_ftc_11_asme1_rb, sg1-c5-214.
+        const FLOOR: usize = 4;
+        assert!(
+            clean.len() >= FLOOR,
+            "geometrically clean corpus count regressed below {FLOOR}: only {clean:?} pass"
+        );
+    }
+
     fn corpus_files() -> Vec<std::path::PathBuf> {
         let root = format!("{}/tests/data/step", env!("CARGO_MANIFEST_DIR"));
         let mut files = Vec::new();
