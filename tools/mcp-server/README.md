@@ -20,7 +20,11 @@ produces the identical shape in the GUI, and vice-versa.
 | `get_screenshot` | Render a model to a PNG from a named view (`iso`, `front`, `top`, …). |
 | `export`         | Write a model to a file: `step` \| `stl` \| `obj`, with the document `unit` declared in the STEP header. |
 | `measure`        | Mass properties: volume, surface area, centroid, inertia, bounding box. |
-| `validate`       | Structural check: is the mesh a closed, consistently-oriented manifold enclosing a finite non-zero volume? |
+| `validate`       | Structural check: is the mesh a closed, consistently-oriented manifold enclosing a finite non-zero volume — and does the exact B-Rep body pass the kernel's own validation? |
+| `inspect_topology` | Structure: planar faces, circular rims, holes with their **axes** and diameters, shell count, genus, plus axis probes. |
+| `assert_model`   | Check a model against expected values (volume, bbox, genus, hole count *and axis*, clearance, …) and report pass/fail per expectation. |
+| `diff_models`    | What changed between two models: volume delta, area, bbox, centroid, and the structural counts. |
+| `measure_clearance` | Signed distances from probe points to the solid, or interference between two models. |
 | `optimize`       | Drive a model's `param()` design variables onto a mass/volume/centroid target under constraints, and write the result back. |
 | `get_capabilities` | The machine-readable manifest: every tool's input schema and every script op's signature. |
 | `list_models`    | List the models registered this session. |
@@ -43,6 +47,18 @@ an immediate measure/validate summary of the part. Every solid gets its own
 `model_id`; the top-level one is the whole file, with assembly occurrences
 placed. See the [agent guide](../../docs/AGENT_GUIDE.md#import_step) for the
 full payload.
+
+**Which oracle to reach for.** `validate` and `measure` report scalars over the
+whole part, and a part can be badly wrong while every scalar looks right: the
+gallery's angle bracket shipped with its four mounting holes bored sideways,
+reporting `valid: true`, rendering plausibly, exporting a clean STL, and
+measuring only ~4% light. When a feature has a *direction* — a hole, a bore, a
+slot — check the direction: `assert_model` with
+`{"type": "through_holes", "value": 4, "axis": [0,1,0], "diameter": 5}`, or
+`inspect_topology` to see what the axes actually are. See
+[the friction log](../../docs/dogfood-bracket-friction-log.md) for the whole
+account and the [agent guide](../../docs/AGENT_GUIDE.md#which-oracle-answers-which-question)
+for the full table.
 
 ## The script format
 

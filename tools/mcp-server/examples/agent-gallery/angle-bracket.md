@@ -53,7 +53,9 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 >   },
 >   "volume": 18736.52541076776,
 >   "valid": true,
->   "issues": []
+>   "issues": [],
+>   "mesher": "adaptive-sdf",
+>   "brepChecked": false
 > }
 > ```
 
@@ -118,7 +120,8 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 >   "model_id": "model-1",
 >   "format": "step",
 >   "path": "output/angle-bracket.step",
->   "bytes": 8476930
+>   "bytes": 8476930,
+>   "unit": "mm"
 > }
 > ```
 

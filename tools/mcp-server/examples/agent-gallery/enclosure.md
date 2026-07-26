@@ -47,7 +47,9 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 >   },
 >   "volume": 34763.23671539217,
 >   "valid": true,
->   "issues": []
+>   "issues": [],
+>   "mesher": "adaptive-sdf",
+>   "brepChecked": false
 > }
 > ```
 
@@ -65,7 +67,8 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 >   "model_id": "model-3",
 >   "format": "step",
 >   "path": "output/enclosure-body.step",
->   "bytes": 5924701
+>   "bytes": 5924701,
+>   "unit": "mm"
 > }
 > ```
 
@@ -117,7 +120,9 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 >   },
 >   "volume": 28883.29791850566,
 >   "valid": true,
->   "issues": []
+>   "issues": [],
+>   "mesher": "adaptive-sdf",
+>   "brepChecked": false
 > }
 > ```
 
@@ -133,7 +138,8 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 >   "model_id": "model-4",
 >   "format": "step",
 >   "path": "output/enclosure-lid.step",
->   "bytes": 4721867
+>   "bytes": 4721867,
+>   "unit": "mm"
 > }
 > ```
 

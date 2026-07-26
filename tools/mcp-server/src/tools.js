@@ -10,9 +10,20 @@ import { getMesh, buildBinaryStl, buildObj } from './mesh.js';
 import { renderPng, VIEW_NAMES } from './render.js';
 import { optimize } from './optimize.js';
 import { buildManifest, SERVER_INFO, UNITS } from './capabilities.js';
+import { inspect as inspectTopology, probeAxis } from './topology.js';
 
 const EXPORT_FORMATS = ['step', 'stl', 'obj'];
 const MEASURE_QUERIES = ['all', 'volume', 'surface_area', 'bbox', 'centroid', 'mass'];
+/** Softmin blend `measure_clearance` uses when the caller names none. */
+const DEFAULT_CLEARANCE_SOFTNESS = 0.02;
+/**
+ * Relative tolerance `assert_model` applies to a continuous quantity when the
+ * caller gives none. 1% because these are integrals over a tessellation, not
+ * analytic values — a tighter default would fail on correct parts, and a looser
+ * one would pass the wrong-axis-hole bug the whole tool exists to catch (that
+ * bracket's volume was ~4% light).
+ */
+const DEFAULT_RELATIVE_TOLERANCE = 0.01;
 // Document units the STEP writer can declare (docs/units.md). The kernel
 // defaults an unknown key to millimetres silently; the tool rejects it instead,
 // because "I asked for inches and got millimetres" is exactly the interop bug
@@ -101,6 +112,436 @@ function diagnosticsView(report) {
   };
 }
 
+/**
+ * Normalize a probe-point argument: `[[x,y,z],…]`, a flat `[x,y,z,…]`, or a
+ * single `[x,y,z]`, into a `Float64Array` of flat coordinates.
+ *
+ * Both shapes are accepted because both are natural to write and the flat form
+ * is what the kernel takes; rejecting one would be a papercut with no upside.
+ * Throws with a message naming the accepted shapes.
+ */
+export function flattenProbes(value, label = 'probes') {
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new Error(`${label} must be a non-empty array of [x,y,z] points or a flat [x,y,z,…] array`);
+  }
+  const flat = [];
+  if (Array.isArray(value[0])) {
+    for (const p of value) {
+      if (!Array.isArray(p) || p.length !== 3) {
+        throw new Error(`${label}: every point must be [x,y,z], got ${JSON.stringify(p)}`);
+      }
+      flat.push(...p);
+    }
+  } else {
+    flat.push(...value);
+  }
+  if (flat.length % 3 !== 0) {
+    throw new Error(`${label} has ${flat.length} coordinates, which is not a whole number of points`);
+  }
+  if (!flat.every((c) => Number.isFinite(c))) {
+    throw new Error(`${label} contains a non-finite coordinate`);
+  }
+  return new Float64Array(flat);
+}
+
+/**
+ * The tolerance an assertion allows: an explicit absolute `tolerance`, an
+ * explicit `relative_tolerance` of the expected magnitude, or
+ * `DEFAULT_RELATIVE_TOLERANCE` of it.
+ *
+ * Zero is a legitimate absolute tolerance (an exact integer count), so the
+ * check is `!== undefined` rather than truthiness.
+ */
+function toleranceFor(spec, expected) {
+  if (spec.tolerance !== undefined) {
+    if (!(Number.isFinite(spec.tolerance) && spec.tolerance >= 0)) {
+      throw new Error(`tolerance must be a non-negative number, got ${spec.tolerance}`);
+    }
+    return spec.tolerance;
+  }
+  const rel = spec.relative_tolerance ?? DEFAULT_RELATIVE_TOLERANCE;
+  if (!(Number.isFinite(rel) && rel >= 0)) {
+    throw new Error(`relative_tolerance must be a non-negative number, got ${rel}`);
+  }
+  return rel * Math.abs(expected);
+}
+
+/** One assertion result, in the shape every `assert_model` check returns. */
+function checked(type, ok, expected, actual, message) {
+  return { type, ok, expected, actual, message };
+}
+
+/**
+ * Compare a scalar against an expectation, or report why it could not be
+ * compared. A null `actual` is a *failure*, not a skip: "the tool could not
+ * measure this" is exactly the case that used to pass silently.
+ */
+function checkScalar(type, spec, actual) {
+  if (!Number.isFinite(spec.value)) {
+    return checked(type, false, spec.value, actual, `${type}: 'value' must be a finite number`);
+  }
+  if (!Number.isFinite(actual)) {
+    return checked(
+      type,
+      false,
+      spec.value,
+      actual,
+      `${type} could not be measured (got ${actual}); a null measurement is not a passing check`,
+    );
+  }
+  const tol = toleranceFor(spec, spec.value);
+  const delta = actual - spec.value;
+  const ok = Math.abs(delta) <= tol;
+  return checked(
+    type,
+    ok,
+    spec.value,
+    actual,
+    ok
+      ? `${type} ${actual} is within ${tol} of ${spec.value}`
+      : `${type} ${actual} differs from ${spec.value} by ${delta} (allowed ${tol})`,
+  );
+}
+
+/**
+ * Compare a 3-vector componentwise. A `null` component in the expectation skips
+ * that axis, so "centred in x and z, don't care about y" is expressible.
+ */
+function checkVector(type, spec, actual, expectedName = 'value') {
+  const expected = spec[expectedName];
+  if (!Array.isArray(expected) || expected.length !== 3) {
+    return checked(type, false, expected, actual, `${type}: '${expectedName}' must be [x,y,z]`);
+  }
+  if (!Array.isArray(actual) || actual.length !== 3 || !actual.every((c) => Number.isFinite(c))) {
+    return checked(
+      type,
+      false,
+      expected,
+      actual,
+      `${type} could not be measured (got ${JSON.stringify(actual)})`,
+    );
+  }
+  const failures = [];
+  for (let i = 0; i < 3; i += 1) {
+    if (expected[i] === null || expected[i] === undefined) continue;
+    if (!Number.isFinite(expected[i])) {
+      failures.push(`component ${i} of '${expectedName}' is not a number`);
+      continue;
+    }
+    const tol = toleranceFor(spec, expected[i]);
+    const delta = actual[i] - expected[i];
+    if (Math.abs(delta) > tol) {
+      failures.push(`axis ${'xyz'[i]}: ${actual[i]} vs ${expected[i]} (off by ${delta}, allowed ${tol})`);
+    }
+  }
+  return checked(
+    type,
+    failures.length === 0,
+    expected,
+    actual,
+    failures.length === 0 ? `${type} matches` : `${type}: ${failures.join('; ')}`,
+  );
+}
+
+/** Compare an integer count exactly. */
+function checkCount(type, spec, actual, what) {
+  if (!Number.isInteger(spec.value) || spec.value < 0) {
+    return checked(type, false, spec.value, actual, `${type}: 'value' must be a non-negative integer`);
+  }
+  if (!Number.isInteger(actual)) {
+    return checked(
+      type,
+      false,
+      spec.value,
+      actual,
+      `${type} could not be counted (got ${actual}) — the mesh may not be a closed surface`,
+    );
+  }
+  const ok = actual === spec.value;
+  return checked(
+    type,
+    ok,
+    spec.value,
+    actual,
+    ok ? `${actual} ${what}, as expected` : `expected ${spec.value} ${what}, found ${actual}`,
+  );
+}
+
+/**
+ * Lazy, memoized views of one model, so a batch of assertions meshes and
+ * measures the part once however many of them need it. Meshing a bracket at a
+ * fine accuracy is the expensive part of any of these calls.
+ */
+function modelViews(shape, accuracy) {
+  let measure;
+  let validation;
+  let census;
+  let brep;
+  return {
+    shape,
+    measure: () => (measure ??= JSON.parse(shape.measure(accuracy))),
+    validation: () => (validation ??= JSON.parse(shape.validate(accuracy, undefined))),
+    census: () => (census ??= inspectTopology(shape, getMesh(shape, { accuracy }))),
+    brep: () => (brep ??= JSON.parse(shape.brepCheck(false))),
+  };
+}
+
+/** Every `assert_model` check type, for the schema and the error message. */
+const ASSERTION_TYPES = [
+  'volume',
+  'surface_area',
+  'bbox_size',
+  'centroid',
+  'closed_solid',
+  'shells',
+  'genus',
+  'planar_faces',
+  'through_holes',
+  'hole_at',
+  'material_at',
+  'clearance',
+  'brep_sound',
+];
+
+/**
+ * Evaluate one assertion against a model. Returns `{ type, ok, expected,
+ * actual, message }`.
+ *
+ * The design rule throughout: an assertion that cannot be evaluated **fails**.
+ * A null volume, an unmeasurable genus, or an absent B-Rep are all reported as
+ * `ok: false` with the reason, never as a pass. The friction log's core finding
+ * is that a part with sideways holes satisfied every oracle it was offered, and
+ * a check that quietly abstains reproduces exactly that.
+ */
+export function evaluateAssertion(spec, views) {
+  const type = spec && spec.type;
+  switch (type) {
+    case 'volume':
+      return checkScalar('volume', spec, views.measure().volume);
+    case 'surface_area':
+      return checkScalar('surface_area', spec, views.measure().surfaceArea);
+    case 'bbox_size': {
+      const box = views.measure().boundingBox;
+      return checkVector('bbox_size', spec, box ? box.size : null);
+    }
+    case 'centroid':
+      return checkVector('centroid', spec, views.measure().centroid);
+    case 'closed_solid': {
+      const v = views.validation();
+      return checked(
+        'closed_solid',
+        v.valid === true,
+        true,
+        v.valid,
+        v.valid ? 'closed, consistently oriented solid' : `not a valid solid: ${v.issues.join('; ')}`,
+      );
+    }
+    case 'shells':
+      return checkCount('shells', spec, views.census().counts.shells, 'disconnected shells');
+    case 'genus':
+      return checkCount(
+        'genus',
+        spec,
+        views.census().counts.genus,
+        'handles (through-holes) in the surface',
+      );
+    case 'planar_faces':
+      return checkCount('planar_faces', spec, views.census().counts.planarFaces, 'planar faces');
+    case 'through_holes': {
+      // Optionally filtered by axis and diameter, which is the assertion that
+      // catches a hole drilled on the wrong axis: the count is right and the
+      // axis is not.
+      const all = views.census().cylinders.filter((c) => c.kind === 'through-hole');
+      let matching = all;
+      const notes = [];
+      if (spec.axis !== undefined) {
+        const axis = spec.axis;
+        if (!Array.isArray(axis) || axis.length !== 3 || !axis.every((c) => Number.isFinite(c))) {
+          return checked('through_holes', false, spec.value, null, "through_holes: 'axis' must be [x,y,z]");
+        }
+        const len = Math.hypot(...axis);
+        if (len === 0) {
+          return checked('through_holes', false, spec.value, null, "through_holes: 'axis' must be non-zero");
+        }
+        const unit = axis.map((c) => c / len);
+        const cosTol = Math.cos(((spec.axis_tolerance_deg ?? 5) * Math.PI) / 180);
+        // Absolute dot: a hole has no preferred direction along its own axis.
+        matching = matching.filter(
+          (c) => Math.abs(c.axis[0] * unit[0] + c.axis[1] * unit[1] + c.axis[2] * unit[2]) >= cosTol,
+        );
+        notes.push(`axis ≈ [${unit.map((c) => c.toFixed(3))}]`);
+      }
+      if (spec.diameter !== undefined) {
+        const tol = toleranceFor(spec, spec.diameter);
+        matching = matching.filter((c) => Math.abs(c.diameter - spec.diameter) <= tol);
+        notes.push(`Ø${spec.diameter} ±${tol}`);
+      }
+      const result = checkCount(
+        'through_holes',
+        spec,
+        matching.length,
+        `through-holes${notes.length ? ` matching ${notes.join(', ')}` : ''}`,
+      );
+      // When the filter is what failed, say what *was* found — "0 holes on +Z"
+      // is far less useful than "0 on +Z; 4 on +Y".
+      if (!result.ok && all.length !== matching.length) {
+        result.message +=
+          `. The part has ${all.length} through-hole(s) in total: ` +
+          all
+            .map(
+              (c) =>
+                `Ø${c.diameter.toFixed(3)} along [${c.axis.map((v) => v.toFixed(2))}] ` +
+                `at [${c.center.map((v) => v.toFixed(2))}]`,
+            )
+            .join('; ');
+      }
+      return result;
+    }
+    case 'hole_at': {
+      // "There is a bore through `at`, running along `axis`" is two facts, and
+      // checking only one of them passes on nonsense. Along the axis the line
+      // must be *clear* — that is what makes it a bore rather than material.
+      // Across the axis it must go material → gap → material, which is what
+      // makes the clear line a hole in something rather than a line in free
+      // space beside the part. Both, or neither means anything.
+      const expected = { at: spec.at, axis: spec.axis, diameter: spec.diameter };
+      if (spec.at === undefined || spec.axis === undefined) {
+        return checked('hole_at', false, expected, null, "hole_at needs both 'at' and 'axis'");
+      }
+      const along = probeAxis(views.shape, spec.axis, spec.at);
+      if (along.materialLength > 0) {
+        return checked(
+          'hole_at',
+          false,
+          expected,
+          { clearAlongAxis: false, materialLength: along.materialLength },
+          `the line through [${spec.at}] along [${along.axis.map((v) => v.toFixed(2))}] ` +
+            `crosses ${along.materialLength} of material, so no bore runs that way here. ` +
+            'Name the bore\'s own axis and a point on its centreline.',
+        );
+      }
+      // Two directions across the axis. A circular bore reads the same width
+      // from any of them, so both agreeing is also a check that the void is a
+      // bore and not a slot.
+      const a = along.axis;
+      const seed = Math.abs(a[0]) < 0.9 ? [1, 0, 0] : [0, 1, 0];
+      const cross = (p, q) => [
+        p[1] * q[2] - p[2] * q[1],
+        p[2] * q[0] - p[0] * q[2],
+        p[0] * q[1] - p[1] * q[0],
+      ];
+      const u = cross(a, seed);
+      const across = [u, cross(a, u)].map((dir) => probeAxis(views.shape, dir, spec.at));
+      const enclosed = across.filter((p) => p.throughHole);
+      if (enclosed.length < 2) {
+        return checked(
+          'hole_at',
+          false,
+          expected,
+          { clearAlongAxis: true, enclosedDirections: enclosed.length },
+          `[${spec.at}] is clear along [${a.map((v) => v.toFixed(2))}], but the void around it ` +
+            `is enclosed by material in only ${enclosed.length} of 2 directions across that ` +
+            'axis — this reads as open space beside the part, not a bore through it',
+        );
+      }
+      // The narrower of the two crossings: for a point on the centreline both
+      // equal the diameter, and a point off-centre reads narrower in one.
+      const width = Math.min(...across.map((p) => p.gapLength));
+      if (spec.diameter === undefined) {
+        return checked(
+          'hole_at',
+          true,
+          { at: spec.at, axis: spec.axis },
+          width,
+          `a bore runs through [${spec.at}] along [${a.map((v) => v.toFixed(2))}], ${width} across`,
+        );
+      }
+      const tol = toleranceFor(spec, spec.diameter);
+      const ok = Math.abs(width - spec.diameter) <= tol;
+      return checked(
+        'hole_at',
+        ok,
+        spec.diameter,
+        width,
+        ok
+          ? `bore present, ${width} across`
+          : `bore present but ${width} across, not ${spec.diameter} (allowed ${tol}). ` +
+            'A point off the bore centreline reads narrower than the diameter — check `at`.',
+      );
+    }
+    case 'material_at': {
+      if (!Array.isArray(spec.at) || spec.at.length !== 3) {
+        return checked('material_at', false, spec.value, null, "material_at needs 'at' as [x,y,z]");
+      }
+      const want = spec.value === undefined ? true : Boolean(spec.value);
+      const d = views.shape.distance(spec.at[0], spec.at[1], spec.at[2]);
+      const isSolid = d < 0;
+      return checked(
+        'material_at',
+        isSolid === want,
+        want,
+        isSolid,
+        `[${spec.at}] is ${isSolid ? 'inside' : 'outside'} the solid (signed distance ${d})`,
+      );
+    }
+    case 'clearance': {
+      if (spec.min === undefined || !Number.isFinite(spec.min)) {
+        return checked('clearance', false, spec.min, null, "clearance needs a finite 'min'");
+      }
+      let flat;
+      try {
+        flat = flattenProbes(spec.probes, 'clearance.probes');
+      } catch (err) {
+        return checked('clearance', false, spec.min, null, err.message);
+      }
+      let worst = Infinity;
+      let worstAt = null;
+      for (let i = 0; i < flat.length; i += 3) {
+        const d = views.shape.distance(flat[i], flat[i + 1], flat[i + 2]);
+        if (d < worst) {
+          worst = d;
+          worstAt = [flat[i], flat[i + 1], flat[i + 2]];
+        }
+      }
+      const ok = worst >= spec.min;
+      return checked(
+        'clearance',
+        ok,
+        spec.min,
+        worst,
+        ok
+          ? `every probe clears the solid by at least ${worst}`
+          : `the nearest probe [${worstAt}] is ${worst} from the solid, under the required ${spec.min}` +
+            (worst < 0 ? ' (negative means the probe is inside the material)' : ''),
+      );
+    }
+    case 'brep_sound': {
+      const b = views.brep();
+      if (!b.available) {
+        return checked('brep_sound', false, 'a checkable B-Rep', null, `no B-Rep to check: ${b.reason}`);
+      }
+      const ok = b.failures.length === 0;
+      return checked(
+        'brep_sound',
+        ok,
+        0,
+        b.failures.length,
+        ok
+          ? 'the B-Rep body passes the kernel check'
+          : `${b.failures.length} B-Rep defect(s): ${b.failures.map((f) => f.message).join('; ')}`,
+      );
+    }
+    default:
+      return checked(
+        String(type),
+        false,
+        null,
+        null,
+        `unknown assertion type '${type}'; use one of ${ASSERTION_TYPES.join(', ')}`,
+      );
+  }
+}
+
 /** Resolve where an export should be written. */
 function exportPath(requested, outputDir, model, format) {
   if (requested) {
@@ -166,7 +607,7 @@ export function createTools(config = {}) {
           return fail(`script failed: ${errMessage(err)}`);
         }
         const measure = JSON.parse(model.shape.measure(undefined));
-        const validation = JSON.parse(model.shape.validate(undefined));
+        const validation = JSON.parse(model.shape.validate(undefined, undefined));
         return text(
           withMassError(
             {
@@ -178,6 +619,12 @@ export function createTools(config = {}) {
               volume: measure.volume,
               valid: validation.valid,
               issues: validation.issues,
+              // Which mesh `valid`/`volume` are statements about, and whether an
+              // exact B-Rep was checked at all — so a bare `valid: true` is not
+              // mistaken for a full bill of health. `validate` carries the whole
+              // report; `inspect_topology` is where structure gets checked.
+              mesher: validation.mesher,
+              brepChecked: validation.brep.available,
               // The design variables the script declared via param(). Present so
               // an agent sees, from the create call alone, exactly what `optimize`
               // may move and within what bounds. Omitted when the script declares none.
@@ -350,7 +797,7 @@ export function createTools(config = {}) {
             exact: report.assembledExact,
           });
           const measure = JSON.parse(model.shape.measure(undefined));
-          const validation = JSON.parse(model.shape.validate(undefined));
+          const validation = JSON.parse(model.shape.validate(undefined, undefined));
           return text(
             withMassError(
               {
@@ -397,6 +844,16 @@ export function createTools(config = {}) {
                 volume: measure.volume,
                 valid: validation.valid,
                 issues: validation.issues,
+                // Imported topology is exactly what `TopologyStore::check` was
+                // written for — a body of unknown provenance, where "the file
+                // parsed" says nothing about whether the geometry holds
+                // together. `validate` on this model_id gives the full report,
+                // `deep: true` adds self-intersection.
+                mesher: validation.mesher,
+                brepChecked: validation.brep.available,
+                ...(validation.brep.available && validation.brep.counts
+                  ? { brepCounts: validation.brep.counts }
+                  : {}),
               },
               measure,
             ),
@@ -605,13 +1062,29 @@ export function createTools(config = {}) {
       definition: {
         name: 'validate',
         description:
-          'Check a model: whether its mesh is a closed, consistently oriented manifold ' +
-          'enclosing a finite non-zero volume. Returns a report with any issues found.',
+          'Check a model on two fronts: its mesh is a closed, consistently oriented ' +
+          'manifold enclosing a finite non-zero volume, and — when the model carries an ' +
+          'exact B-Rep (`exact: true`, or an un-booleaned primitive) — that body passes ' +
+          "the kernel's own validation: referential integrity, loop bookkeeping, " +
+          'edge/face closure and orientation, the Euler-Poincaré formula, edges lying on ' +
+          'their faces, pcurve fidelity, face sense against loop winding, and (with ' +
+          '`deep`) face-face self-intersection. `mesher` names which mesh answered; ' +
+          '`brep` carries the body report, including a reason when there is no B-Rep to ' +
+          'check — so a `valid: true` always says what it did *not* verify. Mesh closure ' +
+          'alone cannot see a hole bored on the wrong axis; pair this with ' +
+          '`inspect_topology` or `assert_model` for that.',
         inputSchema: {
           type: 'object',
           properties: {
             model_id: { type: 'string' },
             accuracy: { type: 'number', description: 'Target chordal deviation for the checked mesh.' },
+            deep: {
+              type: 'boolean',
+              description:
+                'Also run the B-Rep self-intersection pass (every face pair tested for ' +
+                'clashes away from shared topology). Off by default: it is a pairwise ' +
+                'search over faces, not a single walk of the body.',
+            },
           },
           required: ['model_id'],
         },
@@ -623,7 +1096,484 @@ export function createTools(config = {}) {
         } catch (err) {
           return fail(err.message);
         }
-        return text(JSON.parse(model.shape.validate(accuracyArg(args.accuracy))));
+        return text(
+          JSON.parse(model.shape.validate(accuracyArg(args.accuracy), Boolean(args.deep))),
+        );
+      },
+    },
+
+    inspect_topology: {
+      definition: {
+        name: 'inspect_topology',
+        description:
+          'Interrogate a model\'s structure rather than its scalars: planar faces (with ' +
+          'normals, plane offsets and areas), circular rims, cylindrical features ' +
+          'classified as through-holes or bosses (each with its axis, diameter, centre ' +
+          'and depth), shell count, and genus — the number of handles in the surface, ' +
+          'i.e. how many holes go through the part. Optionally casts `probes`: lines ' +
+          'through a point along an axis, reporting the solid/void spans they cross, ' +
+          'which answers "is there a hole through here, along this direction?" directly. ' +
+          'For models with an exact B-Rep the report also carries that body\'s authoritative ' +
+          'entity counts (faces, edges, vertices, hole loops, and how many faces sit on ' +
+          'planes vs cylinders vs spheres). This is the oracle `validate`, `measure`, ' +
+          '`boundingBox` and a screenshot all miss: a hole drilled on the wrong axis ' +
+          'removes nearly the right volume and renders plausibly, but it is a different ' +
+          'shape, and the axis is right here.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            model_id: { type: 'string' },
+            accuracy: {
+              type: 'number',
+              description:
+                'Target chordal deviation of the inspected mesh. Finer resolves small ' +
+                'features; the genus and shell counts are exact combinatorics and do not ' +
+                'drift with it.',
+            },
+            probes: {
+              type: 'array',
+              description:
+                'Lines to cast. Each is `{axis:[x,y,z], at:[x,y,z]}` — the line through ' +
+                '`at` along `axis`, reported as the ordered solid/void spans it crosses ' +
+                'plus a `throughHole` verdict (material, gap, material).',
+              items: {
+                type: 'object',
+                properties: {
+                  axis: { type: 'array', items: { type: 'number' }, description: '[x,y,z] direction.' },
+                  at: { type: 'array', items: { type: 'number' }, description: '[x,y,z] point on the line.' },
+                },
+                required: ['axis', 'at'],
+              },
+            },
+            include_faces: {
+              type: 'boolean',
+              description:
+                'Include the per-face list (normal, offset, area). Default true; set false ' +
+                'for just the counts on a part with many faces.',
+            },
+          },
+          required: ['model_id'],
+        },
+      },
+      handler(args) {
+        let model;
+        try {
+          model = store.get(args.model_id);
+        } catch (err) {
+          return fail(err.message);
+        }
+        const accuracy = accuracyArg(args.accuracy);
+        let census;
+        try {
+          census = inspectTopology(model.shape, getMesh(model.shape, { accuracy }));
+        } catch (err) {
+          return fail(`topology inspection failed: ${errMessage(err)}`);
+        }
+        let probes;
+        if (args.probes !== undefined) {
+          if (!Array.isArray(args.probes)) {
+            return fail('probes must be an array of {axis, at} objects');
+          }
+          try {
+            probes = args.probes.map((p) => {
+              const r = probeAxis(model.shape, p && p.axis, p && p.at);
+              return {
+                axis: r.axis,
+                at: r.at,
+                throughHole: r.throughHole,
+                solidSpans: r.solidSpans,
+                voidSpans: r.voidSpans,
+                materialLength: r.materialLength,
+                gapLength: r.gapLength,
+                spans: r.spans,
+              };
+            });
+          } catch (err) {
+            return fail(`probe failed: ${errMessage(err)}`);
+          }
+        }
+        const brep = JSON.parse(model.shape.brepCheck(false));
+        return text({
+          model_id: model.id,
+          ...(accuracy !== undefined ? { accuracy } : {}),
+          counts: census.counts,
+          mesh: census.mesh,
+          cylinders: census.cylinders,
+          planarFaces: {
+            count: census.planarFaces.faces.length,
+            totalArea: census.planarFaces.totalArea,
+            // What fraction of the surface the planar faces account for. The
+            // rest is genuine curvature plus the one-cell bevel the SDF mesher
+            // leaves where the part has a sharp edge — stated, because face
+            // areas run that much under their analytic values.
+            planarAreaFraction: census.planarFaces.planarAreaFraction,
+            remainderArea: census.planarFaces.remainderArea,
+            ...(args.include_faces === false ? {} : { faces: census.planarFaces.faces }),
+          },
+          // The exact body's own counts when there is one: a mesh cannot supply
+          // a true face or edge count, because the mesher bevels sharp edges.
+          brep: brep.available
+            ? { available: true, source: brep.source, counts: brep.counts }
+            : { available: false, reason: brep.reason },
+          ...(probes ? { probes } : {}),
+        });
+      },
+    },
+
+    assert_model: {
+      definition: {
+        name: 'assert_model',
+        description:
+          'Check a model against expected values and report each one pass/fail. This is ' +
+          'the tool to reach for before believing a part is right: state what you intended ' +
+          '— the volume you computed from the spec, the bounding box, four Ø5 holes along ' +
+          '+Y, genus 4, nothing inside a keep-out — and get back which expectations the ' +
+          'geometry actually meets. An expectation that cannot be evaluated (a null volume, ' +
+          'an unmeasurable genus, an absent B-Rep) FAILS rather than abstaining, because a ' +
+          'check that quietly skips is how a wrong part passes. Continuous quantities ' +
+          'default to a 1% relative tolerance; counts must match exactly.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            model_id: { type: 'string' },
+            accuracy: { type: 'number', description: 'Target chordal deviation for the measured mesh.' },
+            expect: {
+              type: 'array',
+              description:
+                'The expectations. Each is `{type, …}`:\n' +
+                '• `volume` / `surface_area` — `value`, plus `tolerance` (absolute) or ' +
+                '`relative_tolerance` (default 0.01).\n' +
+                '• `bbox_size` / `centroid` — `value: [x,y,z]`; a null component skips that axis.\n' +
+                '• `closed_solid` — the mesh is a watertight, consistently oriented solid.\n' +
+                '• `shells` — `value`: expected number of disconnected shells (2 means the ' +
+                'part fell apart).\n' +
+                '• `genus` — `value`: handles in the surface, i.e. holes through the part.\n' +
+                '• `planar_faces` — `value`: number of planar faces.\n' +
+                '• `through_holes` — `value`: count, optionally filtered by `axis: [x,y,z]` ' +
+                '(within `axis_tolerance_deg`, default 5) and `diameter`. The axis filter is ' +
+                'what catches a hole drilled the wrong way; the failure message lists the ' +
+                'holes that *are* there and their axes.\n' +
+                '• `hole_at` — `at: [x,y,z]` on a bore\'s centreline, `axis: [x,y,z]` the ' +
+                "bore's own direction, optional `diameter`: the line along the axis is clear " +
+                'of material and the void around it is enclosed by material in both directions ' +
+                'across it. Both, so that free space beside the part cannot pass.\n' +
+                '• `material_at` — `at: [x,y,z]`, `value` true (default) or false: whether ' +
+                'that point is inside the solid.\n' +
+                '• `clearance` — `probes` and `min`: every probe point stands at least `min` ' +
+                'clear of the solid.\n' +
+                '• `brep_sound` — the exact B-Rep body passes the kernel check (fails when ' +
+                'the model has no B-Rep, since then nothing was verified).',
+              items: {
+                type: 'object',
+                properties: {
+                  type: { type: 'string', enum: ASSERTION_TYPES },
+                  value: { description: 'Expected value: a number, [x,y,z], or a boolean by type.' },
+                  tolerance: { type: 'number', description: 'Absolute tolerance.' },
+                  relative_tolerance: {
+                    type: 'number',
+                    description: 'Tolerance as a fraction of the expected magnitude (default 0.01).',
+                  },
+                  at: { type: 'array', items: { type: 'number' }, description: 'Point, for hole_at / material_at.' },
+                  axis: { type: 'array', items: { type: 'number' }, description: 'Direction, for hole_at / through_holes.' },
+                  axis_tolerance_deg: { type: 'number', description: 'Angular slack for an axis filter (default 5).' },
+                  diameter: { type: 'number', description: 'Expected hole diameter.' },
+                  probes: { description: 'Keep-out points for clearance: [[x,y,z],…] or flat [x,y,z,…].' },
+                  min: { type: 'number', description: 'Minimum clearance.' },
+                },
+                required: ['type'],
+              },
+            },
+          },
+          required: ['model_id', 'expect'],
+        },
+      },
+      handler(args) {
+        let model;
+        try {
+          model = store.get(args.model_id);
+        } catch (err) {
+          return fail(err.message);
+        }
+        if (!Array.isArray(args.expect) || args.expect.length === 0) {
+          return fail('expect must be a non-empty array of {type, …} expectations');
+        }
+        const views = modelViews(model.shape, accuracyArg(args.accuracy));
+        const results = [];
+        for (const spec of args.expect) {
+          try {
+            results.push(evaluateAssertion(spec, views));
+          } catch (err) {
+            results.push(
+              checked(String(spec && spec.type), false, null, null, `check failed: ${errMessage(err)}`),
+            );
+          }
+        }
+        const failed = results.filter((r) => !r.ok);
+        return text({
+          model_id: model.id,
+          ok: failed.length === 0,
+          passed: results.length - failed.length,
+          failed: failed.length,
+          checks: results,
+        });
+      },
+    },
+
+    diff_models: {
+      definition: {
+        name: 'diff_models',
+        description:
+          'Compare two models and report what changed: volume (absolute delta and ratio), ' +
+          'surface area, bounding-box size, centroid, and the structural counts — shells, ' +
+          'genus, planar faces, through-holes. Built for the before/after question a ' +
+          'feature edit actually poses: "I subtracted four Ø5 holes from a 5 mm plate; did ' +
+          'they remove the 392.7 mm³ they should have?" `expect_volume_delta` turns that ' +
+          'into a pass/fail. A volume delta compared against a number computed from the ' +
+          'spec is the only oracle that caught the wrong-axis-hole bug on the gallery ' +
+          'bracket, and it needed a hand calculation to do it; this is that oracle, ' +
+          'without the paper.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            model_id_a: { type: 'string', description: 'The baseline model (the "before").' },
+            model_id_b: { type: 'string', description: 'The model to compare against it (the "after").' },
+            accuracy: {
+              type: 'number',
+              description:
+                'Target chordal deviation for BOTH meshes, so the two are measured at the ' +
+                'same fidelity — comparing a fine mesh against a coarse one turns a meshing ' +
+                'difference into an apparent design difference.',
+            },
+            expect_volume_delta: {
+              type: 'object',
+              description:
+                'Optional assertion on `volume(b) - volume(a)`. Negative for material removed.',
+              properties: {
+                value: { type: 'number' },
+                tolerance: { type: 'number', description: 'Absolute tolerance.' },
+                relative_tolerance: {
+                  type: 'number',
+                  description: 'Fraction of the expected delta (default 0.01).',
+                },
+              },
+              required: ['value'],
+            },
+          },
+          required: ['model_id_a', 'model_id_b'],
+        },
+      },
+      handler(args) {
+        const accuracy = accuracyArg(args.accuracy);
+        // Each model carries its own exact-booleans flag, and `store.get` applies
+        // it to the process-global toggle — so measure each fully before touching
+        // the other, or the second `get` re-routes the first one's meshing.
+        const read = (id) => {
+          const model = store.get(id);
+          const views = modelViews(model.shape, accuracy);
+          const m = views.measure();
+          const c = views.census().counts;
+          return {
+            model_id: model.id,
+            name: model.name,
+            volume: m.volume,
+            surfaceArea: m.surfaceArea,
+            centroid: m.centroid,
+            bboxSize: m.boundingBox ? m.boundingBox.size : null,
+            counts: c,
+            ...(m.massError ? { massError: m.massError } : {}),
+          };
+        };
+        let a;
+        let b;
+        try {
+          a = read(args.model_id_a);
+          b = read(args.model_id_b);
+        } catch (err) {
+          return fail(err.message);
+        }
+
+        const scalarDelta = (x, y) =>
+          Number.isFinite(x) && Number.isFinite(y) ? y - x : null;
+        const vectorDelta = (x, y) =>
+          Array.isArray(x) && Array.isArray(y) ? y.map((v, i) => v - x[i]) : null;
+        const volumeDelta = scalarDelta(a.volume, b.volume);
+        const countDelta = {};
+        for (const key of Object.keys(a.counts)) {
+          const av = a.counts[key];
+          const bv = b.counts[key];
+          countDelta[key] = Number.isFinite(av) && Number.isFinite(bv) ? bv - av : null;
+        }
+
+        const payload = {
+          a,
+          b,
+          delta: {
+            volume: volumeDelta,
+            // Fraction of A's volume, the form a "3% lighter" claim wants.
+            volumeRatio:
+              Number.isFinite(volumeDelta) && Number.isFinite(a.volume) && a.volume !== 0
+                ? volumeDelta / a.volume
+                : null,
+            surfaceArea: scalarDelta(a.surfaceArea, b.surfaceArea),
+            centroid: vectorDelta(a.centroid, b.centroid),
+            bboxSize: vectorDelta(a.bboxSize, b.bboxSize),
+            counts: countDelta,
+          },
+        };
+        if (args.expect_volume_delta !== undefined) {
+          try {
+            payload.volumeDeltaCheck = checkScalar(
+              'volume_delta',
+              args.expect_volume_delta,
+              volumeDelta,
+            );
+          } catch (err) {
+            return fail(`expect_volume_delta: ${errMessage(err)}`);
+          }
+        }
+        return text(payload);
+      },
+    },
+
+    measure_clearance: {
+      definition: {
+        name: 'measure_clearance',
+        description:
+          'Measure how close a model comes to points or to another model — a passive ' +
+          'interference check, the read-only counterpart to the `clearance` constraint ' +
+          '`optimize` descends on. With `probes`, reports each point\'s signed distance to ' +
+          'the solid (negative means the point is inside the material), the nearest one, ' +
+          'and the smooth softmin the optimiser uses. With `against_model_id`, samples that ' +
+          "model's mesh vertices against this model's field and reports whether the two " +
+          'overlap and by how much, with the deepest point of intersection. Nothing else ' +
+          'in the toolset answers "do these two parts collide?".',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            model_id: { type: 'string' },
+            probes: {
+              description:
+                'Points to measure against the solid: [[x,y,z],…] or a flat [x,y,z,…] array.',
+            },
+            against_model_id: {
+              type: 'string',
+              description:
+                "Another model to test for interference. Its mesh vertices are measured " +
+                "against this model's field, so the resolution of the answer is that mesh's " +
+                '`accuracy`: a shallow overlap thinner than the triangle spacing can be missed.',
+            },
+            accuracy: {
+              type: 'number',
+              description: 'Target chordal deviation for the other model\'s mesh (interference mode).',
+            },
+            softness: {
+              type: 'number',
+              description:
+                `Softmin blend for the differentiable clearance value (model units, default ${DEFAULT_CLEARANCE_SOFTNESS}). ` +
+                'Smaller approaches a hard min; this affects only the `softMin` field.',
+            },
+          },
+          required: ['model_id'],
+        },
+      },
+      handler(args) {
+        if (args.probes === undefined && args.against_model_id === undefined) {
+          return fail('give either `probes` (points) or `against_model_id` (another model)');
+        }
+        let model;
+        try {
+          model = store.get(args.model_id);
+        } catch (err) {
+          return fail(err.message);
+        }
+        const softness =
+          Number.isFinite(args.softness) && args.softness > 0
+            ? args.softness
+            : DEFAULT_CLEARANCE_SOFTNESS;
+
+        /** Measure a flat probe buffer against this model's field. */
+        const against = (flat) => {
+          const distances = [];
+          let min = Infinity;
+          let minAt = null;
+          let inside = 0;
+          for (let i = 0; i < flat.length; i += 3) {
+            const d = model.shape.distance(flat[i], flat[i + 1], flat[i + 2]);
+            distances.push(d);
+            if (d < 0) inside += 1;
+            if (d < min) {
+              min = d;
+              minAt = [flat[i], flat[i + 1], flat[i + 2]];
+            }
+          }
+          return { distances, min, minAt, inside, count: distances.length };
+        };
+
+        const payload = { model_id: model.id };
+
+        if (args.probes !== undefined) {
+          let flat;
+          try {
+            flat = flattenProbes(args.probes);
+          } catch (err) {
+            return fail(err.message);
+          }
+          const r = against(flat);
+          let softMin = null;
+          try {
+            softMin = model.shape.fieldClearance(flat, softness);
+          } catch (err) {
+            // A softmin failure must not sink the exact per-probe answer, which
+            // is the number a caller actually wants here.
+            payload.softMinError = errMessage(err);
+          }
+          payload.probes = {
+            count: r.count,
+            // Exact signed distances, one per probe, in input order.
+            distances: r.distances,
+            minDistance: r.min,
+            nearestProbe: r.minAt,
+            probesInsideMaterial: r.inside,
+            clear: r.min > 0,
+            softMin,
+            softness,
+          };
+        }
+
+        if (args.against_model_id !== undefined) {
+          let other;
+          try {
+            other = store.get(args.against_model_id);
+          } catch (err) {
+            return fail(err.message);
+          }
+          // `store.get` just re-pointed the global exact toggle at `other`; mesh
+          // it now, then put the toggle back before measuring against `model`.
+          const mesh = getMesh(other.shape, { accuracy: accuracyArg(args.accuracy) });
+          if (mesh.triangles === 0) {
+            return fail(`model ${other.id} produced an empty mesh; nothing to test against`);
+          }
+          store.get(model.id);
+          const r = against(mesh.positions);
+          payload.interference = {
+            against_model_id: other.id,
+            sampledVertices: r.count,
+            // Negative min = the other model's surface reaches inside this one.
+            minDistance: r.min,
+            deepestPoint: r.minAt,
+            verticesInsideMaterial: r.inside,
+            interferes: r.min < 0,
+            // Positive: the gap between the two. Negative: how deep they overlap.
+            clearance: r.min,
+            note:
+              'Sampled at the other model\'s mesh vertices, so an overlap narrower than its ' +
+              'triangle spacing can be missed; pass a finer `accuracy` to tighten it. Only ' +
+              "the other model's surface is sampled, so one solid entirely inside the other " +
+              'with no surface contact reads as a deep interference, which it is.',
+          };
+        }
+
+        return text(payload);
       },
     },
 

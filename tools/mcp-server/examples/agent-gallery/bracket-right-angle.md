@@ -76,7 +76,9 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 >   },
 >   "volume": 19786.79765644562,
 >   "valid": true,
->   "issues": []
+>   "issues": [],
+>   "mesher": "adaptive-sdf",
+>   "brepChecked": false
 > }
 > ```
 
@@ -133,7 +135,317 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 > }
 > ```
 
-**Agent:** Volume 19787 mm³ = 19.8 cm³; in 6061 aluminium (2.70 g/cm³) that is about **53 g**. The reported `boundingBox` measures the part itself (it is taken off the same mesh these mass properties integrate), so it is good to the meshing accuracy and can be read as a measurement. Exporting:
+**Agent:** Volume 19787 mm³ = 19.8 cm³; in 6061 aluminium (2.70 g/cm³) that is about **53 g**. The reported `boundingBox` measures the part itself (it is taken off the same mesh these mass properties integrate), so it is good to the meshing accuracy and can be read as a measurement.
+
+Before exporting, though, a volume is a weak oracle for a part like this. Four Ø5 holes bored the *wrong* way through these plates remove nearly the right amount of material, render plausibly, and still report `valid: true` — that is a bug this part actually shipped with once. So I will ask about the structure directly, not the scalars:
+
+> 🔧 **`inspect_topology`**
+> ```json
+> {
+>   "model_id": "model-7",
+>   "include_faces": false
+> }
+> ```
+> ```json
+> {
+>   "model_id": "model-7",
+>   "counts": {
+>     "planarFaces": 11,
+>     "circularRims": 8,
+>     "throughHoles": 4,
+>     "pockets": 0,
+>     "cavities": 0,
+>     "bosses": 0,
+>     "unpairedRims": 0,
+>     "shells": 1,
+>     "genus": 4
+>   },
+>   "mesh": {
+>     "components": 1,
+>     "vertices": 14392,
+>     "edges": 43194,
+>     "triangles": 28796,
+>     "eulerCharacteristic": -6,
+>     "genus": 4,
+>     "closed": true
+>   },
+>   "cylinders": [
+>     {
+>       "kind": "through-hole",
+>       "axis": [
+>         0.0001851866783509887,
+>         -0.000020362539085941532,
+>         0.9999999826456304
+>       ],
+>       "radius": 2.5008861654446406,
+>       "diameter": 5.001772330889281,
+>       "center": [
+>         14.99985070653431,
+>         10.000325632925215,
+>         2.453933957939784
+>       ],
+>       "ends": [
+>         [
+>           14.999397940176744,
+>           10.00037541767612,
+>           0.009015383115880831
+>         ],
+>         [
+>           15.00030347289188,
+>           10.000275848174308,
+>           4.898852532763687
+>         ]
+>       ],
+>       "depth": 4.889837234507849
+>     },
+>     {
+>       "kind": "through-hole",
+>       "axis": [
+>         -0.00003511599840040121,
+>         -0.0000019641007542183265,
+>         0.9999999993815045
+>       ],
+>       "radius": 2.500755790782285,
+>       "diameter": 5.00151158156457,
+>       "center": [
+>         15.000357427236448,
+>         29.9997141689513,
+>         2.454844603787395
+>       ],
+>       "ends": [
+>         [
+>           15.000443349673766,
+>           29.999718974747278,
+>           0.008027165048380908
+>         ],
+>         [
+>           15.00027150479913,
+>           29.99970936315532,
+>           4.90166204252641
+>         ]
+>       ],
+>       "depth": 4.89363488050472
+>     },
+>     {
+>       "kind": "through-hole",
+>       "axis": [
+>         0.9999999496592932,
+>         -0.00031701248536326204,
+>         -0.000013582910102976422
+>       ],
+>       "radius": 2.500575626491806,
+>       "diameter": 5.001151252983612,
+>       "center": [
+>         -27.501180219927477,
+>         9.999119380354962,
+>         32.000029501570516
+>       ],
+>       "ends": [
+>         [
+>           -29.98292362813131,
+>           9.999906124040436,
+>           32.000063210869826
+>         ],
+>         [
+>           -25.019436811723644,
+>           9.998332636669488,
+>           31.999995792271207
+>         ]
+>       ],
+>       "depth": 4.963487066273114
+>     },
+>     {
+>       "kind": "through-hole",
+>       "axis": [
+>         0.9999999539044516,
+>         0.0003030119374527411,
+>         -0.00001936130565446517
+>       ],
+>       "radius": 2.5005539153409373,
+>       "diameter": 5.001107830681875,
+>       "center": [
+>         -27.49649140683647,
+>         30.000843577701062,
+>         32.00001017878982
+>       ],
+>       "ends": [
+>         [
+>           -29.981875912627988,
+>           30.000090476491934,
+>           32.000058299081125
+>         ],
+>         [
+>           -25.011106901044947,
+>           30.001596678910193,
+>           31.999962058498518
+>         ]
+>       ],
+>       "depth": 4.970769240713375
+>     }
+>   ],
+>   "planarFaces": {
+>     "count": 11,
+>     "totalArea": 9221.085273841834,
+>     "planarAreaFraction": 0.869784324096345,
+>     "remainderArea": 1200.7298514985541
+>   },
+>   "brep": {
+>     "available": false,
+>     "reason": "this shape has no exact B-Rep companion: an op in its chain is outside exact coverage (smooth blends, rounded boxes, sweeps/lofts/ribs, offsets, shells, anisotropic scale), or a boolean gated back to the F-Rep path. Only the mesh oracles (validate, measure, meshAgreement) apply."
+>   }
+> }
+> ```
+
+**Agent:** `genus: 4` — four handles in the surface, which is four holes going *through* the part; that number comes from `V − E + F` over the mesh, so it is combinatorics and cannot drift with meshing accuracy. `shells: 1`, so nothing was severed. And each bore is listed with the axis it was actually drilled on: two along Z through the base plate, two along X through the wall, all Ø5.00 through 4.9 mm of plate. That is the check no screenshot and no volume can make.
+
+Now the whole spec at once, as expectations rather than numbers I have to eyeball:
+
+> 🔧 **`assert_model`**
+> ```json
+> {
+>   "model_id": "model-7",
+>   "expect": [
+>     {
+>       "type": "closed_solid"
+>     },
+>     {
+>       "type": "shells",
+>       "value": 1
+>     },
+>     {
+>       "type": "genus",
+>       "value": 4
+>     },
+>     {
+>       "type": "volume",
+>       "value": 19792,
+>       "relative_tolerance": 0.01
+>     },
+>     {
+>       "type": "bbox_size",
+>       "value": [
+>         60,
+>         40,
+>         40
+>       ],
+>       "tolerance": 0.5
+>     },
+>     {
+>       "type": "through_holes",
+>       "value": 2,
+>       "axis": [
+>         0,
+>         0,
+>         1
+>       ],
+>       "diameter": 5,
+>       "tolerance": 0.3
+>     },
+>     {
+>       "type": "through_holes",
+>       "value": 2,
+>       "axis": [
+>         1,
+>         0,
+>         0
+>       ],
+>       "diameter": 5,
+>       "tolerance": 0.3
+>     },
+>     {
+>       "type": "hole_at",
+>       "at": [
+>         15,
+>         10,
+>         2.5
+>       ],
+>       "axis": [
+>         0,
+>         0,
+>         1
+>       ],
+>       "diameter": 5,
+>       "tolerance": 0.3
+>     }
+>   ]
+> }
+> ```
+> ```json
+> {
+>   "model_id": "model-7",
+>   "ok": true,
+>   "passed": 8,
+>   "failed": 0,
+>   "checks": [
+>     {
+>       "type": "closed_solid",
+>       "ok": true,
+>       "expected": true,
+>       "actual": true,
+>       "message": "closed, consistently oriented solid"
+>     },
+>     {
+>       "type": "shells",
+>       "ok": true,
+>       "expected": 1,
+>       "actual": 1,
+>       "message": "1 disconnected shells, as expected"
+>     },
+>     {
+>       "type": "genus",
+>       "ok": true,
+>       "expected": 4,
+>       "actual": 4,
+>       "message": "4 handles (through-holes) in the surface, as expected"
+>     },
+>     {
+>       "type": "volume",
+>       "ok": true,
+>       "expected": 19792,
+>       "actual": 19786.79765644562,
+>       "message": "volume 19786.79765644562 is within 197.92000000000002 of 19792"
+>     },
+>     {
+>       "type": "bbox_size",
+>       "ok": true,
+>       "expected": [
+>         60,
+>         40,
+>         40
+>       ],
+>       "actual": [
+>         60.00000000000017,
+>         40,
+>         40.000000000256044
+>       ],
+>       "message": "bbox_size matches"
+>     },
+>     {
+>       "type": "through_holes",
+>       "ok": true,
+>       "expected": 2,
+>       "actual": 2,
+>       "message": "2 through-holes matching axis ≈ [0.000,0.000,1.000], Ø5 ±0.3, as expected"
+>     },
+>     {
+>       "type": "through_holes",
+>       "ok": true,
+>       "expected": 2,
+>       "actual": 2,
+>       "message": "2 through-holes matching axis ≈ [1.000,0.000,0.000], Ø5 ±0.3, as expected"
+>     },
+>     {
+>       "type": "hole_at",
+>       "ok": true,
+>       "expected": 5,
+>       "actual": 5.000000000000016,
+>       "message": "bore present, 5.000000000000016 across"
+>     }
+>   ]
+> }
+> ```
+
+**Agent:** `8/8` — the part meets its spec, including the two assertions that name the drilling axes. Mutate the `rotate` calls in the script and those two fail while `closed_solid` keeps passing, which is exactly the failure mode. Exporting:
 
 > 🔧 **`export`** `{ "model_id": "model-7", "format": "step", "path": "bracket-right-angle.step" }`
 > ```json
@@ -141,7 +453,8 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 >   "model_id": "model-7",
 >   "format": "step",
 >   "path": "output/bracket-right-angle.step",
->   "bytes": 11887644
+>   "bytes": 11887644,
+>   "unit": "mm"
 > }
 > ```
 

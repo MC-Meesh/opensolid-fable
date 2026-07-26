@@ -50,6 +50,16 @@ function display(obj) {
 function json(obj) {
   return JSON.stringify(display(obj), null, 2);
 }
+/**
+ * Name a measured axis direction for prose: `+Z`, `−X`, and so on. A hole has
+ * no preferred direction along its own axis, so the sign is the fitted one and
+ * the narration says "along Z" rather than claiming a polarity that means
+ * nothing.
+ */
+function axisWord(axis) {
+  const i = axis.reduce((best, v, k) => (Math.abs(v) > Math.abs(axis[best]) ? k : best), 0);
+  return `${'XYZ'[i]}`;
+}
 
 // ── Transcript recorder ───────────────────────────────────────────────────
 // One instance per example. Each call runs the real tool, records a structured
@@ -113,6 +123,21 @@ class Transcript {
     const payload = JSON.parse(res.content[0].text);
     this.turns.push({ kind: 'validate', args, payload });
     console.error(`  ok  validate`);
+    return payload;
+  }
+
+  /**
+   * Any tool, recorded generically: the call arguments and the JSON payload,
+   * rendered verbatim. The purpose-built wrappers above exist because their
+   * turns need extra handling (a script block, an image, a tolerated error);
+   * a tool whose turn is just "these arguments, that JSON" needs none.
+   */
+  tool(name, args) {
+    const res = this._run(name, args);
+    if (res.isError) throw new Error(`${name} failed: ${res.content[0].text}`);
+    const payload = JSON.parse(res.content[0].text);
+    this.turns.push({ kind: 'tool', name, args, payload });
+    console.error(`  ok  ${name}`);
     return payload;
   }
 
@@ -201,6 +226,17 @@ class Transcript {
       }
       case 'validate': {
         const lines = [`> 🔧 **\`validate\`** \`{ "model_id": "${stableId(turn.args.model_id)}" }\``];
+        lines.push('> ```json');
+        for (const l of json(turn.payload).split('\n')) lines.push(`> ${l}`);
+        lines.push('> ```');
+        return lines.join('\n');
+      }
+      case 'tool': {
+        const args = { ...turn.args, model_id: stableId(turn.args.model_id) };
+        const lines = [`> 🔧 **\`${turn.name}\`**`];
+        lines.push('> ```json');
+        for (const l of json(args).split('\n')) lines.push(`> ${l}`);
+        lines.push('> ```');
         lines.push('> ```json');
         for (const l of json(turn.payload).split('\n')) lines.push(`> ${l}`);
         lines.push('> ```');
@@ -697,7 +733,47 @@ return part;
         `**${((mass.volume / 1000) * 2.7).toFixed(0)} g**. The reported ` +
         '`boundingBox` measures the part itself (it is taken off the same mesh ' +
         'these mass properties integrate), so it is good to the meshing ' +
-        'accuracy and can be read as a measurement. Exporting:',
+        'accuracy and can be read as a measurement.\n\n' +
+        'Before exporting, though, a volume is a weak oracle for a part like ' +
+        'this. Four Ø5 holes bored the *wrong* way through these plates remove ' +
+        'nearly the right amount of material, render plausibly, and still ' +
+        'report `valid: true` — that is a bug this part actually shipped with ' +
+        'once. So I will ask about the structure directly, not the scalars:',
+    );
+    const topo = t.tool('inspect_topology', { model_id: m.model_id, include_faces: false });
+    t.say(
+      `\`genus: ${topo.counts.genus}\` — four handles in the surface, which is ` +
+        'four holes going *through* the part; that number comes from ' +
+        '`V − E + F` over the mesh, so it is combinatorics and cannot drift ' +
+        `with meshing accuracy. \`shells: ${topo.counts.shells}\`, so nothing was ` +
+        'severed. And each bore is listed with the axis it was actually drilled ' +
+        `on: two along ${axisWord(topo.cylinders[0].axis)} through the base ` +
+        `plate, two along ${axisWord(topo.cylinders[2].axis)} through the wall, ` +
+        `all Ø${topo.cylinders[0].diameter.toFixed(2)} through ` +
+        `${topo.cylinders[0].depth.toFixed(1)} mm of plate. That is the check ` +
+        'no screenshot and no volume can make.\n\n' +
+        'Now the whole spec at once, as expectations rather than numbers I have ' +
+        'to eyeball:',
+    );
+    const asserted = t.tool('assert_model', {
+      model_id: m.model_id,
+      expect: [
+        { type: 'closed_solid' },
+        { type: 'shells', value: 1 },
+        { type: 'genus', value: 4 },
+        { type: 'volume', value: 19792, relative_tolerance: 0.01 },
+        { type: 'bbox_size', value: [60, 40, 40], tolerance: 0.5 },
+        { type: 'through_holes', value: 2, axis: [0, 0, 1], diameter: 5, tolerance: 0.3 },
+        { type: 'through_holes', value: 2, axis: [1, 0, 0], diameter: 5, tolerance: 0.3 },
+        { type: 'hole_at', at: [15, 10, 2.5], axis: [0, 0, 1], diameter: 5, tolerance: 0.3 },
+      ],
+    });
+    t.say(
+      `\`${asserted.passed}/${asserted.passed + asserted.failed}\` — the part ` +
+        'meets its spec, including the two assertions that name the drilling ' +
+        'axes. Mutate the `rotate` calls in the script and those two fail while ' +
+        '`closed_solid` keeps passing, which is exactly the failure mode. ' +
+        'Exporting:',
     );
     t.export(m.model_id, 'step', 'bracket-right-angle.step');
     t.export(m.model_id, 'stl', 'bracket-right-angle.stl');

@@ -172,3 +172,71 @@ The reader-side round-trip is covered by
 The hole-volume assertion is the one that matters. It is the only test in the
 repo that would have caught `of-4tu`, and it exists because a hand calculation
 disagreed with every oracle the tools offered.
+
+## The oracles that exist now — `of-2y4.5`
+
+The headline above said the agent interface had no working correctness oracle for
+a part with a hole in it. It has four, and they are tools rather than a hand
+calculation:
+
+- **`inspect_topology`** answers the question the scalars could not: how many
+  holes go through the part, along which axis, at what diameter and depth. Rims
+  are fitted from the mesh, paired into coaxial features, and classified
+  through-hole vs boss by sampling the field between them; `probes` casts a line
+  through any point along any axis and reports the ordered solid/void spans it
+  crosses. `genus` — handles in the surface, from `V − E + F` over the welded
+  mesh — is the cheapest form of the same check and is exact combinatorics, so it
+  does not drift with `accuracy` the way a volume does. The bracket's wrong-axis
+  holes report `axis: [0,0,1]` where the spec wanted `[0,1,0]`, in one call.
+- **`assert_model`** turns intent into pass/fail:
+  `{"type": "through_holes", "value": 4, "axis": [0,1,0], "diameter": 5}` fails
+  on the mis-drilled part *and names what is actually there*. The rule
+  throughout is that an expectation which cannot be evaluated **fails** — a null
+  volume, an unmeasurable genus, a `brep_sound` on a model with no B-Rep. A
+  check that quietly abstains is how the wrong part passed the first time.
+- **`diff_models`** with `expect_volume_delta` is the hand calculation, without
+  the paper: "these four Ø5 bores should remove 392.7 mm³" becomes an argument.
+  Its `counts` delta covers the structural half — drilling four holes must move
+  `genus` by exactly +4.
+- **`measure_clearance`** exposes the keep-out measurement that used to be
+  reachable only as an `optimize` constraint, and adds model-vs-model
+  interference — nothing in the toolset previously answered "do these two parts
+  collide?".
+
+Two of the other items above are addressed alongside:
+
+- **`validate` beyond mesh closure (§ the `valid` row of the headline table).**
+  It now also runs the kernel's own `TopologyStore::check` /`check_geometry` over
+  the model's exact B-Rep and reports every failure — referential integrity,
+  loop bookkeeping, orientation across every edge, the Euler–Poincaré formula,
+  edges lying on their faces, pcurve fidelity, face sense against loop winding —
+  with `deep: true` adding face-face self-intersection (`of-ipt.13`,
+  `of-ipt.14`). Where there is *no* B-Rep to check it says so with a reason
+  rather than reporting an empty failure list, because "nothing was checked" and
+  "checked, sound" are different answers. `validate` also carries the exact
+  body's entity census, which is the only place a *true* face or edge count comes
+  from: the SDF mesher renders a sharp edge as a one-cell bevel, so nothing
+  recovered from a tessellation can count them exactly.
+- **The three-mesher disagreement (§2, `of-2i8`).** `validate` names which
+  mesher answered (`mesher`), and `shape.meshAgreement(accuracy)` runs all of
+  them — uniform grid, adaptive SDF, faceted-STEP recovery, exact tessellation —
+  and reports each verdict side by side with a named `disagreement`. The
+  "`valid: true`, STL fine, STEP declines" signature is now a fact a caller can
+  read before paying for the export, rather than an inference from which tool
+  happened to fail. Not *reconciled* — the meshers still differ — but no longer
+  invisible.
+
+Every other numbered item above has since been closed on its own bead —
+`of-4tu` (the docs and `get_capabilities` conventions now say +Y, loudly),
+`of-obv` (faceted STEP on a drilled plate), `of-b06` (`measure`'s `boundingBox`
+is the measured mesh's extent, not the tracked box), `of-ysr` (`massError` and a
+defect-keyed hint travel with every null volume), `of-2i8` (`export` takes an
+`accuracy`), `of-fc8` (round-trip volume identity) — leaving only `of-6t8`, the
+duplicated issue string, which is cosmetic.
+
+What none of this changes: the tools can now *tell* you the holes are on the
+wrong axis, and they will not do it unasked. `validate` still answers only the
+question it is asked, and it is a narrow one. The habit that has to go with these
+tools is stating the intent — `assert_model` with the axis, or a `diff_models`
+volume delta against a number from the spec — because a part that satisfies
+every check you thought to run is not the same thing as a correct part.

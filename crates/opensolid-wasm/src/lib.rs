@@ -21,10 +21,21 @@ use opensolid_core::mesh::TriangleMesh;
 use opensolid_core::types::{BoundingBox3, Point3, Vector3};
 use opensolid_frep::diff::objective::{Occupancy, clearance_field, measure_field};
 use opensolid_frep::{OpenPath2D, Profile2D, RibSide};
-use opensolid_kernel::brep::BooleanOp;
+use opensolid_kernel::brep::{BooleanOp, CheckFailure};
 use opensolid_kernel::mass_properties;
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
+
+/// Grid resolution `meshAgreement` probes the fixed-resolution `mesh()` path
+/// at — the playground viewport's own default, so the reported verdict is the
+/// one an interactive session would see.
+const UNIFORM_PROBE_RESOLUTION: usize = 64;
+
+/// Relative volume spread `meshAgreement` tolerates between two meshers before
+/// calling it a disagreement. These are different tessellations of one surface,
+/// so a fraction of a percent apart is expected and only a gross mismatch — a
+/// missing feature, a hole that closed over — is information.
+const MESH_VOLUME_AGREEMENT: f64 = 0.01;
 
 /// One queued segment of a WASM profile/path builder, replayed onto the
 /// frep [`Profile2DBuilder`](opensolid_frep::Profile2DBuilder) /
@@ -509,6 +520,128 @@ impl WasmShape {
     /// (see [`ExactRep::measurement_mesh`]).
     fn measurement_mesh(&self) -> Option<&TriangleMesh> {
         self.exact.as_ref().and_then(|r| r.measurement_mesh())
+    }
+
+    /// Which mesher's answer `measure`/`validate` are reporting, as the label
+    /// they carry in their `mesher` field.
+    ///
+    /// Three distinct provenances, not two: an exact boolean's own validated
+    /// tessellation, a STEP reader's tessellation of an imported body, and an
+    /// adaptive SDF re-mesh. They differ in what a "closed manifold" verdict is
+    /// *about*, so a caller reading `valid: true` should be able to tell which
+    /// artifact it holds for — and `meshAgreement` labels the same paths the
+    /// same way.
+    fn measurement_mesher(&self) -> &'static str {
+        if self.measurement_mesh().is_none() {
+            return "adaptive-sdf";
+        }
+        match self.exact.as_ref() {
+            Some(ExactRep::Imported(_)) | Some(ExactRep::Tessellated(_)) => "step-reader",
+            _ => "exact-brep",
+        }
+    }
+
+    /// The B-Rep check report for this shape, as `(json, failure messages)`.
+    ///
+    /// Two returns because two callers want different shapes of the same
+    /// answer: `brepCheck` serves the JSON, and `validate` embeds that JSON
+    /// *and* folds the messages into its own `issues` list. Computing the
+    /// check twice, or re-parsing the JSON to recover the messages, would be
+    /// two ways for the two reports to disagree.
+    fn brep_report(&self, deep: bool) -> (String, Vec<String>) {
+        let unavailable = |reason: &str| {
+            (
+                format!(
+                    "{{\"available\":false,\"reason\":\"{}\",\"failures\":[],\
+                     \"selfIntersectionChecked\":false}}",
+                    json_escape(reason),
+                ),
+                Vec::new(),
+            )
+        };
+        let Some(rep) = self.exact.as_ref() else {
+            return unavailable(
+                "this shape has no exact B-Rep companion: an op in its chain is outside exact \
+                 coverage (smooth blends, rounded boxes, sweeps/lofts/ribs, offsets, shells, \
+                 anisotropic scale), or a boolean gated back to the F-Rep path. Only the mesh \
+                 oracles (validate, measure, meshAgreement) apply.",
+            );
+        };
+        if matches!(rep, ExactRep::Boolean(_)) && !exact::exact_enabled() {
+            // Unreachable through `create_model` (the toggle is set before the
+            // script runs), but a caller flipping it mid-session would otherwise
+            // get a report about a body its meshes no longer come from.
+            return unavailable(
+                "the exact-boolean mode is off, so the meshes being measured do not come from \
+                 this B-Rep; rebuild the model with exact: true to check the body it exports.",
+            );
+        }
+        if matches!(rep, ExactRep::Tessellated(_)) {
+            return unavailable(
+                "this shape carries a known-good tessellation but no analytic body — a STEP solid \
+                 the reader could only recover as a mesh, or a placed assembly. The mesh oracles \
+                 apply; the STEP import report says which solids took that path and why.",
+            );
+        }
+        let source = match rep {
+            ExactRep::Spec(_) => "primitive",
+            ExactRep::Boolean(_) => "boolean-result",
+            ExactRep::Imported(_) => "step-import",
+            ExactRep::Tessellated(_) => unreachable!("returned above"),
+        };
+        let Some(failures) = rep.check(deep) else {
+            return unavailable(
+                "the primitive has no exact B-Rep constructor (e.g. a spindle torus), so there \
+                 is no body to check; it models and meshes through the SDF path only.",
+            );
+        };
+        let list = failures
+            .iter()
+            .map(|f| {
+                format!(
+                    "{{\"kind\":\"{}\",\"structural\":{},\"message\":\"{}\"}}",
+                    check_failure_kind(f),
+                    f.is_structural(),
+                    json_escape(&f.to_string()),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let messages = failures
+            .iter()
+            .map(|f| format!("B-Rep body check: {f}"))
+            .collect();
+        let counts = match rep.census() {
+            Some(c) => format!(
+                "{{\"shells\":{},\"faces\":{},\"loops\":{},\"innerLoops\":{},\"fins\":{},\
+                 \"edges\":{},\"vertices\":{},\"genus\":{},\"surfaceKinds\":{{\"plane\":{},\
+                 \"cylinder\":{},\"cone\":{},\"sphere\":{},\"torus\":{},\"nurbs\":{},\
+                 \"unattached\":{}}}}}",
+                c.shells,
+                c.faces,
+                c.loops,
+                c.innerLoops,
+                c.fins,
+                c.edges,
+                c.vertices,
+                c.genus,
+                c.planes,
+                c.cylinders,
+                c.cones,
+                c.spheres,
+                c.tori,
+                c.nurbs,
+                c.surfaceless,
+            ),
+            None => "null".to_string(),
+        };
+        (
+            format!(
+                "{{\"available\":true,\"source\":\"{source}\",\"counts\":{counts},\
+                 \"failures\":[{list}],\"selfIntersectionChecked\":{deep}}}",
+            ),
+            messages,
+        )
     }
 
     /// Run `f` over the mesh that measurement should use: the validated
@@ -1240,13 +1373,207 @@ impl WasmShape {
         Ok(clearance_field(&self.inner.shape, &pts, softness))
     }
 
+    /// The kernel's B-Rep body validation for this shape's exact
+    /// representation, as a JSON object string:
+    /// `{ available, reason?, source?, counts?, failures:[{kind, structural,
+    /// message}], selfIntersectionChecked }`.
+    ///
+    /// `counts` is the body's entity census — shells, faces, loops, inner
+    /// (hole) loops, edges, vertices, genus, and how many faces sit on each
+    /// analytic surface kind. That is the *real* topology count, which no
+    /// tessellation can supply: an SDF mesher renders a sharp edge as a
+    /// one-cell bevel, so any face or edge count taken off a mesh is partly a
+    /// statement about the mesher. "Four cylindrical faces" answers "did I
+    /// drill four holes?" outright.
+    ///
+    /// This is the check mesh closure cannot make. A tessellation can be a
+    /// perfectly closed, consistently oriented manifold while the B-Rep
+    /// behind it has an edge that leaves its face's surface, a pcurve on the
+    /// wrong branch of a periodic surface, a face whose sense contradicts its
+    /// loop winding, or two faces passing through each other — every one of
+    /// which is a defect a downstream consumer (STEP importer, CAM, FEA) will
+    /// trip over. It runs [`TopologyStore::check`] and
+    /// `check_geometry`, plus `check_self_intersection` when
+    /// `self_intersection` is set (a pairwise face search, so opt-in).
+    ///
+    /// `available` is false — with a `reason` — whenever there is no exact
+    /// B-Rep to check: the exact-boolean mode is off, the op chain left exact
+    /// coverage (a smooth blend, a sweep, an anisotropic scale), a boolean
+    /// gated back to F-Rep, or the primitive has no exact constructor. That
+    /// is deliberately *not* reported as "no failures": "nothing to check"
+    /// and "checked, sound" are different answers and an oracle that conflates
+    /// them is worse than none.
+    #[wasm_bindgen(js_name = brepCheck)]
+    pub fn brep_check(&self, self_intersection: Option<bool>) -> String {
+        self.brep_report(self_intersection.unwrap_or(false)).0
+    }
+
+    /// Whether the shape's several meshers agree that it is a closed solid,
+    /// as a JSON object string: `{ agree, paths:[{name, available, closed,
+    /// triangles, volume, error?}], disagreement? }`.
+    ///
+    /// The shape is meshed by more than one route and they are not
+    /// interchangeable: `mesh` dual-contours a fixed uniform grid, `measure`
+    /// and `validate` read an adaptive octree mesh, faceted STEP export
+    /// recovers planar regions through `sdf_to_brep`, and an exact boolean
+    /// result serves its own validated analytic tessellation. "valid:true,
+    /// STL fine, STEP declines" is a real and previously undiagnosable
+    /// signature (of-obv, of-2i8) precisely because a caller could see only
+    /// one of those answers at a time. This runs each available path at the
+    /// same `accuracy` and reports all of them side by side, so a
+    /// disagreement is a visible fact rather than an inference from which
+    /// tool happened to fail.
+    ///
+    /// `accuracy` is the target chordal deviation for the adaptive and
+    /// faceted-STEP paths (absent or invalid falls back to 0.5% of the
+    /// shape's extent, as elsewhere). The uniform path has no accuracy knob —
+    /// it is reported at its interactive default resolution.
+    ///
+    /// `agree` weighs closure across *every* path — that is the verdict they
+    /// are all answering the same question about — but volume only across the
+    /// paths `accuracy` actually governs (`adaptive-sdf` and whichever
+    /// authoritative tessellation is in play — `exact-brep` or
+    /// `step-reader`), with a
+    /// 1% relative tolerance. The uniform grid's volume is reported for
+    /// information and excluded from the verdict: it is a fixed
+    /// `UNIFORM_PROBE_RESOLUTION`³ grid, so on a shape whose features are
+    /// small against its extent it is *legitimately* coarser (measured ~3%
+    /// light on a 30 mm plate with a Ø5 hole), and calling that a defect would
+    /// make the whole report cry wolf on well-formed parts.
+    #[wasm_bindgen(js_name = meshAgreement)]
+    pub fn mesh_agreement(&self, accuracy: Option<f64>) -> String {
+        /// One mesher's verdict, rendered as a JSON object.
+        fn path_json(name: &str, mesh: &TriangleMesh) -> (String, Option<f64>, bool) {
+            let closed = mesh.is_closed_manifold();
+            let volume = mass_properties(mesh).ok().map(|mp| mp.volume);
+            let json = format!(
+                "{{\"name\":\"{}\",\"available\":true,\"closed\":{},\"triangles\":{},\"volume\":{}}}",
+                name,
+                closed,
+                mesh.triangle_count(),
+                volume.map(json_num).unwrap_or_else(|| "null".to_string()),
+            );
+            (json, volume, closed)
+        }
+
+        let size = self.inner.bounds.max - self.inner.bounds.min;
+        let extent = size.x.max(size.y).max(size.z).max(1e-9);
+        let accuracy = match accuracy {
+            Some(a) if a.is_finite() && a > 0.0 => a,
+            _ => 5e-3 * extent,
+        };
+
+        let mut paths: Vec<String> = Vec::new();
+        let mut closures: Vec<(&str, bool)> = Vec::new();
+        let mut volumes: Vec<(&str, f64)> = Vec::new();
+        // `compare_volume` marks the paths whose fidelity `accuracy` sets, and
+        // so the only ones whose volumes are commensurable (see the doc above).
+        let mut record = |name: &'static str, mesh: &TriangleMesh, compare_volume: bool| {
+            let (json, volume, closed) = path_json(name, mesh);
+            paths.push(json);
+            closures.push((name, closed));
+            if let (Some(v), true) = (volume, compare_volume) {
+                volumes.push((name, v));
+            }
+        };
+
+        // The mesh measurement actually reads, under the name `validate` gives
+        // it — not `exact_mesh()`, which ignores the exact-boolean mode and
+        // would report a tessellation that is not in play.
+        if let Some(mesh) = self.measurement_mesh() {
+            record(self.measurement_mesher(), mesh, true);
+        }
+        record(
+            "uniform-grid",
+            &self.inner.mesh(UNIFORM_PROBE_RESOLUTION, None),
+            false,
+        );
+        record(
+            "adaptive-sdf",
+            &self.inner.mesh_adaptive(accuracy, None),
+            true,
+        );
+        match step::faceted_body(&self.inner, Some(accuracy)) {
+            Ok(probe) => paths.push(format!(
+                "{{\"name\":\"step-facet\",\"available\":true,\"closed\":true,\
+                 \"faces\":{},\"volume\":null}}",
+                probe.faces,
+            )),
+            Err(e) => {
+                closures.push(("step-facet", false));
+                paths.push(format!(
+                    "{{\"name\":\"step-facet\",\"available\":false,\"closed\":false,\
+                     \"error\":\"{}\"}}",
+                    json_escape(&e),
+                ));
+            }
+        }
+
+        // Disagreement, in the two ways that matter to a caller: one path says
+        // "not a solid" while another says it is, or two paths bound volumes
+        // that are not the same volume.
+        let mut disagreements: Vec<String> = Vec::new();
+        let closed_yes: Vec<&str> = closures
+            .iter()
+            .filter(|(_, c)| *c)
+            .map(|(n, _)| *n)
+            .collect();
+        let closed_no: Vec<&str> = closures
+            .iter()
+            .filter(|(_, c)| !*c)
+            .map(|(n, _)| *n)
+            .collect();
+        if !closed_yes.is_empty() && !closed_no.is_empty() {
+            disagreements.push(format!(
+                "{} produced a closed solid but {} did not",
+                closed_yes.join(", "),
+                closed_no.join(", "),
+            ));
+        }
+        for (i, (na, va)) in volumes.iter().enumerate() {
+            for (nb, vb) in &volumes[i + 1..] {
+                let scale = va.abs().max(vb.abs()).max(1e-12);
+                if (va - vb).abs() / scale > MESH_VOLUME_AGREEMENT {
+                    disagreements.push(format!("{na} measures {va} but {nb} measures {vb}"));
+                }
+            }
+        }
+        let detail = disagreements
+            .iter()
+            .map(|d| format!("\"{}\"", json_escape(d)))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "{{\"agree\":{},\"accuracy\":{},\"paths\":[{}],\"disagreement\":[{}]}}",
+            disagreements.is_empty(),
+            json_num(accuracy),
+            paths.join(","),
+            detail,
+        )
+    }
+
     /// A structural check report for the shape's measured mesh, as a JSON
     /// object string: `{ valid, closedManifold, triangles, vertices, volume,
-    /// exact, issues:[…] }`. `valid` is true exactly when the mesh is
-    /// non-empty, a closed and consistently oriented 2-manifold, and encloses
-    /// a finite non-zero volume; otherwise `issues` names each failure.
-    pub fn validate(&self, accuracy: Option<f64>) -> String {
+    /// exact, mesher, issues:[…], brep:{…} }`. `valid` is true exactly when
+    /// the mesh is non-empty, a closed and consistently oriented 2-manifold,
+    /// encloses a finite non-zero volume, **and** — when there is an exact
+    /// B-Rep to check — that body passes the kernel's own validation; `issues`
+    /// names each failure.
+    ///
+    /// `mesher` names which path answered — `exact-brep` (an exact boolean's own
+    /// validated tessellation), `step-reader` (the STEP reader's tessellation of
+    /// an imported body) or `adaptive-sdf` — so
+    /// a caller can tell whether "valid" is a statement about the analytic
+    /// body or about an SDF tessellation of it; `meshAgreement` compares all
+    /// of them. `brep` is the [`brepCheck`](Self::brep_check) report,
+    /// including its `available:false` reason when there is no body to check —
+    /// so a `valid:true` always says what it did and did not verify.
+    ///
+    /// `deep` runs the B-Rep self-intersection pass as well (a pairwise search
+    /// over faces; off by default).
+    pub fn validate(&self, accuracy: Option<f64>, deep: Option<bool>) -> String {
         let exact = self.measured_exact();
+        let (brep_json, brep_issues) = self.brep_report(deep.unwrap_or(false));
         self.with_measure_mesh(accuracy, |mesh| {
             let mut issues: Vec<String> = Vec::new();
             let defects = mesh.manifold_defects();
@@ -1272,6 +1599,10 @@ impl WasmShape {
                     "null".to_string()
                 }
             };
+            // B-Rep defects last: they are a claim about a different artifact
+            // (the analytic body, not this tessellation), and reading them
+            // after the mesh verdict keeps that boundary legible.
+            issues.extend(brep_issues.iter().cloned());
             let issues_json = issues
                 .iter()
                 .map(|s| format!("\"{}\"", json_escape(s)))
@@ -1279,13 +1610,15 @@ impl WasmShape {
                 .join(",");
             format!(
                 "{{\"valid\":{},\"closedManifold\":{},\"triangles\":{},\"vertices\":{},\
-                 \"volume\":{},\"exact\":{},\"issues\":[{}]}}",
+                 \"volume\":{},\"exact\":{},\"mesher\":\"{}\",\"brep\":{},\"issues\":[{}]}}",
                 issues.is_empty(),
                 closed,
                 mesh.triangle_count(),
                 mesh.vertex_count(),
                 volume,
                 exact,
+                self.measurement_mesher(),
+                brep_json,
                 issues_json,
             )
         })
@@ -1383,6 +1716,52 @@ pub fn import_step(bytes: &[u8], circle_segments: Option<f64>) -> Result<WasmSte
         assembled,
         report,
     })
+}
+
+/// The variant name of a [`CheckFailure`], as a stable machine-readable kind
+/// string next to its human-readable message. A caller filtering for one class
+/// of defect ("did anything self-intersect?") should not have to pattern-match
+/// on prose.
+fn check_failure_kind(failure: &CheckFailure) -> &'static str {
+    match failure {
+        CheckFailure::StaleBody(_) => "StaleBody",
+        CheckFailure::StaleReference { .. } => "StaleReference",
+        CheckFailure::BackPointerMismatch { .. } => "BackPointerMismatch",
+        CheckFailure::EmptyShell(_) => "EmptyShell",
+        CheckFailure::SolidWithoutShells(_) => "SolidWithoutShells",
+        CheckFailure::FaceWithoutOuterLoop(_) => "FaceWithoutOuterLoop",
+        CheckFailure::EmptyLoop(_) => "EmptyLoop",
+        CheckFailure::VertexLoopWithFins(_) => "VertexLoopWithFins",
+        CheckFailure::OuterLoopFlaggedInner { .. } => "OuterLoopFlaggedInner",
+        CheckFailure::InnerLoopFlaggedOuter { .. } => "InnerLoopFlaggedOuter",
+        CheckFailure::DuplicateLoopOnFace { .. } => "DuplicateLoopOnFace",
+        CheckFailure::FinLinkBroken { .. } => "FinLinkBroken",
+        CheckFailure::LoopNotVertexContinuous { .. } => "LoopNotVertexContinuous",
+        CheckFailure::FinMissingFromEdge { .. } => "FinMissingFromEdge",
+        CheckFailure::ForeignFinOnEdge { .. } => "ForeignFinOnEdge",
+        CheckFailure::EdgeMissingFromVertex { .. } => "EdgeMissingFromVertex",
+        CheckFailure::ForeignEdgeOnVertex { .. } => "ForeignEdgeOnVertex",
+        CheckFailure::OpenEdgeInClosedShell { .. } => "OpenEdgeInClosedShell",
+        CheckFailure::OpenShellInSolid { .. } => "OpenShellInSolid",
+        CheckFailure::ShellFlaggedOpenButClosed(_) => "ShellFlaggedOpenButClosed",
+        CheckFailure::NonManifoldEdge { .. } => "NonManifoldEdge",
+        CheckFailure::EdgeSharedBetweenShells { .. } => "EdgeSharedBetweenShells",
+        CheckFailure::VertexSharedBetweenShells { .. } => "VertexSharedBetweenShells",
+        CheckFailure::UnmatedFins { .. } => "UnmatedFins",
+        CheckFailure::MateNotMutual { .. } => "MateNotMutual",
+        CheckFailure::MateOnDifferentEdge { .. } => "MateOnDifferentEdge",
+        CheckFailure::InconsistentOrientation { .. } => "InconsistentOrientation",
+        CheckFailure::EulerViolation { .. } => "EulerViolation",
+        CheckFailure::InvalidTolerance { .. } => "InvalidTolerance",
+        CheckFailure::ToleranceExceeded { .. } => "ToleranceExceeded",
+        CheckFailure::NonFinitePoint(_) => "NonFinitePoint",
+        CheckFailure::EdgeOffSurface { .. } => "EdgeOffSurface",
+        CheckFailure::VertexOffEdge { .. } => "VertexOffEdge",
+        CheckFailure::PcurveDeviation { .. } => "PcurveDeviation",
+        CheckFailure::FaceSenseContradictsLoop { .. } => "FaceSenseContradictsLoop",
+        CheckFailure::InvalidEdgeRange { .. } => "InvalidEdgeRange",
+        CheckFailure::SelfIntersection { .. } => "SelfIntersection",
+    }
 }
 
 #[cfg(test)]
@@ -1550,7 +1929,7 @@ mod tests {
         // The deep interior is hollowed out — that is the whole point.
         assert!(hollow.distance(0.0, 0.0, 0.0) > 0.0, "interior not hollow");
         // The hollowed body still tessellates to a closed, oriented solid.
-        let report = hollow.validate(Some(0.01));
+        let report = hollow.validate(Some(0.01), None);
         assert!(
             report.contains("\"closedManifold\":true") && report.contains("\"valid\":true"),
             "shell failed validation: {report}"
@@ -1706,7 +2085,7 @@ mod tests {
 
     #[test]
     fn validate_accepts_solid_and_reports_boolean_result() {
-        let sphere = WasmShape::sphere(1.0).validate(None);
+        let sphere = WasmShape::sphere(1.0).validate(None, None);
         assert!(sphere.contains("\"valid\":true"), "{sphere}");
         assert!(sphere.contains("\"closedManifold\":true"));
         let volume = json_field(&sphere, "volume").expect("volume present");
@@ -1716,8 +2095,90 @@ mod tests {
         // A boolean difference still validates as a watertight solid.
         let part = WasmShape::box3(1.0, 1.0, 1.0)
             .subtract(&WasmShape::cylinder(0.4, 2.0))
-            .validate(None);
+            .validate(None, None);
         assert!(part.contains("\"valid\":true"), "{part}");
+    }
+
+    /// `validate` now says which mesher answered and carries the B-Rep
+    /// report, so a `valid:true` discloses what it did *not* check.
+    #[test]
+    fn validate_names_its_mesher_and_carries_the_brep_report() {
+        let report = WasmShape::sphere(1.0).validate(None, None);
+        assert!(report.contains("\"mesher\":\"adaptive-sdf\""), "{report}");
+        assert!(report.contains("\"brep\":"), "{report}");
+        // A bare primitive has an exact companion, so the body *is* checkable
+        // even with the boolean mode off, and it is sound.
+        assert!(report.contains("\"available\":true"), "{report}");
+        assert!(report.contains("\"failures\":[]"), "{report}");
+        assert!(report.contains("\"valid\":true"), "{report}");
+    }
+
+    /// A shape outside exact coverage has no body to check, and says so
+    /// rather than reporting an empty failure list as a clean bill of health.
+    #[test]
+    fn brep_check_declines_outside_exact_coverage() {
+        let blended =
+            WasmShape::sphere(1.0).smooth_union(&WasmShape::box3(1.0, 1.0, 1.0), Some(0.2));
+        let report = blended.brep_check(None);
+        assert!(report.contains("\"available\":false"), "{report}");
+        assert!(report.contains("outside exact coverage"), "{report}");
+        // ...and the mesh oracles still apply, so `valid` is unaffected.
+        let validation = blended.validate(None, None);
+        assert!(validation.contains("\"valid\":true"), "{validation}");
+    }
+
+    /// The deep pass is opt-in and is reported as having run, so "no
+    /// self-intersections found" can be told apart from "not looked for".
+    #[test]
+    fn brep_check_reports_whether_the_deep_pass_ran() {
+        let block = WasmShape::box3(1.0, 0.4, 1.0);
+        assert!(
+            block
+                .brep_check(None)
+                .contains("\"selfIntersectionChecked\":false")
+        );
+        let deep = block.brep_check(Some(true));
+        assert!(deep.contains("\"selfIntersectionChecked\":true"), "{deep}");
+        assert!(deep.contains("\"failures\":[]"), "{deep}");
+    }
+
+    /// A drilled plate is where the meshers historically split: the mesh
+    /// oracles pass and faceted STEP declines. Whatever this shape does
+    /// today, `meshAgreement` must report every path's verdict and set
+    /// `agree` from them rather than from whichever one it asked first.
+    #[test]
+    fn mesh_agreement_reports_every_path() {
+        let plate = WasmShape::box3(15.0, 1.25, 10.0).subtract(
+            &WasmShape::cylinder(2.5, 10.0)
+                .rotate(1.0, 0.0, 0.0, 90.0)
+                .translate(7.5, 0.0, 0.0),
+        );
+        let json = plate.mesh_agreement(Some(0.2));
+        for path in ["uniform-grid", "adaptive-sdf", "step-facet"] {
+            assert!(json.contains(path), "{path} missing from {json}");
+        }
+        assert!(json.contains("\"accuracy\":0.2"), "{json}");
+        // `agree:false` and a named disagreement are the same fact stated
+        // twice; a verdict with nothing behind it is the failure mode here.
+        assert_eq!(
+            json.contains("\"agree\":false"),
+            !json.contains("\"disagreement\":[]"),
+            "the verdict and the reasons for it disagree: {json}"
+        );
+        // A path that failed to close must be named as a disagreement rather
+        // than averaged away.
+        if json.contains("\"closed\":false") {
+            assert!(json.contains("\"agree\":false"), "{json}");
+        }
+    }
+
+    /// Every mesher agrees about a plain box, and says so.
+    #[test]
+    fn mesh_agreement_is_unanimous_on_a_box() {
+        let json = WasmShape::box3(2.0, 1.0, 1.5).mesh_agreement(Some(0.05));
+        assert!(json.contains("\"agree\":true"), "{json}");
+        assert!(json.contains("\"disagreement\":[]"), "{json}");
+        assert!(!json.contains("\"closed\":false"), "{json}");
     }
 
     #[test]

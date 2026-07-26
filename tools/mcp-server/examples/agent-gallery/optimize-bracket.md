@@ -49,6 +49,8 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 >   "volume": 18217.806820822865,
 >   "valid": true,
 >   "issues": [],
+>   "mesher": "adaptive-sdf",
+>   "brepChecked": false,
 >   "params": [
 >     {
 >       "name": "thickness",
@@ -414,6 +416,13 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 >   "vertices": 8738,
 >   "volume": 16665.69730681346,
 >   "exact": false,
+>   "mesher": "adaptive-sdf",
+>   "brep": {
+>     "available": false,
+>     "reason": "this shape has no exact B-Rep companion: an op in its chain is outside exact coverage (smooth blends, rounded boxes, sweeps/lofts/ribs, offsets, shells, anisotropic scale), or a boolean gated back to the F-Rep path. Only the mesh oracles (validate, measure, meshAgreement) apply.",
+>     "failures": [],
+>     "selfIntersectionChecked": false
+>   },
 >   "issues": []
 > }
 > ```

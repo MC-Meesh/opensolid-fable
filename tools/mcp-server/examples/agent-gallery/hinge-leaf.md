@@ -52,7 +52,9 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 >   },
 >   "volume": 3815.201362779873,
 >   "valid": true,
->   "issues": []
+>   "issues": [],
+>   "mesher": "adaptive-sdf",
+>   "brepChecked": false
 > }
 > ```
 
@@ -73,6 +75,13 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 >   "vertices": 15642,
 >   "volume": 3815.201362779873,
 >   "exact": false,
+>   "mesher": "adaptive-sdf",
+>   "brep": {
+>     "available": false,
+>     "reason": "this shape has no exact B-Rep companion: an op in its chain is outside exact coverage (smooth blends, rounded boxes, sweeps/lofts/ribs, offsets, shells, anisotropic scale), or a boolean gated back to the F-Rep path. Only the mesh oracles (validate, measure, meshAgreement) apply.",
+>     "failures": [],
+>     "selfIntersectionChecked": false
+>   },
 >   "issues": []
 > }
 > ```
@@ -85,7 +94,8 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 >   "model_id": "model-2",
 >   "format": "step",
 >   "path": "output/hinge-leaf.step",
->   "bytes": 18541157
+>   "bytes": 18541157,
+>   "unit": "mm"
 > }
 > ```
 

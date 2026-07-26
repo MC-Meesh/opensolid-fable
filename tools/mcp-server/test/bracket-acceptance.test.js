@@ -84,6 +84,17 @@ for (const y of [10, 30]) part = part.subtract(xHole.translate(-27.5, y, 32));
 const BRACKET_SCRIPT = `${BODY_SCRIPT}${DRILL_SCRIPT}\nreturn part;`;
 const UNDRILLED_SCRIPT = `${BODY_SCRIPT}\nreturn part;`;
 
+// The of-4tu bug itself, kept as a live negative control: the same four bores
+// with the rotations omitted, which is what an agent writes if it believes the
+// docs' old claim that `cylinder` stands on +Z. This part is a perfectly valid
+// closed solid whose holes run lengthwise through the plates. It is the shape
+// the correctness oracles have to be able to reject.
+const MISDRILLED_SCRIPT = `${BODY_SCRIPT}
+const hole = Shape.cylinder(2.5, 10);                        // left on +Y
+for (const y of [10, 30]) part = part.subtract(hole.translate(15, y, 0));
+for (const y of [10, 30]) part = part.subtract(hole.translate(-27.5, y, 32));
+return part;`;
+
 // ── Minimal MCP stdio client ───────────────────────────────────────────────
 function connect(outputDir) {
   const child = spawn('node', [SERVER], {
@@ -195,6 +206,115 @@ describe('right-angle bracket acceptance (of-2y4.1)', () => {
       `holes removed ${removed.toFixed(1)} mm^3, expected ~${HOLES.toFixed(1)} mm^3. ` +
         'A large overshoot means a hole is drilled on the wrong axis.',
     );
+  });
+
+  // The oracles from of-2y4.5, on the part that motivated them. The point of
+  // these three tests is the pairing: each one must pass on the bracket *and*
+  // fail on MISDRILLED_SCRIPT, which is a valid closed solid with the same
+  // nominal features on the wrong axes. A check that only passes on the good
+  // part would have passed on the bad one too — that is how of-4tu shipped.
+  test('inspect_topology finds the four bores on their intended axes', async () => {
+    const r = await call('create_model', { script: BRACKET_SCRIPT, name: 'bracket-topology' });
+    assert.ok(!r.isError, r.text);
+    const topo = await call('inspect_topology', { model_id: r.json.model_id });
+    assert.ok(!topo.isError, topo.text);
+    const { counts, cylinders } = topo.json;
+    assert.equal(counts.shells, 1, 'the bracket is one solid');
+    assert.equal(counts.genus, 4, 'four holes through the part');
+    assert.equal(counts.throughHoles, 4);
+    // Two bores along +Z through the base plate, two along +X through the wall.
+    const axisOf = (c) => c.axis.map((v) => Math.round(Math.abs(v))).join('');
+    const byAxis = cylinders.map(axisOf).sort();
+    assert.deepEqual(byAxis, ['001', '001', '100', '100']);
+    for (const c of cylinders) {
+      assert.equal(c.kind, 'through-hole');
+      assert.ok(Math.abs(c.diameter - 5) < 0.15, `bore Ø${c.diameter}`);
+      // Each passes through 5 mm of plate.
+      assert.ok(Math.abs(c.depth - 5) < 0.25, `bore depth ${c.depth}`);
+    }
+  });
+
+  test('assert_model passes on the bracket and rejects the mis-drilled part', async () => {
+    // Written the way an agent should: state the intent, including the axes.
+    const expect = [
+      { type: 'closed_solid' },
+      { type: 'shells', value: 1 },
+      { type: 'genus', value: 4 },
+      { type: 'volume', value: ANALYTIC_VOLUME, relative_tolerance: VOLUME_TOL },
+      { type: 'bbox_size', value: [60, 40, 40], tolerance: 0.5 },
+      { type: 'through_holes', value: 2, axis: [0, 0, 1], diameter: 5, tolerance: 0.3 },
+      { type: 'through_holes', value: 2, axis: [1, 0, 0], diameter: 5, tolerance: 0.3 },
+      { type: 'hole_at', at: [15, 10, 2.5], axis: [0, 0, 1], diameter: 5, tolerance: 0.3 },
+    ];
+
+    const good = await call('create_model', { script: BRACKET_SCRIPT, name: 'bracket-assert' });
+    assert.ok(!good.isError, good.text);
+    const pass = await call('assert_model', { model_id: good.json.model_id, expect });
+    assert.ok(!pass.isError, pass.text);
+    assert.equal(
+      pass.json.ok,
+      true,
+      `the bracket should meet its own spec: ${JSON.stringify(
+        pass.json.checks.filter((c) => !c.ok),
+        null,
+        2,
+      )}`,
+    );
+
+    const bad = await call('create_model', { script: MISDRILLED_SCRIPT, name: 'bracket-misdrilled' });
+    assert.ok(!bad.isError, bad.text);
+    // The damning fact this whole exercise turns on: the wrong part is a valid
+    // solid. Mesh closure cannot adjudicate a hole's direction.
+    assert.equal(bad.json.valid, true, 'the mis-drilled part really does report valid');
+    const fail = await call('assert_model', { model_id: bad.json.model_id, expect });
+    assert.ok(!fail.isError, fail.text);
+    assert.equal(fail.json.ok, false, 'the mis-drilled part must not pass the spec');
+    const byType = new Map(fail.json.checks.map((c) => [`${c.type}:${JSON.stringify(c.expected)}`, c]));
+    assert.equal(
+      byType.get('closed_solid:true').ok,
+      true,
+      'and it fails on structure, not on closure — closure passes',
+    );
+    for (const c of fail.json.checks.filter((x) => x.type === 'through_holes')) {
+      assert.equal(c.ok, false, `axis assertion should fail: ${c.message}`);
+      assert.match(c.message, /axis/);
+    }
+    assert.equal(byType.get('hole_at:{"at":[15,10,2.5],"axis":[0,0,1],"diameter":5}').ok, false);
+  });
+
+  test('diff_models checks the holes removed the volume they should', async () => {
+    const solid = await call('create_model', { script: UNDRILLED_SCRIPT, name: 'diff-undrilled' });
+    const drilled = await call('create_model', { script: BRACKET_SCRIPT, name: 'diff-drilled' });
+    assert.ok(!solid.isError && !drilled.isError, 'both models must build');
+    // Same tolerance rationale as the volume-delta test above: two independently
+    // meshed ~20000 mm³ bodies differenced for a 392.7 mm³ signal.
+    const good = await call('diff_models', {
+      model_id_a: solid.json.model_id,
+      model_id_b: drilled.json.model_id,
+      expect_volume_delta: { value: -HOLES, relative_tolerance: 0.25 },
+    });
+    assert.ok(!good.isError, good.text);
+    assert.equal(good.json.volumeDeltaCheck.ok, true, good.json.volumeDeltaCheck.message);
+    // Drilling four through-holes adds exactly four handles to the surface.
+    assert.equal(good.json.delta.counts.genus, 4);
+    assert.equal(good.json.delta.counts.throughHoles, 4);
+
+    // The mis-drilled part fails the same delta: a lengthwise channel removes
+    // several times the material a through-hole does.
+    const bad = await call('create_model', { script: MISDRILLED_SCRIPT, name: 'diff-misdrilled' });
+    const wrong = await call('diff_models', {
+      model_id_a: solid.json.model_id,
+      model_id_b: bad.json.model_id,
+      expect_volume_delta: { value: -HOLES, relative_tolerance: 0.25 },
+    });
+    assert.ok(!wrong.isError, wrong.text);
+    assert.equal(
+      wrong.json.volumeDeltaCheck.ok,
+      false,
+      `mis-drilled delta ${wrong.json.delta.volume} should not pass as ${-HOLES}`,
+    );
+    // ...and it severed the part in two, which the shell count says outright.
+    assert.equal(wrong.json.b.counts.shells, 2, 'the lengthwise bores cut the plate apart');
   });
 
   test('renders each named view', async () => {

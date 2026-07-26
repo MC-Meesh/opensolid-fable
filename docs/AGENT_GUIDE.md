@@ -90,7 +90,11 @@ persistence. Exports and screenshots are written to `OPENSOLID_MCP_OUTPUT_DIR`.
 | `export`         | **`model_id`**, **`format`**, `path`, `accuracy`, `unit` | file path + byte size |
 | `measure`        | **`model_id`**, `query`, `accuracy`                | mass properties |
 | `optimize`       | **`model_id`**, **`params`**, **`objective`**, `constraints`, `options` | converged params + achieved objective + trajectory |
-| `validate`       | **`model_id`**, `accuracy`                          | structural report |
+| `validate`       | **`model_id`**, `accuracy`, `deep`                 | mesh + B-Rep structural report |
+| `inspect_topology` | **`model_id`**, `accuracy`, `probes`, `include_faces` | faces, rims, holes with axes, shells, genus |
+| `assert_model`   | **`model_id`**, **`expect`**, `accuracy`           | pass/fail per expectation |
+| `diff_models`    | **`model_id_a`**, **`model_id_b`**, `accuracy`, `expect_volume_delta` | what changed between two models |
+| `measure_clearance` | **`model_id`**, `probes` \| `against_model_id`, `accuracy`, `softness` | signed distances / interference |
 | `get_capabilities` | `section`                                        | machine-readable manifest of every tool and script op |
 | `list_models`    | —                                                  | models registered this session |
 | `get_model`      | **`model_id`**                                      | the model's own source: its script, or where it was imported from |
@@ -98,6 +102,29 @@ persistence. Exports and screenshots are written to `OPENSOLID_MCP_OUTPUT_DIR`.
 Every tool except `create_model`, `import_step`, `get_capabilities`, and
 `list_models` takes a `model_id` handed back by an earlier `create_model` or
 `import_step` call.
+
+### Which oracle answers which question
+
+`validate` and `measure` report *scalars over the whole part*, and a part can be
+badly wrong while every scalar looks fine. The gallery's angle bracket shipped
+with its four mounting holes bored sideways through the plates: `validate` said
+`valid: true`, the screenshot rendered plausibly, STL wrote fine, and the volume
+was only ~4% light, because a wrong-axis hole removes nearly the right amount of
+material. See [the friction log](dogfood-bracket-friction-log.md) for the full
+account. Reach for the tool that can actually see the mistake you might be
+making:
+
+| Question | Tool |
+|---|---|
+| Is the mesh watertight? Is the B-Rep body sound? | `validate` (`deep: true` for self-intersection) |
+| Is this **imported** STEP body actually sound? | `validate` — the B-Rep check exists for topology of unknown provenance, and "the file parsed" says nothing about whether its geometry holds together |
+| How much material is there? Where is its centre of mass? | `measure` |
+| **How many holes go through it, and along which axis?** | `inspect_topology` |
+| Is there a hole through *this point* in *this direction*? | `inspect_topology` `probes`, or `assert_model` `hole_at` |
+| Did my cut remove the volume it should have? | `diff_models` with `expect_volume_delta` |
+| Does the finished part match what I intended? | `assert_model` |
+| Do two parts collide? Does the solid stay clear of a keep-out? | `measure_clearance` |
+| Do the several meshers agree this is a solid? | `validate` (`mesher` field), `meshAgreement` in-script |
 
 ### `create_model`
 
@@ -293,8 +320,9 @@ script and optimize again. Worked example:
 
 ### `validate`
 
-Checks whether the mesh is a closed, consistently-oriented manifold enclosing a
-finite non-zero volume:
+Two checks in one report: the mesh is a closed, consistently-oriented manifold
+enclosing a finite non-zero volume, **and** — when the model carries an exact
+B-Rep — that body passes the kernel's own validation.
 
 ```json
 {
@@ -304,12 +332,170 @@ finite non-zero volume:
   "vertices": 8376,
   "volume": 7008.29,
   "exact": false,
+  "mesher": "adaptive-sdf",
+  "brep": { "available": true, "source": "boolean-result",
+            "counts": { "shells": 1, "faces": 7, "edges": 15, "vertices": 8, "genus": 1,
+                        "innerLoops": 2, "surfaceKinds": { "plane": 6, "cylinder": 1 } },
+            "failures": [], "selfIntersectionChecked": false },
   "issues": []
 }
 ```
 
-Call it before trusting a boolean result. A model that looks right in a
-screenshot but isn't watertight will fail here with named `issues`.
+- `mesher` names which mesh answered — `exact-brep` (an exact boolean's own
+  validated tessellation), `step-reader` (the STEP reader's tessellation of a
+  body from `import_step`), or `adaptive-sdf`. It matters: `valid` is a statement about
+  *that* mesh, and the several meshers do not always agree (§4).
+- `brep` is the body report. The kernel checks referential integrity, loop
+  bookkeeping, shell closure and manifoldness, orientation consistency across
+  every edge, tolerance sanity, the Euler–Poincaré formula, and the geometric
+  invariants: every edge lying on the surfaces of the faces it bounds, every
+  vertex on its edges' endpoints, pcurve fidelity, and face sense against loop
+  winding. `deep: true` adds face-face **self-intersection** — the body passing
+  through itself — which is a pairwise search over faces and so is opt-in.
+  Failures appear both here (with a machine-readable `kind`) and in `issues`,
+  and they make `valid` false.
+- `counts` is the body's real entity census. This is the one place a *true* face
+  or edge count comes from: an SDF mesher renders a sharp edge as a one-cell
+  bevel, so nothing recovered from a tessellation can count them exactly.
+  `surfaceKinds` is often the fastest sanity check there is — four Ø5 bores are
+  four cylindrical faces.
+- `brep.available: false` carries a `reason` (the op chain left exact coverage, a
+  boolean gated back to F-Rep, the mode is off). It is deliberately not reported
+  as "no failures": *nothing was checked* and *checked, sound* are different
+  answers, and conflating them is how a wrong part passes.
+
+Call it before trusting a boolean result. But note what it still cannot see: a
+closed manifold with the right volume can have its holes on the wrong axis. That
+is `inspect_topology`'s job.
+
+### `inspect_topology`
+
+Structure instead of scalars — the oracle the other tools do not provide.
+
+```jsonc
+{
+  "counts": { "planarFaces": 6, "circularRims": 8, "throughHoles": 4, "pockets": 0,
+              "cavities": 0, "bosses": 0, "unpairedRims": 0, "shells": 1, "genus": 4 },
+  "mesh": { "components": 1, "vertices": 16200, "edges": 48600, "triangles": 32396,
+            "eulerCharacteristic": -6, "genus": 4, "closed": true },
+  "cylinders": [
+    { "kind": "through-hole", "axis": [0, 1, 0], "radius": 2.501, "diameter": 5.002,
+      "center": [10, 0, 6], "depth": 4.96 }
+    // ...three more
+  ],
+  "planarFaces": { "count": 6, "totalArea": 1256.4, "planarAreaFraction": 0.813,
+                   "remainderArea": 235.1,
+                   "faces": [ { "normal": [0, 1, 0], "offset": 2.5, "area": 510.3, "triangles": 8804 } ] },
+  "brep": { "available": false, "reason": "…" }
+}
+```
+
+- **`genus`** is the number of handles in the surface — for a plate, exactly how
+  many holes go through it. It comes from `V − E + F` over the welded mesh, so it
+  is pure combinatorics: no tolerance, no fit, and it does not drift with
+  `accuracy`. `shells` is the connected-component count; a `shells: 2` on a part
+  you meant to be one solid means a cut went all the way through and severed it.
+- **`cylinders`** is the census that catches a mis-drilled hole. Rims are fitted
+  from the mesh and paired into coaxial features, then the field is asked two
+  questions about each: is the bore empty (else it is a `boss`), and does it open
+  to air at both ends (`through-hole`), one end (`pocket`), or neither
+  (`cavity`)? So `kind`, `axis`, `diameter` and `depth` are all measured rather
+  than assumed. A hole meant to run through a 5 mm plate along +Y and bored along
+  +Z shows up here with an axis of `[0,0,1]`, immediately.
+- **`probes`** casts lines: `[{ "axis": [0,1,0], "at": [15,0,10] }]` returns the
+  ordered solid/void `spans` that line crosses and a `throughHole` verdict
+  (material → gap → material). This is independent of meshing entirely — it
+  samples the distance field — and it is the most direct possible answer to "is
+  there a hole here, going this way?".
+- **`planarFaces`** grows each face from a seed plane, so it is stable against
+  the mesher's bevel: 6 faces for a box, not the 194 a crease-cutting algorithm
+  reports. `planarAreaFraction` is what the planar faces account for; the
+  remainder is genuine curvature plus that bevel. Face areas run a percent or so
+  under their analytic values for the same reason, so compare them with that in
+  mind — or use `brep.counts` where the model has a B-Rep.
+
+### `assert_model`
+
+State what you intended; get back which expectations the geometry meets.
+
+```jsonc
+{
+  "model_id": "bracket-1",
+  "expect": [
+    { "type": "closed_solid" },
+    { "type": "volume", "value": 19750.08, "tolerance": 1 },
+    { "type": "bbox_size", "value": [60, 40, 40], "tolerance": 0.5 },
+    { "type": "genus", "value": 4 },
+    { "type": "through_holes", "value": 4, "axis": [0, 1, 0], "diameter": 5 },
+    { "type": "hole_at", "at": [22, 0, 14], "axis": [0, 1, 0], "diameter": 5 },
+    { "type": "material_at", "at": [0, 0, 0], "value": true },
+    { "type": "clearance", "probes": [[0, 30, 0]], "min": 2 },
+    { "type": "brep_sound" }
+  ]
+}
+```
+
+Returns `{ ok, passed, failed, checks: [{ type, ok, expected, actual, message }] }`.
+Full type list: `volume`, `surface_area`, `bbox_size`, `centroid`,
+`closed_solid`, `shells`, `genus`, `planar_faces`, `through_holes`, `hole_at`,
+`material_at`, `clearance`, `brep_sound` (see `get_capabilities` for the schema).
+
+- Continuous quantities take an absolute `tolerance` or a `relative_tolerance`,
+  defaulting to **1%** — these are integrals over a tessellation, not analytic
+  values. Counts must match exactly.
+- `bbox_size` and `centroid` take `[x,y,z]`; a `null` component skips that axis.
+- `hole_at` takes the bore's **own** axis and a point on its centreline. It checks
+  two things, because either alone is meaningless: the line along the axis is
+  clear of material (so it is a bore), *and* the void around that point is
+  enclosed by material in both directions across the axis (so it is a bore
+  through the part, not empty space beside it).
+- `through_holes` with an `axis` is the assertion that would have caught the
+  bracket bug, and when it fails it tells you what is actually there: *"expected
+  4 through-holes matching axis ≈ [0.000,1.000,0.000], found 0. The part has 4
+  through-hole(s) in total: Ø5.002 along [0.00,0.00,1.00] at [22.00,0.00,14.00];
+  …"*.
+- **An expectation that cannot be evaluated fails.** A null volume, an
+  unmeasurable genus, a `brep_sound` on a model with no B-Rep — all `ok: false`
+  with the reason. A check that quietly abstains is how the wrong part passed the
+  first time.
+
+### `diff_models`
+
+Compares two models measured at the same `accuracy` and reports the deltas:
+volume (absolute and as a ratio of A), surface area, bounding-box size,
+centroid, and the structural counts from `inspect_topology` (`shells`, `genus`,
+`planarFaces`, `throughHoles`).
+
+```jsonc
+{
+  "model_id_a": "plate-blank",
+  "model_id_b": "plate-drilled",
+  "expect_volume_delta": { "value": -392.7, "tolerance": 5 }
+}
+```
+
+`expect_volume_delta` turns "these four Ø5 holes should remove 392.7 mm³" into a
+pass/fail (`volumeDeltaCheck` in the response). Negative for material removed.
+Pass the same `accuracy` for both — that is what the shared argument is for;
+comparing a fine mesh against a coarse one turns a meshing difference into an
+apparent design difference. `counts` deltas catch the structural half: drilling
+four holes should move `genus` by exactly +4.
+
+### `measure_clearance`
+
+The passive counterpart to `optimize`'s `clearance` constraint — measuring,
+not moving.
+
+- With **`probes`** (`[[x,y,z],…]` or flat): each point's signed distance to the
+  solid (negative = the point is inside the material), the `minDistance` and
+  which probe it was, how many probes are inside, a `clear` verdict, and the
+  smooth `softMin` the optimiser descends on.
+- With **`against_model_id`**: samples that model's mesh vertices against this
+  model's field and reports `interferes`, `minDistance` (negative = overlap
+  depth), `deepestPoint`, and how many vertices are inside. Nothing else in the
+  toolset answers "do these two parts collide?". Resolution is that mesh's
+  `accuracy`, so an overlap thinner than its triangle spacing can be missed —
+  pass a finer `accuracy` to tighten it.
 
 ### `get_capabilities`
 
@@ -646,11 +832,57 @@ boxes that don't overlap yields an empty mesh:
 }
 ```
 
-This is the single most important habit for an agent: **check `valid` (or call
-`validate`) before exporting.** A screenshot can look plausible while the mesh is
-open; the validity report cannot be fooled. Trying to screenshot an empty model
-is itself a clean error — `Error: model produced an empty mesh; nothing to
-render`.
+Check `valid` (or call `validate`) before exporting. A screenshot can look
+plausible while the mesh is open; the validity report cannot be fooled about
+*closure*. Trying to screenshot an empty model is itself a clean error — `Error:
+model produced an empty mesh; nothing to render`.
+
+### Structurally wrong but perfectly valid — caught by `inspect_topology`
+
+`valid: true` is a narrow claim: this mesh is closed, oriented, and bounds a
+volume. It is not a claim that the part is the one you designed. The gallery's
+angle bracket had its four mounting holes bored along the wrong axis and reported
+`valid: true`, rendered plausibly, exported STL fine, and measured only ~4%
+light. Every oracle available at the time agreed with it.
+
+So when a feature has a *direction* — a hole, a bore, a slot, a pocket — verify
+the direction:
+
+```jsonc
+// Did the four Ø5 holes actually go through the plate, along +Y?
+{ "type": "through_holes", "value": 4, "axis": [0, 1, 0], "diameter": 5 }
+```
+
+`assert_model` with that expectation, or `inspect_topology`'s `cylinders` and
+`probes`, will say so in one call. `genus` is the cheapest version: four holes
+through a plate is genus 4, and no meshing accuracy can make it read otherwise.
+
+### Meshers that disagree — `mesher`, and `meshAgreement`
+
+A shape is meshed by more than one route and they are not interchangeable:
+`mesh` dual-contours a fixed uniform grid (what the playground viewport shows),
+`measure`/`validate` read an adaptive octree mesh, faceted STEP export recovers
+planar regions through `sdf_to_brep`, and an exact boolean result serves its own
+validated analytic tessellation. "`valid: true`, STL fine, STEP declines" is a
+real signature (of-obv, of-2i8) and it used to be undiagnosable, because a caller
+could only ever see one of those answers at a time.
+
+`validate`'s `mesher` field names the one that answered. To see all of them side
+by side, call `shape.meshAgreement(accuracy)` from inside a script:
+
+```js
+const s = Shape.box3(15, 2.5, 10).subtract(Shape.cylinder(2.5, 10));
+// { agree, accuracy, paths: [{name, available, closed, triangles, volume}], disagreement: [...] }
+console.log(s.meshAgreement(0.2));
+return s;
+```
+
+`agree` weighs closure across every path, and volume only across the paths
+`accuracy` governs — the uniform grid has no accuracy knob, so it is legitimately
+coarser (measured ~3% light on a 30 mm plate with a Ø5 hole) and its volume is
+reported but excluded from the verdict. A `step-facet` path that comes back
+`available: false` is telling you STEP export will decline, before you spend the
+export.
 
 ### Export limitations — reported by `export`
 
@@ -694,11 +926,19 @@ Other export errors:
    anything else; on an import, read the per-solid `outcome` first — a `mesh`
    fallback is a different part from a `brep` one in everything but shape.
 2. **`validate`** (or trust `create_model`'s summary) to confirm a closed
-   manifold after a nontrivial boolean.
-3. **`measure`** to check intent — a volume delta proves a cut removed material;
-   a centroid proves a feature is where you meant it.
-4. **`get_screenshot`** for a human-readable gut check from any named view.
-5. **`export`** to STEP/STL/OBJ, branching on `isError` for the STEP faceting
+   manifold — and a sound B-Rep body, where the model has one — after a
+   nontrivial boolean.
+3. **`assert_model`** with what you actually intended: the volume you computed
+   from the spec, the bounding box, and — for every directional feature — the
+   hole count *with its axis*. This is the step that was missing. Steps 1, 2, 4
+   and 5 all passed on a bracket drilled the wrong way.
+4. **`inspect_topology`** when an assertion fails and you need to see what the
+   geometry actually is: the hole axes, the genus, the shell count. Or
+   **`diff_models`** against the model before the cut, to check the cut removed
+   what it should have.
+5. **`get_screenshot`** for a human-readable gut check from any named view. Useful
+   for framing and proportion; it cannot adjudicate a hole's axis.
+6. **`export`** to STEP/STL/OBJ, branching on `isError` for the STEP faceting
    limitation above.
 
 The seven gallery transcripts each walk this loop on a real part. Start there —

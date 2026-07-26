@@ -29,7 +29,9 @@ use opensolid_core::mesh::TriangleMesh;
 use opensolid_core::types::{Transform3, Vector3};
 use opensolid_kernel::brep::topology::Body;
 use opensolid_kernel::brep::transform::transform_body;
-use opensolid_kernel::brep::{BooleanOp, BooleanOutput, GeometryStore, TopologyStore, primitives};
+use opensolid_kernel::brep::{
+    BooleanOp, BooleanOutput, CheckFailure, GeometryStore, Surface3, TopologyStore, primitives,
+};
 use opensolid_kernel::hybrid::{self, HybridBody, HybridOptions, HybridPath};
 use opensolid_kernel::io::step::write::{StepWriteOptions, write_step};
 
@@ -182,6 +184,33 @@ impl ExactSpec {
     }
 }
 
+/// Entity counts of one exact B-Rep body, plus the analytic surface kinds its
+/// faces carry. Field names are the JSON keys `WasmShape::brepCheck` reports.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[allow(non_snake_case)]
+pub struct BodyCensus {
+    pub shells: usize,
+    pub faces: usize,
+    pub loops: usize,
+    /// Hole loops across all faces — the `R − F` part of the Euler formula's
+    /// `R` term, and the count of "this face has a hole in it".
+    pub innerLoops: usize,
+    pub fins: usize,
+    pub edges: usize,
+    pub vertices: usize,
+    /// Sum of the shells' genus: through-holes as the topology records them,
+    /// not as a mesh implies them.
+    pub genus: usize,
+    pub planes: usize,
+    pub cylinders: usize,
+    pub cones: usize,
+    pub spheres: usize,
+    pub tori: usize,
+    pub nurbs: usize,
+    /// Faces whose surface geometry has not been attached.
+    pub surfaceless: usize,
+}
+
 /// An exact boolean result: the store-backed body (for further chained
 /// booleans) plus the tessellation that already passed the hybrid gate
 /// ladder (closed manifold, chordal deviation, volume validation).
@@ -282,6 +311,151 @@ impl ExactRep {
             ExactRep::Tessellated(mesh) => Some(mesh),
             _ if !exact_enabled() => None,
             rep => rep.exact_mesh(),
+        }
+    }
+
+    /// Run the kernel's body validation over this shape's exact B-Rep —
+    /// [`TopologyStore::check`] plus [`TopologyStore::check_geometry`], and
+    /// [`TopologyStore::check_self_intersection`] when `self_intersection`
+    /// is set. Empty means the body is sound.
+    ///
+    /// `None` when there is no analytic body to check: a spec whose primitive
+    /// has no exact B-Rep constructor, or a [`Tessellated`](Self::Tessellated)
+    /// shape, which is a known-good mesh and nothing more. Both are conditions
+    /// [`to_step`](Self::to_step) also declines under.
+    ///
+    /// This is the check the mesh-closure oracle cannot make: a mesh can be
+    /// a closed manifold while the B-Rep it came from has an edge off its
+    /// face's surface, a pcurve on the wrong branch, or two faces crossing.
+    /// The self-intersection pass is a pairwise search over faces, so it is
+    /// opt-in rather than always-on.
+    ///
+    /// An [`Imported`](Self::Imported) body is the case this check exists for:
+    /// [`crate::check`]'s own docs describe it as a diagnostic for topology of
+    /// *unknown provenance*, and a STEP file that parsed says nothing at all
+    /// about whether its geometry holds together.
+    pub fn check(&self, self_intersection: bool) -> Option<Vec<CheckFailure>> {
+        fn run(
+            store: &TopologyStore,
+            geo: &GeometryStore,
+            body: EntityId<Body>,
+            self_intersection: bool,
+        ) -> Vec<CheckFailure> {
+            let mut failures = store.check(body);
+            // A stale body is one report, not three: the geometric passes
+            // would each restate it. (Mirrors `check_with_geometry`.)
+            if failures == [CheckFailure::StaleBody(body)] {
+                return failures;
+            }
+            failures.extend(store.check_geometry(geo, body));
+            if self_intersection {
+                failures.extend(store.check_self_intersection(geo, body));
+            }
+            failures
+        }
+        match self {
+            ExactRep::Spec(spec) => {
+                let mut store = TopologyStore::new();
+                let mut geo = GeometryStore::new();
+                let body = spec.materialize(&mut store, &mut geo).ok()?;
+                Some(run(&store, &geo, body, self_intersection))
+            }
+            ExactRep::Boolean(b) => {
+                let out = b.out.borrow();
+                Some(run(&out.store, &out.geo, out.body, self_intersection))
+            }
+            ExactRep::Imported(b) => {
+                Some(run(&b.file.store, &b.file.geo, b.body, self_intersection))
+            }
+            ExactRep::Tessellated(_) => None,
+        }
+    }
+
+    /// Count this shape's exact B-Rep entities, and the analytic surface kinds
+    /// its faces carry. `None` under the same condition
+    /// [`check`](Self::check) declines under.
+    ///
+    /// These are the *real* topology counts — "6 faces, 12 edges, 8 vertices,
+    /// genus 0" — as opposed to anything recoverable from a tessellation, where
+    /// a sharp edge arrives as a one-cell bevel and a face count is a statement
+    /// about the mesher. `surfaceKinds` is the census that answers "did I drill
+    /// four holes?" without a hand calculation: four Ø5 bores are four
+    /// cylindrical faces, whatever axis they ended up on.
+    pub fn census(&self) -> Option<BodyCensus> {
+        fn count(
+            store: &TopologyStore,
+            geo: &GeometryStore,
+            body: EntityId<Body>,
+        ) -> Option<BodyCensus> {
+            let b = store.bodies.get(body)?;
+            let mut c = BodyCensus {
+                shells: b.shells.len(),
+                genus: 0,
+                ..BodyCensus::default()
+            };
+            let mut edges: Vec<EntityId<_>> = Vec::new();
+            let mut vertices: Vec<EntityId<_>> = Vec::new();
+            for &shell_id in &b.shells {
+                let Some(shell) = store.shells.get(shell_id) else {
+                    continue;
+                };
+                c.genus += shell.genus as usize;
+                c.faces += shell.faces.len();
+                for &face_id in &shell.faces {
+                    let Some(face) = store.faces.get(face_id) else {
+                        continue;
+                    };
+                    match face.surface.and_then(|s| geo.surfaces.get(s)) {
+                        Some(Surface3::Plane { .. }) => c.planes += 1,
+                        Some(Surface3::Cylinder { .. }) => c.cylinders += 1,
+                        Some(Surface3::Cone { .. }) => c.cones += 1,
+                        Some(Surface3::Sphere { .. }) => c.spheres += 1,
+                        Some(Surface3::Torus { .. }) => c.tori += 1,
+                        Some(Surface3::Nurbs(_)) => c.nurbs += 1,
+                        None => c.surfaceless += 1,
+                    }
+                    c.loops += face.outer_loop.is_some() as usize + face.inner_loops.len();
+                    c.innerLoops += face.inner_loops.len();
+                    for loop_id in face.outer_loop.into_iter().chain(face.inner_loops.clone()) {
+                        let Some(lp) = store.loops.get(loop_id) else {
+                            continue;
+                        };
+                        for &fin_id in &lp.fins {
+                            let Some(fin) = store.fins.get(fin_id) else {
+                                continue;
+                            };
+                            c.fins += 1;
+                            if !edges.contains(&fin.edge) {
+                                edges.push(fin.edge);
+                                if let Some(edge) = store.edges.get(fin.edge) {
+                                    for v in [edge.start_vertex, edge.end_vertex] {
+                                        if !vertices.contains(&v) {
+                                            vertices.push(v);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            c.edges = edges.len();
+            c.vertices = vertices.len();
+            Some(c)
+        }
+        match self {
+            ExactRep::Spec(spec) => {
+                let mut store = TopologyStore::new();
+                let mut geo = GeometryStore::new();
+                let body = spec.materialize(&mut store, &mut geo).ok()?;
+                count(&store, &geo, body)
+            }
+            ExactRep::Boolean(b) => {
+                let out = b.out.borrow();
+                count(&out.store, &out.geo, out.body)
+            }
+            ExactRep::Imported(b) => count(&b.file.store, &b.file.geo, b.body),
+            ExactRep::Tessellated(_) => None,
         }
     }
 
@@ -551,6 +725,86 @@ mod tests {
             hz: 1.0,
         }));
         assert!(exact_boolean(BooleanOp::Unite, &spindle, &block).is_none());
+    }
+
+    /// The B-Rep check reaches both representations and passes on sound
+    /// bodies: a materialized primitive spec and a boolean result.
+    #[test]
+    fn check_passes_on_both_representations() {
+        let block = ExactRep::Spec(ExactSpec::new(ExactPrim::Block {
+            hx: 1.0,
+            hy: 0.4,
+            hz: 1.0,
+        }));
+        assert_eq!(
+            block.check(true),
+            Some(vec![]),
+            "a materialized block should be a sound body"
+        );
+
+        let hole = ExactRep::Spec(ExactSpec::new(ExactPrim::Cylinder {
+            radius: 0.4,
+            half_height: 1.0,
+        }));
+        let drilled = ExactRep::Boolean(Rc::new(
+            exact_boolean(BooleanOp::Subtract, &block, &hole).expect("exact path"),
+        ));
+        let failures = drilled.check(true).expect("boolean results are checkable");
+        assert_eq!(
+            failures,
+            vec![],
+            "block − cylinder should be a sound body, got {failures:?}"
+        );
+    }
+
+    /// The entity census is the count a mesh cannot give: a block is exactly
+    /// 6 planar faces / 12 edges / 8 vertices, and drilling it adds a
+    /// cylindrical face and a hole loop on each face the bore breaks through.
+    #[test]
+    fn census_counts_the_real_topology() {
+        let block = ExactRep::Spec(ExactSpec::new(ExactPrim::Block {
+            hx: 1.0,
+            hy: 0.4,
+            hz: 1.0,
+        }));
+        let c = block.census().expect("a block is buildable");
+        assert_eq!((c.shells, c.faces, c.edges, c.vertices), (1, 6, 12, 8));
+        assert_eq!(c.planes, 6, "every face of a block is a plane");
+        assert_eq!((c.innerLoops, c.genus), (0, 0));
+
+        let hole = ExactRep::Spec(ExactSpec::new(ExactPrim::Cylinder {
+            radius: 0.4,
+            half_height: 1.0,
+        }));
+        let drilled = ExactRep::Boolean(Rc::new(
+            exact_boolean(BooleanOp::Subtract, &block, &hole).expect("exact path"),
+        ));
+        let d = drilled.census().expect("boolean results are countable");
+        assert_eq!(
+            d.cylinders, 1,
+            "the bore wall is a cylindrical face: {d:#?}"
+        );
+        assert_eq!(
+            d.innerLoops, 2,
+            "the bore breaks through two faces, so each gains a hole loop: {d:#?}"
+        );
+        assert!(
+            d.faces > c.faces,
+            "drilling adds the bore wall: {} vs {}",
+            d.faces,
+            c.faces
+        );
+    }
+
+    /// A spec with no exact B-Rep constructor cannot be checked at all —
+    /// reported as "no answer", not as a clean bill of health.
+    #[test]
+    fn check_declines_when_the_body_cannot_be_built() {
+        let spindle = ExactRep::Spec(ExactSpec::new(ExactPrim::Torus {
+            major: 0.2,
+            minor: 0.5,
+        }));
+        assert_eq!(spindle.check(false), None);
     }
 
     #[test]

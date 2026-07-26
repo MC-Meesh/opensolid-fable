@@ -15,6 +15,8 @@
 //! Plain Rust (no wasm-bindgen types) so the logic and both paths are
 //! exercised by native `cargo test`; `lib.rs` wraps it for JS.
 
+use opensolid_core::EntityId;
+use opensolid_kernel::brep::topology::Body;
 use opensolid_kernel::brep::{GeometryStore, TopologyStore};
 use opensolid_kernel::convert::sdf_to_brep::{SdfToBrepOptions, sdf_to_brep};
 use opensolid_kernel::io::step::write::{LengthUnit, StepWriteOptions, write_step};
@@ -76,9 +78,34 @@ pub fn export_step(
         return Ok(StepExport { text, exact: true });
     }
 
-    // Faceted fallback: mesh bounds and depth derivation mirror
-    // `BoundedShape::mesh_adaptive` so the exported facets match what the
-    // viewport shows at the same accuracy.
+    let faceted = faceted_body(inner, accuracy)?;
+    let text = write_step(&faceted.store, &faceted.geo, &[faceted.body], &options)
+        .map_err(|e| format!("STEP export failed: {e}"))?;
+    Ok(StepExport { text, exact: false })
+}
+
+/// The faceted path's recovered B-Rep: the stores, the body, and its face
+/// count.
+pub struct FacetedBody {
+    pub store: TopologyStore,
+    pub geo: GeometryStore,
+    pub body: EntityId<Body>,
+    /// Planar faces the recovery produced, the one number that says how
+    /// coarsely the surface was approximated.
+    pub faces: usize,
+}
+
+/// Recover a faceted B-Rep from a shape's SDF at `accuracy` — the body the
+/// faceted STEP path serializes.
+///
+/// Separate from [`export_step`] so the *meshing* half can be exercised
+/// without producing a file: this is the step that declines on a plate with a
+/// through-hole (of-obv), and `WasmShape::meshAgreement` needs to ask whether
+/// it would close without paying to serialize megabytes of Part 21 text.
+///
+/// Mesh bounds and depth derivation mirror `BoundedShape::mesh_adaptive` so
+/// the exported facets match what the viewport shows at the same accuracy.
+pub fn faceted_body(inner: &BoundedShape, accuracy: Option<f64>) -> Result<FacetedBody, String> {
     let bounds = inner.mesh_bounds(64);
     let extent = {
         let size = bounds.max - bounds.min;
@@ -99,9 +126,23 @@ pub fn export_step(
     let mut geo = GeometryStore::new();
     let body = sdf_to_brep(&inner.shape, &mut store, &mut geo, &opts)
         .map_err(|e| format!("STEP export failed: {e}"))?;
-    let text = write_step(&store, &geo, &[body], &options)
-        .map_err(|e| format!("STEP export failed: {e}"))?;
-    Ok(StepExport { text, exact: false })
+    let faces = store
+        .bodies
+        .get(body)
+        .map(|b| {
+            b.shells
+                .iter()
+                .filter_map(|&s| store.shells.get(s))
+                .map(|s| s.faces.len())
+                .sum()
+        })
+        .unwrap_or(0);
+    Ok(FacetedBody {
+        store,
+        geo,
+        body,
+        faces,
+    })
 }
 
 #[cfg(test)]

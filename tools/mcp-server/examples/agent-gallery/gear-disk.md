@@ -52,7 +52,9 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 >   },
 >   "volume": 8601.14607606569,
 >   "valid": true,
->   "issues": []
+>   "issues": [],
+>   "mesher": "adaptive-sdf",
+>   "brepChecked": false
 > }
 > ```
 
@@ -90,6 +92,7 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 >   "model_id": "model-5",
 >   "format": "step",
 >   "path": "output/gear-disk.step",
->   "bytes": 41675079
+>   "bytes": 41675079,
+>   "unit": "mm"
 > }
 > ```

@@ -518,7 +518,23 @@ const SHAPE_INTERNAL = [
   { name: 'mesh', doc: 'Fixed-resolution mesh; the server meshes adaptively instead.' },
   { name: 'meshAdaptive', doc: 'Adaptive mesh behind every tool’s `accuracy` argument.' },
   { name: 'measure', doc: 'Backs the `measure` tool.' },
-  { name: 'validate', doc: 'Backs the `validate` tool and create_model’s valid/issues.' },
+  {
+    name: 'validate',
+    doc: 'Backs the `validate` tool and create_model’s valid/issues; takes (accuracy, deep).',
+  },
+  {
+    name: 'brepCheck',
+    doc:
+      'The kernel’s B-Rep body validation plus that body’s entity census, folded into ' +
+      '`validate` and `inspect_topology`. Reports available:false with a reason when the ' +
+      'shape has no exact B-Rep.',
+  },
+  {
+    name: 'meshAgreement',
+    doc:
+      'Runs every mesher (uniform grid, adaptive SDF, faceted-STEP recovery, exact ' +
+      'tessellation) and reports whether they agree the shape is a closed solid.',
+  },
   { name: 'exportStep', doc: 'Backs `export` with format "step"; takes (accuracy, unit).' },
   { name: 'silhouetteEdges', doc: 'View-dependent outline edges, used by the renderer.' },
   { name: 'fieldMeasure', doc: 'Field-quadrature measurement used by `optimize`.' },
