@@ -633,7 +633,9 @@ enum QuadricUSpan {
 /// without hole bridging and is rejected for the CDT pass (of-q6u).
 ///
 /// Samples at parameterization singularities (cone apex) are excluded from the
-/// `u` analysis — their `u` is arbitrary — but still bound the `v` range.
+/// `u` analysis — their `u` is arbitrary — but still bound the `v` range. That
+/// includes the vertex of a degenerate loop, which is a boundary sample the
+/// face carries without any fin to sample it from (of-26t).
 ///
 /// # Errors
 /// [`CoreError::NotImplemented`] if the boundary is trimmed and not a clean
@@ -656,6 +658,18 @@ fn boundary_param_range(
         .into_iter()
         .chain(face.inner_loops.iter().copied())
     {
+        // A degenerate loop (STEP's VERTEX_LOOP, a sweep's pole loop) has no
+        // fins: its single vertex is the boundary sample, and it is exactly
+        // the apex the `v` range has to reach for the grid to close.
+        if let Some(vertex) = store.loop_(loop_id).and_then(|lp| lp.vertex) {
+            let point = store
+                .vertex(vertex)
+                .ok_or_else(|| invalid_face(face_id, "loop references a stale vertex"))?
+                .point;
+            let projected = surface.project_point(&point);
+            lo = lo.min(projected.v);
+            hi = hi.max(projected.v);
+        }
         for &fin_id in store.fins_of_loop(loop_id) {
             let (curve, t_from, t_to) = fin_curve(store, geo, face_id, fin_id)?;
             for k in 0..=BOUNDARY_SAMPLES {

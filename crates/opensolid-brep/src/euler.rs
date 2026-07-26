@@ -139,13 +139,7 @@ impl TopologyStore {
         let shell = self.create_shell(body, true, ShellOrientation::Outward);
         let face = self.create_face(shell, FaceSense::Positive);
         let vertex = self.create_vertex(point, SYSTEM_RESOLUTION);
-        let loop_id = self.loops.insert(Loop {
-            face,
-            fins: Vec::new(),
-            loop_type: LoopType::Vertex,
-            vertex: Some(vertex),
-        });
-        self.faces.get_mut(face).expect("just created").outer_loop = Some(loop_id);
+        self.create_vertex_loop(face, LoopType::Vertex, vertex, true);
 
         self.debug_check_invariants(body);
         (body, vertex, face, shell)
@@ -932,13 +926,7 @@ mod tests {
         let shell2 = store.create_shell(body, true, ShellOrientation::Outward);
         let face2 = store.create_face(shell2, FaceSense::Positive);
         let lone = store.create_vertex(p(5.0, 5.0, 5.0), SYSTEM_RESOLUTION);
-        let vloop = store.loops.insert(Loop {
-            face: face2,
-            fins: Vec::new(),
-            loop_type: LoopType::Vertex,
-            vertex: Some(lone),
-        });
-        store.faces.get_mut(face2).unwrap().outer_loop = Some(vloop);
+        store.create_vertex_loop(face2, LoopType::Vertex, lone, true);
         let before = checked_counts(&store, body);
         assert_eq!((before.shells, before.faces, before.genus), (2, 3, 0));
 

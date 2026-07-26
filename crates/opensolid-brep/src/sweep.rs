@@ -45,8 +45,8 @@
 use crate::check::CheckFailure;
 use crate::curve::{Curve3, CurveEval, TWO_PI, plane_basis};
 use crate::topology::{
-    Body, BodyType, Edge, Face, FaceSense, FinSense, Loop, LoopType, SYSTEM_RESOLUTION,
-    ShellOrientation, TopologyStore, Vertex,
+    Body, BodyType, Edge, Face, FaceSense, FinSense, LoopType, SYSTEM_RESOLUTION, ShellOrientation,
+    TopologyStore, Vertex,
 };
 use crate::triangulate::ear_clip;
 use opensolid_core::EntityId;
@@ -845,18 +845,7 @@ pub fn revolve(profile: &Profile, axis_point: Point3, axis_dir: Vector3) -> Core
 /// Add a degenerate vertex loop at an axis pole to `face`.
 fn add_pole_loop(store: &mut TopologyStore, face: EntityId<Face>, point: Point3, as_outer: bool) {
     let pole = store.create_vertex(point, SYSTEM_RESOLUTION);
-    let loop_id = store.loops.insert(Loop {
-        face,
-        fins: Vec::new(),
-        loop_type: LoopType::Singular,
-        vertex: Some(pole),
-    });
-    let f = store.faces.get_mut(face).expect("live face");
-    if as_outer {
-        f.outer_loop = Some(loop_id);
-    } else {
-        f.inner_loops.push(loop_id);
-    }
+    store.create_vertex_loop(face, LoopType::Singular, pole, as_outer);
 }
 
 /// Swept construction is deterministic; a check failure here is a kernel

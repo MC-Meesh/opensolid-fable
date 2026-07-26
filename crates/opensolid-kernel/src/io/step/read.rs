@@ -23,7 +23,12 @@
 //! - **Topology**: `vertex_point`, `edge_curve`, `oriented_edge`,
 //!   `edge_loop`, `face_bound` / `face_outer_bound`, `advanced_face`,
 //!   `closed_shell`, `manifold_solid_brep` → `Vertex` / `Edge` / `Loop` /
-//!   `Face` / `Shell` / `Body`. A `brep_with_voids` maps its
+//!   `Face` / `Shell` / `Body`. A `vertex_loop` — the bound at a
+//!   parameterization singularity, a cone apex or sphere pole — maps to the
+//!   degenerate loop that carries a vertex and no fins
+//!   ([`Loop::vertex`](opensolid_brep::Loop::vertex)); having no extent, it
+//!   never takes the outer role on a face that also has a real loop, however
+//!   the file tags it. A `brep_with_voids` maps its
 //!   `oriented_closed_shell` cavities to inner shells
 //!   ([`ShellOrientation::Inward`](opensolid_brep::ShellOrientation)),
 //!   reversing faces whose orientation flag negates the authored winding.
@@ -2215,6 +2220,13 @@ fn rollback(store: &mut TopologyStore, geo: &mut GeometryStore, created: &Create
     // good (see `finish_exact_body`), which is past every rollback path.
 }
 
+/// What one face bound's loop contributes to the face: a cycle of directed
+/// edges (`EDGE_LOOP`), or the single vertex of a degenerate `VERTEX_LOOP`.
+enum BoundLoop {
+    Edges(Vec<(EntityId<Edge>, FinSense)>),
+    Vertex(EntityId<Vertex>),
+}
+
 struct SolidBuilder<'a> {
     file: &'a StepFile,
     store: &'a mut TopologyStore,
@@ -2325,18 +2337,30 @@ impl SolidBuilder<'_> {
         }
 
         // At most one FACE_OUTER_BOUND; without one, the first bound plays
-        // the outer role (AP203 permits plain FACE_BOUNDs only).
-        let mut outer_index = None;
+        // the outer role (AP203 permits plain FACE_BOUNDs only). A degenerate
+        // VERTEX_LOOP has no extent and so cannot bound the face's region:
+        // whenever a real loop is available it takes the outer role, whatever
+        // the file tags. A face bounded *only* by vertex loops still needs an
+        // outer loop, so there the first bound plays it (as the sweep
+        // constructors do for a pole face).
+        let mut flagged_outer = None;
+        let mut degenerate = Vec::with_capacity(bounds.len());
         for (i, &bound_ref) in bounds.iter().enumerate() {
             let inst = instance(self.file, bound_ref, face_ref)?;
             if inst.entity.part("FACE_OUTER_BOUND").is_some() {
-                if outer_index.is_some() {
+                if flagged_outer.is_some() {
                     return Err(invalid(face_ref, "face has multiple FACE_OUTER_BOUNDs"));
                 }
-                outer_index = Some(i);
+                flagged_outer = Some(i);
             }
+            let (loop_ref, _) = self.resolve_bound(bound_ref, face_ref)?;
+            degenerate.push(self.is_vertex_loop(loop_ref, bound_ref)?);
         }
-        let outer_index = outer_index.unwrap_or(0);
+        let first_real = degenerate.iter().position(|&d| !d);
+        let outer_index = match flagged_outer {
+            Some(i) if !degenerate[i] => i,
+            _ => first_real.unwrap_or(0),
+        };
 
         let sense = if same_sense != flip {
             FaceSense::Positive
@@ -2355,19 +2379,29 @@ impl SolidBuilder<'_> {
 
         for (i, &bound_ref) in bounds.iter().enumerate() {
             let (loop_ref, orientation) = self.resolve_bound(bound_ref, face_ref)?;
-            let mut loop_edges = self.map_loop(loop_ref, bound_ref)?;
-            if orientation == flip {
-                loop_edges.reverse();
-                for (_, sense) in &mut loop_edges {
-                    *sense = sense.opposite();
+            let is_outer = i == outer_index;
+            let loop_id = match self.map_loop(loop_ref, bound_ref)? {
+                BoundLoop::Vertex(vertex) => {
+                    // A VERTEX_LOOP is orientation-free: a single point has
+                    // no traversal to reverse, so `flip` does not apply.
+                    self.store
+                        .create_vertex_loop(face, LoopType::Vertex, vertex, is_outer)
                 }
-            }
-            let loop_type = if i == outer_index {
-                LoopType::Outer
-            } else {
-                LoopType::Inner
+                BoundLoop::Edges(mut loop_edges) => {
+                    if orientation == flip {
+                        loop_edges.reverse();
+                        for (_, sense) in &mut loop_edges {
+                            *sense = sense.opposite();
+                        }
+                    }
+                    let loop_type = if is_outer {
+                        LoopType::Outer
+                    } else {
+                        LoopType::Inner
+                    };
+                    self.store.create_loop(face, loop_type, &loop_edges)
+                }
             };
-            let loop_id = self.store.create_loop(face, loop_type, &loop_edges);
             self.created.loops.push(loop_id);
             let fins = self
                 .store
@@ -2396,14 +2430,21 @@ impl SolidBuilder<'_> {
         Ok((ref_attr(rec, 1, bound_ref)?, bool_attr(rec, 2, bound_ref)?))
     }
 
-    fn map_loop(
-        &mut self,
-        loop_ref: u64,
-        referrer: u64,
-    ) -> MapResult<Vec<(EntityId<Edge>, FinSense)>> {
+    /// Whether the loop named by `loop_ref` is a degenerate `VERTEX_LOOP`.
+    fn is_vertex_loop(&self, loop_ref: u64, referrer: u64) -> MapResult<bool> {
         let inst = instance(self.file, loop_ref, referrer)?;
-        if inst.entity.part("VERTEX_LOOP").is_some() {
-            return Err(unsupported(loop_ref, "VERTEX_LOOP bounds"));
+        Ok(inst.entity.part("VERTEX_LOOP").is_some())
+    }
+
+    fn map_loop(&mut self, loop_ref: u64, referrer: u64) -> MapResult<BoundLoop> {
+        let inst = instance(self.file, loop_ref, referrer)?;
+        if let Some(rec) = inst.entity.part("VERTEX_LOOP") {
+            // `VERTEX_LOOP('', #v)`: the face closes at a single point — a
+            // cone apex or a sphere pole, where the surface parameterization
+            // is singular. It maps to a degenerate loop with no fins.
+            let vertex_ref = ref_attr(rec, 1, loop_ref)?;
+            let vertex = self.map_vertex(vertex_ref, loop_ref)?;
+            return Ok(BoundLoop::Vertex(vertex));
         }
         let rec = typed_record(self.file, loop_ref, "EDGE_LOOP", referrer)?;
         let oriented_edges = ref_list(rec, 1, loop_ref)?;
@@ -2423,7 +2464,7 @@ impl SolidBuilder<'_> {
             };
             edges.push((edge, sense));
         }
-        Ok(edges)
+        Ok(BoundLoop::Edges(edges))
     }
 
     fn map_edge(&mut self, edge_ref: u64, referrer: u64) -> MapResult<EntityId<Edge>> {
@@ -3019,6 +3060,11 @@ impl FallbackMesher<'_> {
 
     /// A face bound as one closed 3D polygon (no repeated closing point),
     /// oriented per the bound's and oriented-edges' senses.
+    ///
+    /// A degenerate `VERTEX_LOOP` bound yields its single point: it cuts
+    /// nothing out of a planar face (the triangulator ignores rings under
+    /// three points), and on a quadric it is the apex/pole sample that bounds
+    /// the `v` range the grid must span.
     fn bound_polygon(&mut self, bound_ref: u64, referrer: u64) -> MapResult<Vec<Point3>> {
         let inst = instance(self.file, bound_ref, referrer)?;
         let rec = inst
@@ -3034,6 +3080,18 @@ impl FallbackMesher<'_> {
         let loop_ref = ref_attr(rec, 1, bound_ref)?;
         let bound_orientation = bool_attr(rec, 2, bound_ref)?;
 
+        let loop_inst = instance(self.file, loop_ref, bound_ref)?;
+        if let Some(vertex_loop) = loop_inst.entity.part("VERTEX_LOOP") {
+            let vertex_ref = ref_attr(vertex_loop, 1, loop_ref)?;
+            let vrec = typed_record(self.file, vertex_ref, "VERTEX_POINT", loop_ref)?;
+            let point = resolve_point(
+                self.file,
+                ref_attr(vrec, 1, vertex_ref)?,
+                vertex_ref,
+                self.scale,
+            )?;
+            return Ok(vec![point]);
+        }
         let loop_rec = typed_record(self.file, loop_ref, "EDGE_LOOP", bound_ref)?;
         let mut polygon = Vec::new();
         for oe_ref in ref_list(loop_rec, 1, loop_ref)? {
@@ -4157,6 +4215,46 @@ mod tests {
         )
     }
 
+    /// AP203 full cone (of-26t): a base cap plus a conical wall bounded by
+    /// the base circle and — at the apex, where the parameterization is
+    /// singular — a degenerate `VERTEX_LOOP`.
+    ///
+    /// The cone placement's axis points *down* (`-z`) because a
+    /// `CONICAL_SURFACE` widens along its axis: radius `r` in the base
+    /// plane, narrowing upwards to the apex at `z = h`.
+    fn cone_step(r: f64, h: f64) -> String {
+        wrap(&format!(
+            "\
+#1 = CARTESIAN_POINT('', (0., 0., 0.));
+#2 = CARTESIAN_POINT('', ({r:.6}, 0., 0.));
+#3 = CARTESIAN_POINT('', (0., 0., {h:.6}));
+#4 = DIRECTION('', (0., 0., 1.));
+#5 = DIRECTION('', (0., 0., -1.));
+#6 = DIRECTION('', (1., 0., 0.));
+#7 = VERTEX_POINT('', #2);
+#8 = VERTEX_POINT('', #3);
+#9 = AXIS2_PLACEMENT_3D('', #1, #4, #6);
+#10 = AXIS2_PLACEMENT_3D('', #1, #5, #6);
+#11 = CIRCLE('', #9, {r:.6});
+#12 = PLANE('', #10);
+#13 = CONICAL_SURFACE('', #10, {r:.6}, {half_angle:.15});
+#14 = EDGE_CURVE('', #7, #7, #11, .T.);
+#15 = ORIENTED_EDGE('', *, *, #14, .F.);
+#16 = EDGE_LOOP('', (#15));
+#17 = FACE_OUTER_BOUND('', #16, .T.);
+#18 = ADVANCED_FACE('', (#17), #12, .T.);
+#19 = ORIENTED_EDGE('', *, *, #14, .T.);
+#20 = EDGE_LOOP('', (#19));
+#21 = FACE_BOUND('', #20, .T.);
+#22 = VERTEX_LOOP('', #8);
+#23 = FACE_BOUND('', #22, .T.);
+#24 = ADVANCED_FACE('', (#21, #23), #13, .T.);
+#25 = CLOSED_SHELL('', (#18, #24));
+#26 = MANIFOLD_SOLID_BREP('cone', #25);",
+            half_angle = (r / h).atan(),
+        ))
+    }
+
     /// AP203 torus: one toroidal face closed by major and minor seam
     /// circles meeting at a single vertex on the outer equator.
     fn torus_step(major: f64, minor: f64) -> String {
@@ -4372,6 +4470,125 @@ mod tests {
             (signed_volume(&mesh) - 24.0).abs() < 1e-9,
             "bilinear patches mesh exactly"
         );
+    }
+
+    // ---- degenerate VERTEX_LOOP bounds (of-26t) ----
+
+    /// The cone's apex bound carries no edges at all. It must import as a
+    /// degenerate loop holding the apex vertex — before of-26t the reader
+    /// refused it and dropped the whole solid to the mesh fallback.
+    #[test]
+    fn cone_apex_vertex_loop_imports_as_exact_brep() {
+        let (store, geo, report) = import(&cone_step(1.0, 2.0));
+        no_error_diagnostics(&report);
+        let body = brep_body(&report.solids[0].outcome);
+
+        assert!(store.check(body).is_empty(), "{:?}", store.check(body));
+        let counts = store.euler_counts(body);
+        // The apex vertex is reachable only through the degenerate loop, and
+        // it counts in the Euler formula like any other: 2 - 1 + 2 - 1 = 2.
+        assert_eq!(
+            (counts.vertices, counts.edges, counts.faces, counts.rings),
+            (2, 1, 2, 1)
+        );
+        assert_eq!(counts.genus, 0);
+
+        let wall = store
+            .faces_of_body(body)
+            .into_iter()
+            .find(|&f| {
+                matches!(
+                    geo.surface(store.face(f).unwrap().surface.unwrap())
+                        .unwrap(),
+                    Surface3::Cone { .. }
+                )
+            })
+            .expect("one conical face");
+        // The base circle bounds the region; the apex loop is the extra ring.
+        let outer = store.face(wall).unwrap().outer_loop.expect("outer loop");
+        assert_eq!(store.fins_of_loop(outer).len(), 1);
+        let inner = store.face(wall).unwrap().inner_loops.clone();
+        assert_eq!(inner.len(), 1);
+        let apex_loop = store.loop_(inner[0]).unwrap();
+        assert!(apex_loop.fins.is_empty(), "a vertex loop has no fins");
+        assert_eq!(apex_loop.loop_type, LoopType::Vertex);
+        let apex = store
+            .vertex(apex_loop.vertex.expect("apex vertex"))
+            .unwrap();
+        assert!(
+            (apex.point - Point3::new(0.0, 0.0, 2.0)).norm() < 1e-12,
+            "apex at {:?}",
+            apex.point
+        );
+
+        let mesh = tessellate_body(&store, &geo, body, &TessellationOptions::default()).unwrap();
+        assert!(mesh.is_closed_manifold());
+        let exact = PI * 2.0 / 3.0;
+        assert!(
+            (signed_volume(&mesh) - exact).abs() / exact < 0.02,
+            "volume {} vs {exact}",
+            signed_volume(&mesh)
+        );
+    }
+
+    /// A degenerate loop has no extent, so it cannot bound the face's region
+    /// however the file tags it: the real loop still takes the outer role.
+    #[test]
+    fn vertex_loop_tagged_as_outer_bound_yields_to_the_real_loop() {
+        let src = cone_step(1.0, 2.0).replace(
+            "#23 = FACE_BOUND('', #22, .T.);",
+            "#23 = FACE_OUTER_BOUND('', #22, .T.);",
+        );
+        let (store, geo, report) = import(&src);
+        no_error_diagnostics(&report);
+        let body = brep_body(&report.solids[0].outcome);
+        assert!(store.check(body).is_empty(), "{:?}", store.check(body));
+
+        let wall = store
+            .faces_of_body(body)
+            .into_iter()
+            .find(|&f| {
+                matches!(
+                    geo.surface(store.face(f).unwrap().surface.unwrap())
+                        .unwrap(),
+                    Surface3::Cone { .. }
+                )
+            })
+            .expect("one conical face");
+        let outer = store.face(wall).unwrap().outer_loop.expect("outer loop");
+        assert_eq!(
+            store.fins_of_loop(outer).len(),
+            1,
+            "the edge loop must stay the outer loop"
+        );
+    }
+
+    /// The mesh fallback reads the same bound. A composite-curve base edge
+    /// forces tessellated import; the apex sample is what bounds the cone
+    /// grid's `v` range, so the mesh closes at the apex instead of stopping
+    /// at the base plane.
+    #[test]
+    fn cone_apex_vertex_loop_survives_mesh_fallback() {
+        let src = cone_step(1.0, 2.0).replace(
+            "#14 = EDGE_CURVE('', #7, #7, #11, .T.);",
+            "#402 = COMPOSITE_CURVE_SEGMENT(.CONTINUOUS., .T., #11);\n\
+             #403 = COMPOSITE_CURVE('', (#402), .T.);\n\
+             #14 = EDGE_CURVE('', #7, #7, #403, .T.);",
+        );
+        let (_store, _geo, report) = import(&src);
+        no_error_diagnostics(&report);
+        match &report.solids[0].outcome {
+            SolidOutcome::Mesh { mesh, .. } => {
+                assert!(mesh.is_closed_manifold());
+                let exact = PI * 2.0 / 3.0;
+                assert!(
+                    (signed_volume(mesh) - exact).abs() / exact < 0.02,
+                    "fallback volume {} vs {exact}",
+                    signed_volume(mesh)
+                );
+            }
+            other => panic!("expected the mesh fallback, got {other:?}"),
+        }
     }
 
     #[test]

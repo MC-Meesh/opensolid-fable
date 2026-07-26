@@ -468,6 +468,60 @@ impl TopologyStore {
         loop_id
     }
 
+    /// Create a degenerate loop on `face`: no fins, closed by the single
+    /// `vertex` it carries (see [`Loop::vertex`]).
+    ///
+    /// This is what bounds a face at a parameterization singularity — a cone
+    /// apex, a sphere pole, STEP's `VERTEX_LOOP` — and what MVFS seeds a body
+    /// with. `as_outer` chooses the role on the face (`outer_loop` versus an
+    /// entry in `inner_loops`); a degenerate loop has no extent, so it is the
+    /// outer loop only on a face that has no real boundary at all.
+    ///
+    /// # Panics
+    /// Panics if `face` or `vertex` is stale, if `loop_type` is not
+    /// [`LoopType::Vertex`] or [`LoopType::Singular`], or if `as_outer` is set
+    /// on a face that already has an outer loop.
+    pub fn create_vertex_loop(
+        &mut self,
+        face: EntityId<Face>,
+        loop_type: LoopType,
+        vertex: EntityId<Vertex>,
+        as_outer: bool,
+    ) -> EntityId<Loop> {
+        assert!(
+            self.faces.get(face).is_some(),
+            "create_vertex_loop: stale Face id"
+        );
+        assert!(
+            self.vertices.get(vertex).is_some(),
+            "create_vertex_loop: stale Vertex id"
+        );
+        assert!(
+            matches!(loop_type, LoopType::Vertex | LoopType::Singular),
+            "create_vertex_loop: {loop_type:?} is not a degenerate loop type"
+        );
+
+        let loop_id = self.loops.insert(Loop {
+            face,
+            fins: Vec::new(),
+            loop_type,
+            vertex: Some(vertex),
+        });
+
+        let face_ref = self.faces.get_mut(face).expect("checked above");
+        if as_outer {
+            assert!(
+                face_ref.outer_loop.is_none(),
+                "create_vertex_loop: face already has an outer loop"
+            );
+            face_ref.outer_loop = Some(loop_id);
+        } else {
+            face_ref.inner_loops.push(loop_id);
+        }
+
+        loop_id
+    }
+
     // ------------------------------------------------------------------
     // Direct lookup (Option-returning: usable as id-validity checks)
     // ------------------------------------------------------------------
@@ -1005,5 +1059,58 @@ mod tests {
         assert_eq!(f.inner_loops, vec![hole]);
         assert_eq!(store.loops_of_face(face), vec![outer, hole]);
         assert_eq!(store.loop_(hole).unwrap().loop_type, LoopType::Inner);
+    }
+
+    /// A degenerate loop carries a vertex instead of fins, and takes either
+    /// role on its face (a cone apex is a ring alongside the real boundary;
+    /// an MVFS seed face has nothing else).
+    #[test]
+    fn vertex_loop_carries_a_vertex_in_either_role() {
+        let mut store = TopologyStore::new();
+        let body = store.create_body(BodyType::Sheet);
+        let shell = store.create_shell(body, false, ShellOrientation::Outward);
+        let apex_face = store.create_face(shell, FaceSense::Positive);
+        let seed_face = store.create_face(shell, FaceSense::Positive);
+
+        let apex = store.create_vertex(Point3::new(0.0, 0.0, 1.0), SYSTEM_RESOLUTION);
+        let seed = store.create_vertex(Point3::new(5.0, 0.0, 0.0), SYSTEM_RESOLUTION);
+        let ring = store.create_vertex_loop(apex_face, LoopType::Vertex, apex, false);
+        let outer = store.create_vertex_loop(seed_face, LoopType::Singular, seed, true);
+
+        assert_eq!(store.face(apex_face).unwrap().outer_loop, None);
+        assert_eq!(store.face(apex_face).unwrap().inner_loops, vec![ring]);
+        assert_eq!(store.face(seed_face).unwrap().outer_loop, Some(outer));
+        assert!(store.face(seed_face).unwrap().inner_loops.is_empty());
+
+        let lp = store.loop_(ring).unwrap();
+        assert!(lp.fins.is_empty(), "a degenerate loop has no fins");
+        assert_eq!(lp.vertex, Some(apex));
+        assert_eq!(lp.loop_type, LoopType::Vertex);
+        assert!(store.fins_of_loop(ring).is_empty());
+        assert_eq!(store.loop_(outer).unwrap().loop_type, LoopType::Singular);
+    }
+
+    #[test]
+    #[should_panic(expected = "not a degenerate loop type")]
+    fn vertex_loop_rejects_a_non_degenerate_loop_type() {
+        let mut store = TopologyStore::new();
+        let body = store.create_body(BodyType::Sheet);
+        let shell = store.create_shell(body, false, ShellOrientation::Outward);
+        let face = store.create_face(shell, FaceSense::Positive);
+        let v = store.create_vertex(Point3::origin(), SYSTEM_RESOLUTION);
+        store.create_vertex_loop(face, LoopType::Outer, v, true);
+    }
+
+    #[test]
+    #[should_panic(expected = "face already has an outer loop")]
+    fn vertex_loop_rejects_a_second_outer_loop() {
+        let mut store = TopologyStore::new();
+        let body = store.create_body(BodyType::Sheet);
+        let shell = store.create_shell(body, false, ShellOrientation::Outward);
+        let face = store.create_face(shell, FaceSense::Positive);
+        let a = store.create_vertex(Point3::origin(), SYSTEM_RESOLUTION);
+        let b = store.create_vertex(Point3::new(1.0, 0.0, 0.0), SYSTEM_RESOLUTION);
+        store.create_vertex_loop(face, LoopType::Vertex, a, true);
+        store.create_vertex_loop(face, LoopType::Vertex, b, true);
     }
 }

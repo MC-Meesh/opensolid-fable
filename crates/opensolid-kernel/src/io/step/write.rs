@@ -17,8 +17,10 @@
 //! - **Topology**: `Vertex` / `Edge` / `Loop` / `Face` / `Shell` / `Body` →
 //!   `vertex_point`, `edge_curve`, `oriented_edge`, `edge_loop`,
 //!   `face_outer_bound` / `face_bound`, `advanced_face`, `closed_shell`,
-//!   `manifold_solid_brep`. Shared vertices, edges, curves and surfaces are
-//!   emitted once and referenced, so seams and mated fins survive the
+//!   `manifold_solid_brep`. A degenerate loop — no fins, one vertex, as a
+//!   cone apex or sphere pole carries — is written as the `vertex_loop` the
+//!   reader maps back (of-26t). Shared vertices, edges, curves and surfaces
+//!   are emitted once and referenced, so seams and mated fins survive the
 //!   round trip.
 //! - **Trim geometry**: a fin carrying a [`Curve2`]
 //!   ([`Fin::pcurve`](opensolid_brep::Fin::pcurve)) contributes a `pcurve`
@@ -808,9 +810,13 @@ impl<'a> Emitter<'a> {
             .get(loop_id)
             .ok_or_else(|| invalid("face references a stale loop"))?;
         if loop_rec.fins.is_empty() {
-            return Err(unsupported(
-                "degenerate vertex loops (VERTEX_LOOP is not readable back yet)",
-            ));
+            // A degenerate loop closing the face at one point (cone apex,
+            // sphere pole) is Part 42's VERTEX_LOOP.
+            let vertex = loop_rec
+                .vertex
+                .ok_or_else(|| invalid("loop has neither fins nor a vertex"))?;
+            let vertex_id = self.emit_vertex(vertex)?;
+            return Ok(self.emit(format!("VERTEX_LOOP('',#{vertex_id})")));
         }
         let mut oriented = Vec::with_capacity(loop_rec.fins.len());
         for &fin in &loop_rec.fins {
@@ -2634,7 +2640,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_vertex_loops() {
+    fn rejects_loop_with_neither_fins_nor_vertex() {
         let mut store = TopologyStore::new();
         let mut geo = GeometryStore::new();
         let body = store.create_body(BodyType::Solid);
@@ -2643,17 +2649,77 @@ mod tests {
         store.faces.get_mut(face).expect("face").surface = Some(
             geo.add_surface(Surface3::sphere(Point3::origin(), Vector3::z(), 1.0).expect("sphere")),
         );
-        let vertex = store.create_vertex(Point3::new(0.0, 0.0, 1.0), SYSTEM_RESOLUTION);
-        let vertex_loop = store.loops.insert(Loop {
+        let empty = store.loops.insert(Loop {
             face,
             fins: Vec::new(),
             loop_type: LoopType::Vertex,
-            vertex: Some(vertex),
+            vertex: None,
         });
-        store.faces.get_mut(face).expect("face").outer_loop = Some(vertex_loop);
+        store.faces.get_mut(face).expect("face").outer_loop = Some(empty);
 
         let err = write_step(&store, &geo, &[body], &StepWriteOptions::default()).unwrap_err();
-        assert!(matches!(err, StepWriteError::Unsupported(_)), "{err}");
+        assert!(
+            matches!(&err, StepWriteError::Invalid(what) if what.contains("neither fins nor a vertex")),
+            "{err}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Degenerate vertex loops (of-26t)
+    // ------------------------------------------------------------------
+
+    /// A pointed cone in the shape STEP writes it: the wall's apex bound is
+    /// a degenerate loop, not the seam endpoint `primitives::cone` uses.
+    fn cone_with_apex_vertex_loop(
+        store: &mut TopologyStore,
+        geo: &mut GeometryStore,
+        r: f64,
+        h: f64,
+    ) -> EntityId<Body> {
+        let base_center = Point3::origin();
+        // The cone widens along its axis, so the frame looks down from the
+        // base plane (`v = 0`, radius `r`) towards the apex at `v = -h`.
+        let wall = Surface3::cone(base_center, -Vector3::z(), (r / h).atan(), r).expect("cone");
+        let cap = Surface3::plane(base_center, -Vector3::z()).expect("plane");
+        let circle = geo.add_curve(Curve3::circle(base_center, Vector3::z(), r).expect("circle"));
+
+        let body = store.create_body(BodyType::Solid);
+        let shell = store.create_shell(body, true, ShellOrientation::Outward);
+        let seam = store.create_vertex(Point3::new(r, 0.0, 0.0), SYSTEM_RESOLUTION);
+        let apex = store.create_vertex(Point3::new(0.0, 0.0, h), SYSTEM_RESOLUTION);
+        let base = store.create_edge_with_curve(seam, seam, SYSTEM_RESOLUTION, circle, 0.0, TAU);
+
+        let f_cap = store.create_face(shell, FaceSense::Positive);
+        store.faces.get_mut(f_cap).expect("face").surface = Some(geo.add_surface(cap));
+        store.create_loop(f_cap, LoopType::Outer, &[(base, FinSense::Reversed)]);
+
+        let f_wall = store.create_face(shell, FaceSense::Positive);
+        store.faces.get_mut(f_wall).expect("face").surface = Some(geo.add_surface(wall));
+        store.create_loop(f_wall, LoopType::Outer, &[(base, FinSense::Forward)]);
+        store.create_vertex_loop(f_wall, LoopType::Vertex, apex, false);
+        body
+    }
+
+    #[test]
+    fn vertex_loop_emits_step_vertex_loop() {
+        let mut store = TopologyStore::new();
+        let mut geo = GeometryStore::new();
+        let body = cone_with_apex_vertex_loop(&mut store, &mut geo, 1.0, 2.0);
+        let text = write_step(&store, &geo, &[body], &StepWriteOptions::default())
+            .expect("body must serialize");
+        assert_eq!(
+            text.matches("VERTEX_LOOP('',#").count(),
+            1,
+            "the apex bound is the file's one VERTEX_LOOP:\n{text}"
+        );
+    }
+
+    #[test]
+    fn round_trip_cone_with_apex_vertex_loop() {
+        let mut store = TopologyStore::new();
+        let mut geo = GeometryStore::new();
+        let body = cone_with_apex_vertex_loop(&mut store, &mut geo, 1.0, 2.0);
+        assert_round_trip(&store, &geo, body);
     }
 
     // ------------------------------------------------------------------
