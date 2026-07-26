@@ -43,21 +43,17 @@
 //!   [`CoreError::NotImplemented`] instead of silently gridding it wrong
 //!   (of-q6u); it arrives with the CDT pass
 //!   ([`crate::boolean::BooleanOutput::tessellate`] already handles it).
-//! - A **curved** NURBS face does not weld to its neighbours. Its lattice
-//!   samples the shared edge at its own parameter positions, while the
-//!   neighbour samples the *edge curve* (uniform angle, for a circle), so the
-//!   two rims miss each other and the welded body mesh is left open — the
-//!   of-2i3 failure on a surface class with no parameterization to share
-//!   (of-dvj). Planar-patch NURBS bodies are unaffected: their lattice is the
-//!   four corners, which coincide exactly.
-//! - NURBS faces must be **untrimmed** — every boundary sample projecting onto
-//!   the border of the knot domain, with no inner loops. A trimmed patch needs
-//!   hole bridging and boundary-conforming refinement and is rejected for the
-//!   CDT pass, the same deferral a non-rectangular quadric trim takes. Note
-//!   this is the *store-backed* path, used for whole input bodies; boolean
-//!   *results* carry trimmed NURBS faces through
-//!   [`crate::boolean::BooleanOutput::tessellate`]'s CDT instead, which
-//!   already handles them (of-hqb). Closing the gap here is of-37i.6.
+//! - NURBS faces do **not** grid at all. They take the same
+//!   constrained-Delaunay pass a boolean result's faces take
+//!   ([`nurbs_face_cdt`], of-37i.6), which lifts both of the grid arm's
+//!   limits at once: the face's boundary is sampled from its **edge curves**,
+//!   so a curved patch welds to its neighbours (of-dvj — a grid sampled the
+//!   shared edge by its own rational parameter and the two rims missed each
+//!   other), and trimming and inner loops need no iso-rectangle. The one
+//!   exception is a patch with a *collapsed control row*, which has no chart
+//!   ([`crate::boolean`]'s `Chart::build` rejects it, of-37i.7): untrimmed,
+//!   it still grids off the same turning measure ([`nurbs_lattice`]);
+//!   trimmed, it is rejected.
 //! - Sphere/torus faces must cover the **full `v` domain/period**: their
 //!   boundary must consist purely of seams (every edge traversed with net-zero
 //!   sense), as the primitive constructors and STEP reader produce. Trimmed
@@ -75,6 +71,7 @@ use crate::surface::{Surface3, SurfaceEval};
 use crate::topology::{Body, Edge, Face, FaceSense, Fin, FinSense, Loop, TopologyStore};
 use opensolid_core::error::{CoreError, CoreResult};
 use opensolid_core::mesh::TriangleMesh;
+use opensolid_core::tolerance::ToleranceContext;
 use opensolid_core::{EntityId, Point3, Vector3};
 
 /// Fidelity controls for tessellation.
@@ -189,8 +186,10 @@ fn nurbs_curve_segments(
 /// # Errors
 /// [`CoreError::InvalidArgument`] if `body` is stale, or any reached face
 /// or edge lacks attached geometry; [`CoreError::NotImplemented`] for the
-/// trimmed quadric faces the module docs list; [`CoreError::Degenerate`] if a
-/// planar face's inner loops do not bound a valid region.
+/// trimmed quadric faces the module docs list, and for a trimmed
+/// collapsed-row NURBS patch; [`CoreError::Degenerate`] if a planar face's
+/// inner loops do not bound a valid region, or a NURBS face's loops do not
+/// bound a triangulable one.
 pub fn tessellate_body(
     store: &TopologyStore,
     geo: &GeometryStore,
@@ -301,18 +300,121 @@ fn tessellate_face_into(
             );
             Ok(())
         }
-        // A freeform patch has no axis to price an angular pitch off, so the
-        // lattice is derived from how far the *normal turns* instead
-        // (`nurbs_lattice`). Only untrimmed patches grid this way; a trimmed
-        // NURBS face is deferred to the CDT pass, exactly as a non-rectangular
-        // quadric trim is.
-        Surface3::Nurbs(nurbs) => {
+        // A freeform patch takes the constrained-Delaunay pass (of-37i.6):
+        // its boundary comes from the *edge curves*, so it welds to whatever
+        // is on the other side of them, and its interior from a lattice
+        // priced off how far the normal turns. That covers trimmed faces and
+        // inner loops as well, which a grid cannot represent at all.
+        //
+        // The one patch that cannot take it is one with a collapsed control
+        // row, which has no chart (`Chart::build` rejects it — the pole
+        // machinery has no analogue for one). Untrimmed, it still grids
+        // correctly off the same turning measure, so it keeps that path.
+        Surface3::Nurbs(nurbs) if nurbs.has_degenerate_edge() => {
             let (us, vs) = nurbs_lattice(store, geo, face_id, face, surface, nurbs, options)?;
             let v_range = (vs[0], vs[vs.len() - 1]);
             emit_grid(surface, &us, &vs, v_range, false, false, flip, mesh);
             Ok(())
         }
+        Surface3::Nurbs(_) => {
+            nurbs_face_cdt(store, geo, face_id, face, surface, flip, options, mesh)
+        }
     }
+}
+
+/// Tessellate a NURBS face through the of-lcx constrained-Delaunay pass —
+/// the same one a boolean result's faces take
+/// ([`crate::boolean::BooleanOutput::tessellate`]) — instead of gridding it
+/// (of-37i.6).
+///
+/// Two things fall out of that, and they are the two limits the grid arm
+/// could not lift:
+///
+/// - **The face welds.** Its boundary vertices are the *edge curves'* own
+///   samples, taken by [`sample_loop`] — the very points the face on the
+///   other side of each edge uses. A grid instead samples the shared edge
+///   at its own parameter positions, which for a curved patch are not the
+///   curve's (a rational quarter-cylinder's parameter is not angle-uniform,
+///   so its rim missed the cap's by up to half a sample: of-dvj, 128 open
+///   edges on a 124-triangle bore).
+/// - **Trimming and inner loops work.** The boundary is whatever the loops
+///   say it is, and holes are removed by ring parity rather than needing an
+///   iso-rectangle. Nothing here requires the boundary to run along the
+///   knot-domain border.
+///
+/// Each sample's `uv` comes from projecting its 3D curve point onto the
+/// patch, so the ring is the curve's polyline first and a parameter-space
+/// ring second. A projection is only ever used to place a point the
+/// triangulation already owns, never to *produce* one, so its error costs
+/// combinatorics and shading, not position.
+#[allow(clippy::too_many_arguments)]
+fn nurbs_face_cdt(
+    store: &TopologyStore,
+    geo: &GeometryStore,
+    face_id: EntityId<Face>,
+    face: &Face,
+    surface: &Surface3,
+    flip: bool,
+    options: &TessellationOptions,
+    mesh: &mut TriangleMesh,
+) -> CoreResult<()> {
+    let loop_id = face
+        .outer_loop
+        .ok_or_else(|| invalid_face(face_id, "has no outer loop"))?;
+    let mut rings_p = vec![sample_loop(store, geo, face_id, loop_id, options)?];
+    if rings_p[0].len() < 3 {
+        return Err(invalid_face(
+            face_id,
+            "outer loop samples to fewer than 3 points",
+        ));
+    }
+    for &inner_id in &face.inner_loops {
+        rings_p.push(sample_loop(store, geo, face_id, inner_id, options)?);
+    }
+    let rings_uv: Vec<Vec<(f64, f64)>> = rings_p
+        .iter()
+        .map(|ring| {
+            ring.iter()
+                .map(|p| {
+                    let projected = surface.project_point(p);
+                    (projected.u, projected.v)
+                })
+                .collect()
+        })
+        .collect();
+
+    // The tolerance only feeds `Chart::param`'s iterative inverse, which
+    // this path never reaches — every boundary uv is already in hand.
+    let (tris, uv, points) = crate::boolean::triangulate_trimmed_region(
+        surface,
+        &ToleranceContext::default(),
+        options.angular_step,
+        &rings_uv,
+        &rings_p,
+    )?;
+
+    let base = mesh.positions.len();
+    for (&(u, v), &p) in uv.iter().zip(&points) {
+        mesh.positions.push(p);
+        // `Chart::build` admitted this patch, so it has a normal
+        // everywhere — a collapsed control row is the only NURBS analogue
+        // of a pole and it is rejected there, before this point.
+        let normal = surface.normal(u, v).unwrap_or_else(Vector3::zeros);
+        mesh.normals.push(if flip { -normal } else { normal });
+    }
+    // Triangles come out counter-clockwise in parameter space, which is the
+    // `du × dv` side; a Negative-sense face's outward direction opposes it.
+    for t in tris {
+        let tri = if flip {
+            [base + t[0], base + t[2], base + t[1]]
+        } else {
+            [base + t[0], base + t[1], base + t[2]]
+        };
+        if tri[0] != tri[1] && tri[1] != tri[2] && tri[0] != tri[2] {
+            mesh.indices.push(tri);
+        }
+    }
+    Ok(())
 }
 
 /// Ear-clip triangulate a planar face, bridging any inner loops (holes) into
@@ -748,6 +850,12 @@ fn emit_grid(
 /// domain: `(us, vs)`, both running from the domain's low end to its high end
 /// inclusive.
 ///
+/// Only patches with a **collapsed control row** still reach this. Every
+/// other NURBS face takes [`nurbs_face_cdt`], which welds and admits trimming;
+/// a collapsed row has no chart at all ([`crate::boolean`]'s `Chart::build`
+/// rejects it, of-37i.7), so this grid is what it has (of-37i.6). It does not
+/// weld to its neighbours either — see [`span_samples`].
+///
 /// Two things make this different from the quadric path:
 ///
 /// - **The lattice cannot be priced in parameter units.** A knot domain is
@@ -770,9 +878,8 @@ fn emit_grid(
 /// # Errors
 /// [`CoreError::NotImplemented`] if the face is *trimmed* — its boundary does
 /// not run along the border of the patch's knot domain. Such a face needs
-/// hole bridging and boundary-conforming refinement, which is the CDT pass
-/// ([`crate::boolean::BooleanOutput::tessellate`], of-37i.6), the same
-/// deferral non-rectangular quadric trims take.
+/// the CDT, which a collapsed-row patch cannot take for want of a chart; the
+/// same deferral non-rectangular quadric trims take.
 fn nurbs_lattice(
     store: &TopologyStore,
     geo: &GeometryStore,
@@ -897,7 +1004,9 @@ fn span_samples(
             // Exact endpoint on the last step, so consecutive spans meet bit
             // for bit. This does *not* extend to the neighbouring face across
             // a shared edge — it samples that edge by its own rule, and for a
-            // curved patch the two disagree (of-dvj).
+            // curved patch the two disagree. That is why only collapsed-row
+            // patches, which have no chart and so cannot take the CDT, still
+            // come through here (of-dvj, of-37i.6).
             let t = if i == steps {
                 b
             } else {
@@ -1862,6 +1971,61 @@ mod tests {
             face
         }
 
+        /// A quarter-cylinder wall face of radius `r` and height `h` on the
+        /// given surface, bounded the way a real body binds one: two circle
+        /// arc edges for the rims and two straight seams. Unlike
+        /// [`quad_face`]'s all-line boundary, this puts the *true* edge
+        /// geometry on the curved sides, which is what the face's neighbours
+        /// would share.
+        fn quarter_wall_face(
+            store: &mut TopologyStore,
+            geo: &mut GeometryStore,
+            surface: Surface3,
+            r: f64,
+            h: f64,
+        ) -> EntityId<Face> {
+            let body = store.create_body(BodyType::Solid);
+            let shell = store.create_shell(body, true, ShellOrientation::Outward);
+            let face = store.create_face(shell, FaceSense::Positive);
+            store.faces.get_mut(face).expect("just created").surface =
+                Some(geo.add_surface(surface));
+
+            let corner = |k: usize, z: f64| {
+                let angle = FRAC_PI_2 * k as f64;
+                Point3::new(r * angle.cos(), r * angle.sin(), z)
+            };
+            let vertices = [corner(0, 0.0), corner(1, 0.0), corner(1, h), corner(0, h)]
+                .map(|p| store.create_vertex(p, SYSTEM_RESOLUTION));
+            // Rim arcs: the `Curve3::circle` parameter origin is
+            // `plane_basis(+Z).0 = +X`, so the first quarter is `[0, π/2]`.
+            let rim = |store: &mut TopologyStore, geo: &mut GeometryStore, z: f64, a, b| {
+                let circle = Curve3::circle(Point3::new(0.0, 0.0, z), Vector3::z(), r)
+                    .expect("valid rim circle");
+                let curve = geo.add_curve(circle);
+                store.create_edge_with_curve(a, b, SYSTEM_RESOLUTION, curve, 0.0, FRAC_PI_2)
+            };
+            let seam = |store: &mut TopologyStore, geo: &mut GeometryStore, k: usize, a, b| {
+                let line = Curve3::line(corner(k, 0.0), Vector3::z()).expect("valid seam");
+                let curve = geo.add_curve(line);
+                store.create_edge_with_curve(a, b, SYSTEM_RESOLUTION, curve, 0.0, h)
+            };
+            let bottom = rim(store, geo, 0.0, vertices[0], vertices[1]);
+            let top = rim(store, geo, h, vertices[3], vertices[2]);
+            let seam_0 = seam(store, geo, 0, vertices[0], vertices[3]);
+            let seam_1 = seam(store, geo, 1, vertices[1], vertices[2]);
+            store.create_loop(
+                face,
+                LoopType::Outer,
+                &[
+                    (bottom, FinSense::Forward),
+                    (seam_1, FinSense::Forward),
+                    (top, FinSense::Reversed),
+                    (seam_0, FinSense::Reversed),
+                ],
+            );
+            face
+        }
+
         /// Flat degree-1 patch over an arbitrary knot domain, spanning the
         /// unit square in the `z = 0` plane.
         fn flat_patch(domain: (f64, f64)) -> Surface3 {
@@ -1944,13 +2108,18 @@ mod tests {
         }
 
         /// The exact rational quarter-cylinder of of-pb7.3 — the §9 gate's
-        /// "NURBS patch of exact analytic form". Its normal turns through
-        /// exactly 90°, so the turning-derived lattice must land on the same
-        /// segment count `angular_segments` gives that quarter arc: the NURBS
-        /// duplicate of an analytic surface meshes like the analytic surface,
-        /// which is what lets adjacent NURBS and analytic faces agree.
+        /// "NURBS patch of exact analytic form" — as a *face*, with the two
+        /// rims carried by the circle edges a real body binds there.
+        ///
+        /// This is the of-dvj shape in miniature. The face's rim vertices
+        /// must be the circle's own samples, at the same uniform angles the
+        /// analytic cylinder and the planar cap take, and *not* the patch's
+        /// own rational parameter — which runs faster near the ends and so
+        /// lands elsewhere. Only then do the NURBS duplicate and the
+        /// analytic surface it duplicates mesh alike, which is what lets
+        /// adjacent faces weld.
         #[test]
-        fn exact_quarter_cylinder_patch_matches_the_analytic_pitch() {
+        fn exact_quarter_cylinder_face_rims_follow_the_edge_circles() {
             let (r, h) = (2.0, 3.0);
             let w = FRAC_1_SQRT_2;
             // 90° arc: corner control point at the tangent intersection
@@ -1975,61 +2144,55 @@ mod tests {
 
             let mut store = TopologyStore::new();
             let mut geo = GeometryStore::new();
-            let face = quad_face(
-                &mut store,
-                &mut geo,
-                Surface3::nurbs(patch),
-                [
-                    Point3::new(r, 0.0, 0.0),
-                    Point3::new(0.0, r, 0.0),
-                    Point3::new(0.0, r, h),
-                    Point3::new(r, 0.0, h),
-                ],
-            );
+            let face = quarter_wall_face(&mut store, &mut geo, Surface3::nurbs(patch), r, h);
             let options = TessellationOptions::default();
-            let mesh =
-                tessellate_face(&store, &geo, face, &options).expect("untrimmed patch grids");
+            let mesh = tessellate_face(&store, &geo, face, &options).expect("patch tessellates");
 
-            // One quad row in v (ruled), n_u quads across the arc, two
-            // triangles each.
-            let expected_u = angular_segments(FRAC_PI_2, &options);
-            assert_eq!(
-                mesh.triangle_count(),
-                2 * expected_u,
-                "turning-derived pitch must match the analytic quarter arc's \
-                 {expected_u} segments"
-            );
+            // Every sample the bottom circle edge takes must appear as a
+            // mesh vertex, exactly. This is the welding contract: the cap on
+            // the other side of that edge samples it identically.
+            let segments = angular_segments(FRAC_PI_2, &options);
+            for k in 0..=segments {
+                let angle = FRAC_PI_2 * k as f64 / segments as f64;
+                let rim = Point3::new(r * angle.cos(), r * angle.sin(), 0.0);
+                assert!(
+                    mesh.positions.iter().any(|p| (p - rim).norm() < 1e-12),
+                    "rim sample at {angle} rad is missing from the face mesh — \
+                     it would not weld to the neighbour across that edge"
+                );
+            }
+
             // The mesh inscribes the true wall, so it loses the chordal
-            // deficit and nothing else. A regular `expected_u`-gon would lose
-            // `1 - sinc(π/4n)`; this patch loses marginally more because a
-            // rational quadratic arc is not *angle*-uniform in `u` (the
-            // parameter runs faster near the ends), which is precisely why the
-            // pitch is derived from the turned angle rather than from `u`.
+            // deficit and nothing else. A regular `segments`-gon rim bounds
+            // that loss from below; the interior lattice can only pull the
+            // area back up toward exact, never past it.
             let exact = FRAC_PI_2 * r * h;
             let regular_gon =
-                2.0 * r * (FRAC_PI_2 / (2.0 * expected_u as f64)).sin() * expected_u as f64 * h;
+                2.0 * r * (FRAC_PI_2 / (2.0 * segments as f64)).sin() * segments as f64 * h;
             let area = mesh.total_area();
             assert!(
-                area < exact && area > regular_gon * (1.0 - 1e-3),
+                area < exact && area >= regular_gon * (1.0 - 1e-9),
                 "quarter-cylinder wall area {area} must inscribe the exact \
-                 {exact} and stay within a hair of the regular-gon chord \
-                 area {regular_gon}"
+                 {exact} and stay at or above the regular-gon chord area \
+                 {regular_gon}"
             );
             assert_within(area, exact, 2e-3, "quarter-cylinder wall area");
         }
 
         /// A *trimmed* NURBS face — its boundary cuts diagonally across the
-        /// patch instead of running along the knot-domain border — cannot be
-        /// gridded on the `u × v` lattice, and must defer to the CDT pass
-        /// rather than be gridded as if it were the whole patch. The same
-        /// deferral a non-rectangular quadric trim takes (of-q6u); closing it
-        /// is of-37i.6.
+        /// patch instead of running along the knot-domain border — used to
+        /// be rejected outright, because a `u × v` grid cannot represent it
+        /// (the same deferral a non-rectangular quadric trim still takes,
+        /// of-q6u). The CDT pass has no such restriction: the boundary is
+        /// whatever the loops say it is (of-37i.6).
         #[test]
-        fn rejects_trimmed_nurbs_face() {
+        fn tessellates_a_trimmed_nurbs_face() {
             let mut store = TopologyStore::new();
             let mut geo = GeometryStore::new();
             // A triangular sub-region of the unit-square patch: the diagonal
-            // from (1,0) to (0,1) leaves the domain border.
+            // from (1,0) to (0,1) leaves the domain border. The fourth corner
+            // sits *on* the u = 0 edge, so the ring also carries a collinear
+            // run — which the CDT has to place without minting a sliver.
             let face = quad_face(
                 &mut store,
                 &mut geo,
@@ -2041,15 +2204,60 @@ mod tests {
                     Point3::new(0.0, 0.5, 0.0),
                 ],
             );
-            let err = tessellate_face(&store, &geo, face, &TessellationOptions::default())
-                .expect_err("a trimmed NURBS face must be rejected, not gridded in full");
+            let mesh = tessellate_face(&store, &geo, face, &TessellationOptions::default())
+                .expect("a trimmed NURBS face tessellates through the CDT pass");
             assert!(
-                matches!(err, CoreError::NotImplemented { .. }),
-                "got {err:?}"
+                (mesh.total_area() - 0.5).abs() < 1e-12,
+                "the trimmed half of the unit patch must come out at area 0.5, got {}",
+                mesh.total_area()
             );
+        }
+
+        /// A NURBS face with an **inner loop**: the grid arm rejected these
+        /// outright (a hole cannot be gridded without bridging), and the CDT
+        /// removes them by ring parity instead (of-37i.6).
+        #[test]
+        fn tessellates_a_nurbs_face_with_a_hole() {
+            let mut store = TopologyStore::new();
+            let mut geo = GeometryStore::new();
+            let face = quad_face(
+                &mut store,
+                &mut geo,
+                flat_patch((0.0, 1.0)),
+                unit_square_corners(),
+            );
+            // A square hole [0.25, 0.75]², wound clockwise about the face's
+            // outward normal as an inner loop is.
+            let hole = [
+                Point3::new(0.25, 0.25, 0.0),
+                Point3::new(0.25, 0.75, 0.0),
+                Point3::new(0.75, 0.75, 0.0),
+                Point3::new(0.75, 0.25, 0.0),
+            ];
+            let vertices = hole.map(|p| store.create_vertex(p, SYSTEM_RESOLUTION));
+            let fins: Vec<_> = (0..4)
+                .map(|i| {
+                    let (a, b) = (hole[i], hole[(i + 1) % 4]);
+                    let curve = geo.add_curve(Curve3::line(a, b - a).expect("distinct corners"));
+                    let edge = store.create_edge_with_curve(
+                        vertices[i],
+                        vertices[(i + 1) % 4],
+                        SYSTEM_RESOLUTION,
+                        curve,
+                        0.0,
+                        (b - a).norm(),
+                    );
+                    (edge, FinSense::Forward)
+                })
+                .collect();
+            store.create_loop(face, LoopType::Inner, &fins);
+
+            let mesh = tessellate_face(&store, &geo, face, &TessellationOptions::default())
+                .expect("a NURBS face with a hole tessellates through the CDT pass");
             assert!(
-                err.to_string().contains("trimmed NURBS"),
-                "the error must name what is unsupported: {err}"
+                (mesh.total_area() - 0.75).abs() < 1e-12,
+                "the unit patch less a 0.5 x 0.5 hole must come out at area 0.75, got {}",
+                mesh.total_area()
             );
         }
     }

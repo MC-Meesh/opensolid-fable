@@ -57,7 +57,8 @@ use opensolid_brep::curve::plane_basis;
 use opensolid_brep::{
     Body, BodyType, BooleanOp, BooleanOutput, CheckFailure, Curve3, FaceSense, FinSense,
     GeometryStore, KnotVector, LoopType, NurbsSurface, SYSTEM_RESOLUTION, ShellOrientation,
-    Surface3, TopologyStore, primitives, rotate_body, translate_body,
+    Surface3, TessellationOptions, TopologyStore, primitives, rotate_body, tessellate_body,
+    translate_body,
 };
 use opensolid_core::EntityId;
 use opensolid_core::error::{CoreError, CoreResult};
@@ -3778,13 +3779,17 @@ fn nurbs_box_bored_by_analytic_bar() {
 //
 // Two limits that arm did not lift, and that this section structurally
 // cannot see because it never tessellates an input *body*: trimmed NURBS
-// faces on input bodies still defer to the CDT pass (of-37i.6), and a
-// *curved* untrimmed patch does not weld to its neighbour, because the two
-// sample their shared edge by different rules (of-dvj). So the kernel-level
-// promotion is real for planar-patch NURBS solids and still blocked for
-// curved ones. That does not weaken the cases here: every operand is
-// booleaned directly, and the curved bore below still checks the exact path
-// against the closed-form analytic answer.
+// faces on input bodies, and a *curved* untrimmed patch not welding to its
+// neighbour because the two sampled their shared edge by different rules
+// (of-dvj). of-37i.6 lifted both, by taking the grid away from NURBS faces
+// entirely — they now go through the same CDT a result's faces take, whose
+// boundary comes from the edge curves. The kernel-level promotion is
+// therefore real for curved NURBS solids too, asserted in `hybrid_e2e.rs`.
+//
+// What this section *does* own for phase 4 is the deviation bar itself:
+// `nurbs_results_tessellate_within_one_frep_cell` below is §9's phase-4
+// gate, checking every NURBS-hosted result against exactly the F-Rep cell
+// `hybrid::boolean` compares chords to before trusting the exact mesh.
 
 /// Exact strict interior predicate for the finite solid cylinder (axis
 /// `+Z` through `(cx, cy)`, radius `r`, `z ∈ (z0, z1)`), to inject via
@@ -3977,6 +3982,167 @@ fn block_bored_by_exact_nurbs_cylinder_matches_analytic() {
         CYL_VOLUME_RTOL,
         "NURBS vs analytic cylinder bore volumes",
     );
+}
+
+/// The F-Rep cell `hybrid::boolean` measures a result's chords against
+/// before it trusts the exact mesh: the mesh's longest bounding-box axis
+/// over the default grid resolution (`hybrid::cell_size`, resolution 64).
+/// Duplicated here rather than imported because it is private to the
+/// kernel and this crate is below it.
+fn frep_cell(mesh: &TriangleMesh, resolution: usize) -> f64 {
+    let e = mesh
+        .bounding_box()
+        .expect("a boolean result mesh is non-empty")
+        .extents();
+    e.x.max(e.y).max(e.z) / resolution as f64
+}
+
+/// of-dvj, at the level it actually broke: a **curved** NURBS *input* body
+/// must tessellate watertight. The four rational quarter patches of
+/// [`Scene::nurbs_cylinder`] and their two planar caps share four circular
+/// edges, and the wall used to sample each by its own rational parameter
+/// while the cap sampled the *edge curve* by angle. The two are not the same
+/// positions — the rims missed each other by up to half a sample and the
+/// welded body came out with 128 open edges on 124 triangles, so
+/// `MeshSdf::new` rejected the operand and `hybrid::boolean` could build
+/// neither the of-3oj sign crutch nor the F-Rep fallback's field.
+///
+/// Held here rather than only at the kernel level because this is the
+/// cheapest possible statement of it: no boolean, just `tessellate_body`.
+#[test]
+fn curved_nurbs_input_body_tessellates_watertight() {
+    let (r, h) = (1.0, 3.0);
+    let mut scene = Scene::new();
+    let body = scene.nurbs_cylinder(0.0, 0.0, r, 0.0, h);
+    let mesh = tessellate_body(
+        &scene.store,
+        &scene.geo,
+        body,
+        &TessellationOptions::default(),
+    )
+    .expect("a curved NURBS body tessellates");
+    assert!(
+        mesh.is_closed_manifold(),
+        "a NURBS-walled cylinder must weld watertight, got {} triangles that do not",
+        mesh.triangle_count()
+    );
+    let volume = mass_properties(&mesh)
+        .expect("closed manifold has mass properties")
+        .volume;
+    // Bracketed, not approximated. The caps are ear-clipped from the four
+    // quarter arcs at the default `angular_step`, so their rim is an
+    // inscribed 32-gon and the body cannot hold more than the exact
+    // cylinder nor less than that prism. It lands strictly between: the
+    // wall's interior lattice points sit on the true surface, bulging
+    // slightly past the rim chords.
+    let segments = 4.0 * (FRAC_PI_2 / (std::f64::consts::TAU / 32.0)).ceil();
+    let prism = 0.5 * segments * r * r * (std::f64::consts::TAU / segments).sin() * h;
+    assert!(
+        volume > prism && volume < PI * r * r * h,
+        "NURBS-walled cylinder volume {volume} must sit between the inscribed \
+         {segments}-gon prism {prism} and the exact cylinder {}",
+        PI * r * r * h
+    );
+}
+
+/// §9's **phase-4 gate** (of-37i.6): every NURBS-hosted result in the
+/// corpus tessellates within one F-Rep cell, so `hybrid::boolean` keeps
+/// the exact mesh instead of diverting to the fallback on the deviation
+/// check.
+///
+/// Deviation is what `BooleanOutput::tessellate_measured` reports — the
+/// largest distance from a triangle edge's 3D midpoint to the surface
+/// point at its parameter-space midpoint — and the bar is
+/// `hybrid::cell_size` at the default resolution, exactly the comparison
+/// `hybrid::boolean` makes. The margin is asserted too: passing by a hair
+/// would mean a slightly larger operand or a slightly coarser grid tips
+/// the router back to F-Rep, which is the failure this gate exists to
+/// keep out.
+///
+/// Worth recording honestly: **this gate was already green before the
+/// curvature-derived interior lattice landed**, and stays green with it.
+/// of-hqb's reasoning for laying no Steiner points on a NURBS chart holds
+/// for the corpus's exact-form cylinder — the patch is *ruled*, so flat
+/// chords are exact along `v`, and its trim rings are marched densely
+/// enough to carry `u` on their own. A patch that curves *both* ways has
+/// no such rescue, and that is what the lattice is for; the case that
+/// actually discriminates is the unit test
+/// `boolean::tests::nurbs_lattice_cuts_the_worst_chord_on_a_doubly_curved_patch`.
+/// What this test pins is the corpus-level bar itself, and that the
+/// lattice did not *regress* it.
+///
+/// Faces the lattice legitimately leaves flat — planar patches — deviate
+/// only by rational-evaluation round-off, and are included here to pin
+/// that no Steiner points are laid where they buy nothing.
+#[test]
+fn nurbs_results_tessellate_within_one_frep_cell() {
+    let bar = |context: &str, out: &BooleanOutput| {
+        let (mesh, deviation) = out
+            .tessellate_measured()
+            .unwrap_or_else(|e| panic!("{context}: tessellation failed: {e:?}"));
+        assert!(
+            mesh.is_closed_manifold(),
+            "{context}: result mesh is not a closed manifold"
+        );
+        let cell = frep_cell(&mesh, 64);
+        assert!(
+            deviation <= cell,
+            "{context}: chord deviation {deviation:.3e} exceeds the F-Rep cell \
+             {cell:.3e} — hybrid::boolean would divert this result to the fallback"
+        );
+        // Half a cell of headroom, so the gate is not sitting on its own
+        // rounding.
+        assert!(
+            deviation <= 0.5 * cell,
+            "{context}: chord deviation {deviation:.3e} is within the F-Rep cell \
+             {cell:.3e} but with no margin — a marginally coarser grid diverts it"
+        );
+    };
+
+    // Curved: the exact-form NURBS cylinder bored through a block. Every
+    // wall face is a trimmed rational quarter patch.
+    let (cx, cy, r) = (1.0, 1.0, 0.5);
+    let (z0, h) = (-1.0, 4.0);
+    let mut scene = Scene::new();
+    let a = scene.block([0.0; 3], [2.0; 3]);
+    let b = scene.nurbs_cylinder(cx, cy, r, z0, h);
+    let inside_b = cylinder_inside_test(cx, cy, r, z0, z0 + h);
+    let tests: [Option<InsideTest>; 2] = [None, Some(&inside_b)];
+    for (op, context) in [
+        (BooleanOp::Subtract, "block − exact NURBS cylinder"),
+        (BooleanOp::Intersect, "block ∩ exact NURBS cylinder"),
+        (BooleanOp::Unite, "block ∪ exact NURBS cylinder"),
+    ] {
+        let out = boolean_with_inside_tests(op, &scene.store, &scene.geo, a, b, &tol(), tests)
+            .unwrap_or_else(|e| panic!("{context}: exact pipeline rejected the boolean: {e:?}"));
+        bar(context, &out);
+    }
+
+    // Planar-patch NURBS: a NURBS box bored by an analytic bar. Flat faces
+    // must come out at deviation zero — no lattice where it buys nothing.
+    let mut scene = Scene::new();
+    let a = scene.nurbs_block([0.0; 3], [2.0; 3]);
+    let b = scene.block([0.5, 0.5, -1.0], [1.5, 1.5, 3.0]);
+    let inside_a = box_inside_test([0.0; 3], [2.0; 3]);
+    let tests: [Option<InsideTest>; 2] = [Some(&inside_a), None];
+    let context = "NURBS box bored by analytic bar";
+    let out = boolean_with_inside_tests(
+        BooleanOp::Subtract,
+        &scene.store,
+        &scene.geo,
+        a,
+        b,
+        &tol(),
+        tests,
+    )
+    .unwrap_or_else(|e| panic!("{context}: exact pipeline rejected the boolean: {e:?}"));
+    let (_, deviation) = out.tessellate_measured().expect("planar NURBS tessellates");
+    assert!(
+        deviation <= 1e-12,
+        "{context}: planar NURBS patches must tessellate exactly, deviated {deviation:.3e} \
+         (only rational-evaluation round-off is allowed here, ~1e-16)"
+    );
+    bar(context, &out);
 }
 
 /// Expected `(components, total genus)` of `A − B`'s boundary for a

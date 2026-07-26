@@ -733,28 +733,31 @@ fn nurbs_cylinder(
     body
 }
 
-/// How far the promotion reaches on **curved** NURBS — held as an executable
-/// bug report for of-dvj, not softened to pass.
+/// How far the promotion reaches on **curved** NURBS. Held as an executable
+/// bug report for of-dvj until of-37i.6; **live since**.
 ///
 /// The planar-patch tests above cannot speak for curved operands, and this
-/// one fails: the tool's wall patch and its planar cap share a circular edge
-/// and sample it *differently* — the cap ear-clips the curve at uniform
-/// angles (11.25° steps), the NURBS wall grids uniformly in its own rational
-/// parameter, which is not angle-uniform. The rims do not weld (128 open
-/// edges on a 124-triangle mesh), `MeshSdf::new` rejects the operand, and so
-/// neither the exact path's inside-test crutch nor the F-Rep fallback's field
-/// can be built. It is the of-2i3 lesson in a new place: adjacent faces must
-/// sample a shared edge at the same positions, which the quadric path gets
-/// for free by parameterizing both sides by angle.
+/// one used to fail: the tool's wall patch and its planar cap share a
+/// circular edge and sampled it *differently* — the cap ear-clips the curve
+/// at uniform angles (11.25° steps), while the NURBS wall gridded uniformly
+/// in its own rational parameter, which is not angle-uniform. The rims did
+/// not weld (128 open edges on a 124-triangle mesh), `MeshSdf::new` rejected
+/// the operand, and so neither the exact path's inside-test crutch nor the
+/// F-Rep fallback's field could be built. It was the of-2i3 lesson in a new
+/// place: adjacent faces must sample a shared edge at the same positions,
+/// which the quadric path gets for free by parameterizing both sides by
+/// angle.
 ///
-/// Note what this does *not* say. A curved NURBS face arising from a boolean
-/// *result* tessellates fine — those go through the CDT
-/// (`BooleanOutput::tessellate`). The gap is curved NURBS as an **input
-/// body**. The assertion is deliberately weak — succeeds, watertight,
+/// The fix took the grid away from NURBS faces entirely: they go through the
+/// same constrained-Delaunay pass a boolean *result*'s faces take, whose
+/// boundary is sampled from the **edge curves** and therefore agrees with
+/// whatever is on the other side of them by construction
+/// (`tessellate::nurbs_face_cdt`).
+///
+/// The assertion is deliberately weak — succeeds, watertight,
 /// volume-accurate on *whichever* path — because diverting to F-Rep on the
 /// deviation gate would be a legitimate outcome; only the hard error is not.
 #[test]
-#[ignore = "of-dvj: curved NURBS input bodies tessellate non-watertight"]
 fn curved_nurbs_operand_produces_a_correct_result_on_whichever_path() {
     let (r, h) = (1.0, 4.0);
     let mut store = TopologyStore::new();

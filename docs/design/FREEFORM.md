@@ -578,6 +578,54 @@ under-refined NURBS face simply fails `deviation <= cell_size(...)` in
 correctness** — which is why tessellation is *not* on the critical path and
 should not be allowed to block the phase-2/3 promotion.
 
+### 7.1 What phase 4 actually did (of-37i.6), and where this plan was wrong
+
+Both couplings broke as described, but the plan's *shape* — a NURBS arm in
+`tessellate.rs` alongside the quadric grids — did not survive contact. The
+store-backed path now has **no NURBS grid arm at all**: a NURBS face is routed
+into the same CDT a boolean result's faces take, through a new
+`boolean::triangulate_trimmed_region`. One change lifted both of the grid's
+limits, because they had one cause:
+
+- A grid samples a shared edge **by its own parameter rule**. The CDT samples
+  it from the **edge curve**, which is what the face on the other side does
+  too. That is `of-dvj` — a rational quarter-cylinder's parameter is not
+  angle-uniform, so its rim landed between the cap's samples and the body
+  would not weld (128 open edges on a 124-triangle bore).
+- A grid needs the boundary to be an iso-rectangle. The CDT does not care what
+  the boundary is, and removes inner loops by ring parity. That is the trimmed
+  face.
+
+The only patch that keeps a grid is one with a **collapsed control row**: it
+has no chart at all (`Chart::build` rejects it, §2), so it cannot take the CDT.
+Untrimmed, it still grids off the turning measure; trimmed, it is rejected.
+
+Two corrections to the couplings themselves:
+
+1. The pitch is derived from **turning, not curvature**, and it is measured
+   over the *region's* uv box rather than the knot domain — a trim region on a
+   flat corner of a patch should not be charged for a fold elsewhere on it.
+   Turning is the right primitive because `pitch` then keeps its meaning
+   across surface classes: a NURBS patch of exact analytic form lands on the
+   same lattice as the analytic surface it duplicates. Second derivatives
+   turned out not to be needed; `normal` at `2·degree + 1` probes per knot
+   span is enough, and summing consecutive angles recovers the total turn
+   exactly while the normal rotates monotonically.
+2. `uv_scale` being point-valued does not make `scale` point-valued
+   *downstream*. The clearance metric needs one number per axis, so the arm
+   takes the **sup** over the region — matching what the analytic arms already
+   do by quoting each chart's widest `u`-circle radius. Squaring cells up in
+   model units, though, wants the region's *actual* arc length rather than
+   that sup (a rational arc's speed peaks ~5% above its mean), so the probe
+   sweep measures the polyline directly.
+
+And one measurement worth carrying forward, because it invalidates the obvious
+test: **the corpus's exact-form NURBS cylinder already met the deviation bar
+with no interior lattice at all.** A cylinder is *ruled*, so flat chords are
+exact along `v`, and its trim rings are sampled densely enough to carry `u` on
+their own — exactly what of-hqb observed. The lattice only shows up on a patch
+that curves *both* ways. Do not use a cylinder to test a tessellation lattice.
+
 ## 8. Fallback boundaries — what stays F-Rep
 
 The fallback is not a consolation prize; it is the reason this can be phased at
@@ -589,8 +637,9 @@ mismatch. Each item below is therefore a *deliberate* fallback, not a bug:
 | Configuration | Path | Why |
 |---|---|---|
 | NURBS ↔ NURBS/analytic, transversal, clamped, non-degenerate | **exact** — DELIVERED (of-ew7) for planar-patch operands | the target |
-| *Curved* NURBS face on an **input** body | **neither** — hard error | patch and neighbour sample their shared edge differently, so the body will not weld watertight; with no operand mesh there is no SDF, hence no fallback either (of-dvj) |
-| *Trimmed* NURBS face on an **input** body | **F-Rep** | `tessellate_face` grids untrimmed patches only; boolean *results* carry trimmed NURBS faces through the CDT already (of-37i.6) |
+| *Curved* NURBS face on an **input** body | **exact** — DELIVERED (of-37i.6) | was a hard error: patch and neighbour sampled their shared edge differently, so the body would not weld and with no operand mesh there was no SDF and hence no fallback either (of-dvj). The face's boundary now comes from the edge curves, so it welds by construction |
+| *Trimmed* NURBS face on an **input** body | **exact** — DELIVERED (of-37i.6) | input bodies take the same CDT boolean *results* always did; nothing requires the boundary to be an iso-rectangle |
+| NURBS face with a **collapsed control row** on an input body | **F-Rep** (untrimmed) / rejected (trimmed) | it has no chart, so it cannot take the CDT; untrimmed it still grids (of-37i.7) |
 | Tangential or coincident NURBS contact | **F-Rep** | `NEAR_TANGENCY_SIN` bail; matches the analytic MVP's own limit |
 | NURBS with degenerate edges (collapsed rows) | **F-Rep** | pole machinery has no analogue (§2) |
 | Periodic/unclamped NURBS | **F-Rep** (or rejected at construction) | seams belong in topology, not the chart (§1) |
@@ -697,18 +746,22 @@ gates the promotion.
 - Closed manifold + `check()` + genus on every output.
 - Trim regions abutting the knot-domain boundary.
 
-**Phase 4 — tessellation quality (`of-37i.6`). PARTLY PULLED FORWARD by
-`of-ew7`.** The untrimmed-patch arm in `tessellate.rs` landed with the
-promotion, its lattice priced off the normal's turning per knot span. What
-remains is **trimmed** NURBS faces on input bodies (boundary-conforming
-refinement and hole bridging — the CDT pass) and the corpus-wide accuracy bar,
-plus the watertightness gap the promotion exposed: a **curved** untrimmed patch
-and its neighbour sample their shared edge by different rules (the neighbour by
-the curve's angle, the patch by its own rational parameter), so curved NURBS
-*input* bodies do not weld — `of-dvj`, the of-2i3 lesson recurring on a surface
-class that has no parameterization to share.
+**Phase 4 — tessellation quality (`of-37i.6`). DELIVERED.** Partly pulled
+forward by `of-ew7`, whose untrimmed-patch grid arm landed with the promotion,
+priced off the normal's turning per knot span. of-37i.6 then took that grid
+back out: NURBS faces on input bodies go through the **CDT** instead, boundary
+sampled from the edge curves. That closed **trimmed** NURBS faces and inner
+loops, closed `of-dvj` (a curved untrimmed patch and its neighbour sampled
+their shared edge by different rules — the neighbour by the curve's angle, the
+patch by its own rational parameter — so curved NURBS *input* bodies did not
+weld; the of-2i3 lesson recurring on a surface class with no parameterization
+to share), and broke §7's two couplings: the lattice pitch is now derived from
+turning over the *region*, and `refine_curved_region`'s constant `scale`
+follows the point-valued `uv_scale`. See §7.1 for where the plan was wrong.
 **Gate:** worst chord deviation `≤` F-Rep cell on the stress corpus, so NURBS
-booleans stop diverting to F-Rep on the deviation gate.
+booleans stop diverting to F-Rep on the deviation gate —
+`boolean_stress::nurbs_results_tessellate_within_one_frep_cell`, green with
+≥2× margin.
 
 *Correction to the original plan, recorded because it cost the promotion a
 round-trip:* this phase was scheduled as "accuracy only — must not gate phase

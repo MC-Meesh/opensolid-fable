@@ -50,7 +50,7 @@
 use crate::check::CheckFailure;
 use crate::curve::{Curve3, CurveEval, TWO_PI, plane_basis};
 use crate::geometry::GeometryStore;
-use crate::nurbs::curve::NurbsCurve;
+use crate::nurbs::curve::{KnotVector, NurbsCurve};
 use crate::nurbs::surface::NurbsSurface;
 use crate::project::{CurveProject, SurfaceProject, SurfaceProjection};
 use crate::ssi::{
@@ -910,6 +910,73 @@ impl Chart {
                 let ders = surface.derivatives(u, v, 1);
                 (ders[1][0].norm(), ders[0][1].norm())
             }
+        }
+    }
+
+    /// Whether [`triangulate_mesh_face`] should replace a region's ear-clip
+    /// seed with the boundary CDT before refining it (of-6ry). True for
+    /// every chart that curves — every chart but the plane, and excluding
+    /// the degenerate cone whose reference radius is zero, which lays no
+    /// lattice either.
+    fn takes_cdt_seed(&self) -> bool {
+        match self {
+            Chart::Plane { .. } => false,
+            Chart::Cone { radius, .. } => radius.abs() > 0.0,
+            Chart::Cylinder { .. }
+            | Chart::Sphere { .. }
+            | Chart::Torus { .. }
+            | Chart::Nurbs { .. } => true,
+        }
+    }
+
+    /// Interior-lattice parameters for a region whose uv bounding box is
+    /// `bbox = (u0, u1, v0, v1)`, laid to an angular `pitch` (the maximum
+    /// turn of the normal between adjacent lattice lines):
+    /// `(pitch_u, pitch_v, (u_scale, v_scale))`.
+    /// `None` means *lay no lattice* — the region is flat in 3D (a plane, or
+    /// a NURBS patch that does not turn), so the boundary triangulation
+    /// already hugs the surface exactly.
+    ///
+    /// The pitches are the target parameter step between lattice lines; the
+    /// scales convert each parameter axis to model arc length so the
+    /// boundary-clearance metric is isotropic in 3D. Analytic charts state
+    /// both in closed form off `pitch`, which their `u` axis (an angle)
+    /// *is*: cylinder `v` is a model length (rows one pitch of arc apart),
+    /// sphere/torus `v` is an angle (rows at the angular pitch directly).
+    /// Each analytic `u` scale is the chart's *widest* `u`-circle radius —
+    /// conservative for clearance where that circle shrinks (sphere poles,
+    /// torus bore).
+    ///
+    /// A freeform patch has no `u`-circle to price an angular pitch off and
+    /// its curvature varies across the domain, so its arm measures both
+    /// instead — see [`nurbs_lattice_spec`] (of-37i.6).
+    fn lattice_spec(
+        &self,
+        bbox: (f64, f64, f64, f64),
+        pitch: f64,
+    ) -> Option<(f64, f64, (f64, f64))> {
+        match self {
+            Chart::Plane { .. } => None,
+            Chart::Cylinder { radius, .. } => {
+                Some((pitch, radius.abs() * pitch, (radius.abs(), 1.0)))
+            }
+            Chart::Sphere { radius, .. } => Some((pitch, pitch, (radius.abs(), radius.abs()))),
+            Chart::Torus {
+                major_radius,
+                minor_radius,
+                ..
+            } => Some((pitch, pitch, (major_radius + minor_radius, *minor_radius))),
+            // Row spacing and u arc-scale from the reference (v = 0) radius.
+            // The true u-circle radius varies along v; deriving the per-face
+            // widest radius is a refinement follow-up (of-dtj sub-bead). A
+            // face left too coarse by this estimate diverts to the F-Rep
+            // fallback via the mesh deviation gate, so this is quality-only,
+            // never a correctness risk.
+            Chart::Cone { radius, .. } => {
+                let r = radius.abs();
+                (r > 0.0).then_some((pitch, r * pitch, (r, 1.0)))
+            }
+            Chart::Nurbs { surface, .. } => nurbs_lattice_spec(surface, bbox, pitch),
         }
     }
 
@@ -5860,44 +5927,10 @@ fn triangulate_mesh_face(mf: &MeshFace, weld_eps: f64) -> CoreResult<(Vec<Triang
     // never touch the boundary (so cross-face welding is untouched), boundary
     // ring edges are constraints that are never flipped, and the whole
     // construction is deterministic. See `refine_curved_region`.
-    // Per-chart lattice parameters: the v-row spacing in v units, and the
-    // arc-length scales that make the clearance metric isotropic in 3D.
-    // Cylinder v is a model length (rows at one sampling pitch of arc);
-    // sphere/torus v is an angle (rows at the angular pitch directly). The
-    // u scale is each chart's widest u-circle radius — conservative for
-    // clearance where the circle shrinks (sphere poles, torus bore).
-    let pitch = TWO_PI / SAMPLES_PER_CIRCLE as f64;
-    let lattice = match mf.chart {
-        Chart::Cylinder { radius, .. } => Some((radius.abs() * pitch, (radius.abs(), 1.0))),
-        Chart::Sphere { radius, .. } => Some((pitch, (radius.abs(), radius.abs()))),
-        Chart::Torus {
-            major_radius,
-            minor_radius,
-            ..
-        } => Some((pitch, (major_radius + minor_radius, minor_radius))),
-        // Row spacing and u arc-scale from the reference (v = 0) radius. The
-        // true u-circle radius varies along v; deriving the per-face widest
-        // radius is a refinement follow-up (of-dtj sub-bead). A face left too
-        // coarse by this estimate diverts to the F-Rep fallback via the mesh
-        // deviation gate, so this is quality-only, never a correctness risk.
-        Chart::Cone { radius, .. } => {
-            let r = radius.abs();
-            (r > 0.0).then_some((r * pitch, (r, 1.0)))
-        }
-        Chart::Plane { .. } => None,
-        // A freeform patch has no u-circle to price an angular pitch off,
-        // and its curvature varies across the domain; the curvature-derived
-        // pitch is of-37i.6 (phase 4). `None` skips the interior lattice,
-        // leaving the region on the boundary-CDT seed below (of-hqb):
-        // its trim rings are marched/sampled densely, and Delaunay between
-        // dense opposing rings yields thin strips that already hug the
-        // surface (a bore wall loses ~0.1% of its volume, vs ~13% under
-        // the ear-clip fans). A patch whose interior genuinely needs Steiner
-        // points diverts to the F-Rep fallback via the mesh deviation gate
-        // — quality-only, exactly as for the cone estimate above, and
-        // never a correctness risk.
-        Chart::Nurbs { .. } => None,
-    };
+    // The lattice's pitches and arc-length scales are per-chart and depend on
+    // the region's own uv extent, so they are derived inside
+    // `refine_curved_region` from [`Chart::lattice_spec`].
+    //
     // Curved charts: replace the ear-clip seed with a constrained Delaunay
     // triangulation of the ring vertices before laying the interior lattice.
     // Ear clipping's least-reflex fallback force-clips corners across a wide
@@ -5909,27 +5942,23 @@ fn triangulate_mesh_face(mf: &MeshFace, weld_eps: f64) -> CoreResult<(Vec<Triang
     // the ear-clip seed if the CDT cannot be built (e.g. a degenerate ring or
     // an unrecoverable constraint edge) — no worse than today for those.
     //
-    // NURBS charts take the CDT seed too, even though they lay no lattice:
-    // both of-6ry's folding hazard and the wide-chord hazard are properties
-    // of the chart being curved, not of having a lattice pitch (see the
-    // `lattice` match above).
-    if lattice.is_some() || matches!(mf.chart, Chart::Nurbs { .. }) {
+    // NURBS charts take the CDT seed too, including the flat-patch case that
+    // lays no lattice: both of-6ry's folding hazard and the wide-chord hazard
+    // are properties of the chart being curved, not of having a lattice pitch.
+    if mf.chart.takes_cdt_seed() {
         if let Some(cdt) = boundary_cdt(&all_uv, &ring_ranges) {
             tris = cdt;
         }
     }
 
-    if let Some((pitch_v, scale)) = lattice {
-        refine_curved_region(
-            &mut tris,
-            &mut all_uv,
-            &mut all_p,
-            &mf.chart,
-            pitch_v,
-            scale,
-            &ring_ranges,
-        );
-    }
+    refine_curved_region(
+        &mut tris,
+        &mut all_uv,
+        &mut all_p,
+        &mf.chart,
+        TWO_PI / SAMPLES_PER_CIRCLE as f64,
+        &ring_ranges,
+    );
 
     // Emit 3D triangles; flip winding when the outward normal opposes the
     // chart normal (param-space CCW maps to the chart normal side).
@@ -6373,15 +6402,250 @@ fn ring_contains(uv: (f64, f64), verts: &[(f64, f64)], ring_ranges: &[(usize, us
     inside
 }
 
+/// [`triangulate_trimmed_region`]'s result: the triangles, and the uv and
+/// 3D coordinates of every vertex they index — the caller's own boundary
+/// samples first, in the order they were given, then the interior lattice.
+pub(crate) type TriangulatedRegion = (Vec<[usize; 3]>, Vec<(f64, f64)>, Vec<Point3>);
+
+/// Triangulate a **trimmed region of a curved surface** in its own chart,
+/// given the region's boundary rings already sampled in uv *and* in 3D —
+/// the entry point `crate::tessellate` uses to put a store-backed face
+/// through the same of-lcx constrained-Delaunay pass a boolean result's
+/// faces take (of-37i.6).
+///
+/// `rings_uv[0]`/`rings_p[0]` is the outer ring; the rest are holes. The
+/// two must agree index for index: the 3D points are the caller's, taken
+/// from the *edge curves*, and are returned untouched at the front of the
+/// output so the caller's boundary polylines stay bit-identical to the
+/// adjacent faces' copies of the same edges. That is the whole point of
+/// routing a face through here rather than gridding it — a grid samples
+/// the shared edge by its own parameter rule and the two rims miss each
+/// other (of-dvj, the of-2i3 lesson on a surface class with no
+/// parameterization to share).
+///
+/// Interior lattice points are appended after them, spaced to hold the
+/// normal's turn between adjacent lattice lines to `pitch`.
+///
+/// Returns `(triangles, uv, points)`, the triangles wound counter-clockwise
+/// in parameter space — which is the `du × dv` side, so a caller whose face
+/// is outward-opposed reverses them.
+///
+/// # Errors
+/// [`CoreError::NotImplemented`] if the surface has no chart (see
+/// [`Chart::build`] — a NURBS patch with a collapsed control row);
+/// [`CoreError::Degenerate`] if the rings do not bound a triangulable
+/// region.
+pub(crate) fn triangulate_trimmed_region(
+    surface: &Surface3,
+    tol: &ToleranceContext,
+    pitch: f64,
+    rings_uv: &[Vec<(f64, f64)>],
+    rings_p: &[Vec<Point3>],
+) -> CoreResult<TriangulatedRegion> {
+    // The chart's captured tolerance only feeds `Chart::param`'s iterative
+    // inverse, which nothing on this path calls — the caller already holds
+    // every boundary uv.
+    let chart = Chart::build(surface, tol)?;
+    let (mut all_uv, mut all_p) = (Vec::new(), Vec::new());
+    let mut ring_ranges = Vec::with_capacity(rings_uv.len());
+    for (uv, p) in rings_uv.iter().zip(rings_p) {
+        debug_assert_eq!(uv.len(), p.len(), "ring uv and 3D samples must correspond");
+        if uv.len() < 3 {
+            continue; // a ring of fewer than 3 points bounds nothing
+        }
+        ring_ranges.push((all_uv.len(), uv.len()));
+        all_uv.extend_from_slice(uv);
+        all_p.extend_from_slice(p);
+    }
+    if ring_ranges.is_empty() {
+        return Err(CoreError::Degenerate {
+            context: "boolean::triangulate_trimmed_region",
+            reason: "no boundary ring has three or more samples".into(),
+        });
+    }
+    let mut tris = boundary_cdt(&all_uv, &ring_ranges).ok_or_else(|| CoreError::Degenerate {
+        context: "boolean::triangulate_trimmed_region",
+        reason: "the boundary rings do not bound a triangulable region".into(),
+    })?;
+    refine_curved_region(
+        &mut tris,
+        &mut all_uv,
+        &mut all_p,
+        &chart,
+        pitch,
+        &ring_ranges,
+    );
+    Ok((tris, all_uv, all_p))
+}
+
+/// Probe parameters spanning `[a, b]` along one axis of a knot vector: every
+/// distinct interior knot is kept (the polynomial pieces are only smooth
+/// *within* a span, and a knot is where a crease can live), and each
+/// resulting sub-span is subdivided into `2·degree + 1` equal steps — enough
+/// probes to resolve a polynomial piece of that degree.
+///
+/// The endpoints are exact, so a probe list never strays outside the region
+/// it was asked for.
+fn knot_probe_params(knot_vector: &KnotVector, a: f64, b: f64) -> Vec<f64> {
+    let (lo, hi) = knot_vector.domain();
+    let (a, b) = (a.max(lo), b.min(hi));
+    if b <= a {
+        return vec![a];
+    }
+    let mut breaks = vec![a];
+    for &k in knot_vector.knots() {
+        if k > breaks[breaks.len() - 1] + f64::EPSILON && k < b {
+            breaks.push(k);
+        }
+    }
+    breaks.push(b);
+    // Cap the total probe count: a heavily-knotted patch does not need
+    // `2·degree + 1` probes in every one of its spans to price a lattice.
+    let per = (2 * knot_vector.degree() + 1).min((256 / breaks.len()).max(1));
+    let mut out = vec![breaks[0]];
+    for window in breaks.windows(2) {
+        let (s, e) = (window[0], window[1]);
+        for i in 1..=per {
+            // Exact endpoint on the last step, so consecutive spans meet bit
+            // for bit and the list ends exactly on `b`.
+            out.push(if i == per {
+                e
+            } else {
+                s + (e - s) * i as f64 / per as f64
+            });
+        }
+    }
+    out
+}
+
+/// [`Chart::lattice_spec`]'s freeform arm: price a NURBS patch's interior
+/// lattice off how far its **normal turns** across the region, the way
+/// `tessellate::span_samples` prices the untrimmed grid (of-37i.6).
+///
+/// Three things make this different from the analytic arms:
+///
+/// - **A knot domain carries no units.** The same patch may be built over
+///   `[0, 1]` or over `[3, 13]` (§6/of-37i.3), so no fixed parameter pitch
+///   can mean the same thing twice. Turning is a property of the geometry
+///   alone, so `pitch` keeps its meaning — the maximum normal turn between
+///   adjacent lattice lines — and a NURBS patch of exact analytic form lands
+///   on the same lattice as the analytic surface it duplicates.
+/// - **Curvature varies across the patch**, so the measurement is taken over
+///   *this region's* box rather than the whole domain. A trim region on a
+///   nearly-flat corner of a patch is not charged for a sharp fold elsewhere
+///   on it.
+/// - **The scale is genuinely point-valued** ([`Chart::uv_scale`]). The
+///   clearance metric needs one number per axis, so the arm takes the
+///   largest `|S_u|`/`|S_v|` it probes — the same conservative choice the
+///   analytic arms make by using each chart's widest `u`-circle radius.
+///   Squaring the cells up, though, wants the region's *actual* arc length
+///   rather than that supremum bound (a rational arc's `|S_u|` peaks well
+///   above its mean), so the sweep measures the probe polyline directly.
+///
+/// The cross-direction is probed at three stations rather than one and the
+/// worst turn wins: a patch can be flat along one edge and sharply curved
+/// along the opposite one, and the lattice is shared by every row.
+///
+/// A direction that does not turn at all (a ruled direction, or a
+/// degree-1 patch, which is *exact* under any lattice) gets its step from
+/// the other direction's cell size instead, so cells stay roughly square in
+/// model units — the same relation the cylinder arm states in closed form
+/// with `pitch_v = radius · pitch`. When *neither* direction turns the patch
+/// is planar over this region and the answer is `None`: no lattice at all.
+fn nurbs_lattice_spec(
+    surface: &NurbsSurface,
+    bbox: (f64, f64, f64, f64),
+    pitch: f64,
+) -> Option<(f64, f64, (f64, f64))> {
+    const MAX_STEPS: usize = 256;
+    const FLAT: f64 = 1e-12;
+    let (u0, u1, v0, v1) = bbox;
+    let probes_u = knot_probe_params(surface.knot_vector_u(), u0, u1);
+    let probes_v = knot_probe_params(surface.knot_vector_v(), v0, v1);
+    let (u0, u1) = (probes_u[0], probes_u[probes_u.len() - 1]);
+    let (v0, v1) = (probes_v[0], probes_v[probes_v.len() - 1]);
+    if !(u1 > u0 && v1 > v0) {
+        return None;
+    }
+    let stations = |lo: f64, hi: f64| [lo, 0.5 * (lo + hi), hi];
+
+    // Summing the angle between consecutive normals recovers the total turn
+    // exactly while the normal rotates monotonically, and under-counts only
+    // if it wiggles *within* one span — which the probes past the degree are
+    // there to catch. Probes where the normal is undefined are skipped
+    // rather than guessed. The same sweep measures the region's arc length
+    // (the probe polyline, which is the geometry the chords actually have
+    // to cover) and the largest `|S_u|`/`|S_v|` seen.
+    let (mut su, mut sv) = (0.0f64, 0.0f64);
+    let mut sweep = |along_u: bool| -> (f64, f64) {
+        let (probes, cross) = if along_u {
+            (&probes_u, stations(v0, v1))
+        } else {
+            (&probes_v, stations(u0, u1))
+        };
+        let (mut worst_turn, mut worst_arc): (f64, f64) = (0.0, 0.0);
+        for c in cross {
+            let (mut turn, mut arc) = (0.0, 0.0);
+            let mut previous: Option<(Vector3, Point3)> = None;
+            for &t in probes {
+                let (u, v) = if along_u { (t, c) } else { (c, t) };
+                let derivatives = surface.derivatives(u, v, 1);
+                su = su.max(derivatives[1][0].norm());
+                sv = sv.max(derivatives[0][1].norm());
+                let point = surface.point(u, v);
+                let Some(normal) = surface.normal(u, v) else {
+                    continue;
+                };
+                if let Some((n, p)) = previous {
+                    turn += n.angle(&normal);
+                    arc += (point - p).norm();
+                }
+                previous = Some((normal, point));
+            }
+            worst_turn = worst_turn.max(turn);
+            worst_arc = worst_arc.max(arc);
+        }
+        (worst_turn, worst_arc)
+    };
+    let ((turn_u, arc_u), (turn_v, arc_v)) = (sweep(true), sweep(false));
+    if turn_u <= FLAT && turn_v <= FLAT {
+        return None; // planar over this region — flat chords are exact
+    }
+
+    let (su, sv) = (su.max(1e-12), sv.max(1e-12));
+    let steps = |turn: f64| ((turn / pitch).ceil() as usize).clamp(1, MAX_STEPS);
+    let (mut n_u, mut n_v) = (steps(turn_u), steps(turn_v));
+
+    // Square the cells up in model units off whichever direction the
+    // curvature actually constrained.
+    let mut cell = f64::INFINITY;
+    if turn_u > FLAT {
+        cell = cell.min(arc_u / n_u as f64);
+    }
+    if turn_v > FLAT {
+        cell = cell.min(arc_v / n_v as f64);
+    }
+    if cell > 0.0 && cell.is_finite() {
+        let fit = |arc: f64| ((arc / cell).ceil() as usize).clamp(1, MAX_STEPS);
+        n_u = n_u.max(fit(arc_u));
+        n_v = n_v.max(fit(arc_v));
+    }
+
+    Some(((u1 - u0) / n_u as f64, (v1 - v0) / n_v as f64, (su, sv)))
+}
+
 /// Retriangulate a curved face's ear-clip result into a constrained
 /// Delaunay mesh seeded with a lattice of interior points, so every triangle
-/// edge spans at most about one sampling pitch in `u` (always an angle on
-/// curved charts) and `pitch_v` in `v`. The flat 3D chords then hug the
-/// surface instead of cutting long secants through it.
+/// edge spans at most about one sampling pitch of the chart in each
+/// direction. The flat 3D chords then hug the surface instead of cutting
+/// long secants through it.
 ///
-/// `pitch_v` is the interior row spacing in `v` units (model length on a
-/// cylinder, radians on sphere/torus); `scale` converts each parameter axis
-/// to model arc length for the boundary-clearance metric.
+/// The pitches and the arc-length scales that make the boundary-clearance
+/// metric isotropic in 3D come from [`Chart::lattice_spec`], evaluated on
+/// this region's own uv bounding box — a freeform patch's curvature varies
+/// across its domain, so a region-independent pitch would be wrong for it
+/// (of-37i.6). A `None` spec means the region is flat in 3D and needs no
+/// interior points at all; it is left exactly as seeded.
 ///
 /// `tris` is a valid triangulation of the region using only boundary
 /// vertices; `ring_ranges` gives each original boundary ring's index span in
@@ -6396,14 +6660,12 @@ fn refine_curved_region(
     all_uv: &mut Vec<(f64, f64)>,
     all_p: &mut Vec<Point3>,
     chart: &Chart,
-    pitch_v: f64,
-    scale: (f64, f64),
+    pitch: f64,
     ring_ranges: &[(usize, usize)],
 ) {
     if tris.is_empty() || ring_ranges.is_empty() {
         return;
     }
-    let pitch = TWO_PI / SAMPLES_PER_CIRCLE as f64;
 
     // Boundary constraint edges (never flipped) and bounding box.
     let mut constraints: std::collections::HashSet<(usize, usize)> =
@@ -6429,18 +6691,24 @@ fn refine_curved_region(
     if !(u1 > u0 && v1 > v0) {
         return; // degenerate region
     }
+    // Flat in 3D (a plane, or a NURBS patch that does not turn over this
+    // region): the boundary triangulation already hugs the surface exactly,
+    // and Steiner points would only add vertices.
+    let Some((pitch_u, pitch_v, scale)) = chart.lattice_spec((u0, u1, v0, v1), pitch) else {
+        return;
+    };
 
     let mut mesh = FlipMesh::from_tris(tris, all_uv);
 
     // Interior lattice of Steiner points, spread strictly inside the region
-    // bounding box. `u` (always an angle here) is spaced at most one sampling
-    // pitch apart so retriangulation can bound every edge's u-span; `v` rows
-    // are spaced `pitch_v` apart, capped so thin or tall faces stay cheap.
-    // At least one interior row and column are laid whenever the region has
-    // area (so even a thin full-wrap band still gets its wide chords broken
-    // up).
+    // bounding box. Columns are spaced at most `pitch_u` apart so
+    // retriangulation can bound every edge's u-span; `v` rows are spaced
+    // `pitch_v` apart, capped so thin or tall faces stay cheap. At least one
+    // interior row and column are laid whenever the region has area (so even
+    // a thin full-wrap band still gets its wide chords broken up).
     let (su, sv) = (scale.0.abs().max(1e-12), scale.1.abs().max(1e-12));
-    let n_cols = (((u1 - u0) / pitch).ceil() as usize).max(2) - 1;
+    let pitch_u = pitch_u.max(1e-12);
+    let n_cols = (((u1 - u0) / pitch_u).ceil() as usize).max(2) - 1;
     let step_u = (u1 - u0) / (n_cols + 1) as f64;
     let pitch_v = pitch_v.max(1e-12);
     let n_rows = (((v1 - v0) / pitch_v).ceil() as usize).clamp(2, 256) - 1;
@@ -6609,7 +6877,7 @@ fn refine_curved_region(
         // finer than the boundary itself (one full sagitta leaves cap/lens
         // volumes ~1% low; half clears the tolerance with margin).
         let r = su.max(sv);
-        0.5 * r * (1.0 - (0.5 * pitch).cos())
+        0.5 * r * (1.0 - (0.5 * pitch_u).cos())
     };
     if matches!(chart, Chart::Sphere { .. }) && target_sag > 0.0 {
         let eps_area = 1e-12 * (u1 - u0) * (v1 - v0);
@@ -10619,6 +10887,245 @@ mod tests {
                 "uv_scale ({su}, {sv}) disagrees with the measured metric ({du}, {dv}) at ({u}, {v})"
             );
         }
+    }
+
+    // -----------------------------------------------------------------
+    // The freeform interior lattice (of-37i.6, FREEFORM §7).
+    // -----------------------------------------------------------------
+
+    /// An exact rational quarter-cylinder patch of radius `r`, ruled along
+    /// `v`, over the knot domains `u_domain`/`v_domain`. The of-pb7.3
+    /// construction: a 90° arc with its middle control point at the tangent
+    /// intersection and weight `1/√2`.
+    fn quarter_cylinder_patch(
+        r: f64,
+        u_domain: (f64, f64),
+        v_domain: (f64, f64),
+        height: f64,
+    ) -> NurbsSurface {
+        let control_points: Vec<Vec<Point3>> = [(r, 0.0), (r, r), (0.0, r)]
+            .iter()
+            .map(|&(x, y)| vec![Point3::new(x, y, 0.0), Point3::new(x, y, height)])
+            .collect();
+        let weights: Vec<Vec<f64>> = [1.0, std::f64::consts::FRAC_1_SQRT_2, 1.0]
+            .iter()
+            .map(|&w| vec![w, w])
+            .collect();
+        NurbsSurface::new(
+            control_points,
+            weights,
+            scaled_knots(2, 3, u_domain.0, u_domain.1 - u_domain.0),
+            scaled_knots(1, 2, v_domain.0, v_domain.1 - v_domain.0),
+        )
+        .expect("valid rational quarter-cylinder patch")
+    }
+
+    /// The point of pricing the lattice off *turning* rather than off the
+    /// parameter: a NURBS patch of exact analytic form must land on the
+    /// same lattice as the analytic surface it duplicates. A quarter
+    /// cylinder turns 90°, so it takes `SAMPLES_PER_CIRCLE / 4` columns —
+    /// exactly what the analytic cylinder chart's `TWO_PI /
+    /// SAMPLES_PER_CIRCLE` pitch gives that quarter arc.
+    ///
+    /// The ruled direction turns not at all, so it takes its step from the
+    /// curved one instead and comes out square in model units, which is
+    /// the relation `Chart::Cylinder`'s arm states in closed form as
+    /// `pitch_v = radius · pitch`.
+    #[test]
+    fn nurbs_lattice_matches_the_analytic_pitch_on_an_exact_quarter_cylinder() {
+        let (r, height) = (2.0, 6.0);
+        let patch = quarter_cylinder_patch(r, (0.0, 1.0), (0.0, 1.0), height);
+        let chart = build_chart(&Surface3::nurbs(patch)).expect("regular patch");
+        let (pitch_u, pitch_v, (su, sv)) = chart
+            .lattice_spec((0.0, 1.0, 0.0, 1.0), TWO_PI / SAMPLES_PER_CIRCLE as f64)
+            .expect("a quarter cylinder turns, so it takes a lattice");
+
+        let columns = (1.0 / pitch_u).round() as usize;
+        assert_eq!(
+            columns,
+            SAMPLES_PER_CIRCLE / 4,
+            "a NURBS quarter cylinder must take the same column count as the analytic one"
+        );
+        // The ruled direction: rows one u-arc-step of model length apart.
+        // Compared as a model-space spacing rather than an exact row count,
+        // because the arc the spec measures is a probe *polyline* and so
+        // runs a few tenths of a percent short of the true arc.
+        let arc_step = r * TWO_PI / SAMPLES_PER_CIRCLE as f64;
+        let row_spacing = pitch_v * sv;
+        assert!(
+            (row_spacing - arc_step).abs() < 0.03 * arc_step,
+            "ruled-direction rows are {row_spacing} apart in model units, \
+             not the u-arc-step {arc_step}"
+        );
+        // The scales are the *suprema* of `uv_scale` over the region, so
+        // over this unit domain `su` sits just above the arc `r · π/2` (a
+        // rational arc's speed peaks above its mean) and `sv` is the ruling
+        // length exactly.
+        let mean_u = r * std::f64::consts::FRAC_PI_2;
+        assert!(
+            su >= mean_u && su < 1.1 * mean_u,
+            "u arc-length scale {su} is not a tight bound on the patch's speed (mean {mean_u})"
+        );
+        assert!(
+            (sv - height).abs() < 1e-9,
+            "v arc-length scale {sv} is not the ruling length {height}"
+        );
+    }
+
+    /// §6's normalization trap, on the lattice: the same patch over a
+    /// `[3, 13]` knot domain is the same *surface*, so it must take the
+    /// same lattice. A pitch quoted in parameter units would silently
+    /// coarsen by 10× here.
+    #[test]
+    fn nurbs_lattice_is_invariant_under_knot_scaling() {
+        let (r, height) = (2.0, 6.0);
+        let counts = [((0.0, 1.0), (0.0, 1.0)), ((3.0, 13.0), (-4.0, 0.5))].map(|(ud, vd)| {
+            let patch = quarter_cylinder_patch(r, ud, vd, height);
+            let chart = build_chart(&Surface3::nurbs(patch)).expect("regular patch");
+            let (pitch_u, pitch_v, _) = chart
+                .lattice_spec((ud.0, ud.1, vd.0, vd.1), TWO_PI / SAMPLES_PER_CIRCLE as f64)
+                .expect("a quarter cylinder turns, so it takes a lattice");
+            (
+                ((ud.1 - ud.0) / pitch_u).round() as usize,
+                ((vd.1 - vd.0) / pitch_v).round() as usize,
+            )
+        });
+        assert_eq!(
+            counts[0], counts[1],
+            "knot scaling changed the lattice of a geometrically identical patch"
+        );
+    }
+
+    /// A patch that does not turn is met *exactly* by flat chords, so it
+    /// takes no lattice at all — laying one would only add vertices. This
+    /// is the case every planar-patch NURBS body hits (of-ew7's promotion
+    /// runs entirely on them).
+    #[test]
+    fn nurbs_lattice_is_declined_by_a_patch_that_does_not_turn() {
+        let control_points: Vec<Vec<Point3>> = (0..2)
+            .map(|i| {
+                (0..2)
+                    .map(|j| Point3::new(2.0 * i as f64, 3.0 * j as f64, 0.0))
+                    .collect()
+            })
+            .collect();
+        let knots = KnotVector::clamped_uniform(1, 2).expect("degree-1 knots");
+        let patch = NurbsSurface::bspline(control_points, knots.clone(), knots)
+            .expect("valid bilinear patch");
+        let chart = build_chart(&Surface3::nurbs(patch)).expect("regular patch");
+        assert!(
+            chart
+                .lattice_spec((0.0, 1.0, 0.0, 1.0), TWO_PI / SAMPLES_PER_CIRCLE as f64)
+                .is_none(),
+            "a flat patch must take no interior lattice"
+        );
+    }
+
+    /// Curvature varies across a freeform patch, which is why the lattice
+    /// is priced over the *region's* box and not the whole domain: a
+    /// sub-region gets a pitch of its own, and a region covering a sharper
+    /// part of the patch is refined harder than one covering a flatter
+    /// part. Measured on a wavy bicubic by comparing the two halves the
+    /// seed happens to bend differently.
+    #[test]
+    fn nurbs_lattice_is_priced_over_the_region_not_the_whole_domain() {
+        let mut rng = Rng::new(0x1A771CE);
+        let patch = wavy_patch(&mut rng, (0.0, 3.0), (0.0, 3.0), 1.4);
+        let chart = build_chart(&Surface3::nurbs(patch)).expect("regular patch");
+        let whole = chart
+            .lattice_spec((0.0, 3.0, 0.0, 3.0), TWO_PI / SAMPLES_PER_CIRCLE as f64)
+            .expect("a wavy patch turns");
+        let corner = chart
+            .lattice_spec((0.0, 0.75, 0.0, 0.75), TWO_PI / SAMPLES_PER_CIRCLE as f64)
+            .expect("a wavy patch turns");
+        // Same *parameter* pitch on a quarter-size region would mean the
+        // region's own curvature was never consulted.
+        assert!(
+            (corner.0 - whole.0).abs() > 1e-9 || (corner.1 - whole.1).abs() > 1e-9,
+            "a sub-region took the whole domain's pitch — the lattice ignored its own extent"
+        );
+        // A quarter of the domain never needs *more* than the whole
+        // domain's column count over that same stretch.
+        assert!(
+            0.75 / corner.0 <= 3.0 / whole.0 + 1.0,
+            "a sub-region was refined harder than the whole patch containing it"
+        );
+    }
+
+    /// THE PHASE-4 UNIT GATE: interior Steiner points actually buy chord
+    /// accuracy on a doubly-curved patch. A coarse boundary ring on a wavy
+    /// bicubic is triangulated with and without the lattice, and the worst
+    /// chord deviation — the same midpoint measure
+    /// `triangulate_mesh_face` reports and `hybrid::boolean` gates on — has
+    /// to fall by an order of magnitude.
+    ///
+    /// This is the case the corpus's exact-form NURBS cylinder cannot
+    /// speak for: a cylinder is *ruled*, so its widest chords run along a
+    /// direction where flat is already exact, and its trim rings are
+    /// sampled densely enough to carry the curved direction on their own.
+    /// A patch that curves both ways has no such rescue.
+    #[test]
+    fn nurbs_lattice_cuts_the_worst_chord_on_a_doubly_curved_patch() {
+        let mut rng = Rng::new(0xB1CB1C);
+        let patch = wavy_patch(&mut rng, (0.0, 3.0), (0.0, 3.0), 1.2);
+        let chart = build_chart(&Surface3::nurbs(patch)).expect("regular patch");
+
+        // A square ring well inside the domain, sampled as densely as the
+        // pipeline samples a trim ring — so the boundary chords are *not*
+        // what the measurement below is limited by. Only the interior is
+        // unsampled, and only the lattice can reach it.
+        let (lo, hi) = (0.4, 2.6);
+        const PER_SIDE: usize = 24;
+        let mut ring: Vec<(f64, f64)> = Vec::new();
+        for k in 0..4 {
+            for i in 0..PER_SIDE {
+                let f = i as f64 / PER_SIDE as f64;
+                let (a, b) = (lo + (hi - lo) * f, lo + (hi - lo) * (1.0 - f));
+                ring.push(match k {
+                    0 => (a, lo),
+                    1 => (hi, a),
+                    2 => (b, hi),
+                    _ => (lo, b),
+                });
+            }
+        }
+        let ring_ranges = [(0usize, ring.len())];
+        let points: Vec<Point3> = ring.iter().map(|&uv| chart_point(&chart, uv)).collect();
+        let seed = boundary_cdt(&ring, &ring_ranges).expect("a convex ring triangulates");
+
+        let worst = |tris: &[[usize; 3]], uv: &[(f64, f64)], p: &[Point3]| -> f64 {
+            let mut worst: f64 = 0.0;
+            for t in tris {
+                for k in 0..3 {
+                    let (i, j) = (t[k], t[(k + 1) % 3]);
+                    let mid_uv = (0.5 * (uv[i].0 + uv[j].0), 0.5 * (uv[i].1 + uv[j].1));
+                    let mid_p = Point3::from((p[i].coords + p[j].coords) * 0.5);
+                    worst = worst.max((chart_point(&chart, mid_uv) - mid_p).norm());
+                }
+            }
+            worst
+        };
+        let before = worst(&seed, &ring, &points);
+
+        let (mut tris, mut uv, mut p) = (seed, ring, points);
+        refine_curved_region(
+            &mut tris,
+            &mut uv,
+            &mut p,
+            &chart,
+            TWO_PI / SAMPLES_PER_CIRCLE as f64,
+            &ring_ranges,
+        );
+        let after = worst(&tris, &uv, &p);
+
+        assert!(
+            uv.len() > ring_ranges[0].1,
+            "no interior points were laid on a doubly-curved patch"
+        );
+        assert!(
+            after * 10.0 < before,
+            "the interior lattice barely helped: worst chord {before:.4e} -> {after:.4e}"
+        );
     }
 
     /// A rigid transform of a patch is exact through its control points,
