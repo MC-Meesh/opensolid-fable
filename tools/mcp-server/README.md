@@ -125,31 +125,32 @@ analytic STEP export, for shapes inside the kernel's exact coverage
 (sphere/box/cylinder/torus, rigid transforms, uniform scale, sharp booleans).
 Anything outside that coverage falls back to the SDF path automatically.
 
-## Setup
+## Install
+
+The published package bundles the kernel as prebuilt WebAssembly, so the only
+requirement is **Node ≥ 18**. No Rust, no `wasm-pack`, no build step:
 
 ```bash
-cd tools/mcp-server
-npm run build      # compiles crates/opensolid-wasm to ./pkg via wasm-pack
-npm test           # runs the unit + end-to-end tests
+npx opensolid-mcp
 ```
 
-`npm run build` needs [`wasm-pack`](https://rustwasm.github.io/wasm-pack/)
-(`cargo install wasm-pack`) and the wasm target
-(`rustup target add wasm32-unknown-unknown`). `pkg/` is build output — rerun the
-build after any change under `crates/`.
+For Claude Code:
+
+```bash
+claude mcp add opensolid -- npx -y opensolid-mcp
+```
 
 ### Registering with an MCP client
 
-The server speaks the MCP **stdio** transport. Point your client at
-`src/server.js`:
+The server speaks the MCP **stdio** transport:
 
 ```jsonc
 // e.g. an MCP client config
 {
   "mcpServers": {
     "opensolid": {
-      "command": "node",
-      "args": ["/absolute/path/to/tools/mcp-server/src/server.js"],
+      "command": "npx",
+      "args": ["-y", "opensolid-mcp"],
       "env": {
         // where export/screenshot files land (default: $TMPDIR/opensolid-mcp)
         "OPENSOLID_MCP_OUTPUT_DIR": "/absolute/path/to/output"
@@ -159,11 +160,35 @@ The server speaks the MCP **stdio** transport. Point your client at
 }
 ```
 
-For Claude Code:
+## Building from source
+
+Only needed to work *on* the kernel — a change under `crates/` is not in the
+published package until it is released.
 
 ```bash
-claude mcp add opensolid -- node /absolute/path/to/tools/mcp-server/src/server.js
+cd tools/mcp-server
+npm run build      # compiles crates/opensolid-wasm to ./pkg via wasm-pack
+npm test           # unit, end-to-end, and distribution tests
 ```
+
+`npm run build` needs [`wasm-pack`](https://rustwasm.github.io/wasm-pack/)
+(`cargo install wasm-pack`) and the wasm target
+(`rustup target add wasm32-unknown-unknown`). `pkg/` is build output — rerun the
+build after any change under `crates/`. Running the tests against a **stale**
+`pkg/` is the classic way to see a wall of unrelated failures; rebuild first.
+
+Point a client at a source checkout with `node /absolute/path/to/tools/mcp-server/src/server.js`
+instead of `npx opensolid-mcp`.
+
+### Releasing
+
+`.github/workflows/release-mcp.yml` publishes to npm when a
+`opensolid-mcp-v<version>` tag is pushed, after rebuilding the wasm and running
+the full test suite. Bump `version` in `package.json`, merge, then tag. The
+`prepack` gate refuses to build a tarball that has no wasm kernel in it, and
+`test/package.test.js` packs a real tarball, unpacks it, and drives it over
+stdio — because a published npm version is immutable and a kernel-less package
+installs cleanly and only fails on the user's machine.
 
 ## Examples
 
@@ -180,10 +205,13 @@ limitation and how the tool reports it.
 Regenerate the whole gallery (renders, exports, and transcripts):
 
 ```bash
-node examples/agent-gallery/build-gallery.mjs
+npm run gallery    # ~4 min; needs a built pkg/
 ```
 
-Exported files and renders land in [`examples/output/`](examples/output/). For
+Renders land in [`examples/output/`](examples/output/) and are committed; the
+STEP/STL/OBJ exports land there too but are **not** committed — they are ~100 MB
+of regenerable build output that the STEP writer rewrites wholesale whenever
+entity ordering changes. Run the gallery to produce them. For
 connecting a client, the full tool reference, the script API, and the failure
 modes these examples exercise, see the
 [Agent Guide](../../docs/AGENT_GUIDE.md).

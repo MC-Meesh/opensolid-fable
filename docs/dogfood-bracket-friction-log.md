@@ -152,7 +152,10 @@ byte-identical; the existing exact test's idiom does not transfer.)
 **FreeCAD import is unverified.** FreeCAD is not installed on this machine and
 the acceptance criterion says to document manual verification — so this is the
 open item, not a passed check. `tools/mcp-server/examples/output/bracket-right-angle.step`
-(20.8 MB, faceted, mm units, z-up) is committed and ready for someone to open.
+(faceted, mm units, z-up) is what to open. It used to be committed; it is now
+regenerated on demand by `cd tools/mcp-server && npm run gallery`, because the
+gallery's exports are ~100 MB of build output that the STEP writer rewrites
+wholesale whenever entity ordering changes (of-2y4.3).
 The reader-side round-trip is covered by
 `bracket_faceted_step_round_trips_with_volume_identity`.
 

@@ -2,17 +2,19 @@
 //
 // The whole promise of this package is that `npx opensolid-mcp` works with
 // nothing but Node >= 18 — no Rust, no wasm-pack, no cargo. That promise lives
-// or dies on two files being inside the tarball, and both fail *silently*:
+// or dies on two files being inside the tarball, and it can fail *silently*:
 //
 //   1. pkg/ missing entirely — publishing from a tree that was never built.
 //   2. pkg/.gitignore present — wasm-pack writes it containing `*`, and npm
-//      falls back to a package's .gitignore when there is no .npmignore, so it
-//      drops pkg/ out of the tarball even though `files` lists it. The package
-//      publishes, installs, and then throws MODULE_NOT_FOUND on first use.
+//      consults a package's own .gitignore when there is no .npmignore. The
+//      current `files` list names the two wasm files by exact path, which wins
+//      over that rule; the directory form (`files: ["pkg/"]`) loses to it and
+//      packs zero pkg files. Either way the package publishes, installs, and
+//      then throws MODULE_NOT_FOUND on the user's first call.
 //
-// Both are unrecoverable once published (npm versions are immutable), so this
-// refuses to build the tarball instead. build-wasm.mjs already removes the
-// .gitignore; this is the backstop for a stale pkg/ built before that fix.
+// Published npm versions are immutable, so a bad tarball cannot be fixed in
+// place — this refuses to build one instead. build-wasm.mjs already removes the
+// .gitignore; this is the backstop for a pkg/ built before that fix landed.
 
 import { existsSync, rmSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';

@@ -36,15 +36,17 @@ if (result.error) {
 }
 
 if (result.status === 0) {
-  // wasm-pack writes `pkg/.gitignore` containing `*`. That single line is the
-  // reason a published tarball used to arrive with no kernel in it: npm has no
-  // .npmignore here, so it falls back to the nearest .gitignore — including
-  // this nested one — and quietly drops every file `files` asked for under
-  // pkg/. Nothing warns; `npm pack` just emits a package where `require`ing
-  // the wasm throws MODULE_NOT_FOUND on the user's machine.
+  // wasm-pack writes `pkg/.gitignore` containing `*`, and npm consults a
+  // package's own .gitignore when there is no .npmignore. package.json lists
+  // the two wasm files by exact path, which beats that rule — but the
+  // directory form (`files: ["pkg/"]`) does not: measured on npm 11.6.4, the
+  // pair emits a tarball with zero pkg files. It installs clean and then
+  // throws MODULE_NOT_FOUND on the user's first call, with no warning at pack
+  // time. Since that is one innocuous edit away, delete the trap at the source
+  // rather than rely on the `files` form staying exactly as it is.
   //
-  // Delete it at the source. pkg/ stays untracked via the repo-root .gitignore
-  // entry, which npm packing does not consult (of-2y4.3).
+  // pkg/ stays untracked via the repo-root .gitignore entry, which npm packing
+  // does not consult (of-2y4.3).
   rmSync(resolve(serverDir, 'pkg', '.gitignore'), { force: true });
 }
 

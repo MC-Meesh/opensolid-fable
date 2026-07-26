@@ -1,0 +1,98 @@
+name: Release opensolid-mcp
+
+# Publishes tools/mcp-server to npm as `opensolid-mcp`, with the wasm kernel
+# prebuilt into the tarball — that is what lets `npx opensolid-mcp` run on a
+# machine with nothing but Node >= 18 (of-2y4.3).
+#
+# ONE-TIME OPERATOR SETUP: add an npm automation token as the `NPM_TOKEN` repo
+# secret (Settings -> Secrets and variables -> Actions). Without it the publish
+# step fails on authentication; nothing else here needs configuring.
+#
+# To cut a release: bump `version` in tools/mcp-server/package.json, merge, then
+# push a matching tag:
+#
+#   git tag opensolid-mcp-v0.1.0 && git push origin opensolid-mcp-v0.1.0
+#
+# The tag is what triggers this. npm versions are immutable once published, so
+# the gates below all run *before* the publish step and it never runs on a red
+# build — `npm test` covers the server, `test/package.test.js` unpacks a real
+# tarball and drives it over stdio, and `prepack` refuses to build a tarball
+# with no kernel in it.
+
+on:
+  push:
+    tags:
+      - "opensolid-mcp-v*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Pack and verify, but do not publish"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  id-token: write # npm provenance attestation
+
+jobs:
+  publish:
+    name: build / verify / publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.88.0"
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: wasm
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Install wasm-pack
+        run: curl -sSf https://rustwasm.github.io/wasm-pack/installer/init.sh | sh
+
+      - name: Build wasm kernel
+        working-directory: tools/mcp-server
+        run: npm run build
+
+      - name: Tests
+        working-directory: tools/mcp-server
+        run: npm test
+
+      # A tag that disagrees with package.json publishes a version nobody can
+      # find from the tag, and it cannot be corrected in place. Catch it here.
+      - name: Tag matches package version
+        if: startsWith(github.ref, 'refs/tags/')
+        working-directory: tools/mcp-server
+        run: |
+          pkg="$(node -p "require('./package.json').version")"
+          tag="${GITHUB_REF_NAME#opensolid-mcp-v}"
+          if [ "$pkg" != "$tag" ]; then
+            echo "tag $GITHUB_REF_NAME implies version $tag but package.json says $pkg" >&2
+            exit 1
+          fi
+          echo "publishing opensolid-mcp@$pkg"
+
+      - name: Publish
+        if: startsWith(github.ref, 'refs/tags/') && inputs.dry_run != true
+        working-directory: tools/mcp-server
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      # workflow_dispatch defaults to a dry run so the whole pipeline can be
+      # exercised — including prepack and the tarball contents — without
+      # burning a version number.
+      - name: Dry-run pack
+        if: inputs.dry_run == true
+        working-directory: tools/mcp-server
+        run: npm publish --provenance --access public --dry-run

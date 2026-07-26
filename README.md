@@ -402,6 +402,12 @@ An interactive browser playground: edit a JS script that builds a shape with the
 `opensolid-wasm` API, mesh it in WASM, orbit it in a three.js viewport, and
 download binary STL.
 
+**Hosted:** <https://mc-meesh.github.io/opensolid-fable/> — the kernel runs as
+wasm in your browser, so nothing is uploaded and there is nothing to install.
+Deployed from `main` by [`.github/workflows/pages.yml`](.github/workflows/pages.yml).
+
+To run it locally instead:
+
 Prerequisites: Node 20+, the Rust wasm target
 (`rustup target add wasm32-unknown-unknown`), and
 [wasm-pack](https://rustwasm.github.io/wasm-pack/) (`cargo install wasm-pack`).
@@ -430,17 +436,21 @@ screenshots, checks mass properties, and exports STEP/STL/OBJ, with no GUI in th
 loop. The kernel is the same wasm build the playground runs, so anything an agent
 builds opens unchanged in the browser.
 
-- **[Agent Guide](docs/AGENT_GUIDE.md)** — connect a client, the tool reference,
-  the script API, and every failure mode with how it's reported.
-- **[Agent gallery](tools/mcp-server/examples/agent-gallery/)** — five worked
-  transcripts (bracket, hinge, enclosure, gear, bottle), each real unedited
-  output from the server: prompt in, manufacturable part out.
-- **[MCP server](tools/mcp-server/)** — the server itself, setup, and tests.
+The server ships as an npm package with the kernel prebuilt into it as
+WebAssembly, so connecting an agent needs **Node ≥ 18 and nothing else** — no
+Rust toolchain, no `wasm-pack`, no build step:
 
 ```bash
-cd tools/mcp-server && npm run build
-claude mcp add opensolid -- node "$PWD/src/server.js"
+claude mcp add opensolid -- npx -y opensolid-mcp
 ```
+
+- **[Agent Guide](docs/AGENT_GUIDE.md)** — connect a client, the tool reference,
+  the script API, and every failure mode with how it's reported.
+- **[Agent gallery](tools/mcp-server/examples/agent-gallery/)** — seven worked
+  transcripts (bracket, hinge, enclosure, gear, bottle, right-angle bracket,
+  gradient optimization), each real unedited output from the server: prompt in,
+  manufacturable part out.
+- **[MCP server](tools/mcp-server/)** — the server itself, setup, and tests.
 
 ---
 

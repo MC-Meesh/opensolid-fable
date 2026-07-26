@@ -1,0 +1,91 @@
+name: Playground
+
+# Publishes the browser playground to GitHub Pages on every push to main, so
+# "try OpenSolid" is a link instead of a five-step local build (of-2y4.3).
+#
+# ONE-TIME OPERATOR SETUP: Settings -> Pages -> Build and deployment ->
+# Source: "GitHub Actions". Until that is set, this workflow's deploy step
+# fails with "Pages site not found" — nothing in the repo can enable it.
+#
+# The playground is a fully static Vite SPA and the kernel runs in wasm in the
+# browser, so there is no server side to host. vite.config.js sets `base: './'`,
+# which is what makes the build work unmodified under the project subpath
+# (https://<owner>.github.io/<repo>/) rather than needing a repo-specific base.
+
+on:
+  push:
+    branches: [main]
+    # The deployed artifact is the playground plus the kernel it compiles from,
+    # so a docs-only commit does not need to rebuild and redeploy the site.
+    paths:
+      - "web/playground/**"
+      - "crates/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Never let two deploys race; queue instead. `cancel-in-progress: false` because
+# cancelling a half-finished deploy can leave the live site in a mixed state.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build playground
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.88.0"
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: wasm
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install wasm-pack
+        run: curl -sSf https://rustwasm.github.io/wasm-pack/installer/init.sh | sh
+
+      - name: Install deps
+        working-directory: web/playground
+        run: npm ci
+
+      # pkg/ is generated build output and is not checked in, so this is a
+      # required step, not an optimization — `npm run build` fails without it.
+      - name: Build wasm kernel
+        working-directory: web/playground
+        run: npm run wasm
+
+      - name: Build site
+        working-directory: web/playground
+        run: npm run build
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: web/playground/dist
+
+  deploy:
+    name: deploy to Pages
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

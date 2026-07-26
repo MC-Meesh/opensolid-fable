@@ -29,6 +29,7 @@
     "src/",
     "pkg/opensolid_wasm.js",
     "pkg/opensolid_wasm_bg.wasm",
+    "pkg/package.json",
     "README.md"
   ],
   "scripts": {

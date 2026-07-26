@@ -13,8 +13,9 @@ client, the tool reference, the script API, and the failure modes an agent will
 actually hit — and exactly how each one is reported.
 
 See it in action first: the [agent gallery](../tools/mcp-server/examples/agent-gallery/)
-has five end-to-end transcripts (bracket, hinge, enclosure, gear, bottle), each
-real unedited output from the server.
+has seven end-to-end transcripts (bracket, hinge, enclosure, gear, bottle,
+right-angle bracket, gradient optimization), each real unedited output from the
+server.
 
 ---
 
@@ -22,24 +23,15 @@ real unedited output from the server.
 
 ### Prerequisites
 
-The server is a Node process that loads a prebuilt wasm bundle. Build it once:
-
-```bash
-cd tools/mcp-server
-npm install        # no runtime deps today, but keeps the lockfile honest
-npm run build      # compiles crates/opensolid-wasm → ./pkg via wasm-pack
-npm test           # optional: unit + end-to-end tests
-```
-
-`npm run build` needs [`wasm-pack`](https://rustwasm.github.io/wasm-pack/)
-(`cargo install wasm-pack`) and the wasm target
-(`rustup target add wasm32-unknown-unknown`). `pkg/` is generated build output —
-rerun the build after any change under `crates/`.
+**Node ≥ 18.** That is the whole list. The published `opensolid-mcp` package
+carries the CAD kernel with it as prebuilt WebAssembly, so there is no Rust
+toolchain to install, no `wasm-pack`, and no build step before an agent can
+call a tool.
 
 ### Claude Code
 
 ```bash
-claude mcp add opensolid -- node /absolute/path/to/tools/mcp-server/src/server.js
+claude mcp add opensolid -- npx -y opensolid-mcp
 ```
 
 Then, in a session, ask Claude to build something ("design a 60×40×8 bracket with
@@ -48,14 +40,14 @@ tools below.
 
 ### Any MCP client (stdio)
 
-The server speaks the MCP **stdio** transport. Register `src/server.js`:
+The server speaks the MCP **stdio** transport:
 
 ```jsonc
 {
   "mcpServers": {
     "opensolid": {
-      "command": "node",
-      "args": ["/absolute/path/to/tools/mcp-server/src/server.js"],
+      "command": "npx",
+      "args": ["-y", "opensolid-mcp"],
       "env": {
         // where export/screenshot files land (default: $TMPDIR/opensolid-mcp)
         "OPENSOLID_MCP_OUTPUT_DIR": "/absolute/path/to/output"
@@ -64,6 +56,24 @@ The server speaks the MCP **stdio** transport. Register `src/server.js`:
   }
 }
 ```
+
+### From a source checkout
+
+Only needed to drive a kernel change that has not been released yet. Build the
+wasm first — the tools import the kernel through it, and running against a stale
+or absent `pkg/` fails in ways that look like unrelated tool bugs:
+
+```bash
+cd tools/mcp-server
+npm run build      # compiles crates/opensolid-wasm → ./pkg via wasm-pack
+npm test           # unit, end-to-end, and distribution tests
+```
+
+`npm run build` needs [`wasm-pack`](https://rustwasm.github.io/wasm-pack/)
+(`cargo install wasm-pack`) and the wasm target
+(`rustup target add wasm32-unknown-unknown`). Then register
+`node /absolute/path/to/tools/mcp-server/src/server.js` as the command instead
+of `npx opensolid-mcp`.
 
 Models live in memory for the lifetime of the server process — there is no
 persistence. Exports and screenshots are written to `OPENSOLID_MCP_OUTPUT_DIR`.

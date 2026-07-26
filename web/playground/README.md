@@ -4,6 +4,13 @@ Interactive browser playground for the OpenSolid F-Rep kernel: edit a small
 JS script that builds a shape with the `opensolid-wasm` API, mesh it in WASM,
 orbit it in a three.js viewer, and download the result as binary STL.
 
+**Hosted at <https://mc-meesh.github.io/opensolid-fable/>** — a fully static
+build; the kernel runs as wasm in the browser, so nothing is uploaded and there
+is no server side. `main` deploys via
+[`.github/workflows/pages.yml`](../../.github/workflows/pages.yml). `vite.config.js`
+sets `base: './'`, which is what lets the same build serve from the Pages project
+subpath and from `npm run preview` without a repo-specific base.
+
 React + Vite SPA. The UI is componentized under `src/components/`:
 
 - **App** — owns all state (script, accuracy, wireframe, mesh, stats,
