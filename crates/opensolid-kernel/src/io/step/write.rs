@@ -20,6 +20,14 @@
 //!   `manifold_solid_brep`. Shared vertices, edges, curves and surfaces are
 //!   emitted once and referenced, so seams and mated fins survive the
 //!   round trip.
+//! - **Trim geometry**: a fin carrying a [`Curve2`]
+//!   ([`Fin::pcurve`](opensolid_brep::Fin::pcurve)) contributes a `pcurve`
+//!   with its 2D `line` / `circle` / degree-1 `b_spline_curve_with_knots`
+//!   inside a `definitional_representation`, and the edge's geometry is
+//!   wrapped in a `surface_curve` associating them — a `seam_curve` when
+//!   both associations are pcurves on the one surface, which is how an
+//!   importer recognizes a parameterization seam. An edge whose fins carry
+//!   no pcurve is written bare, exactly as before.
 //!
 //! Every `edge_curve` is written with `same_sense = .T.` and its curve in
 //! the edge's own orientation; STEP trims edges by their vertices, so the
@@ -109,7 +117,7 @@ use std::fmt::Write as _;
 
 use opensolid_brep::curve::plane_basis;
 use opensolid_brep::{
-    Body, BodyType, Curve3, Edge, FaceSense, FinSense, GeometryStore, Loop, NurbsCurve,
+    Body, BodyType, Curve2, Curve3, Edge, FaceSense, FinSense, GeometryStore, Loop, NurbsCurve,
     NurbsSurface, Surface3, TopologyStore, Vertex,
 };
 use opensolid_core::{EntityId, Point3, Transform3, Vector3};
@@ -492,6 +500,11 @@ fn fmt_triple(x: f64, y: f64, z: f64) -> String {
     format!("({},{},{})", fmt_real(x), fmt_real(y), fmt_real(z))
 }
 
+/// A 2D coordinate pair, for the parameter-space geometry inside a `PCURVE`.
+fn fmt_pair(x: f64, y: f64) -> String {
+    format!("({},{})", fmt_real(x), fmt_real(y))
+}
+
 fn step_bool(b: bool) -> &'static str {
     if b { ".T." } else { ".F." }
 }
@@ -557,6 +570,12 @@ struct Emitter<'a> {
     edges: HashMap<EntityId<Edge>, u64>,
     curves: HashMap<EntityId<Curve3>, u64>,
     surfaces: HashMap<EntityId<Surface3>, u64>,
+    /// Fin pcurve → the `PCURVE` naming it. A pcurve belongs to exactly one
+    /// fin, hence one face and one surface, so the pairing is unambiguous.
+    pcurves: HashMap<EntityId<Curve2>, u64>,
+    /// The shared 2D `PARAMETRIC_REPRESENTATION_CONTEXT`, emitted on first
+    /// use and only when the file actually carries a pcurve.
+    parametric_context: Option<u64>,
 }
 
 impl<'a> Emitter<'a> {
@@ -570,6 +589,8 @@ impl<'a> Emitter<'a> {
             edges: HashMap::new(),
             curves: HashMap::new(),
             surfaces: HashMap::new(),
+            pcurves: HashMap::new(),
+            parametric_context: None,
         }
     }
 
@@ -827,12 +848,195 @@ impl<'a> Emitter<'a> {
         let curve = self.emit_curve(curve_id)?;
         let start = self.emit_vertex(edge_rec.start_vertex)?;
         let end = self.emit_vertex(edge_rec.end_vertex)?;
+        let geometry = self.emit_edge_geometry(edge, curve)?;
         // The curve is written in the edge's own orientation, so the edge
         // always agrees with its geometry; the reader re-derives the
         // parameter range from the vertex points.
-        let id = self.emit(format!("EDGE_CURVE('',#{start},#{end},#{curve},.T.)"));
+        let id = self.emit(format!("EDGE_CURVE('',#{start},#{end},#{geometry},.T.)"));
         self.edges.insert(edge, id);
         Ok(id)
+    }
+
+    /// The geometry an `EDGE_CURVE` points at: the bare 3D curve, or — when
+    /// the edge's fins carry 2D trim geometry — that curve wrapped in a
+    /// `SURFACE_CURVE` associating it with each face's surface.
+    ///
+    /// An edge both of whose associations are pcurves on the *same* surface
+    /// is a parameterization seam, and Part 42 has a name for exactly that
+    /// case: `SEAM_CURVE`. Emitting it (rather than a plain `SURFACE_CURVE`)
+    /// is what lets an importer tell a seam apart from a coincidence.
+    fn emit_edge_geometry(&mut self, edge: EntityId<Edge>, curve: u64) -> WriteResult<u64> {
+        let fins = self
+            .store
+            .edges
+            .get(edge)
+            .ok_or_else(|| invalid("fin references a stale edge"))?
+            .fins
+            .clone();
+
+        // (association, the surface it is on, whether it is a real PCURVE).
+        let mut associated: Vec<(u64, EntityId<Surface3>, bool)> = Vec::new();
+        for fin in fins {
+            let Some(fin_rec) = self.store.fins.get(fin) else {
+                continue;
+            };
+            let (Some(pcurve_id), loop_ref) = (fin_rec.pcurve, fin_rec.loop_ref) else {
+                continue;
+            };
+            let Some(pcurve) = self.geo.pcurve(pcurve_id).cloned() else {
+                continue;
+            };
+            let Some(surface_id) = self
+                .store
+                .loops
+                .get(loop_ref)
+                .and_then(|l| self.store.faces.get(l.face))
+                .and_then(|f| f.surface)
+            else {
+                continue;
+            };
+            let surface = self.emit_surface(surface_id)?;
+            match self.emit_pcurve(surface, pcurve_id, &pcurve) {
+                // Part 42's associated geometry is a `pcurve_or_surface`
+                // select, so a pcurve with no exact 2D form still records
+                // the association — naming the bare surface — instead of
+                // being downgraded to a sampled approximation.
+                Some(id) => associated.push((id, surface_id, true)),
+                None => associated.push((surface, surface_id, false)),
+            }
+        }
+        if associated.is_empty() {
+            return Ok(curve);
+        }
+
+        let seam = associated.len() == 2
+            && associated[0].2
+            && associated[1].2
+            && associated[0].1 == associated[1].1;
+        let type_name = if seam { "SEAM_CURVE" } else { "SURFACE_CURVE" };
+        let refs: Vec<u64> = associated.iter().map(|&(id, _, _)| id).collect();
+        Ok(self.emit(format!(
+            "{type_name}('',#{curve},{},.CURVE_3D.)",
+            ref_list(&refs)
+        )))
+    }
+
+    /// `PCURVE` naming `surface` with `pcurve`'s 2D geometry, or `None` when
+    /// the variant has no exact Part 42 counterpart.
+    ///
+    /// The only such variant is a clockwise [`Curve2::Circle`]:
+    /// `AXIS2_PLACEMENT_2D` fixes the perpendicular counterclockwise from
+    /// its reference direction, so a clockwise 2D circle is not expressible
+    /// without changing its parameterization — and a fin's pcurve must keep
+    /// the parameterization of its edge (see [`opensolid_brep::pcurve`]).
+    ///
+    /// That is an ordinary case, not a corner one: a cylinder's two caps
+    /// have opposite normals, so one of the two rim circles is clockwise in
+    /// its face's `(u, v)`. Writing it exactly needs a 2D *rational*
+    /// B-spline, whose control points can run either way. of-3qy.7 built
+    /// exactly that machinery for 3D ([`Emitter::emit_nurbs_curve`] and the
+    /// `RATIONAL_B_SPLINE_CURVE` complex-instance form); porting it to 2D is
+    /// of-50u. Until then the fin associates its bare surface, which is a
+    /// valid `pcurve_or_surface` and loses only the optional trim curve.
+    fn emit_pcurve(
+        &mut self,
+        surface: u64,
+        pcurve_id: EntityId<Curve2>,
+        pcurve: &Curve2,
+    ) -> Option<u64> {
+        if let Some(&id) = self.pcurves.get(&pcurve_id) {
+            return Some(id);
+        }
+        let curve_2d = self.emit_curve_2d(pcurve)?;
+        let context = self.parametric_context();
+        let representation = self.emit(format!(
+            "DEFINITIONAL_REPRESENTATION('',(#{curve_2d}),#{context})"
+        ));
+        let id = self.emit(format!("PCURVE('',#{surface},#{representation})"));
+        self.pcurves.insert(pcurve_id, id);
+        Some(id)
+    }
+
+    /// The 2D curve inside a `DEFINITIONAL_REPRESENTATION`, parameterized
+    /// exactly as the kernel parameterizes the pcurve.
+    fn emit_curve_2d(&mut self, pcurve: &Curve2) -> Option<u64> {
+        match pcurve {
+            Curve2::Line { origin, dir } => {
+                let point = self.emit(format!(
+                    "CARTESIAN_POINT('',{})",
+                    fmt_pair(origin.x, origin.y)
+                ));
+                let rate = dir.norm();
+                let direction = self.emit(format!(
+                    "DIRECTION('',{})",
+                    fmt_pair(dir.x / rate, dir.y / rate)
+                ));
+                // The VECTOR's magnitude carries the rate, so `point(t)`
+                // advances exactly as the kernel's does.
+                let vector = self.emit(format!("VECTOR('',#{direction},{})", fmt_real(rate)));
+                Some(self.emit(format!("LINE('',#{point},#{vector})")))
+            }
+            Curve2::Circle {
+                center,
+                radius,
+                x_dir,
+                ccw,
+            } => {
+                if !ccw {
+                    return None;
+                }
+                let point = self.emit(format!(
+                    "CARTESIAN_POINT('',{})",
+                    fmt_pair(center.x, center.y)
+                ));
+                let direction = self.emit(format!("DIRECTION('',{})", fmt_pair(x_dir.x, x_dir.y)));
+                let placement = self.emit(format!("AXIS2_PLACEMENT_2D('',#{point},#{direction})"));
+                Some(self.emit(format!("CIRCLE('',#{placement},{})", fmt_real(*radius))))
+            }
+            // Degree-1 B-spline with the pcurve's own parameters as its
+            // knots: it interpolates each vertex at that vertex's parameter
+            // and is linear between, which is the polyline exactly — not an
+            // approximation of it.
+            Curve2::Polyline { params, points } => {
+                let cps: Vec<u64> = points
+                    .iter()
+                    .map(|p| self.emit(format!("CARTESIAN_POINT('',{})", fmt_pair(p.x, p.y))))
+                    .collect();
+                let n = params.len();
+                let mut mults = vec![1i64; n];
+                mults[0] = 2;
+                mults[n - 1] = 2;
+                Some(self.emit(format!(
+                    "B_SPLINE_CURVE_WITH_KNOTS('',1,{},.POLYLINE_FORM.,.F.,.F.,({}),({}),.UNSPECIFIED.)",
+                    ref_list(&cps),
+                    mults
+                        .iter()
+                        .map(|m| m.to_string())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    params
+                        .iter()
+                        .map(|&t| fmt_real(t))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                )))
+            }
+        }
+    }
+
+    /// The file's shared 2D parametric representation context. Parameter
+    /// space carries no units — that is what distinguishes it from the
+    /// model-space context — so this one has no unit assignment.
+    fn parametric_context(&mut self) -> u64 {
+        if let Some(id) = self.parametric_context {
+            return id;
+        }
+        let id = self.emit(
+            "( GEOMETRIC_REPRESENTATION_CONTEXT(2) PARAMETRIC_REPRESENTATION_CONTEXT() \
+             REPRESENTATION_CONTEXT('2D SPACE','') )",
+        );
+        self.parametric_context = Some(id);
+        id
     }
 
     fn emit_vertex(&mut self, vertex: EntityId<Vertex>) -> WriteResult<u64> {
@@ -1204,6 +1408,163 @@ mod tests {
             drift <= 1e-9,
             "volume drift {drift:e} exceeds 1e-9 (original {v1}, re-imported {v2})"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Trim geometry (of-3qy.11)
+    // ------------------------------------------------------------------
+
+    /// Round-trip a primitive twice. The first export has nothing to say
+    /// about trim geometry — a kernel-built body carries no pcurves — so
+    /// these tests write, import (which derives them), and write again.
+    fn export_with_pcurves(
+        make: impl Fn(&mut TopologyStore, &mut GeometryStore) -> EntityId<Body>,
+    ) -> String {
+        let mut store = TopologyStore::new();
+        let mut geo = GeometryStore::new();
+        let body = make(&mut store, &mut geo);
+        let text = write_step(&store, &geo, &[body], &StepWriteOptions::default())
+            .expect("body must serialize");
+        let (store2, geo2, bodies) = reimport(&text);
+        write_step(&store2, &geo2, &[bodies[0]], &StepWriteOptions::default())
+            .expect("re-imported body must serialize")
+    }
+
+    /// A block's faces are planes and its edges lines, so every pcurve is a
+    /// 2D line — and no edge is a seam, so each `SURFACE_CURVE` associates
+    /// the two faces meeting there.
+    #[test]
+    fn planar_trim_geometry_emits_pcurve_lines() {
+        let text = export_with_pcurves(|s, g| block(s, g, 2.0, 3.0, 4.0).expect("block"));
+        assert!(
+            text.contains("PARAMETRIC_REPRESENTATION_CONTEXT()"),
+            "a file with pcurves needs a 2D context:\n{text}"
+        );
+        assert!(text.contains("DEFINITIONAL_REPRESENTATION"), "{text}");
+        assert!(text.contains("PCURVE('',#"), "{text}");
+        assert!(text.contains("SURFACE_CURVE('',#"), "{text}");
+        assert!(
+            !text.contains("SEAM_CURVE"),
+            "a block has no seam edges:\n{text}"
+        );
+        // 2D geometry: CARTESIAN_POINT/DIRECTION with two coordinates.
+        assert!(
+            text.contains("CARTESIAN_POINT('',(0.0,0.0));"),
+            "expected a parameter-space point:\n{text}"
+        );
+    }
+
+    /// A cylinder's wall uses its seam edge twice, which Part 42 spells
+    /// `SEAM_CURVE` — the one thing an importer cannot re-derive from the
+    /// 3D geometry alone.
+    #[test]
+    fn a_seam_edge_emits_a_seam_curve() {
+        let text = export_with_pcurves(|s, g| cylinder(s, g, 1.5, 4.0).expect("cylinder"));
+        assert!(text.contains("SEAM_CURVE('',#"), "{text}");
+        assert!(text.contains("SURFACE_CURVE('',#"), "{text}");
+    }
+
+    /// The sphere's caps are singular in `v`, the torus is periodic in both
+    /// directions: both still emit, and both still come back exact.
+    #[test]
+    fn curved_trim_geometry_round_trips() {
+        for (name, text) in [
+            (
+                "sphere",
+                export_with_pcurves(|s, g| sphere(s, g, 2.0).expect("sphere")),
+            ),
+            (
+                "torus",
+                export_with_pcurves(|s, g| torus(s, g, 3.0, 1.0).expect("torus")),
+            ),
+        ] {
+            assert!(text.contains("PCURVE('',#"), "{name}:\n{text}");
+            let (store, _, bodies) = reimport(&text);
+            assert!(
+                store.check(bodies[0]).is_empty(),
+                "{name}: {:?}",
+                store.check(bodies[0])
+            );
+        }
+    }
+
+    /// A clockwise 2D circle has no `AXIS2_PLACEMENT_2D` form (the
+    /// perpendicular is fixed counterclockwise), so its fin records the bare
+    /// surface instead — a valid `pcurve_or_surface` association, and never
+    /// a silently resampled approximation.
+    #[test]
+    fn an_inexpressible_pcurve_falls_back_to_naming_its_surface() {
+        let text = export_with_pcurves(|s, g| block(s, g, 2.0, 3.0, 4.0).expect("block"));
+        let (mut store, mut geo, bodies) = reimport(&text);
+        let before = write_step(&store, &geo, &[bodies[0]], &StepWriteOptions::default())
+            .expect("serializes");
+
+        // A block's pcurves are all 2D lines, so every one of them emits;
+        // swapping a single fin's for a clockwise circle isolates the one
+        // that cannot.
+        let face = store.faces_of_body(bodies[0])[0];
+        let fin = store.fins_of_loop(store.loops_of_face(face)[0])[0];
+        let cw = geo.add_pcurve(
+            Curve2::circle(
+                opensolid_core::Point2::origin(),
+                1.0,
+                opensolid_core::Vector2::x(),
+                false,
+            )
+            .expect("valid"),
+        );
+        store.fins.get_mut(fin).unwrap().pcurve = Some(cw);
+        let after = write_step(&store, &geo, &[bodies[0]], &StepWriteOptions::default())
+            .expect("still serializes");
+
+        // Exactly one association stopped being a PCURVE — the association
+        // itself survives, so the file still says which surface that fin
+        // trims.
+        let pcurves = |text: &str| text.matches("PCURVE('',#").count();
+        assert_eq!(
+            pcurves(&after),
+            pcurves(&before) - 1,
+            "only the inexpressible pcurve should drop out:\n{after}"
+        );
+        assert_eq!(
+            after.matches("SURFACE_CURVE('',#").count(),
+            before.matches("SURFACE_CURVE('',#").count(),
+            "every edge keeps its surface association"
+        );
+        let (store2, _, bodies2) = reimport(&after);
+        assert!(store2.check(bodies2[0]).is_empty());
+    }
+
+    /// A cylinder's two caps have opposite normals, so their parameter
+    /// spaces have opposite handedness and exactly one rim circle comes out
+    /// clockwise. The inexpressible case is ordinary, not exotic — which is
+    /// why the fallback associates the surface rather than failing.
+    #[test]
+    fn one_cap_of_a_cylinder_hits_the_clockwise_circle_case() {
+        let text = export_with_pcurves(|s, g| cylinder(s, g, 1.5, 4.0).expect("cylinder"));
+        let (store, geo, bodies) = reimport(&text);
+
+        let mut clockwise = 0;
+        for face in store.faces_of_body(bodies[0]) {
+            for loop_id in store.loops_of_face(face) {
+                for &fin in store.fins_of_loop(loop_id) {
+                    if let Some(id) = store.fin(fin).unwrap().pcurve
+                        && matches!(geo.pcurve(id), Some(Curve2::Circle { ccw: false, .. }))
+                    {
+                        clockwise += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            clockwise, 1,
+            "one cap's rim circle runs clockwise in (u, v)"
+        );
+        // Six fins, so five pcurves reach the file — and all three edges
+        // keep an association regardless.
+        assert_eq!(text.matches("PCURVE('',#").count(), 5, "{text}");
+        assert_eq!(text.matches("SURFACE_CURVE('',#").count(), 2, "{text}");
+        assert_eq!(text.matches("SEAM_CURVE('',#").count(), 1, "{text}");
     }
 
     // ------------------------------------------------------------------
@@ -1673,6 +2034,8 @@ mod tests {
             edges: HashMap::new(),
             curves: HashMap::new(),
             surfaces: HashMap::new(),
+            pcurves: HashMap::new(),
+            parametric_context: None,
         };
         emitter.emit_curve(curve_id).expect("ellipse serializes");
         // Placement is #4 (point #1, axis #2, ref #3); ref_direction is the
@@ -1701,6 +2064,8 @@ mod tests {
             edges: HashMap::new(),
             curves: HashMap::new(),
             surfaces: HashMap::new(),
+            pcurves: HashMap::new(),
+            parametric_context: None,
         }
     }
 

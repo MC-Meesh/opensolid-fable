@@ -8,13 +8,20 @@
 //! connectivity never need to touch geometry. [`Edge::curve`] and
 //! [`Face::surface`] hold [`EntityId`]s into these arenas.
 //!
-//! 2D parameter-space curves (`Fin::pcurve`) are not stored here yet; the
-//! SP-curve representation is a later issue.
+//! 2D parameter-space curves live here too ([`Curve2`], backing
+//! [`Fin::pcurve`]). They sit in their own arena rather than alongside the
+//! 3D curves because they are a different kind of thing: a pcurve is only
+//! meaningful relative to the surface whose parameter space it lives in, and
+//! sharing follows fin-level trim rather than edge-level geometry — the two
+//! fins of a seam edge share one [`Curve3`] but need *different* pcurves
+//! (see [`crate::pcurve`]).
 //!
 //! [`Edge::curve`]: crate::topology::Edge::curve
 //! [`Face::surface`]: crate::topology::Face::surface
+//! [`Fin::pcurve`]: crate::topology::Fin::pcurve
 
 use crate::curve::Curve3;
+use crate::pcurve::Curve2;
 use crate::surface::Surface3;
 use opensolid_core::{Arena, EntityId};
 
@@ -23,6 +30,7 @@ use opensolid_core::{Arena, EntityId};
 pub struct GeometryStore {
     pub curves: Arena<Curve3>,
     pub surfaces: Arena<Surface3>,
+    pub pcurves: Arena<Curve2>,
 }
 
 impl GeometryStore {
@@ -49,6 +57,16 @@ impl GeometryStore {
     pub fn surface(&self, id: EntityId<Surface3>) -> Option<&Surface3> {
         self.surfaces.get(id)
     }
+
+    /// Insert a 2D parameter-space curve and return its id.
+    pub fn add_pcurve(&mut self, pcurve: Curve2) -> EntityId<Curve2> {
+        self.pcurves.insert(pcurve)
+    }
+
+    /// Look up a pcurve. `None` if the id is stale.
+    pub fn pcurve(&self, id: EntityId<Curve2>) -> Option<&Curve2> {
+        self.pcurves.get(id)
+    }
 }
 
 #[cfg(test)]
@@ -71,5 +89,24 @@ mod tests {
         geo.curves.remove(curve_id);
         assert_eq!(geo.curve(curve_id), None);
         assert_eq!(geo.surface(surface_id), Some(&plane));
+    }
+
+    #[test]
+    fn store_round_trips_pcurves_independently_of_curves() {
+        use crate::pcurve::Curve2;
+        use opensolid_core::types::{Point2, Vector2};
+
+        let mut geo = GeometryStore::new();
+        let curve = Curve3::line(Point3::origin(), Vector3::x()).expect("valid line");
+        let pcurve = Curve2::line(Point2::origin(), Vector2::x()).expect("valid pcurve");
+
+        let curve_id = geo.add_curve(curve);
+        let pcurve_id = geo.add_pcurve(pcurve.clone());
+        assert_eq!(geo.pcurve(pcurve_id), Some(&pcurve));
+
+        // Separate arenas: retiring an edge's 3D curve leaves the fins'
+        // trim geometry addressable (and vice versa).
+        geo.curves.remove(curve_id);
+        assert_eq!(geo.pcurve(pcurve_id), Some(&pcurve));
     }
 }

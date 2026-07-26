@@ -179,13 +179,23 @@ fn assert_round_trip(
     body: EntityId<Body>,
     context: &str,
 ) {
-    assert_round_trip_gate(store, geo, body, context, FixedPoint::Immediate);
+    assert_round_trip_gate(store, geo, body, context, FixedPoint::AfterOneTrip);
 }
 
 /// Whether `write ∘ read` must reproduce the file on the first re-write or
-/// only from the second one (of-kb8: stores sharing one surface/curve
-/// across faces/edges re-import with duplicated geometry instances, which
-/// shifts the fixed point one iteration out).
+/// only from the second one.
+///
+/// Two things push it out by one iteration, and a body built in the kernel
+/// hits at least the second every time:
+/// - of-kb8: stores sharing one surface/curve across faces/edges re-import
+///   with duplicated geometry instances.
+/// - of-3qy.11: a kernel-built body carries no fin pcurves, while an
+///   imported one always does, so the second file gains the `SURFACE_CURVE`
+///   wrappers the first had nothing to write.
+///
+/// `Immediate` therefore only applies to a body that has already been
+/// through an import — a corpus file, not a kernel-built fixture — where it
+/// stays the stronger gate.
 #[derive(Clone, Copy, PartialEq)]
 enum FixedPoint {
     Immediate,
@@ -268,8 +278,11 @@ fn assert_round_trip_gate(
 
 /// Round-trip gate for a boolean output (its own store/geo pair), with the
 /// analytic volume cross-checked against `BooleanOutput::tessellate()`.
+///
+/// A boolean output is kernel-built, so its fixed point is one trip out —
+/// see [`FixedPoint`].
 fn assert_boolean_round_trip(out: &BooleanOutput, expected_volume: f64, context: &str) {
-    assert_boolean_round_trip_gate(out, expected_volume, context, FixedPoint::Immediate);
+    assert_boolean_round_trip_gate(out, expected_volume, context, FixedPoint::AfterOneTrip);
 }
 
 fn assert_boolean_round_trip_gate(
@@ -338,9 +351,25 @@ fn round_trip_every_primitive_in_one_file() {
         bodies2.push(*body2);
     }
 
+    // One trip out, like every kernel-built fixture — see [`FixedPoint`].
     let text2 = write_step(&store2, &geo2, &bodies2, &StepWriteOptions::default())
         .expect("re-imported bodies must serialize");
-    assert_eq!(text, text2, "write ∘ read must be a fixed point");
+    let (store3, geo3, report3) = import(&text2);
+    assert!(!report3.has_errors(), "{:?}", report3.diagnostics);
+    let bodies3: Vec<_> = report3
+        .solids
+        .iter()
+        .map(|solid| match &solid.outcome {
+            SolidOutcome::BRep(body) => *body,
+            other => panic!(
+                "solid #{} did not re-import exactly: {other:?}",
+                solid.step_id
+            ),
+        })
+        .collect();
+    let text3 = write_step(&store3, &geo3, &bodies3, &StepWriteOptions::default())
+        .expect("third write must succeed");
+    assert_eq!(text2, text3, "write ∘ read must stabilize after one trip");
 }
 
 #[test]

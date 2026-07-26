@@ -190,9 +190,16 @@ mod tests {
         assert_eq!(bodies.len(), 1, "one MANIFOLD_SOLID_BREP expected");
         let text2 = write_step(&store2, &geo2, &[bodies[0]], &StepWriteOptions::default())
             .expect("re-imported body must serialize");
+        // One iteration out: a body built by the kernel carries no fin
+        // pcurves and an imported one always does (of-3qy.11), so the second
+        // file gains the SURFACE_CURVE/SEAM_CURVE wrappers the first had
+        // nothing to write. From there it is a byte-identical fixed point.
+        let (store3, geo3, bodies3) = reimport(&text2);
+        let text3 = write_step(&store3, &geo3, &[bodies3[0]], &StepWriteOptions::default())
+            .expect("third write must succeed");
         assert_eq!(
-            text, text2,
-            "write ∘ read must be a byte-identical fixed point (volume identity)"
+            text2, text3,
+            "write ∘ read must reach a byte-identical fixed point (volume identity)"
         );
     }
 
@@ -421,10 +428,14 @@ mod tests {
         // Identity of the file itself: `write ∘ read` as a fixed point, as
         // the exact test does, but compared numerically rather than bytewise
         // — on the faceted path the reader re-normalizes DIRECTION vectors
-        // and shifts scattered facet normals by ~1 ULP.
+        // and shifts scattered facet normals by ~1 ULP. Taken from the
+        // second write for the same reason as the exact test (of-3qy.11).
         let text2 = write_step(&store2, &geo2, &[bodies[0]], &StepWriteOptions::default())
             .expect("re-imported body must serialize");
-        assert_step_numerically_identical(&export.text, &text2);
+        let (store3, geo3, bodies3) = reimport(&text2);
+        let text3 = write_step(&store3, &geo3, &[bodies3[0]], &StepWriteOptions::default())
+            .expect("third write must succeed");
+        assert_step_numerically_identical(&text2, &text3);
     }
 
     /// Compare two STEP texts, requiring every non-numeric token to match

@@ -12,7 +12,9 @@
 //! ([`check`]: [`TopologyStore::check`] returning structured
 //! [`CheckFailure`]s), the sweep constructors ([`sweep`]: [`extrude`]
 //! and [`revolve`] planar profiles into solids), the geometry store
-//! ([`GeometryStore`] backing [`Edge::curve`]/[`Face::surface`]), and
+//! ([`GeometryStore`] backing [`Edge::curve`]/[`Face::surface`]/
+//! [`Fin::pcurve`]), 2D parameter-space trim geometry ([`pcurve`]:
+//! [`Curve2`], [`fit_pcurve`], [`attach_body_pcurves`]), and
 //! primitive solids ([`primitives`]: block, cylinder, sphere, torus with
 //! full topology + geometry), body placement ([`transform`]:
 //! [`translate_body`]), booleans over store-backed bodies ([`boolean`]:
@@ -31,6 +33,7 @@ pub mod curve;
 pub mod euler;
 pub mod geometry;
 pub mod nurbs;
+pub mod pcurve;
 pub mod primitives;
 pub mod project;
 pub mod ssi;
@@ -47,6 +50,7 @@ pub use curve::{Curve3, CurveEval};
 pub use euler::{EulerCounts, EulerError};
 pub use geometry::GeometryStore;
 pub use nurbs::{KnotVector, NurbsCurve, NurbsError, NurbsSurface};
+pub use pcurve::{Curve2, Curve2Eval, SeamSide, attach_body_pcurves, fit_pcurve};
 pub use project::{CurveProject, CurveProjection, SurfaceProject, SurfaceProjection};
 pub use ssi::{
     IntersectionCurve, IntersectionKind, MarchedCurve, SurfaceIntersection, intersect,
@@ -56,7 +60,7 @@ pub use surface::{Surface3, SurfaceEval};
 pub use sweep::{Profile, ProfileSegment, SweptBody, extrude, revolve};
 pub use tessellate::{TessellationOptions, tessellate_body, tessellate_face};
 pub use topology::{
-    Body, BodyType, Curve, Edge, Face, FaceSense, Fin, FinSense, Loop, LoopType, SYSTEM_RESOLUTION,
-    Shell, ShellOrientation, TopologyStore, Vertex,
+    Body, BodyType, Edge, Face, FaceSense, Fin, FinSense, Loop, LoopType, SYSTEM_RESOLUTION, Shell,
+    ShellOrientation, TopologyStore, Vertex,
 };
 pub use transform::{rotate_body, translate_body};

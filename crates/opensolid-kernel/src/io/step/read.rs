@@ -27,6 +27,13 @@
 //!   `oriented_closed_shell` cavities to inner shells
 //!   ([`ShellOrientation::Inward`](opensolid_brep::ShellOrientation)),
 //!   reversing faces whose orientation flag negates the authored winding.
+//! - **Trim geometry**: `surface_curve` / `seam_curve` /
+//!   `intersection_curve` edges map through their `curve_3d`, and every fin
+//!   of an exactly imported body gets a 2D pcurve in its face's parameter
+//!   space ([`Fin::pcurve`](opensolid_brep::Fin::pcurve)). The pcurve is
+//!   derived, not transplanted — see [`validate_associated_geometry`] for why
+//!   the authored `pcurve` geometry does not transfer, and
+//!   [`StepReadOptions::pcurves`] to turn the derivation off.
 //!
 //! STEP trims edges by their vertices, not by curve parameters, so the
 //! mapper recovers each edge's parameter range by inverse-projecting the
@@ -138,7 +145,7 @@ use opensolid_brep::{
     Body, BodyType, Curve3, CurveEval, CurveProject, Edge, Face, FaceSense, Fin, FinSense,
     GeometryStore, KnotVector, Loop, LoopType, NurbsCurve, NurbsError, NurbsSurface,
     SYSTEM_RESOLUTION, Shell, ShellOrientation, Surface3, SurfaceEval, SurfaceProject,
-    TessellationOptions, TopologyStore, Vertex,
+    TessellationOptions, TopologyStore, Vertex, attach_body_pcurves,
 };
 use opensolid_core::error::CoreError;
 use opensolid_core::mesh::TriangleMesh;
@@ -157,7 +164,7 @@ const TAU: f64 = std::f64::consts::TAU;
 const TRIM_TOL_REL: f64 = 1e-6;
 
 /// Options for [`read_step`].
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct StepReadOptions {
     /// Fidelity of the mesh-fallback tessellation.
     pub tessellation: TessellationOptions,
@@ -165,6 +172,24 @@ pub struct StepReadOptions {
     /// before the reader gives up on the exact path (see [`heal`]). The
     /// default heals automatically: import heals, it does not reject.
     pub heal: HealOptions,
+    /// Whether to derive 2D trim geometry for every fin of an exactly
+    /// imported body ([`Fin::pcurve`](opensolid_brep::Fin::pcurve)).
+    ///
+    /// On by default: a face's boundary is only well defined in its
+    /// surface's parameter space, and a seam edge in particular cannot be
+    /// told apart from a stray duplicate without it. Turn it off to skip the
+    /// per-fin projection when an import only needs 3D geometry.
+    pub pcurves: bool,
+}
+
+impl Default for StepReadOptions {
+    fn default() -> Self {
+        Self {
+            tessellation: TessellationOptions::default(),
+            heal: HealOptions::default(),
+            pcurves: true,
+        }
+    }
 }
 
 /// How serious a [`Diagnostic`] is.
@@ -1279,14 +1304,30 @@ enum RawCurve {
     /// `COMPOSITE_CURVE`: chained `(parent, same_sense)` segments; mesh
     /// fallback only (sampled into a polyline).
     Composite(Vec<(RawCurve, bool)>),
+    /// `SURFACE_CURVE` / `SEAM_CURVE` / `INTERSECTION_CURVE`: a 3D basis
+    /// curve that also names the surfaces it lies on, optionally with a
+    /// `PCURVE` per surface giving the 2D trim geometry.
+    ///
+    /// Transparent to the exact path, like [`RawCurve::Trimmed`]: the edge
+    /// takes the 3D basis. The associated geometry is validated
+    /// ([`validate_associated_geometry`]) but not carried — fin pcurves are
+    /// re-derived in the kernel's own parameterization
+    /// ([`attach_body_pcurves`]), and the seam an authored
+    /// `SEAM_CURVE` marks is equally visible in the topology, as an edge its
+    /// face uses twice.
+    OnSurface {
+        basis: Box<RawCurve>,
+    },
 }
 
 impl RawCurve {
-    /// The curve under any `TRIMMED_CURVE` wrapping. Vertex and face bounds
-    /// re-trim, so the wrapper itself is transparent to every consumer here.
+    /// The curve under any `TRIMMED_CURVE` or `SURFACE_CURVE` wrapping.
+    /// Vertex and face bounds re-trim and the surface association says
+    /// nothing about the locus, so both wrappers are transparent to every
+    /// consumer here.
     fn basis(&self) -> &RawCurve {
         match self {
-            RawCurve::Trimmed { basis, .. } => basis.basis(),
+            RawCurve::Trimmed { basis, .. } | RawCurve::OnSurface { basis } => basis.basis(),
             other => other,
         }
     }
@@ -1346,6 +1387,59 @@ fn resolve_trim(
         ));
     }
     Ok(trim)
+}
+
+/// Validate one item of a `SURFACE_CURVE`'s associated geometry.
+///
+/// The item is a `pcurve_or_surface` select: either the surface itself, or a
+/// `PCURVE(name, basis_surface, reference_to_curve)` naming that surface
+/// alongside the 2D curve tracing the same locus in its parameter space.
+/// Either way it must resolve, and a `PCURVE` must actually carry a
+/// definitional representation — a file that says an edge has trim geometry
+/// and then does not supply it is malformed, and importing it as if it were
+/// fine would hide the defect.
+///
+/// The 2D geometry inside the `DEFINITIONAL_REPRESENTATION` is validated as
+/// present but is deliberately not transplanted into the kernel. Two things
+/// stand in the way, and both make re-deriving it the honest answer:
+///
+/// - STEP parameterizes the pcurve in its *basis curve's* parameter, while
+///   the kernel re-parameterizes every curve it imports into its own
+///   convention (arc length for lines, angle for conics — see
+///   [`trim_curve`]). The two do not line up, and a fin's pcurve must line
+///   up with its edge exactly (see [`opensolid_brep::pcurve`]).
+/// - The authored `(u, v)` values are stated in the STEP surface's frame,
+///   whose `ref_direction` the kernel's [`Surface3`] does not keep: a
+///   cylinder derives its own angular origin from its axis. Authored `u = 0`
+///   is therefore not kernel `u = 0`.
+///
+/// The one thing projection cannot recover — that a `SEAM_CURVE`'s edge is a
+/// parameterization seam, so its two fins need opposite branches — the
+/// topology states just as plainly: a seam is an edge its face uses twice.
+/// [`attach_body_pcurves`] reads it from there, which also covers the files
+/// that author a seam without a `SEAM_CURVE`.
+fn validate_associated_geometry(file: &StepFile, id: u64, referrer: u64) -> MapResult<()> {
+    let inst = instance(file, id, referrer)?;
+    let Some(rec) = inst.as_simple() else {
+        // A complex instance here is a surface (surfaces are the entities
+        // that get combined), never a PCURVE.
+        return Ok(());
+    };
+    if rec.type_name != "PCURVE" {
+        return Ok(());
+    }
+    // Attribute 1 is the basis surface: checked to resolve, then dropped
+    // with the rest of the 2D geometry.
+    ref_attr(rec, 1, id)?;
+    let definitional = ref_attr(rec, 2, id)?;
+    let rep = typed_record(file, definitional, "DEFINITIONAL_REPRESENTATION", id)?;
+    if ref_list(rep, 1, definitional)?.is_empty() {
+        return Err(invalid(
+            definitional,
+            "DEFINITIONAL_REPRESENTATION of a PCURVE has no items",
+        ));
+    }
+    Ok(())
 }
 
 fn resolve_curve(
@@ -1483,6 +1577,29 @@ fn resolve_curve(
                 return Err(invalid(id, "COMPOSITE_CURVE has no segments"));
             }
             Ok(RawCurve::Composite(segments))
+        }
+        // `SURFACE_CURVE(name, curve_3d, associated_geometry,
+        // master_representation)`, and its two subtypes: `SEAM_CURVE`
+        // (associated geometry is two pcurves on the *same* surface, which
+        // is what marks the edge as a parameterization seam) and
+        // `INTERSECTION_CURVE`. Every one of them is a 3D curve that also
+        // knows which surfaces it lies on, so the edge takes `curve_3d` and
+        // the associated geometry only tells the fins where they sit in
+        // parameter space.
+        "SURFACE_CURVE" | "SEAM_CURVE" | "INTERSECTION_CURVE" => {
+            let basis = resolve_curve(file, ref_attr(rec, 1, id)?, id, scale, angle_scale)?;
+            for item in list_attr(rec, 2, id)? {
+                let Some(item_ref) = item.as_ref_id() else {
+                    return Err(invalid(
+                        id,
+                        format!("{} associated geometry is not a reference", rec.type_name),
+                    ));
+                };
+                validate_associated_geometry(file, item_ref, id)?;
+            }
+            Ok(RawCurve::OnSurface {
+                basis: Box::new(basis),
+            })
         }
         other => Err(unsupported(id, format!("curve type {other}"))),
     }
@@ -2094,6 +2211,8 @@ fn rollback(store: &mut TopologyStore, geo: &mut GeometryStore, created: &Create
     for &id in &created.surfaces {
         geo.surfaces.remove(id);
     }
+    // Pcurves need no rollback: they are attached only once a body is known
+    // good (see `finish_exact_body`), which is past every rollback path.
 }
 
 struct SolidBuilder<'a> {
@@ -2330,8 +2449,9 @@ impl SolidBuilder<'_> {
             self.scale,
             self.angle_scale,
         )?;
-        // TRIMMED_CURVE wrapping is transparent here: the edge's vertices
-        // re-trim whatever basis the wrapper carries.
+        // TRIMMED_CURVE and SURFACE_CURVE wrapping are both transparent
+        // here: the edge's vertices re-trim whatever basis the wrapper
+        // carries, and a surface association says nothing about the locus.
         let curve = match raw.exact_curve() {
             Some(curve) => curve,
             None => {
@@ -2342,8 +2462,11 @@ impl SolidBuilder<'_> {
                     RawCurve::Composite(_) => {
                         "exact COMPOSITE_CURVE import (geometry store has no multi-segment curve)"
                     }
-                    RawCurve::Analytic(_) | RawCurve::Nurbs(_) | RawCurve::Trimmed { .. } => {
-                        unreachable!("exact_curve covers the storable bases")
+                    RawCurve::Analytic(_)
+                    | RawCurve::Nurbs(_)
+                    | RawCurve::Trimmed { .. }
+                    | RawCurve::OnSurface { .. } => {
+                        unreachable!("exact_curve covers the storable bases, basis() the wrappers")
                     }
                 };
                 return Err(unsupported(
@@ -3050,8 +3173,10 @@ impl FallbackMesher<'_> {
                 Ok(points)
             }
             // The edge's vertices re-trim the basis; the wrapper's own
-            // bounds only matter inside composite segments.
-            RawCurve::Trimmed { basis, .. } => {
+            // bounds only matter inside composite segments. A surface
+            // association is likewise transparent — the fallback works in
+            // 3D, where the pcurves it carries have nothing to add.
+            RawCurve::Trimmed { basis, .. } | RawCurve::OnSurface { basis } => {
                 self.edge_points(*basis, start, end, same_sense, closed, edge_ref)
             }
             RawCurve::Composite(segments) => {
@@ -3130,6 +3255,9 @@ impl FallbackMesher<'_> {
                 sense,
             } => self.sample_trimmed(basis, trims, *sense, entity),
             RawCurve::Composite(segments) => self.sample_composite(segments, entity),
+            // The surface association says nothing about the locus; the
+            // fallback samples the 3D basis exactly as it would unwrapped.
+            RawCurve::OnSurface { basis } => self.sample_bounded(basis, entity),
         }
     }
 
@@ -3251,9 +3379,13 @@ impl FallbackMesher<'_> {
             }
             // Polyline is never produced by the reader; nested wrappers are
             // pathological files — degrade with a diagnostic, don't guess.
-            RawCurve::Analytic(_) | RawCurve::Trimmed { .. } | RawCurve::Composite(_) => Err(
-                unsupported(entity, "nested TRIMMED_CURVE/COMPOSITE_CURVE bases"),
-            ),
+            RawCurve::Analytic(_)
+            | RawCurve::Trimmed { .. }
+            | RawCurve::Composite(_)
+            | RawCurve::OnSurface { .. } => Err(unsupported(
+                entity,
+                "nested TRIMMED_CURVE/COMPOSITE_CURVE/SURFACE_CURVE bases",
+            )),
         }
     }
 
@@ -3495,6 +3627,26 @@ fn map_file(
     }
 }
 
+/// Last step of an exact import: derive the 2D trim geometry the file's
+/// `PCURVE`s could not supply directly (see [`validate_associated_geometry`]).
+///
+/// This runs on the finished body, after validation and any healing, rather
+/// than face by face during mapping. Healing welds duplicate edges and
+/// re-points the orphaned fins onto the survivor, and a pcurve is tied to
+/// its edge's curve and parameter range — so deriving one before the healer
+/// has settled which edge a fin uses would leave it describing an edge that
+/// is no longer there.
+fn finish_exact_body(
+    store: &mut TopologyStore,
+    geo: &mut GeometryStore,
+    body: EntityId<Body>,
+    options: &StepReadOptions,
+) {
+    if options.pcurves {
+        attach_body_pcurves(store, geo, body);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn map_solid(
     file: &StepFile,
@@ -3556,6 +3708,7 @@ fn map_solid(
         Ok(body) => {
             let mut failures = store.check(body);
             if failures.is_empty() {
+                finish_exact_body(store, geo, body, options);
                 return SolidOutcome::BRep(body);
             }
             // Import heals, it does not reject (`spec/06-step-io.md` §4): a
@@ -3581,6 +3734,7 @@ fn map_solid(
                 }
                 failures = result.remaining;
                 if failures.is_empty() {
+                    finish_exact_body(store, geo, body, options);
                     return SolidOutcome::BRep(body);
                 }
             }
@@ -5339,6 +5493,185 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    // ---- pcurves (of-3qy.11) ----
+
+    /// The cylinder fixture with its seam edge's geometry spelled the way
+    /// production CAD systems spell it: a `SEAM_CURVE` over the 3D line,
+    /// carrying a `PCURVE` per branch of the wall's parameter space.
+    fn cylinder_step_with_seam_curve(r: f64, h: f64) -> String {
+        let src = cylinder_step(r, h);
+        let seam_entities = "\
+#40 = SEAM_CURVE('', #16, (#41, #45), .CURVE_3D.);
+#41 = PCURVE('', #22, #42);
+#42 = DEFINITIONAL_REPRESENTATION('', (#43), #47);
+#43 = LINE('', #44, #46);
+#44 = CARTESIAN_POINT('', (0., 0.));
+#45 = PCURVE('', #22, #48);
+#46 = VECTOR('', #49, 1.);
+#47 = ( GEOMETRIC_REPRESENTATION_CONTEXT(2) PARAMETRIC_REPRESENTATION_CONTEXT() \
+REPRESENTATION_CONTEXT('2D SPACE','') );
+#48 = DEFINITIONAL_REPRESENTATION('', (#50), #47);
+#49 = DIRECTION('', (0., 1.));
+#50 = LINE('', #51, #46);
+#51 = CARTESIAN_POINT('', (6.283185307179586, 0.));
+#19 = EDGE_CURVE('', #8, #9, #40, .T.);";
+        src.replace("#19 = EDGE_CURVE('', #8, #9, #16, .T.);", seam_entities)
+    }
+
+    /// Every fin of an exact import carries trim geometry, and it agrees
+    /// with the edge it belongs to at every parameter.
+    fn assert_pcurve_invariant(store: &TopologyStore, geo: &GeometryStore, body: EntityId<Body>) {
+        use opensolid_brep::Curve2Eval;
+
+        for face in store.faces_of_body(body) {
+            let surface = geo
+                .surface(store.face(face).unwrap().surface.unwrap())
+                .unwrap();
+            for loop_id in store.loops_of_face(face) {
+                for &fin_id in store.fins_of_loop(loop_id) {
+                    let fin = store.fin(fin_id).unwrap();
+                    let pcurve = geo
+                        .pcurve(
+                            fin.pcurve
+                                .unwrap_or_else(|| panic!("{fin_id:?} has no pcurve")),
+                        )
+                        .unwrap();
+                    let edge = store.edge(fin.edge).unwrap();
+                    let curve = geo.curve(edge.curve.unwrap()).unwrap();
+                    for k in 0..=8 {
+                        let t = edge.t_start + (edge.t_end - edge.t_start) * f64::from(k) / 8.0;
+                        let uv = pcurve.point(t);
+                        assert!(
+                            (surface.point(uv.x, uv.y) - curve.point(t)).norm() < 1e-6,
+                            "{fin_id:?} at t = {t}: pcurve leaves its edge"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_fin_of_an_exact_import_gets_trim_geometry() {
+        let (store, geo, report) = import(&cylinder_step(1.5, 5.0));
+        no_error_diagnostics(&report);
+        let body = brep_body(&report.solids[0].outcome);
+        assert_pcurve_invariant(&store, &geo, body);
+    }
+
+    /// The wall's seam edge is used twice by the one face, and its two fins
+    /// must land a full period apart in `u` — otherwise the wall's boundary
+    /// does not close in parameter space and encloses nothing.
+    #[test]
+    fn a_seam_edge_gives_its_two_fins_opposite_branches() {
+        use opensolid_brep::Curve2Eval;
+
+        let (store, geo, report) = import(&cylinder_step(1.5, 5.0));
+        no_error_diagnostics(&report);
+        let body = brep_body(&report.solids[0].outcome);
+
+        let wall = store
+            .faces_of_body(body)
+            .into_iter()
+            .find(|&f| {
+                matches!(
+                    geo.surface(store.face(f).unwrap().surface.unwrap()),
+                    Some(Surface3::Cylinder { .. })
+                )
+            })
+            .expect("the fixture has a cylindrical wall");
+
+        let fins = store.fins_of_loop(store.loops_of_face(wall)[0]);
+        let mut by_edge: HashMap<EntityId<Edge>, Vec<f64>> = HashMap::new();
+        for &fin_id in fins {
+            let fin = store.fin(fin_id).unwrap();
+            let edge = store.edge(fin.edge).unwrap();
+            let mid = (edge.t_start + edge.t_end) / 2.0;
+            let u = geo.pcurve(fin.pcurve.expect("fin has a pcurve")).unwrap();
+            by_edge.entry(fin.edge).or_default().push(u.point(mid).x);
+        }
+        let seam = by_edge
+            .values()
+            .find(|us| us.len() == 2)
+            .expect("the wall uses its seam edge twice");
+        assert!(
+            ((seam[1] - seam[0]).abs() - TAU).abs() < 1e-9,
+            "seam fins must be one period apart in u, got {seam:?}"
+        );
+    }
+
+    /// A `SEAM_CURVE` edge used to sink the whole solid to the mesh
+    /// fallback: `resolve_curve` had no arm for it, and every cylinder,
+    /// sphere and torus a production CAD system writes uses one.
+    #[test]
+    fn a_seam_curve_edge_imports_exactly() {
+        let (store, geo, report) = import(&cylinder_step_with_seam_curve(1.5, 5.0));
+        no_error_diagnostics(&report);
+        let body = brep_body(&report.solids[0].outcome);
+        assert!(store.check(body).is_empty());
+        assert_edges_interpolate(&store, &geo, body);
+        assert_pcurve_invariant(&store, &geo, body);
+
+        let mesh = tessellate_body(&store, &geo, body, &TessellationOptions::default()).unwrap();
+        assert!(mesh.is_closed_manifold());
+        let exact = PI * 1.5 * 1.5 * 5.0;
+        assert!((signed_volume(&mesh) - exact).abs() / exact < 0.02);
+    }
+
+    /// A `SURFACE_CURVE` whose associated geometry names bare surfaces
+    /// rather than pcurves — the other half of Part 42's
+    /// `pcurve_or_surface` select — is equally transparent.
+    #[test]
+    fn a_surface_curve_naming_bare_surfaces_imports_exactly() {
+        let src = cylinder_step(1.5, 5.0).replace(
+            "#19 = EDGE_CURVE('', #8, #9, #16, .T.);",
+            "#40 = SURFACE_CURVE('', #16, (#22), .CURVE_3D.);\n\
+             #19 = EDGE_CURVE('', #8, #9, #40, .T.);",
+        );
+        let (store, _, report) = import(&src);
+        no_error_diagnostics(&report);
+        let body = brep_body(&report.solids[0].outcome);
+        assert!(store.check(body).is_empty());
+    }
+
+    /// A `PCURVE` whose definitional representation is empty is malformed;
+    /// the solid degrades rather than importing a lie.
+    #[test]
+    fn an_empty_definitional_representation_is_rejected() {
+        let src = cylinder_step_with_seam_curve(1.5, 5.0).replace(
+            "DEFINITIONAL_REPRESENTATION('', (#43), #47)",
+            "DEFINITIONAL_REPRESENTATION('', (), #47)",
+        );
+        let (_, _, report) = import(&src);
+        assert!(
+            !matches!(report.solids[0].outcome, SolidOutcome::BRep(_)),
+            "a malformed PCURVE must not import as an exact B-Rep"
+        );
+    }
+
+    #[test]
+    fn pcurves_can_be_turned_off() {
+        let mut store = TopologyStore::new();
+        let mut geo = GeometryStore::new();
+        let options = StepReadOptions {
+            pcurves: false,
+            ..Default::default()
+        };
+        let report = read_step(&cylinder_step(1.5, 5.0), &mut store, &mut geo, &options)
+            .expect("fixture parses");
+        no_error_diagnostics(&report);
+        let body = brep_body(&report.solids[0].outcome);
+        assert!(store.check(body).is_empty());
+        for face in store.faces_of_body(body) {
+            for loop_id in store.loops_of_face(face) {
+                for &fin_id in store.fins_of_loop(loop_id) {
+                    assert!(store.fin(fin_id).unwrap().pcurve.is_none());
+                }
+            }
+        }
+        assert_eq!(geo.pcurves.len(), 0);
     }
 
     /// The cylinder fixture with its wall spelled as the extrusion of its

@@ -81,9 +81,9 @@ pub trait SurfaceEval {
 
 /// Analytic 3D surface primitives.
 ///
-/// Named `Surface3` (paralleling [`crate::curve::Curve3`]) to avoid clashing
-/// with the [`crate::topology::Surface`] placeholder marker, which a later
-/// issue replaces with references to this type.
+/// Named `Surface3` (paralleling [`crate::curve::Curve3`]) because the
+/// dimension is load-bearing here: a face's boundary lives in this surface's
+/// 2D parameter space, where the curves are [`Curve2`](crate::pcurve::Curve2).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Surface3 {
     /// Infinite plane through `origin` with unit `normal`.

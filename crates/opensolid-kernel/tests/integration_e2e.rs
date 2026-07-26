@@ -148,9 +148,13 @@ enum FixedPointGate {
     /// The second write must reproduce the first file byte for byte:
     /// the re-imported body is the exported one down to every `f64`.
     ByteIdentical,
-    /// Byte-identical immediately, or at worst from the second write
-    /// (of-kb8: re-imported stores duplicate geometry shared across
-    /// faces/edges, shifting the fixed point out by one iteration).
+    /// Byte-identical immediately, or at worst from the second write.
+    ///
+    /// Two things shift the fixed point out by one iteration: re-imported
+    /// stores duplicate geometry shared across faces/edges (of-kb8), and a
+    /// body built in the kernel carries no fin pcurves while an imported one
+    /// always does (of-3qy.11), so the second file gains the `SURFACE_CURVE`
+    /// wrappers the first had nothing to write.
     Stabilizes,
     /// No byte gate: bodies with non-axis-aligned plane normals oscillate
     /// in the last ULP between writes and never reach a byte fixed point
@@ -267,13 +271,15 @@ fn step_block_minus_sphere_reimports_with_analytic_volume() {
         context,
     );
 
-    // Byte-identical export/import: the re-imported body is this geometry
-    // down to every f64, so it encloses the volume just measured.
+    // Export/import fixed point: the re-imported body is this geometry down
+    // to every f64, so it encloses the volume just measured. One iteration
+    // out, because the boolean output's fins carry no trim geometry and the
+    // re-imported body's do — see [`FixedPointGate::Stabilizes`].
     round_trip(
         &out.store,
         &out.geo,
         out.body,
-        FixedPointGate::ByteIdentical,
+        FixedPointGate::Stabilizes,
         context,
     );
 }
@@ -295,7 +301,7 @@ fn reimported_step_solid_works_as_boolean_operand() {
         &out.store,
         &out.geo,
         out.body,
-        FixedPointGate::ByteIdentical,
+        FixedPointGate::Stabilizes,
         context,
     );
 

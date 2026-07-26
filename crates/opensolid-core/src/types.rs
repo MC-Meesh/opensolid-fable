@@ -4,6 +4,16 @@ pub type Point3 = na::Point3<f64>;
 pub type Vector3 = na::Vector3<f64>;
 pub type Transform3 = na::Isometry3<f64>;
 
+/// A point in a surface's 2D parameter space: `x` is `u`, `y` is `v`.
+///
+/// Parameter space is not a Euclidean copy of model space — a unit step in
+/// `u` covers a different distance on a cylinder than on a plane — so these
+/// are deliberately distinct types from [`Point3`]/[`Vector3`] and never
+/// mixed with them.
+pub type Point2 = na::Point2<f64>;
+/// A displacement in a surface's 2D parameter space (see [`Point2`]).
+pub type Vector2 = na::Vector2<f64>;
+
 /// A ray in 3D: all points `origin + t * direction` for `t >= 0`.
 ///
 /// `direction` need not be unit length; intersection parameters are then in

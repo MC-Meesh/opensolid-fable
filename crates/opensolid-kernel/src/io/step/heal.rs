@@ -33,9 +33,16 @@
 //!   (its enclosed signed volume has the wrong sign for its
 //!   [`ShellOrientation`]) is then reversed wholesale.
 //!
-//! The remaining spec §6 operations — pcurve recompute, edge/surface
-//! consistency, edge-curve recomputation from face-face intersection — are
-//! phase 2 (`of-3qy.14`).
+//! Pcurve recompute is not a repair here: the reader derives fin trim
+//! geometry for every exactly mapped face as it builds it
+//! ([`StepReadOptions::pcurves`](super::read::StepReadOptions::pcurves)), so
+//! there is no absent-pcurve state left for the healer to find. The
+//! remaining spec §6 operations — edge/surface consistency, edge-curve
+//! recomputation from face-face intersection — are phase 2 (`of-3qy.14`).
+//!
+//! A repair that rewires fins (orientation flips, sewing) leaves their
+//! pcurves as mapped: a fin's pcurve depends on its edge's curve and its
+//! face's surface, neither of which those repairs touch.
 //!
 //! # Where healing does *not* reach
 //!

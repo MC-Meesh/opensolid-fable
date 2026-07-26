@@ -24,8 +24,8 @@
 //!
 //! Tolerant-modeling fields exist from day one (`spec/08-tolerances.md`):
 //! every [`Edge`] and [`Vertex`] carries a `tolerance`, and every [`Fin`] has
-//! an optional `pcurve` slot for an SP-curve in the owning face's parameter
-//! space.
+//! an optional [`pcurve`](Fin::pcurve) — its 2D trim curve in the owning
+//! face's parameter space ([`Curve2`], see [`crate::pcurve`]).
 //!
 //! Creation methods panic on stale parent ids (a stale id passed to
 //! construction is a caller bug, not a recoverable condition). Navigation
@@ -34,6 +34,7 @@
 //! return `Option` so callers can test id validity.
 
 use crate::curve::Curve3;
+use crate::pcurve::Curve2;
 use crate::surface::Surface3;
 use opensolid_core::{Arena, EntityId, Point3};
 
@@ -44,18 +45,6 @@ pub const SYSTEM_RESOLUTION: f64 = 1e-10;
 /// Entities with tolerance above this multiple of [`SYSTEM_RESOLUTION`] are
 /// considered "tolerant" (carrying a real precision gap).
 const TOLERANT_THRESHOLD: f64 = SYSTEM_RESOLUTION * 10.0;
-
-/// Placeholder for the 2D parameter-space curve geometry type.
-///
-/// 3D geometry slots reference the real types ([`Edge::curve`] →
-/// [`Curve3`], [`Face::surface`] → [`Surface3`], both living in a
-/// [`GeometryStore`](crate::geometry::GeometryStore)), but no 2D curve
-/// representation exists yet; this marker only serves as the type parameter
-/// of the `EntityId<Curve>` slot in [`Fin::pcurve`] so the topology carries
-/// the reference from day one. A later issue replaces it with the real
-/// SP-curve representation.
-#[derive(Debug, Clone)]
-pub struct Curve;
 
 /// The kind of a [`Body`], constraining its topology.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -184,9 +173,17 @@ pub struct Fin {
     /// Opposite fin on the other face sharing this edge.
     /// `None` for boundary/free edges (single-fin edges).
     pub mate: Option<EntityId<Fin>>,
-    /// 2D curve in the owning face's parameter space (SP-curve for tolerant
-    /// edges, `spec/08-tolerances.md`). Geometry layer pending.
-    pub pcurve: Option<EntityId<Curve>>,
+    /// 2D trim curve in the owning face's parameter space, in a
+    /// [`GeometryStore`](crate::geometry::GeometryStore). Parameterized over
+    /// the same interval as this fin's edge (`[edge.t_start, edge.t_end]`),
+    /// so the two run in lockstep — see [`crate::pcurve`] for the full
+    /// invariant, and for why the two fins of a seam edge need different
+    /// pcurves over the one shared [`Curve3`].
+    ///
+    /// `None` for fins whose trim geometry has not been attached or
+    /// recomputed yet; [`crate::pcurve::fit_pcurve`] derives one from the
+    /// edge's 3D curve and the face's surface.
+    pub pcurve: Option<EntityId<Curve2>>,
 }
 
 /// A bounded curve segment between two vertices.
@@ -908,13 +905,15 @@ mod tests {
 
     #[test]
     fn pcurve_and_curve_slots_accept_geometry_ids() {
+        use crate::geometry::GeometryStore;
+        use opensolid_core::types::{Point2, Vector2};
+
         let mut tet = build_tetrahedron();
 
-        // 2D pcurves are still a placeholder marker; 3D curves are real.
-        let mut pcurves: Arena<Curve> = Arena::new();
-        let pcurve_id = pcurves.insert(Curve);
-        let mut curves: Arena<Curve3> = Arena::new();
-        let curve_id = curves.insert(
+        let mut geo = GeometryStore::new();
+        let pcurve_id =
+            geo.add_pcurve(Curve2::line(Point2::origin(), Vector2::x()).expect("valid pcurve"));
+        let curve_id = geo.add_curve(
             Curve3::line(Point3::new(0.0, 0.0, 0.0), opensolid_core::Vector3::x())
                 .expect("valid line"),
         );
