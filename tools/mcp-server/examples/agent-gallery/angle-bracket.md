@@ -118,7 +118,7 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 >   "model_id": "model-1",
 >   "format": "step",
 >   "path": "output/angle-bracket.step",
->   "bytes": 8476931
+>   "bytes": 8476930
 > }
 > ```
 

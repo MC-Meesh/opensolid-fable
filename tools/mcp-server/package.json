@@ -1,18 +1,44 @@
 {
-  "name": "opensolid-mcp-server",
-  "private": true,
+  "name": "opensolid-mcp",
   "version": "0.1.0",
   "type": "module",
-  "description": "MCP server exposing the OpenSolid kernel as an agentic CAD API surface",
+  "description": "MCP server exposing the OpenSolid CAD kernel as an agentic API surface — script, render, measure, validate, optimize, export STEP/STL/OBJ",
+  "license": "MPL-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MC-Meesh/opensolid-fable.git",
+    "directory": "tools/mcp-server"
+  },
+  "homepage": "https://github.com/MC-Meesh/opensolid-fable/tree/main/tools/mcp-server#readme",
+  "bugs": "https://github.com/MC-Meesh/opensolid-fable/issues",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "cad",
+    "opensolid",
+    "step",
+    "stl",
+    "brep",
+    "sdf",
+    "agent"
+  ],
   "bin": {
     "opensolid-mcp": "src/server.js"
   },
+  "files": [
+    "src/",
+    "pkg/opensolid_wasm.js",
+    "pkg/opensolid_wasm_bg.wasm",
+    "README.md"
+  ],
   "scripts": {
     "build": "node scripts/build-wasm.mjs",
     "prestart": "node scripts/check-pkg.mjs",
     "start": "node src/server.js",
     "pretest": "node scripts/check-pkg.mjs",
-    "test": "node --test"
+    "test": "node --test",
+    "gallery": "node examples/agent-gallery/build-gallery.mjs",
+    "prepack": "node scripts/prepack.mjs"
   },
   "engines": {
     "node": ">=18"

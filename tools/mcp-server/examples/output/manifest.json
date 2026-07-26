@@ -129,7 +129,7 @@
           "model_id": "model-1",
           "format": "step",
           "path": "output/angle-bracket.step",
-          "bytes": 8476931
+          "bytes": 8476930
         }
       },
       {
@@ -231,7 +231,7 @@
           "model_id": "model-2",
           "format": "step",
           "path": "output/hinge-leaf.step",
-          "bytes": 18541158
+          "bytes": 18541157
         }
       },
       {
@@ -328,7 +328,7 @@
           "model_id": "model-3",
           "format": "step",
           "path": "output/enclosure-body.step",
-          "bytes": 5924702
+          "bytes": 5924701
         }
       },
       {
@@ -407,7 +407,7 @@
           "model_id": "model-4",
           "format": "step",
           "path": "output/enclosure-lid.step",
-          "bytes": 4721868
+          "bytes": 4721867
         }
       },
       {
@@ -533,7 +533,7 @@
           "model_id": "model-5",
           "format": "step",
           "path": "output/gear-disk.step",
-          "bytes": 41675080
+          "bytes": 41675079
         }
       }
     ]
@@ -803,7 +803,7 @@
           "model_id": "model-7",
           "format": "step",
           "path": "output/bracket-right-angle.step",
-          "bytes": 11887645
+          "bytes": 11887644
         }
       },
       {

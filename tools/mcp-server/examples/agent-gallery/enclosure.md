@@ -65,7 +65,7 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 >   "model_id": "model-3",
 >   "format": "step",
 >   "path": "output/enclosure-body.step",
->   "bytes": 5924702
+>   "bytes": 5924701
 > }
 > ```
 
@@ -133,7 +133,7 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 >   "model_id": "model-4",
 >   "format": "step",
 >   "path": "output/enclosure-lid.step",
->   "bytes": 4721868
+>   "bytes": 4721867
 > }
 > ```
 

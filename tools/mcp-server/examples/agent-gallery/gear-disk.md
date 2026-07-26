@@ -90,6 +90,6 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 >   "model_id": "model-5",
 >   "format": "step",
 >   "path": "output/gear-disk.step",
->   "bytes": 41675080
+>   "bytes": 41675079
 > }
 > ```

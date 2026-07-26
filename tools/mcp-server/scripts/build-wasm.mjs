@@ -6,6 +6,7 @@
 // in — run this after any Rust change under crates/.
 
 import { spawnSync } from 'node:child_process';
+import { rmSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 
@@ -33,4 +34,18 @@ if (result.error) {
   );
   process.exit(1);
 }
+
+if (result.status === 0) {
+  // wasm-pack writes `pkg/.gitignore` containing `*`. That single line is the
+  // reason a published tarball used to arrive with no kernel in it: npm has no
+  // .npmignore here, so it falls back to the nearest .gitignore — including
+  // this nested one — and quietly drops every file `files` asked for under
+  // pkg/. Nothing warns; `npm pack` just emits a package where `require`ing
+  // the wasm throws MODULE_NOT_FOUND on the user's machine.
+  //
+  // Delete it at the source. pkg/ stays untracked via the repo-root .gitignore
+  // entry, which npm packing does not consult (of-2y4.3).
+  rmSync(resolve(serverDir, 'pkg', '.gitignore'), { force: true });
+}
+
 process.exit(result.status ?? 1);

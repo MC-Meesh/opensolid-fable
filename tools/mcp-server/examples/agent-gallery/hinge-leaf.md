@@ -85,7 +85,7 @@ Every tool call and result below is **real, unedited output** from the OpenSolid
 >   "model_id": "model-2",
 >   "format": "step",
 >   "path": "output/hinge-leaf.step",
->   "bytes": 18541158
+>   "bytes": 18541157
 > }
 > ```
 
