@@ -7,6 +7,9 @@ members = [
     "crates/opensolid-kernel",
     "crates/opensolid-wasm",
 ]
+# The cargo-fuzz package is its own workspace: `libfuzzer-sys` and `arbitrary`
+# are fuzzing-only and must not enter this workspace's lockfile. See fuzz/README.md.
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.1.0"

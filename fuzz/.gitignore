@@ -1,0 +1,13 @@
+# Build output for the fuzz package (its own workspace, so its own target dir).
+/target
+
+# libFuzzer's working corpus: machine-local, grows without bound, and is
+# regenerated from `seeds/` on any machine. Committed seeds live in `seeds/`.
+/corpus
+
+# Coverage data from `cargo fuzz coverage`.
+/coverage
+
+# NOTE: `artifacts/` is deliberately NOT ignored. A crash reproducer that
+# libFuzzer drops there is the whole payoff of a fuzzing run — commit it, and
+# `tests/corpus_replay.rs` re-checks the fix on every push from then on.

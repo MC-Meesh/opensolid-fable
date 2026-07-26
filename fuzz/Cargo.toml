@@ -1,0 +1,67 @@
+[package]
+name = "opensolid-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "MPL-2.0"
+description = "cargo-fuzz targets for the OpenSolid kernel (STEP parser, topology check, NURBS eval)"
+
+# Its own workspace on purpose: `libfuzzer-sys` and `arbitrary` are fuzzing-only
+# dependencies and must never enter the kernel workspace's lockfile (see the
+# minimal-dependency rule in CLAUDE.md). The root manifest lists `fuzz` in
+# `workspace.exclude` to match.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+opensolid-core = { path = "../crates/opensolid-core" }
+opensolid-brep = { path = "../crates/opensolid-brep" }
+opensolid-kernel = { path = "../crates/opensolid-kernel" }
+arbitrary = { version = "1", features = ["derive"] }
+libfuzzer-sys = { version = "0.4", optional = true }
+
+[features]
+# On by default so plain `cargo fuzz run <target>` works with no extra flags.
+# The stable-toolchain regression gate (`tests/corpus_replay.rs`) builds with
+# `--no-default-features`, which drops libFuzzer entirely: the `[[bin]]` targets
+# below declare it as a required feature, so they are not built at all and the
+# harness library compiles on stable Rust like any other crate.
+default = ["libfuzzer"]
+libfuzzer = ["dep:libfuzzer-sys"]
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "step_parse"
+path = "fuzz_targets/step_parse.rs"
+test = false
+doc = false
+bench = false
+required-features = ["libfuzzer"]
+
+[[bin]]
+name = "topology_check"
+path = "fuzz_targets/topology_check.rs"
+test = false
+doc = false
+bench = false
+required-features = ["libfuzzer"]
+
+[[bin]]
+name = "nurbs_eval"
+path = "fuzz_targets/nurbs_eval.rs"
+test = false
+doc = false
+bench = false
+required-features = ["libfuzzer"]
+
+# Fuzzing without optimization is pointless, and the corpus-replay test wants
+# the same code the fuzzer ran.
+[profile.release]
+debug = 1
+
+[profile.test]
+opt-level = 2

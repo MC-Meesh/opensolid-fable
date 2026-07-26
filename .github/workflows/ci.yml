@@ -37,6 +37,23 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+      # The fuzz package is its own workspace (see fuzz/README.md), so the
+      # steps above do not reach it. Building the libFuzzer binaries needs
+      # nightly and is handled by fuzz.yml; what runs here is the harness
+      # library plus the corpus-replay regression gate, which are plain stable
+      # Rust. This is what keeps every past fuzz finding fixed: a committed
+      # crash artifact is re-run on every push.
+      - name: Fuzz harness — format
+        run: cargo fmt --manifest-path fuzz/Cargo.toml --all --check
+
+      - name: Fuzz harness — clippy
+        run: >
+          cargo clippy --manifest-path fuzz/Cargo.toml --no-default-features
+          --all-targets -- -D warnings
+
+      - name: Fuzz harness — corpus replay
+        run: cargo test --manifest-path fuzz/Cargo.toml --no-default-features
+
   # The agent layer — MCP server, its published tarball, and the playground.
   # Until of-2y4.3 none of this was gated: `cargo test` never touches the JS, so
   # a kernel change could break every MCP tool and the playground build and CI

@@ -1,0 +1,18 @@
+ISO-10303-21;
+/* leading
+   comment */
+HEADER;
+FILE_DESCRIPTION((''),'2;1'); /* inline */
+ENDSEC;
+DATA;
+#1 = SPLIT_TOKEN('a
+multi
+line
+string');
+#2   =
+   KEYWORD (
+     1 ,
+     2
+   ) ;
+ENDSEC;
+END-ISO-10303-21;

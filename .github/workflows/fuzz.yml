@@ -1,0 +1,130 @@
+# cargo-fuzz targets for the STEP parser, TopologyStore::check and NURBS
+# evaluation (of-ipt.15). See fuzz/README.md.
+#
+# Two cadences, because fuzzing has two jobs:
+#
+#   smoke — every PR, ~1 minute per target. Catches "the target no longer
+#           builds" and "the change crashes on the committed corpus in the
+#           first thousand mutations". Fast enough to gate on.
+#   long  — nightly cron plus manual dispatch, 20 minutes per target, starting
+#           from the corpus the previous run left behind. This is where real
+#           findings come from; a crasher is uploaded as an artifact so it can
+#           be committed to fuzz/artifacts/ and thereby become a permanent
+#           regression test in the stable CI job.
+#
+# Note the corpus-replay half of this lives in ci.yml, on stable: fuzzing
+# needs nightly, replaying what fuzzing found does not.
+name: fuzz
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "Minutes to fuzz each target"
+        required: false
+        default: "20"
+  schedule:
+    - cron: "23 4 * * *" # Nightly 04:23 UTC
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  smoke:
+    name: smoke (${{ matrix.target }})
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [step_parse, topology_check, nurbs_eval]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nightly Rust
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            fuzz
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Fuzz ${{ matrix.target }} (60s)
+        run: tools/fuzz/run.sh ${{ matrix.target }} 60
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}/
+          if-no-files-found: ignore
+
+  long:
+    name: long (${{ matrix.target }})
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [step_parse, topology_check, nurbs_eval]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nightly Rust
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            fuzz
+
+      # Carrying the corpus between runs is most of what makes a scheduled
+      # fuzz job worth running: each night starts from the coverage the last
+      # one reached instead of from the seeds.
+      - name: Restore corpus
+        uses: actions/cache@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Fuzz ${{ matrix.target }}
+        run: >
+          tools/fuzz/run.sh ${{ matrix.target }}
+          $(( ${{ github.event.inputs.minutes || '20' }} * 60 ))
+
+      - name: Minimize corpus for the next run
+        if: success()
+        run: cargo fuzz cmin ${{ matrix.target }} -- -rss_limit_mb=4096 || true
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}/
+          if-no-files-found: ignore
+
+      - name: Report to the job summary
+        if: always()
+        run: |
+          {
+            echo "## Fuzz: ${{ matrix.target }}"
+            echo "Corpus entries: $(ls -1 fuzz/corpus/${{ matrix.target }} 2>/dev/null | wc -l)"
+            echo "Crash artifacts: $(ls -1 fuzz/artifacts/${{ matrix.target }} 2>/dev/null | grep -cv '^\.gitkeep$' || echo 0)"
+          } >> "$GITHUB_STEP_SUMMARY"

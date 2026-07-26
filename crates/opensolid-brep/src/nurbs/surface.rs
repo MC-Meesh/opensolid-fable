@@ -71,7 +71,11 @@ impl NurbsSurface {
             }
         }
         let flat_weights: Vec<f64> = weights.into_iter().flatten().collect();
-        if let Some(index) = flat_weights.iter().position(|&w| w <= 0.0) {
+        // Finite and positive, for the reason given in `NurbsCurve::new`.
+        if let Some(index) = flat_weights
+            .iter()
+            .position(|&w| !(w.is_finite() && w > 0.0))
+        {
             return Err(NurbsError::NonPositiveWeight { index });
         }
         Ok(Self {
@@ -1044,5 +1048,39 @@ mod tests {
             ),
             Err(NurbsError::NonPositiveWeight { index: 3 })
         );
+    }
+
+    /// NaN and infinite weights are not `<= 0.0`, so they used to construct
+    /// and then divide the homogeneous coordinates into NaN. Found by the
+    /// `nurbs_eval` fuzz target (of-ipt.15).
+    #[test]
+    fn surface_rejects_non_finite_weights() {
+        let knots_u = KnotVector::clamped_uniform(1, 2).unwrap();
+        let knots_v = KnotVector::clamped_uniform(1, 2).unwrap();
+        let grid = vec![
+            vec![Point3::new(0.0, 0.0, 0.0), Point3::new(1.0, 0.0, 0.0)],
+            vec![Point3::new(0.0, 1.0, 0.0), Point3::new(1.0, 1.0, 0.0)],
+        ];
+        for (index, weights) in [
+            (0, vec![vec![f64::NAN, 1.0], vec![1.0, 1.0]]),
+            (3, vec![vec![1.0, 1.0], vec![1.0, f64::INFINITY]]),
+            (2, vec![vec![1.0, 1.0], vec![f64::NEG_INFINITY, 1.0]]),
+        ] {
+            assert_eq!(
+                NurbsSurface::new(grid.clone(), weights, knots_u.clone(), knots_v.clone()),
+                Err(NurbsError::NonPositiveWeight { index })
+            );
+        }
+        assert!(NurbsSurface::new(grid, vec![vec![1.0, 2.0]; 2], knots_u, knots_v).is_ok());
+    }
+
+    /// A non-finite knot cannot reach a surface either — the knot vectors are
+    /// validated by `KnotVector::new` before the grid is ever consulted.
+    #[test]
+    fn surface_rejects_non_finite_knots() {
+        assert!(matches!(
+            KnotVector::new(1, vec![0.0, 0.0, f64::NAN, 1.0, 1.0, 1.0]),
+            Err(NurbsError::NonFiniteKnot { index: 2, .. })
+        ));
     }
 }

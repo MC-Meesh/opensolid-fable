@@ -27,6 +27,8 @@ pub enum NurbsError {
     },
     #[error("knot vector is decreasing at index {index}")]
     DecreasingKnots { index: usize },
+    #[error("knot at index {index} is not finite ({knot})")]
+    NonFiniteKnot { index: usize, knot: f64 },
     #[error("knot vector has an empty domain (start knot equals end knot)")]
     DegenerateDomain,
     #[error("{control_points} control points given, knot vector expects {expected}")]
@@ -39,7 +41,7 @@ pub enum NurbsError {
         weights: usize,
         control_points: usize,
     },
-    #[error("weight at index {index} must be positive")]
+    #[error("weight at index {index} must be finite and positive")]
     NonPositiveWeight { index: usize },
     #[error("knot {knot} lies outside the open domain ({start}, {end})")]
     KnotOutOfDomain { knot: f64, start: f64, end: f64 },
@@ -59,9 +61,14 @@ pub enum NurbsError {
 
 /// Validated knot vector of a fixed degree.
 ///
-/// Invariants (enforced at construction): non-decreasing, at least
-/// `2 * (degree + 1)` knots (so at least `degree + 1` control points), and a
-/// non-empty domain `knots[degree] < knots[len - degree - 1]`.
+/// Invariants (enforced at construction): every knot finite, non-decreasing,
+/// at least `2 * (degree + 1)` knots (so at least `degree + 1` control
+/// points), and a non-empty domain `knots[degree] < knots[len - degree - 1]`.
+///
+/// Finiteness is checked first and is not redundant with the ordering check:
+/// `NaN < x` and `NaN >= x` are both false, so a NaN knot satisfies both the
+/// monotonicity scan and the empty-domain test while making every value
+/// derived from the vector NaN.
 #[derive(Debug, Clone, PartialEq)]
 pub struct KnotVector {
     degree: usize,
@@ -78,6 +85,16 @@ impl KnotVector {
                 expected,
                 got: knots.len(),
             });
+        }
+        // Non-finite knots first: every comparison against NaN is false, so a
+        // NaN slips through the ordering scan below and through the
+        // empty-domain test, then poisons `domain`, `find_span` and every
+        // evaluation downstream to NaN with nothing reporting why. An
+        // infinite knot passes the same way when it sits at the end of the
+        // vector, making the domain infinite. Found by the `nurbs_eval` fuzz
+        // target (of-ipt.15).
+        if let Some((index, &knot)) = knots.iter().enumerate().find(|(_, k)| !k.is_finite()) {
+            return Err(NurbsError::NonFiniteKnot { index, knot });
         }
         for i in 1..knots.len() {
             if knots[i] < knots[i - 1] {
@@ -290,7 +307,10 @@ impl NurbsCurve {
                 control_points: control_points.len(),
             });
         }
-        if let Some(index) = weights.iter().position(|&w| w <= 0.0) {
+        // `w <= 0.0` alone would miss NaN (every comparison against it is
+        // false) and accept an infinite weight; both divide the homogeneous
+        // coordinates into NaN at evaluation time (of-ipt.15).
+        if let Some(index) = weights.iter().position(|&w| !(w.is_finite() && w > 0.0)) {
             return Err(NurbsError::NonPositiveWeight { index });
         }
         Ok(Self {
@@ -598,6 +618,60 @@ mod tests {
         assert_eq!(kv.domain(), (0.0, 1.0));
         assert_eq!(kv.multiplicity(0.5), 1);
         assert_eq!(kv.multiplicity(0.0), 3);
+    }
+
+    /// Regression for the `nurbs_eval` fuzz target's first finding (of-ipt.15).
+    ///
+    /// A NaN knot satisfies both the monotonicity scan (`NaN < x` is false)
+    /// and the empty-domain test (`NaN >= x` is false), so before the
+    /// finiteness check it constructed successfully and evaluated to
+    /// `[NaN, NaN, NaN]` with nothing reporting why. An infinity at the end
+    /// of the vector slipped through the same way and made `domain()`
+    /// infinite.
+    #[test]
+    fn knot_vector_rejects_non_finite_knots() {
+        for (index, knots) in [
+            (0, vec![f64::NAN, 0.0, 1.0, 1.0]),
+            (1, vec![0.0, f64::NAN, 1.0, 1.0]),
+            (2, vec![0.0, 0.0, f64::NAN, 1.0]),
+            (3, vec![0.0, 0.0, 1.0, f64::INFINITY]),
+            (0, vec![f64::NEG_INFINITY, 0.0, 1.0, 1.0]),
+        ] {
+            let error = KnotVector::new(1, knots.clone()).unwrap_err();
+            assert!(
+                matches!(error, NurbsError::NonFiniteKnot { index: i, .. } if i == index),
+                "knots {knots:?} gave {error:?}"
+            );
+        }
+
+        // The interior-NaN case, at the length that used to construct.
+        let error = KnotVector::new(1, vec![0.0, 0.0, f64::NAN, 1.0, 1.0, 1.0]).unwrap_err();
+        assert!(matches!(error, NurbsError::NonFiniteKnot { index: 2, .. }));
+
+        // Finite knots are unaffected.
+        assert!(KnotVector::new(1, vec![0.0, 0.0, 0.5, 1.0, 1.0, 1.0]).is_ok());
+    }
+
+    /// `w <= 0.0` is false for NaN and for `+inf`, so both used to construct
+    /// and then divide the homogeneous coordinates into NaN (of-ipt.15).
+    #[test]
+    fn curve_rejects_non_finite_weights() {
+        let knots = KnotVector::clamped_uniform(1, 2).unwrap();
+        let points = vec![Point3::new(0.0, 0.0, 0.0), Point3::new(1.0, 0.0, 0.0)];
+        for (index, weights) in [
+            (0, vec![f64::NAN, 1.0]),
+            (1, vec![1.0, f64::INFINITY]),
+            (0, vec![f64::NEG_INFINITY, 1.0]),
+            (1, vec![1.0, 0.0]),
+            (0, vec![-1.0, 1.0]),
+        ] {
+            assert_eq!(
+                NurbsCurve::new(points.clone(), weights.clone(), knots.clone()),
+                Err(NurbsError::NonPositiveWeight { index }),
+                "weights {weights:?} were accepted"
+            );
+        }
+        assert!(NurbsCurve::new(points, vec![1.0, 0.5], knots).is_ok());
     }
 
     #[test]

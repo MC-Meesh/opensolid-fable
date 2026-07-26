@@ -66,7 +66,11 @@ Two ideas from the spec we keep:
 - `cargo clippy -- -D warnings` clean
 - Meshes: watertight/manifold checks where applicable
 - Runtime deps stay minimal: `nalgebra`, `thiserror`, `rayon` only
-  (`criterion` + `proptest` approved as **dev**-dependencies)
+  (`criterion` + `proptest` approved as **dev**-dependencies; `libfuzzer-sys`
+  and `arbitrary` live only in the excluded `fuzz/` workspace)
+- Untrusted-input surfaces stay fuzzed: `tools/fuzz/run.sh <target>`, with the
+  corpus replayed on stable by `cargo test --manifest-path fuzz/Cargo.toml
+  --no-default-features` in CI (`fuzz/README.md`)
 - No panics in public APIs — structured errors (`thiserror`)
 
 ## Long poles to watch

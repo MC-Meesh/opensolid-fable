@@ -65,7 +65,10 @@ web/playground/         React 18 + Vite SPA: script → mesh in WASM → three.j
 Dependency direction: `core ← frep`, `core ← brep`, and `kernel` sits on top of
 all three (`crates/opensolid-kernel/src/lib.rs:11-13`). Runtime dependencies are
 deliberately minimal — `nalgebra`, `thiserror`, `rayon` only (`Cargo.toml`);
-`criterion` and `proptest` are dev-only.
+`criterion` and `proptest` are dev-only. The `fuzz/` package (cargo-fuzz
+targets for the STEP parser, topology validation and NURBS evaluation) is its
+own workspace, listed under `workspace.exclude`, so `libfuzzer-sys` and
+`arbitrary` never reach the kernel's lockfile — see `fuzz/README.md`.
 
 ### Data flow
 
