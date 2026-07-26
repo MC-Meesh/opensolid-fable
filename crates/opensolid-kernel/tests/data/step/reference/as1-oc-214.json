@@ -1,0 +1,291 @@
+{
+  "schema": "opensolid-occ-reference/1",
+  "generator": "scripts/occ_reference.py",
+  "occ": "cadquery-ocp 7.9.3.1.1",
+  "source": {
+    "file": "as1-oc-214.stp",
+    "bytes": 441968,
+    "fnv1a64": "96f83367580bcd97"
+  },
+  "read_status": "IFSelect_RetDone",
+  "totals": {
+    "solids": 18,
+    "faces": 160,
+    "edges": 354,
+    "vertices": 236,
+    "volume": 764519.806379,
+    "area": 141079.297888
+  },
+  "solids": [
+    {
+      "volume": 530574.965189,
+      "area": 70027.3494419,
+      "centroid": [
+        90.0,
+        75.0000000087,
+        10.0000037156
+      ],
+      "faces": 18,
+      "edges": 48,
+      "vertices": 32,
+      "shells": 1,
+      "valid": true,
+      "index": 0
+    },
+    {
+      "volume": 96858.5730534,
+      "area": 24628.2653815,
+      "centroid": [
+        19.5945820471,
+        74.9999999999,
+        40.202718623
+      ],
+      "faces": 16,
+      "edges": 42,
+      "vertices": 28,
+      "shells": 1,
+      "valid": true,
+      "index": 1
+    },
+    {
+      "volume": 96858.5730534,
+      "area": 24628.2653815,
+      "centroid": [
+        160.405417953,
+        75.0000000001,
+        40.202718623
+      ],
+      "faces": 16,
+      "edges": 42,
+      "vertices": 28,
+      "shells": 1,
+      "valid": true,
+      "index": 2
+    },
+    {
+      "volume": 15708.3913517,
+      "area": 6440.27050821,
+      "centroid": [
+        89.9979083585,
+        74.9999999729,
+        60.0
+      ],
+      "faces": 4,
+      "edges": 6,
+      "vertices": 4,
+      "shells": 1,
+      "valid": true,
+      "index": 3
+    },
+    {
+      "volume": 3200.718449,
+      "area": 1562.98478691,
+      "centroid": [
+        24.9999999989,
+        75.0,
+        16.0644022634
+      ],
+      "faces": 7,
+      "edges": 12,
+      "vertices": 8,
+      "shells": 1,
+      "valid": true,
+      "index": 4
+    },
+    {
+      "volume": 3200.718449,
+      "area": 1562.98478691,
+      "centroid": [
+        47.4999999989,
+        62.00961894,
+        16.0644022634
+      ],
+      "faces": 7,
+      "edges": 12,
+      "vertices": 8,
+      "shells": 1,
+      "valid": true,
+      "index": 5
+    },
+    {
+      "volume": 3200.718449,
+      "area": 1562.98478691,
+      "centroid": [
+        47.4999999989,
+        87.99038106,
+        16.0644022634
+      ],
+      "faces": 7,
+      "edges": 12,
+      "vertices": 8,
+      "shells": 1,
+      "valid": true,
+      "index": 6
+    },
+    {
+      "volume": 3200.718449,
+      "area": 1562.98478691,
+      "centroid": [
+        155.000000001,
+        75.0,
+        16.0644022634
+      ],
+      "faces": 7,
+      "edges": 12,
+      "vertices": 8,
+      "shells": 1,
+      "valid": true,
+      "index": 7
+    },
+    {
+      "volume": 3200.718449,
+      "area": 1562.98478691,
+      "centroid": [
+        132.500000001,
+        87.99038106,
+        16.0644022634
+      ],
+      "faces": 7,
+      "edges": 12,
+      "vertices": 8,
+      "shells": 1,
+      "valid": true,
+      "index": 8
+    },
+    {
+      "volume": 3200.718449,
+      "area": 1562.98478691,
+      "centroid": [
+        132.500000001,
+        62.00961894,
+        16.0644022634
+      ],
+      "faces": 7,
+      "edges": 12,
+      "vertices": 8,
+      "shells": 1,
+      "valid": true,
+      "index": 9
+    },
+    {
+      "volume": 664.374129725,
+      "area": 747.154806709,
+      "centroid": [
+        176.500011127,
+        75.0000000192,
+        60.0
+      ],
+      "faces": 8,
+      "edges": 18,
+      "vertices": 12,
+      "shells": 1,
+      "valid": true,
+      "index": 10
+    },
+    {
+      "volume": 664.374129725,
+      "area": 747.154806709,
+      "centroid": [
+        3.50001112727,
+        75.0000000192,
+        60.0
+      ],
+      "faces": 8,
+      "edges": 18,
+      "vertices": 12,
+      "shells": 1,
+      "valid": true,
+      "index": 11
+    },
+    {
+      "volume": 664.374129725,
+      "area": 747.154806709,
+      "centroid": [
+        25.0,
+        75.0000000192,
+        -1.50001112727
+      ],
+      "faces": 8,
+      "edges": 18,
+      "vertices": 12,
+      "shells": 1,
+      "valid": true,
+      "index": 12
+    },
+    {
+      "volume": 664.374129725,
+      "area": 747.154806709,
+      "centroid": [
+        47.5,
+        62.0096189592,
+        -1.50001112727
+      ],
+      "faces": 8,
+      "edges": 18,
+      "vertices": 12,
+      "shells": 1,
+      "valid": true,
+      "index": 13
+    },
+    {
+      "volume": 664.374129725,
+      "area": 747.154806709,
+      "centroid": [
+        47.5,
+        87.9903810792,
+        -1.50001112727
+      ],
+      "faces": 8,
+      "edges": 18,
+      "vertices": 12,
+      "shells": 1,
+      "valid": true,
+      "index": 14
+    },
+    {
+      "volume": 664.374129725,
+      "area": 747.154806709,
+      "centroid": [
+        155.0,
+        74.9999999808,
+        -1.50001112727
+      ],
+      "faces": 8,
+      "edges": 18,
+      "vertices": 12,
+      "shells": 1,
+      "valid": true,
+      "index": 15
+    },
+    {
+      "volume": 664.374129725,
+      "area": 747.154806709,
+      "centroid": [
+        132.5,
+        87.9903810408,
+        -1.50001112727
+      ],
+      "faces": 8,
+      "edges": 18,
+      "vertices": 12,
+      "shells": 1,
+      "valid": true,
+      "index": 16
+    },
+    {
+      "volume": 664.374129725,
+      "area": 747.154806709,
+      "centroid": [
+        132.5,
+        62.0096189208,
+        -1.50001112727
+      ],
+      "faces": 8,
+      "edges": 18,
+      "vertices": 12,
+      "shells": 1,
+      "valid": true,
+      "index": 17
+    }
+  ]
+}

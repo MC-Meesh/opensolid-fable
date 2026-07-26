@@ -1,0 +1,36 @@
+{
+  "schema": "opensolid-occ-reference/1",
+  "generator": "scripts/occ_reference.py",
+  "occ": "cadquery-ocp 7.9.3.1.1",
+  "source": {
+    "file": "occ/tangent/sphere_in_matching_pocket.stp",
+    "bytes": 6887,
+    "fnv1a64": "bb81cea83c8ca674"
+  },
+  "read_status": "IFSelect_RetDone",
+  "totals": {
+    "solids": 1,
+    "faces": 3,
+    "edges": 5,
+    "vertices": 3,
+    "volume": 8377.58040957,
+    "area": 2199.11485751
+  },
+  "solids": [
+    {
+      "volume": 8377.58040957,
+      "area": 2199.11485751,
+      "centroid": [
+        -1.02320564472e-13,
+        2.46406906582e-16,
+        3.4375
+      ],
+      "faces": 3,
+      "edges": 5,
+      "vertices": 3,
+      "shells": 1,
+      "valid": true,
+      "index": 0
+    }
+  ]
+}

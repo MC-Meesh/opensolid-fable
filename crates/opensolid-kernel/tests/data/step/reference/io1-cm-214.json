@@ -1,0 +1,36 @@
+{
+  "schema": "opensolid-occ-reference/1",
+  "generator": "scripts/occ_reference.py",
+  "occ": "cadquery-ocp 7.9.3.1.1",
+  "source": {
+    "file": "io1-cm-214.stp",
+    "bytes": 41720,
+    "fnv1a64": "fb1515ac84f23137"
+  },
+  "read_status": "IFSelect_RetDone",
+  "totals": {
+    "solids": 1,
+    "faces": 29,
+    "edges": 70,
+    "vertices": 46,
+    "volume": 78234.4238661,
+    "area": 21137.4137959
+  },
+  "solids": [
+    {
+      "volume": 78234.4238661,
+      "area": 21137.4137959,
+      "centroid": [
+        12.7334712138,
+        2.94055946552e-16,
+        -1.06952295969e-15
+      ],
+      "faces": 29,
+      "edges": 70,
+      "vertices": 46,
+      "shells": 1,
+      "valid": true,
+      "index": 0
+    }
+  ]
+}

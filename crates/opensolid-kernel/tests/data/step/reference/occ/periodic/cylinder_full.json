@@ -1,0 +1,36 @@
+{
+  "schema": "opensolid-occ-reference/1",
+  "generator": "scripts/occ_reference.py",
+  "occ": "cadquery-ocp 7.9.3.1.1",
+  "source": {
+    "file": "occ/periodic/cylinder_full.stp",
+    "bytes": 7196,
+    "fnv1a64": "498fce0e94363414"
+  },
+  "read_status": "IFSelect_RetDone",
+  "totals": {
+    "solids": 1,
+    "faces": 3,
+    "edges": 3,
+    "vertices": 2,
+    "volume": 13571.6802635,
+    "area": 3166.72539482
+  },
+  "solids": [
+    {
+      "volume": 13571.6802635,
+      "area": 3166.72539482,
+      "centroid": [
+        1.67535390629e-15,
+        3.6113870486e-16,
+        0.0
+      ],
+      "faces": 3,
+      "edges": 3,
+      "vertices": 2,
+      "shells": 1,
+      "valid": true,
+      "index": 0
+    }
+  ]
+}

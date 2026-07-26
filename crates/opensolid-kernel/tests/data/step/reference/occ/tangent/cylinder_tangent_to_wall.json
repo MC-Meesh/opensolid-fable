@@ -1,0 +1,36 @@
+{
+  "schema": "opensolid-occ-reference/1",
+  "generator": "scripts/occ_reference.py",
+  "occ": "cadquery-ocp 7.9.3.1.1",
+  "source": {
+    "file": "occ/tangent/cylinder_tangent_to_wall.stp",
+    "bytes": 28221,
+    "fnv1a64": "3f99f3e0ded2cc7d"
+  },
+  "read_status": "IFSelect_RetDone",
+  "totals": {
+    "solids": 1,
+    "faces": 11,
+    "edges": 21,
+    "vertices": 12,
+    "volume": 34261.9467106,
+    "area": 7153.98223686
+  },
+  "solids": [
+    {
+      "volume": 34261.9467106,
+      "area": 7153.98223686,
+      "centroid": [
+        0.924268962756,
+        -4.74790404202e-16,
+        -6.2116073559e-14
+      ],
+      "faces": 11,
+      "edges": 21,
+      "vertices": 12,
+      "shells": 1,
+      "valid": true,
+      "index": 0
+    }
+  ]
+}

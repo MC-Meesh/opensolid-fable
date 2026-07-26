@@ -1,0 +1,36 @@
+{
+  "schema": "opensolid-occ-reference/1",
+  "generator": "scripts/occ_reference.py",
+  "occ": "cadquery-ocp 7.9.3.1.1",
+  "source": {
+    "file": "nist/nist_ftc_09_asme1_rd.stp",
+    "bytes": 263916,
+    "fnv1a64": "d34c0ad630e0c0f9"
+  },
+  "read_status": "IFSelect_RetDone",
+  "totals": {
+    "solids": 1,
+    "faces": 158,
+    "edges": 454,
+    "vertices": 300,
+    "volume": 136445.104825,
+    "area": 96614.2338006
+  },
+  "solids": [
+    {
+      "volume": 136445.104825,
+      "area": 96614.2338006,
+      "centroid": [
+        2.18593563204,
+        1.51503523865,
+        4.55426980806
+      ],
+      "faces": 158,
+      "edges": 454,
+      "vertices": 300,
+      "shells": 1,
+      "valid": true,
+      "index": 0
+    }
+  ]
+}

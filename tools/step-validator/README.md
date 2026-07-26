@@ -33,6 +33,30 @@ workflow_dispatch, or weekly when the repository variable
 `OPENSOLID_STEP_VALIDATOR` is `1`. The pass-rate lines land in the job
 summary.
 
+## The other external kernel: OCC as a per-file oracle
+
+This validator answers "does the file survive a trip through another
+kernel?". It does not answer "is the geometry we imported the same geometry
+that kernel sees?" — that is `scripts/occ_reference.py` (of-ipt.16), which
+records OpenCASCADE's account of every corpus file (per-solid volume, area,
+centroid, face/edge/vertex counts) plus `BRepAlgoAPI` results for a fixed
+boolean operand set as JSON checked in under
+`crates/opensolid-kernel/tests/data/step/reference/`.
+
+Because those references are checked in, the comparison
+(`crates/opensolid-kernel/tests/occ_reference.rs`) is hermetic and runs in
+the default `cargo test`. OCC is only needed to refresh them, which the
+`occ-references` job in the same workflow as this validator does weekly with
+`--check`.
+
+```bash
+pip install cadquery-ocp
+python3 scripts/occ_reference.py corpus     # refresh per-file references
+python3 scripts/occ_reference.py booleans   # refresh the boolean differential
+python3 scripts/occ_reference.py generate   # rebuild the occ/ edge-case files
+python3 scripts/occ_reference.py corpus --check   # CI: fail on drift
+```
+
 ## Related
 
 - `crates/opensolid-kernel/examples/step_import_report.rs` — per-file import
@@ -42,3 +66,5 @@ summary.
   exporter for direction 1.
 - `crates/opensolid-kernel/tests/step_corpus.rs` — the hermetic corpus suite
   (structured outcomes + pass-rate floor) that runs in default CI.
+- `crates/opensolid-kernel/tests/occ_reference.rs` — the hermetic OCC
+  differential described above, also in default CI.

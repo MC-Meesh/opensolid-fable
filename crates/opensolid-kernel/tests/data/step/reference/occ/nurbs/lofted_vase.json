@@ -1,0 +1,36 @@
+{
+  "schema": "opensolid-occ-reference/1",
+  "generator": "scripts/occ_reference.py",
+  "occ": "cadquery-ocp 7.9.3.1.1",
+  "source": {
+    "file": "occ/nurbs/lofted_vase.stp",
+    "bytes": 13575,
+    "fnv1a64": "70a9374031ec5f3e"
+  },
+  "read_status": "IFSelect_RetDone",
+  "totals": {
+    "solids": 1,
+    "faces": 3,
+    "edges": 3,
+    "vertices": 2,
+    "volume": 14205.856892,
+    "area": 2892.96090123
+  },
+  "solids": [
+    {
+      "volume": 14205.856892,
+      "area": 2892.96090123,
+      "centroid": [
+        8.00353381007e-06,
+        1.45001774201e-12,
+        11.5219702925
+      ],
+      "faces": 3,
+      "edges": 3,
+      "vertices": 2,
+      "shells": 1,
+      "valid": true,
+      "index": 0
+    }
+  ]
+}

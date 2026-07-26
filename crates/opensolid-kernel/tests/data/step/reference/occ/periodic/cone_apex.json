@@ -1,0 +1,36 @@
+{
+  "schema": "opensolid-occ-reference/1",
+  "generator": "scripts/occ_reference.py",
+  "occ": "cadquery-ocp 7.9.3.1.1",
+  "source": {
+    "file": "occ/periodic/cone_apex.stp",
+    "bytes": 5966,
+    "fnv1a64": "4ffac3cdd892f245"
+  },
+  "read_status": "IFSelect_RetDone",
+  "totals": {
+    "solids": 1,
+    "faces": 2,
+    "edges": 3,
+    "vertices": 2,
+    "volume": 5890.48622548,
+    "area": 2080.74401978
+  },
+  "solids": [
+    {
+      "volume": 5890.48622548,
+      "area": 2080.74401978,
+      "centroid": [
+        -2.00720800804e-15,
+        -8.21837521628e-18,
+        -6.25000000001
+      ],
+      "faces": 2,
+      "edges": 3,
+      "vertices": 2,
+      "shells": 1,
+      "valid": true,
+      "index": 0
+    }
+  ]
+}

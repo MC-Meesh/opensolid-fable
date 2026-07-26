@@ -1,11 +1,19 @@
-# External STEP validation (of-3qy.10): round-trip our STEP exports through
-# headless FreeCAD and import FreeCAD's exports through our reader, reporting
-# the pass-rate metric from spec/06-step-io.md.
+# External STEP validation: two jobs that both need a CAD kernel we do not
+# want in the default CI image.
 #
-# Deliberately NOT part of the default CI: it needs an external CAD kernel
-# (apt freecad), so it runs only on manual dispatch, or on its weekly
-# schedule when the repository variable OPENSOLID_STEP_VALIDATOR is "1".
-# Default `cargo test` stays hermetic.
+# 1. `validate` (of-3qy.10) — round-trip our STEP exports through headless
+#    FreeCAD and import FreeCAD's exports through our reader, reporting the
+#    pass-rate metric from spec/06-step-io.md.
+# 2. `occ-references` (of-ipt.16) — regenerate the checked-in OCC reference
+#    data with `scripts/occ_reference.py --check` and fail on drift. The
+#    comparison itself (tests/occ_reference.rs) runs per-PR in the default
+#    hermetic suite; this job is what proves the numbers it compares against
+#    still match live OpenCASCADE.
+#
+# Deliberately NOT part of the default CI: both need an external CAD kernel,
+# so they run only on manual dispatch, or on the weekly schedule when the
+# repository variable OPENSOLID_STEP_VALIDATOR is "1". Default `cargo test`
+# stays hermetic.
 name: external-step-validation
 
 on:
@@ -50,3 +58,49 @@ jobs:
             grep -E "pass rate|validation" validator.log || true
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+  occ-references:
+    name: OCC reference freshness
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || vars.OPENSOLID_STEP_VALIDATOR == '1'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install OpenCASCADE bindings
+        run: pip install cadquery-ocp
+
+      # Informational: OCC's own STEP writer changes formatting between
+      # releases, so a diff here usually means the pip wheel moved, not that
+      # anything is wrong. Reported, never gated.
+      - name: Report edge-case corpus drift
+        run: |
+          {
+            echo "## Self-generated corpus files"
+            echo '```'
+            python3 scripts/occ_reference.py generate --check 2>&1 | tail -n 20 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Gated: these are the numbers tests/occ_reference.rs compares against
+      # on every PR. Drift means the oracle itself moved and someone has to
+      # look — regenerate with `scripts/occ_reference.py corpus` (and
+      # `booleans`) and commit, after checking the deltas are OCC's and not
+      # ours. An OCC upgrade landing in the pip wheel can legitimately turn
+      # this red; that is the signal working, not a flake.
+      - name: Check the checked-in references against live OCC
+        run: |
+          # Without pipefail the `| tail` would mask the generator's status.
+          set -o pipefail
+          status=0
+          {
+            echo "## OCC reference freshness"
+            echo '```'
+            python3 scripts/occ_reference.py corpus --check 2>&1 | tail -n 40 || status=1
+            python3 scripts/occ_reference.py booleans --check 2>&1 | tail -n 5 || status=1
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit $status
