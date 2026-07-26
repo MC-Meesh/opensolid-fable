@@ -86,21 +86,41 @@
 //! - **Edge parameter range**: `[t_start, t_end]` is finite and increasing,
 //!   the precondition every consumer of an edge's curve assumes.
 //!
-//! Self-intersection and face-face clash detection are a separate problem
-//! (a pairwise search rather than a walk) and are not here yet.
+//! # Self-intersection
+//!
+//! Face-face clash detection is a different shape of computation — a
+//! pairwise search over faces rather than a walk down the containment tree
+//! — so it is a third entry point,
+//! [`TopologyStore::check_self_intersection`], which
+//! [`TopologyStore::check_with_geometry`] also runs.
+//!
+//! It reports a [`CheckFailure::SelfIntersection`] for each pair of faces
+//! that meet somewhere other than along topology they share. Faces are
+//! pruned against conservative bounding boxes and then intersected through
+//! [`crate::ssi`], and each sample of the resulting curves is classified
+//! against both faces' trimmed regions; adjacency is excused by measuring
+//! the contact against the shared edge or vertex that explains it, so two
+//! faces that share an edge *and* cross elsewhere are still caught. See
+//! that method for the sampling limits.
 
+use crate::boolean::{
+    Chart, CoverEmbedder, CoverPoint, FaceRegionPoly, clip_line_to_box, geometric_snap,
+    is_bounded_marched,
+};
 use crate::curve::{Curve3, CurveEval};
 use crate::euler::EulerCounts;
 use crate::geometry::GeometryStore;
 use crate::pcurve::{Curve2, Curve2Eval};
-use crate::project::SurfaceProject;
+use crate::project::{CurveProject, SurfaceProject};
+use crate::ssi::{self, SurfaceIntersection};
 use crate::surface::{Surface3, SurfaceEval};
 use crate::topology::{
     Body, BodyType, Edge, Face, FaceSense, Fin, FinSense, Loop, LoopType, SYSTEM_RESOLUTION, Shell,
-    TopologyStore, Vertex,
+    ShellOrientation, TopologyStore, Vertex,
 };
 use opensolid_core::EntityId;
-use opensolid_core::types::{Point2, Point3, Vector2};
+use opensolid_core::tolerance::ToleranceContext;
+use opensolid_core::types::{BoundingBox3, Point2, Point3, Vector2};
 use thiserror::Error;
 
 /// Maximum allowed tolerance on any entity, from the spec's default
@@ -389,6 +409,18 @@ pub enum CheckFailure {
         t_start: f64,
         t_end: f64,
     },
+
+    /// Two faces of one body whose trimmed surfaces meet somewhere other
+    /// than along the topology they share — the body passes through itself
+    /// (`spec/11-testing.md` §4.1 `check_no_self_intersection`). `at` is one
+    /// point of the clash, for locating it; a pair is reported once however
+    /// large the overlap.
+    #[error("faces {face_a:?} and {face_b:?} intersect at {at:?}")]
+    SelfIntersection {
+        face_a: EntityId<Face>,
+        face_b: EntityId<Face>,
+        at: Point3,
+    },
 }
 
 impl CheckFailure {
@@ -411,6 +443,7 @@ impl CheckFailure {
                 | CheckFailure::PcurveDeviation { .. }
                 | CheckFailure::FaceSenseContradictsLoop { .. }
                 | CheckFailure::InvalidEdgeRange { .. }
+                | CheckFailure::SelfIntersection { .. }
         )
     }
 }
@@ -1030,12 +1063,12 @@ impl TopologyStore {
     }
 
     /// Validate `body` topologically *and* geometrically: the concatenation
-    /// of [`TopologyStore::check`] and [`TopologyStore::check_geometry`],
-    /// topology first.
+    /// of [`TopologyStore::check`], [`TopologyStore::check_geometry`] and
+    /// [`TopologyStore::check_self_intersection`], topology first.
     ///
-    /// The two passes are independent — a geometric defect never suppresses
-    /// a topological one or vice versa — so the combined list is exactly
-    /// what running both gives.
+    /// The passes are independent — a geometric defect never suppresses a
+    /// topological one or vice versa — so the combined list is exactly what
+    /// running all three gives.
     pub fn check_with_geometry(
         &self,
         geo: &GeometryStore,
@@ -1043,12 +1076,223 @@ impl TopologyStore {
     ) -> Vec<CheckFailure> {
         let mut failures = self.check(body);
         // A stale body is reported once, by `check`; re-reporting it from
-        // the geometric pass would say the same thing twice.
+        // the geometric passes would say the same thing twice.
         if failures == [CheckFailure::StaleBody(body)] {
             return failures;
         }
         failures.extend(self.check_geometry(geo, body));
+        failures.extend(self.check_self_intersection(geo, body));
         failures
+    }
+
+    /// Find the face pairs of `body` that actually meet in space without
+    /// sharing the topology that would make meeting legal — the body
+    /// passing through itself (`spec/11-testing.md` §4.1
+    /// `check_no_self_intersection`).
+    ///
+    /// A third entry point rather than part of [`TopologyStore::check_geometry`]
+    /// because it is a different *shape* of computation: the other geometric
+    /// checks walk the body once and measure each entity against its own
+    /// neighbours, while this one is a pairwise search over faces, and is
+    /// priced accordingly. [`TopologyStore::check_with_geometry`] runs it.
+    ///
+    /// # What counts as a clash
+    ///
+    /// In a valid body two faces may touch only along topology they *share*:
+    /// a common edge or a common vertex. Every other point that lies on both
+    /// faces' trimmed regions is a defect — interiors crossing, an edge
+    /// stabbing through a face, or two faces laid over each other. So a
+    /// point is reported when it lies on both faces (inside the trim, or
+    /// within tolerance of its boundary) and is further than that same
+    /// tolerance band from every edge and vertex the two faces have in
+    /// common. Adjacency is thereby excused by *measurement* against the
+    /// shared entity's own geometry rather than by skipping adjacent pairs
+    /// outright, so two faces that share an edge and *also* cross elsewhere
+    /// are still caught.
+    ///
+    /// # Method and its limits
+    ///
+    /// Broad phase: a conservative bounding box per face — its rim samples
+    /// plus a parameter-space grid over the interior, dilated by the largest
+    /// sagitta that grid leaves unresolved, so a curved face's bulge is
+    /// inside its own box. Pairs whose boxes are disjoint are dropped
+    /// without touching geometry.
+    ///
+    /// Narrow phase: the surfaces' intersection from [`crate::ssi`] — exact
+    /// where a closed form exists, marched otherwise — sampled along its
+    /// curves and each sample classified against both faces' trims. This is
+    /// a *sampled* search, so it is sound (everything reported really is a
+    /// clash, up to the tolerance band above) but not complete: an overlap
+    /// far narrower than the sample spacing can slip between samples, and a
+    /// surface pair whose intersection the SSI layer cannot compute at all
+    /// is skipped rather than guessed at. A face whose geometry is missing,
+    /// whose parameter chart cannot be built, or whose loops do not embed is
+    /// likewise skipped — the same "measure what is there" policy
+    /// [`TopologyStore::check_geometry`] follows.
+    ///
+    /// Faces are paired across the whole body, not within each shell: an
+    /// inner void shell touching its outer shell is as invalid as a shell
+    /// crossing itself.
+    pub fn check_self_intersection(
+        &self,
+        geo: &GeometryStore,
+        body: EntityId<Body>,
+    ) -> Vec<CheckFailure> {
+        let Some(b) = self.bodies.get(body) else {
+            return vec![CheckFailure::StaleBody(body)];
+        };
+        // The checks take no tolerance argument, and the entity tolerances
+        // they do read are per-edge claims about geometry, not the modelling
+        // context. The default context is what the rest of the crate builds
+        // bodies with (`crate::tessellate`, `crate::boolean` callers).
+        let tol = ToleranceContext::default();
+
+        let mut patches: Vec<FacePatch> = Vec::new();
+        for &shell_id in &b.shells {
+            let Some(shell) = self.shells.get(shell_id) else {
+                continue;
+            };
+            for &face_id in &shell.faces {
+                let Some(face) = self.faces.get(face_id) else {
+                    continue;
+                };
+                // The cover embedder needs the loops' winding in the chart,
+                // which is CCW exactly when the face's outward side follows
+                // the surface normal (as `crate::boolean` derives it).
+                let outward_along_normal = (face.sense == FaceSense::Positive)
+                    == (shell.orientation == ShellOrientation::Outward);
+                if let Some(patch) = self.face_patch(geo, &tol, face_id, outward_along_normal) {
+                    patches.push(patch);
+                }
+            }
+        }
+
+        let mut failures = Vec::new();
+        for (i, a) in patches.iter().enumerate() {
+            for b in &patches[i + 1..] {
+                let overlap = a.bbox.intersection(&b.bbox);
+                if overlap.is_empty() {
+                    continue;
+                }
+                if let Some(at) = clash_point(a, b, &overlap, &tol) {
+                    failures.push(CheckFailure::SelfIntersection {
+                        face_a: a.face,
+                        face_b: b.face,
+                        at,
+                    });
+                }
+            }
+        }
+        failures
+    }
+
+    /// The self-intersection pass's working view of one face: its trimmed
+    /// region in parameter space, a conservative box around it in space, and
+    /// the boundary entities that excuse a contact.
+    ///
+    /// `None` for a face this check cannot measure — missing geometry, a
+    /// surface with no invertible chart, a broken edge range, or loops that
+    /// do not embed in the chart's cover. Skipping is deliberate: every one
+    /// of those is either reported by another check or is a face the kernel
+    /// declines to model, and a guessed region would classify clashes
+    /// against a boundary that is not the face's.
+    fn face_patch(
+        &self,
+        geo: &GeometryStore,
+        tol: &ToleranceContext,
+        face_id: EntityId<Face>,
+        outward_along_normal: bool,
+    ) -> Option<FacePatch> {
+        let face = self.faces.get(face_id)?;
+        let surface = geo.surface(face.surface?)?.clone();
+        let chart = Chart::build(&surface, tol).ok()?;
+
+        let mut edges: Vec<BoundaryEdge> = Vec::new();
+        let mut vertices: Vec<(EntityId<Vertex>, Point3)> = Vec::new();
+        let mut tolerance = SYSTEM_RESOLUTION;
+        let mut claim = |t: f64| {
+            if t.is_finite() && t > tolerance {
+                tolerance = t.min(MAX_ALLOWED_TOLERANCE);
+            }
+        };
+
+        let mut loops: Vec<Vec<CoverPoint>> = Vec::new();
+        for loop_id in face
+            .outer_loop
+            .into_iter()
+            .chain(face.inner_loops.iter().copied())
+        {
+            let lp = self.loops.get(loop_id)?;
+            let mut walk: Vec<Point3> = Vec::new();
+            for &fin_id in &lp.fins {
+                let fin = self.fins.get(fin_id)?;
+                let edge = self.edges.get(fin.edge)?;
+                if !edge_range_is_sane(edge) {
+                    return None;
+                }
+                let curve = edge.curve.and_then(|id| geo.curve(id))?;
+                if !edges.iter().any(|e| e.id == fin.edge) {
+                    claim(edge.tolerance);
+                    edges.push(BoundaryEdge {
+                        id: fin.edge,
+                        curve: curve.clone(),
+                        t_start: edge.t_start,
+                        t_end: edge.t_end,
+                    });
+                }
+                for vertex_id in [edge.start_vertex, edge.end_vertex] {
+                    let Some(vertex) = self.vertices.get(vertex_id) else {
+                        continue;
+                    };
+                    if !vertices.iter().any(|&(id, _)| id == vertex_id) {
+                        claim(vertex.tolerance);
+                        vertices.push((vertex_id, vertex.point));
+                    }
+                }
+                append_fin_samples(
+                    &mut walk,
+                    curve,
+                    edge.t_start,
+                    edge.t_end,
+                    fin.sense == FinSense::Forward,
+                );
+            }
+            if walk.len() < 3 {
+                return None;
+            }
+            let mut embedder = CoverEmbedder::new(&chart, outward_along_normal);
+            let mut cover: Vec<CoverPoint> = Vec::with_capacity(walk.len());
+            for p in walk {
+                if !is_finite(&p) {
+                    return None;
+                }
+                embedder.push(p, &mut cover).ok()?;
+            }
+            if cover.len() < 3 {
+                return None;
+            }
+            loops.push(cover);
+        }
+        if loops.is_empty() {
+            return None;
+        }
+
+        let snap = geometric_snap(loops.iter().flatten().map(|&(_, p)| p));
+        let poly = FaceRegionPoly { chart, loops };
+        let (uv_min, uv_max) = uv_bounds(&poly)?;
+        let bbox = face_bbox(&surface, &poly, uv_min, uv_max)?;
+        Some(FacePatch {
+            face: face_id,
+            surface,
+            poly,
+            bbox,
+            uv_min,
+            uv_max,
+            snap,
+            edges,
+            vertices,
+            tolerance,
+        })
     }
 
     /// Twice the signed area a loop encloses in its face's parameter space,
@@ -1364,6 +1608,414 @@ fn pcurve_check_params(pcurve: &Curve2, t_start: f64, t_end: f64) -> Vec<f64> {
         }
     }
     edge_samples(t_start, t_end).collect()
+}
+
+// --------------------------------------------------------------------------
+// Self-intersection
+// --------------------------------------------------------------------------
+
+/// Samples taken along one intersection curve. The clash search is a
+/// sampled one (see [`TopologyStore::check_self_intersection`]), so this is
+/// the resolution below which an overlap can hide: a fine enough comb for
+/// any clash a producer would call a defect, and still cheap against the
+/// closed-form evaluation of a single curve.
+const CLASH_CURVE_SAMPLES: usize = 128;
+
+/// Samples per parameter direction of the grid that fills in a face's
+/// bounding box between its rim samples.
+const FACE_GRID: usize = 12;
+
+/// Samples per parameter direction over a face's parameter rectangle when
+/// its surface is *coincident* with another face's: there is no
+/// intersection curve to walk, so the overlap is hunted over the region
+/// itself. Denser than [`FACE_GRID`], which only has to bound a box.
+const COINCIDENT_GRID: usize = 24;
+
+/// Segments a straight boundary edge is sampled into for the parameter-space
+/// cover. Straight in space is not straight in a curved surface's parameter
+/// space, so even a line gets several.
+const BOUNDARY_LINE_SEGMENTS: usize = 8;
+
+/// Segments a full revolution of a curved boundary edge is sampled into
+/// (matching the density `crate::boolean` builds its own face regions at).
+const BOUNDARY_CIRCLE_SEGMENTS: usize = 96;
+
+/// How far past the two faces' box overlap the intersection curves are
+/// searched, relative to the pair's joint extent.
+///
+/// Not an accuracy knob — a slack that keeps a *degenerate* overlap (two
+/// planar faces meeting along an edge overlap in a zero-width slab)
+/// searchable at all, since clipping a line to a zero-width slab is a
+/// coin flip on the last bit. It must stay well below the tolerance band a
+/// contact is judged against, or a point admitted only by the padding could
+/// read as too far from the shared edge that explains it.
+const SEARCH_PAD_REL: f64 = 1e-9;
+
+/// The self-intersection pass's working view of one face.
+struct FacePatch {
+    face: EntityId<Face>,
+    surface: Surface3,
+    /// The trimmed region in the surface's parameter cover.
+    poly: FaceRegionPoly,
+    /// Conservative bounds of the face in space (see [`face_bbox`]).
+    bbox: BoundingBox3,
+    uv_min: (f64, f64),
+    uv_max: (f64, f64),
+    /// Sub-tolerance nudge for the seam-robust containment test.
+    snap: f64,
+    edges: Vec<BoundaryEdge>,
+    vertices: Vec<(EntityId<Vertex>, Point3)>,
+    /// The widest tolerance anything on this face's boundary claims — the
+    /// band within which a contact is measured rather than believed.
+    tolerance: f64,
+}
+
+impl FacePatch {
+    /// Does this face reach `p`? Inside the trimmed region, or within
+    /// `slack` of its boundary — the second arm is what catches a face
+    /// *stabbed* by another face's edge, where the contact locus lies on
+    /// one face's boundary and the strict even-odd test is a coin flip.
+    fn covers(&self, p: &Point3, slack: f64) -> bool {
+        if let Ok(uv) = self.poly.chart.param(p, None) {
+            if self.poly.contains_for_clip(uv, self.snap) {
+                return true;
+            }
+        }
+        self.boundary_distance(p) <= slack
+    }
+
+    /// Distance from `p` to the nearest point of this face's boundary.
+    fn boundary_distance(&self, p: &Point3) -> f64 {
+        self.edges
+            .iter()
+            .map(|edge| edge.distance_to(p))
+            .fold(f64::INFINITY, f64::min)
+    }
+
+    /// Points of the surface over this face's parameter rectangle, row
+    /// major at `n` samples per direction. `None` if any sample is
+    /// non-finite, which makes every box or overlap built on it meaningless.
+    fn grid(&self, n: usize) -> Option<Vec<Point3>> {
+        let mut out = Vec::with_capacity(n * n);
+        for i in 0..n {
+            for j in 0..n {
+                let p = self.surface.point(
+                    lerp(self.uv_min.0, self.uv_max.0, i, n),
+                    lerp(self.uv_min.1, self.uv_max.1, j, n),
+                );
+                if !is_finite(&p) {
+                    return None;
+                }
+                out.push(p);
+            }
+        }
+        Some(out)
+    }
+}
+
+/// One edge on a face's boundary, with the range the edge trims it to.
+struct BoundaryEdge {
+    id: EntityId<Edge>,
+    curve: Curve3,
+    t_start: f64,
+    t_end: f64,
+}
+
+impl BoundaryEdge {
+    /// Distance from `p` to the *trimmed* edge.
+    ///
+    /// Measured against the curve itself, never against the polyline the
+    /// cover is built from: a 96-segment circle's chords sit up to
+    /// `r·1e-3` inside it, which would leave a point exactly on a shared
+    /// circular edge looking a thousand tolerances away from it and turn
+    /// every cylinder rim into a reported clash.
+    ///
+    /// The endpoints join the projected parameter as candidates, so a
+    /// projection that lands outside the trim (or on a periodic curve's far
+    /// side) still measures to the nearest point of the edge that exists.
+    fn distance_to(&self, p: &Point3) -> f64 {
+        let mut t = self.curve.project_point(p).t;
+        if let Some(period) = self.curve.period() {
+            if period > 0.0 && period.is_finite() {
+                t = self.t_start + (t - self.t_start).rem_euclid(period);
+            }
+        }
+        [t.clamp(self.t_start, self.t_end), self.t_start, self.t_end]
+            .into_iter()
+            .map(|t| self.curve.point(t))
+            .filter(is_finite)
+            .map(|q| (q - p).norm())
+            .fold(f64::INFINITY, f64::min)
+    }
+}
+
+/// Sample `i` of `n` across `[lo, hi]`, both ends included.
+fn lerp(lo: f64, hi: f64, i: usize, n: usize) -> f64 {
+    if n <= 1 {
+        return lo;
+    }
+    lo + (hi - lo) * (i as f64) / ((n - 1) as f64)
+}
+
+/// Append one fin's boundary samples to its loop's walk, in traversal
+/// order. The final point is dropped: the next fin starts there, and the
+/// walk closes implicitly onto its first point.
+fn append_fin_samples(
+    out: &mut Vec<Point3>,
+    curve: &Curve3,
+    t_start: f64,
+    t_end: f64,
+    forward: bool,
+) {
+    let n = boundary_segments(curve, t_start, t_end);
+    let mut points: Vec<Point3> = (0..=n)
+        .map(|i| curve.point(lerp(t_start, t_end, i, n + 1)))
+        .collect();
+    if !forward {
+        points.reverse();
+    }
+    points.pop();
+    out.append(&mut points);
+}
+
+/// How finely one boundary edge is sampled: a straight edge by a fixed
+/// count, an angular one by its sweep, a freeform one by the knot spans it
+/// covers (within a span it is a single polynomial piece).
+fn boundary_segments(curve: &Curve3, t_start: f64, t_end: f64) -> usize {
+    match curve {
+        Curve3::Line { .. } => BOUNDARY_LINE_SEGMENTS,
+        Curve3::Polyline { .. } => {
+            // Parameterized by vertex index: one segment per vertex.
+            (((t_end - t_start).ceil()).max(0.0) as usize).max(BOUNDARY_LINE_SEGMENTS)
+        }
+        Curve3::Nurbs(nurbs) => {
+            let (lo, hi) = (t_start.min(t_end), t_start.max(t_end));
+            let interior = nurbs
+                .knot_vector()
+                .knots()
+                .windows(2)
+                .filter(|w| w[1] > w[0] && w[1] > lo && w[1] < hi)
+                .count();
+            (interior + 1) * (BOUNDARY_CIRCLE_SEGMENTS / 4)
+        }
+        _ => {
+            let sweep = (t_end - t_start).abs() / std::f64::consts::TAU;
+            ((BOUNDARY_CIRCLE_SEGMENTS as f64 * sweep).ceil() as usize).max(BOUNDARY_LINE_SEGMENTS)
+        }
+    }
+}
+
+/// Bounds of a face's cover in parameter space; `None` if it is not finite,
+/// in which case nothing downstream can be sampled over it.
+fn uv_bounds(poly: &FaceRegionPoly) -> Option<((f64, f64), (f64, f64))> {
+    let (mut lo, mut hi) = (
+        (f64::INFINITY, f64::INFINITY),
+        (f64::NEG_INFINITY, f64::NEG_INFINITY),
+    );
+    for &((u, v), _) in poly.loops.iter().flatten() {
+        if !u.is_finite() || !v.is_finite() {
+            return None;
+        }
+        lo = (lo.0.min(u), lo.1.min(v));
+        hi = (hi.0.max(u), hi.1.max(v));
+    }
+    (lo.0 <= hi.0 && lo.1 <= hi.1).then_some((lo, hi))
+}
+
+/// A box containing the whole face, rim *and* interior.
+///
+/// The rim alone is not enough: a sphere zone straddling the equator bulges
+/// a quarter of its radius past the box its two latitude circles span. The
+/// face lies entirely over its cover's parameter rectangle, so the surface
+/// is sampled on a grid across that rectangle and the box taken over
+/// everything. What a grid cannot see is how far the surface bows *between*
+/// samples, so the box is dilated by twice the largest such bow found — the
+/// distance from each cell edge's midpoint on the surface to the chord
+/// between its endpoints. That is zero for a plane, real for a sphere, and
+/// scales down as the square of the cell size, so the doubling is ample
+/// slack rather than a guess.
+fn face_bbox(
+    patch_surface: &Surface3,
+    poly: &FaceRegionPoly,
+    uv_min: (f64, f64),
+    uv_max: (f64, f64),
+) -> Option<BoundingBox3> {
+    let mut grid = Vec::with_capacity(FACE_GRID * FACE_GRID);
+    for i in 0..FACE_GRID {
+        for j in 0..FACE_GRID {
+            let uv = (
+                lerp(uv_min.0, uv_max.0, i, FACE_GRID),
+                lerp(uv_min.1, uv_max.1, j, FACE_GRID),
+            );
+            let p = patch_surface.point(uv.0, uv.1);
+            if !is_finite(&p) {
+                return None;
+            }
+            grid.push((uv, p));
+        }
+    }
+
+    let mut sag: f64 = 0.0;
+    let at = |i: usize, j: usize| grid[i * FACE_GRID + j];
+    for i in 0..FACE_GRID {
+        for j in 0..FACE_GRID {
+            for (di, dj) in [(1, 0), (0, 1)] {
+                let (i2, j2) = (i + di, j + dj);
+                if i2 >= FACE_GRID || j2 >= FACE_GRID {
+                    continue;
+                }
+                let ((u1, v1), p1) = at(i, j);
+                let ((u2, v2), p2) = at(i2, j2);
+                let mid = patch_surface.point(0.5 * (u1 + u2), 0.5 * (v1 + v2));
+                if !is_finite(&mid) {
+                    return None;
+                }
+                sag = sag.max((mid - (p1 + (p2 - p1) * 0.5)).norm());
+            }
+        }
+    }
+
+    let bbox = BoundingBox3::from_points(
+        poly.loops
+            .iter()
+            .flatten()
+            .map(|&(_, p)| p)
+            .chain(grid.iter().map(|&(_, p)| p)),
+    );
+    (!bbox.is_empty()).then(|| bbox.dilate(2.0 * sag))
+}
+
+/// One point where two faces clash, if they do.
+fn clash_point(
+    a: &FacePatch,
+    b: &FacePatch,
+    overlap: &BoundingBox3,
+    tol: &ToleranceContext,
+) -> Option<Point3> {
+    let joint = a.bbox.union(&b.bbox);
+    let pad = (SEARCH_PAD_REL * joint.extents().norm()).max(SYSTEM_RESOLUTION);
+    let roi = overlap.dilate(pad);
+    intersection_samples(a, b, &roi, tol)?
+        .into_iter()
+        .find(|p| is_clash(a, b, p, tol))
+}
+
+/// Is `p` — a point on both surfaces — a defect rather than the two faces
+/// meeting along topology they share?
+fn is_clash(a: &FacePatch, b: &FacePatch, p: &Point3, tol: &ToleranceContext) -> bool {
+    if !is_finite(p) {
+        return false;
+    }
+    let scale = p.coords.iter().fold(1.0f64, |m, &c| m.max(c.abs()));
+    let slack = a.tolerance.max(b.tolerance).max(tol.linear) + PROJECTION_SLACK_REL * scale;
+    if !a.covers(p, slack) || !b.covers(p, slack) {
+        return false;
+    }
+    // Twice the band `covers` admits: a point let in only by sitting `slack`
+    // outside a face is at most that far past the shared edge that explains
+    // it, and excusing it has to be at least as generous as admitting it was.
+    shared_boundary_distance(a, b, p) > 2.0 * slack
+}
+
+/// Distance from `p` to the nearest entity the two faces *share* —
+/// infinite when they share none, so nothing is excused.
+fn shared_boundary_distance(a: &FacePatch, b: &FacePatch, p: &Point3) -> f64 {
+    let edges = a
+        .edges
+        .iter()
+        .filter(|e| b.edges.iter().any(|o| o.id == e.id))
+        .map(|e| e.distance_to(p));
+    let vertices = a
+        .vertices
+        .iter()
+        .filter(|&&(id, _)| b.vertices.iter().any(|&(o, _)| o == id))
+        .map(|&(_, point)| (point - p).norm());
+    edges.chain(vertices).fold(f64::INFINITY, f64::min)
+}
+
+/// Points on both surfaces, to be classified against the two trims.
+///
+/// `None` — as distinct from an empty vector — when the surface pair's
+/// intersection cannot be computed at all, so the pair is skipped rather
+/// than declared clean.
+fn intersection_samples(
+    a: &FacePatch,
+    b: &FacePatch,
+    roi: &BoundingBox3,
+    tol: &ToleranceContext,
+) -> Option<Vec<Point3>> {
+    match ssi::intersect(&a.surface, &b.surface, tol) {
+        Ok(SurfaceIntersection::Empty) => Some(Vec::new()),
+        Ok(SurfaceIntersection::TangentPoint(p)) => Some(vec![p]),
+        Ok(SurfaceIntersection::Curves(curves)) => Some(
+            curves
+                .iter()
+                .flat_map(|c| sample_intersection_curve(&c.curve, roi))
+                .collect(),
+        ),
+        // The same surface twice: there is no intersection *curve* to walk —
+        // the whole of each face's region is on the other's surface — so the
+        // regions themselves are the search space. Both are swept, not just
+        // one: a small face sitting well inside a large one is caught by its
+        // own rim and grid, where the large face's grid could step over it.
+        Ok(SurfaceIntersection::Coincident) => {
+            let mut samples: Vec<Point3> = Vec::new();
+            for patch in [a, b] {
+                samples.extend(patch.poly.loops.iter().flatten().map(|&(_, p)| p));
+                samples.extend(patch.grid(COINCIDENT_GRID)?);
+            }
+            Some(samples)
+        }
+        Err(_) => marched_samples(a, b, roi, tol),
+    }
+}
+
+/// The numerically traced route, for the pairs with no closed form.
+fn marched_samples(
+    a: &FacePatch,
+    b: &FacePatch,
+    roi: &BoundingBox3,
+    tol: &ToleranceContext,
+) -> Option<Vec<Point3>> {
+    let radius = 0.5 * roi.extents().norm();
+    if !radius.is_finite() {
+        return None;
+    }
+    // The region of interest as the sphere through the overlap box's
+    // corners: the marched-bounded route clips its unbounded partners to it,
+    // and anything outside it is outside one of the two faces anyway.
+    let bounds = (roi.center(), radius.max(tol.linear));
+    let curves = if is_bounded_marched(&a.surface, &b.surface) {
+        ssi::intersect_marched_bounded(&a.surface, &b.surface, bounds, tol)
+    } else {
+        ssi::intersect_marched(&a.surface, &b.surface, tol)
+    };
+    Some(curves.ok()?.into_iter().flat_map(|c| c.points).collect())
+}
+
+/// Points along one intersection curve, over the part of it inside `roi`.
+///
+/// An unbounded curve — the line two planes meet in — is clipped to the
+/// region first; there is no other bound on where to look, and outside the
+/// two faces' shared box neither face is present.
+fn sample_intersection_curve(curve: &Curve3, roi: &BoundingBox3) -> Vec<Point3> {
+    let (mut t0, mut t1) = curve.domain();
+    if !t0.is_finite() || !t1.is_finite() {
+        let Curve3::Line { origin, dir } = curve else {
+            return Vec::new();
+        };
+        let Some((clipped_start, clipped_end)) = clip_line_to_box(origin, dir, roi) else {
+            return Vec::new();
+        };
+        (t0, t1) = (clipped_start, clipped_end);
+    }
+    // NaN-safe: only a genuinely increasing range is sampled.
+    if t1.partial_cmp(&t0) != Some(std::cmp::Ordering::Greater) {
+        return Vec::new();
+    }
+    (0..=CLASH_CURVE_SAMPLES)
+        .map(|i| curve.point(lerp(t0, t1, i, CLASH_CURVE_SAMPLES + 1)))
+        .collect()
 }
 
 #[cfg(test)]
@@ -2089,7 +2741,8 @@ mod tests {
         /// Every primitive, with and without trim geometry attached. The
         /// builders promise exact geometry, so nothing here has any slack to
         /// spend: this is the baseline the defect tests perturb.
-        fn primitive_bodies() -> Vec<(&'static str, TopologyStore, GeometryStore, EntityId<Body>)> {
+        pub(super) fn primitive_bodies()
+        -> Vec<(&'static str, TopologyStore, GeometryStore, EntityId<Body>)> {
             let mut out = Vec::new();
             for (name, build) in [
                 (
@@ -2626,6 +3279,11 @@ mod tests {
                     t_start: 1.0,
                     t_end: 0.0,
                 },
+                CheckFailure::SelfIntersection {
+                    face_a: face,
+                    face_b: face,
+                    at: Point3::origin(),
+                },
             ] {
                 assert!(!failure.is_structural(), "{failure:?}");
             }
@@ -2644,6 +3302,416 @@ mod tests {
             assert_eq!(
                 pcurve_check_params(&pcurve, 10.0, 11.0),
                 edge_samples(10.0, 11.0).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    mod self_intersection {
+        use super::*;
+        use crate::curve::Curve3;
+        use crate::primitives;
+        use crate::surface::Surface3;
+
+        /// An empty sheet body to hang hand-built faces off.
+        fn sheet() -> (
+            TopologyStore,
+            GeometryStore,
+            EntityId<Body>,
+            EntityId<Shell>,
+        ) {
+            let (mut store, geo) = (TopologyStore::new(), GeometryStore::new());
+            let body = store.create_body(BodyType::Sheet);
+            let shell = store.create_shell(body, false, ShellOrientation::Outward);
+            (store, geo, body, shell)
+        }
+
+        fn vertex(store: &mut TopologyStore, at: Point3) -> EntityId<Vertex> {
+            store.create_vertex(at, SYSTEM_RESOLUTION)
+        }
+
+        /// A straight edge from `from` to `to`, parameterized by arc length.
+        fn segment(
+            store: &mut TopologyStore,
+            geo: &mut GeometryStore,
+            (v0, from): (EntityId<Vertex>, Point3),
+            (v1, to): (EntityId<Vertex>, Point3),
+        ) -> EntityId<Edge> {
+            let span = to - from;
+            let curve = geo.add_curve(Curve3::line(from, span).expect("a non-degenerate segment"));
+            store.create_edge_with_curve(v0, v1, SYSTEM_RESOLUTION, curve, 0.0, span.norm())
+        }
+
+        /// A planar triangular face on `shell`, bounded by the given directed
+        /// edges. `pts` are the corners in traversal order, which fixes the
+        /// plane and its normal: the loop then runs counterclockwise seen
+        /// from the normal side, as a `Positive` face on an outward shell
+        /// must.
+        fn triangle(
+            store: &mut TopologyStore,
+            geo: &mut GeometryStore,
+            shell: EntityId<Shell>,
+            pts: [Point3; 3],
+            fins: [(EntityId<Edge>, FinSense); 3],
+        ) -> EntityId<Face> {
+            let normal = (pts[1] - pts[0]).cross(&(pts[2] - pts[0]));
+            let surface =
+                geo.add_surface(Surface3::plane(pts[0], normal).expect("a real triangle"));
+            let face = store.create_face(shell, FaceSense::Positive);
+            store.faces.get_mut(face).expect("live face").surface = Some(surface);
+            store.create_loop(face, LoopType::Outer, &fins);
+            face
+        }
+
+        /// A triangle with fresh vertices and edges of its own — sharing
+        /// nothing with anything already on the shell.
+        fn free_triangle(
+            store: &mut TopologyStore,
+            geo: &mut GeometryStore,
+            shell: EntityId<Shell>,
+            pts: [Point3; 3],
+        ) -> EntityId<Face> {
+            let v: Vec<_> = pts.iter().map(|&pt| vertex(store, pt)).collect();
+            let fins = [0, 1, 2].map(|i| {
+                let j = (i + 1) % 3;
+                (
+                    segment(store, geo, (v[i], pts[i]), (v[j], pts[j])),
+                    FinSense::Forward,
+                )
+            });
+            triangle(store, geo, shell, pts, fins)
+        }
+
+        fn clashes(failures: &[CheckFailure]) -> Vec<(EntityId<Face>, EntityId<Face>)> {
+            failures
+                .iter()
+                .filter_map(|f| match f {
+                    CheckFailure::SelfIntersection { face_a, face_b, .. } => {
+                        Some((*face_a, *face_b))
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// The baseline the whole check rests on: every primitive is built
+        /// from faces that meet each other constantly — a cylinder's wall
+        /// touches both its caps along their whole rims — and not one of
+        /// those contacts is a defect, because every one of them is a shared
+        /// edge.
+        #[test]
+        fn primitives_have_no_self_intersections() {
+            for (name, store, geo, body) in super::geometry::primitive_bodies() {
+                assert_eq!(
+                    store.check_self_intersection(&geo, body),
+                    Vec::new(),
+                    "{name} must have no self-intersections"
+                );
+            }
+        }
+
+        #[test]
+        fn faces_that_cross_are_reported() {
+            let (mut store, mut geo, body, shell) = sheet();
+            let flat = free_triangle(
+                &mut store,
+                &mut geo,
+                shell,
+                [p(0.0, 0.0, 0.0), p(4.0, 0.0, 0.0), p(0.0, 4.0, 0.0)],
+            );
+            // Vertical, and passing clean through the flat one's interior.
+            let blade = free_triangle(
+                &mut store,
+                &mut geo,
+                shell,
+                [p(1.0, 1.0, -1.0), p(3.0, 1.0, -1.0), p(1.0, 1.0, 2.0)],
+            );
+
+            assert_eq!(
+                clashes(&store.check_self_intersection(&geo, body)),
+                vec![(flat, blade)]
+            );
+        }
+
+        #[test]
+        fn faces_that_stay_apart_are_not_reported() {
+            let (mut store, mut geo, body, shell) = sheet();
+            free_triangle(
+                &mut store,
+                &mut geo,
+                shell,
+                [p(0.0, 0.0, 0.0), p(1.0, 0.0, 0.0), p(0.0, 1.0, 0.0)],
+            );
+            free_triangle(
+                &mut store,
+                &mut geo,
+                shell,
+                [p(0.0, 0.0, 5.0), p(1.0, 0.0, 5.0), p(0.0, 1.0, 5.0)],
+            );
+            assert_eq!(store.check_self_intersection(&geo, body), Vec::new());
+        }
+
+        /// The distinction the whole check turns on: two faces meeting along
+        /// an edge they *share* is what a body is made of, and the same two
+        /// surfaces meeting anywhere else is a defect. Here the shared edge
+        /// is the only contact.
+        #[test]
+        fn faces_meeting_along_a_shared_edge_are_not_reported() {
+            let (mut store, mut geo, body, shell) = sheet();
+            let (a, b, c) = (p(0.0, 0.0, 0.0), p(2.0, 0.0, 0.0), p(0.0, 2.0, 0.0));
+            let up = p(0.0, 0.0, 2.0);
+            let (va, vb, vc, vup) = (
+                vertex(&mut store, a),
+                vertex(&mut store, b),
+                vertex(&mut store, c),
+                vertex(&mut store, up),
+            );
+            // The hinge, used forward by one face and reversed by the other.
+            let hinge = segment(&mut store, &mut geo, (va, a), (vb, b));
+            let bc = segment(&mut store, &mut geo, (vb, b), (vc, c));
+            let ca = segment(&mut store, &mut geo, (vc, c), (va, a));
+            let a_up = segment(&mut store, &mut geo, (va, a), (vup, up));
+            let up_b = segment(&mut store, &mut geo, (vup, up), (vb, b));
+            let flat = triangle(
+                &mut store,
+                &mut geo,
+                shell,
+                [a, b, c],
+                [
+                    (hinge, FinSense::Forward),
+                    (bc, FinSense::Forward),
+                    (ca, FinSense::Forward),
+                ],
+            );
+            let folded = triangle(
+                &mut store,
+                &mut geo,
+                shell,
+                [b, a, up],
+                [
+                    (hinge, FinSense::Reversed),
+                    (a_up, FinSense::Forward),
+                    (up_b, FinSense::Forward),
+                ],
+            );
+
+            let failures = store.check_self_intersection(&geo, body);
+            assert_eq!(failures, Vec::new(), "{flat:?}/{folded:?}: {failures:?}");
+        }
+
+        /// A face's edge lying *in* another face, sharing nothing with it:
+        /// the contact locus is on one face's boundary, where a strict
+        /// interior test is a coin flip, and it is still a defect — the two
+        /// faces touch along topology neither of them owns.
+        #[test]
+        fn an_edge_lying_in_another_face_is_reported() {
+            let (mut store, mut geo, body, shell) = sheet();
+            let flat = free_triangle(
+                &mut store,
+                &mut geo,
+                shell,
+                [p(0.0, 0.0, 0.0), p(4.0, 0.0, 0.0), p(0.0, 4.0, 0.0)],
+            );
+            // Stands *on* the flat face: its bottom edge is inside it.
+            let fin = free_triangle(
+                &mut store,
+                &mut geo,
+                shell,
+                [p(1.0, 1.0, 0.0), p(2.0, 1.0, 0.0), p(1.0, 1.0, 1.0)],
+            );
+
+            assert_eq!(
+                clashes(&store.check_self_intersection(&geo, body)),
+                vec![(flat, fin)]
+            );
+        }
+
+        /// Two faces on the *same* surface: there is no intersection curve to
+        /// walk, so the overlap is hunted over the region itself.
+        #[test]
+        fn overlapping_coplanar_faces_are_reported() {
+            let (mut store, mut geo, body, shell) = sheet();
+            let lower = free_triangle(
+                &mut store,
+                &mut geo,
+                shell,
+                [p(0.0, 0.0, 0.0), p(4.0, 0.0, 0.0), p(0.0, 4.0, 0.0)],
+            );
+            let overlapping = free_triangle(
+                &mut store,
+                &mut geo,
+                shell,
+                [p(1.0, 1.0, 0.0), p(5.0, 1.0, 0.0), p(1.0, 5.0, 0.0)],
+            );
+
+            assert_eq!(
+                clashes(&store.check_self_intersection(&geo, body)),
+                vec![(lower, overlapping)]
+            );
+        }
+
+        /// A coplanar face wholly *inside* another: the containing face's
+        /// grid could step clean over it, so both regions are swept.
+        #[test]
+        fn a_coplanar_face_buried_inside_another_is_reported() {
+            let (mut store, mut geo, body, shell) = sheet();
+            let large = free_triangle(
+                &mut store,
+                &mut geo,
+                shell,
+                [p(0.0, 0.0, 0.0), p(40.0, 0.0, 0.0), p(0.0, 40.0, 0.0)],
+            );
+            let buried = free_triangle(
+                &mut store,
+                &mut geo,
+                shell,
+                [p(5.0, 5.0, 0.0), p(5.4, 5.0, 0.0), p(5.0, 5.4, 0.0)],
+            );
+
+            assert_eq!(
+                clashes(&store.check_self_intersection(&geo, body)),
+                vec![(large, buried)]
+            );
+        }
+
+        /// Coplanar but disjoint: the same `Coincident` surface pair, with
+        /// nothing to report. The regions, not the surfaces, decide.
+        #[test]
+        fn coplanar_faces_that_do_not_overlap_are_not_reported() {
+            let (mut store, mut geo, body, shell) = sheet();
+            free_triangle(
+                &mut store,
+                &mut geo,
+                shell,
+                [p(0.0, 0.0, 0.0), p(1.0, 0.0, 0.0), p(0.0, 1.0, 0.0)],
+            );
+            free_triangle(
+                &mut store,
+                &mut geo,
+                shell,
+                [p(5.0, 5.0, 0.0), p(6.0, 5.0, 0.0), p(5.0, 6.0, 0.0)],
+            );
+            assert_eq!(store.check_self_intersection(&geo, body), Vec::new());
+        }
+
+        /// A curved narrow phase, on a periodic chart: a blade driven into a
+        /// cylinder (centred on the origin, so its caps sit at `z = ±1`)
+        /// enters through the wall and leaves through the top cap, missing
+        /// the bottom entirely. The wall contact is an ellipse that has to
+        /// be classified in the cylinder's wrapped parameter cover.
+        #[test]
+        fn a_blade_through_a_cylinder_is_reported() {
+            let (mut store, mut geo) = (TopologyStore::new(), GeometryStore::new());
+            let body = primitives::cylinder(&mut store, &mut geo, 1.0, 2.0).expect("a cylinder");
+            let shell = store.shells_of_body(body)[0];
+            let blade = free_triangle(
+                &mut store,
+                &mut geo,
+                shell,
+                [p(-2.0, 0.0, 0.5), p(2.0, 0.0, 0.5), p(-2.0, 0.0, 1.5)],
+            );
+
+            let reported = clashes(&store.check_self_intersection(&geo, body));
+            assert!(
+                reported.iter().all(|&(_, b)| b == blade),
+                "every clash is against the blade: {reported:?}"
+            );
+            let hit: Vec<Surface3> = reported
+                .iter()
+                .map(|&(face, _)| {
+                    let surface = store
+                        .face(face)
+                        .expect("live face")
+                        .surface
+                        .expect("surface");
+                    geo.surface(surface).expect("live surface").clone()
+                })
+                .collect();
+            assert_eq!(hit.len(), 2, "the wall and the top cap: {hit:?}");
+            assert!(
+                hit.iter().any(|s| matches!(s, Surface3::Cylinder { .. })),
+                "the wall is pierced: {hit:?}"
+            );
+            assert!(
+                hit.iter()
+                    .any(|s| matches!(s, Surface3::Plane { origin, .. } if origin.z > 0.0)),
+                "the top cap is pierced: {hit:?}"
+            );
+        }
+
+        /// The bounding-box prune has to be conservative about *curvature*,
+        /// not just about rims: a sphere's face bulges a long way past the
+        /// box its boundary spans, and a prune that believed the rim would
+        /// drop the pair before the narrow phase ever saw it.
+        #[test]
+        fn a_face_box_covers_the_bulge_between_its_rims() {
+            let (mut store, mut geo) = (TopologyStore::new(), GeometryStore::new());
+            let radius = 2.0;
+            let body = primitives::sphere(&mut store, &mut geo, radius).expect("a sphere");
+            let face = store.faces_of_body(body)[0];
+            let tol = ToleranceContext::default();
+            let patch = store
+                .face_patch(&geo, &tol, face, true)
+                .expect("a sphere face is measurable");
+
+            // The seam meridian the face is bounded by spans x >= 0 only,
+            // yet the sphere itself reaches -radius.
+            assert!(
+                patch.bbox.min.x <= -radius && patch.bbox.max.x >= radius,
+                "the box must contain the whole sphere, got {:?}",
+                patch.bbox
+            );
+        }
+
+        /// Geometry the check cannot read is skipped, not guessed at: the
+        /// Euler-built cube has no surfaces or curves at all.
+        #[test]
+        fn a_body_without_geometry_has_nothing_to_pair() {
+            let (store, body, _shell) = build_cube();
+            assert_eq!(
+                store.check_self_intersection(&GeometryStore::new(), body),
+                Vec::new()
+            );
+        }
+
+        #[test]
+        fn stale_body_is_reported() {
+            let (mut store, mut geo, body, shell) = sheet();
+            free_triangle(
+                &mut store,
+                &mut geo,
+                shell,
+                [p(0.0, 0.0, 0.0), p(1.0, 0.0, 0.0), p(0.0, 1.0, 0.0)],
+            );
+            store.bodies.remove(body);
+            assert_eq!(
+                store.check_self_intersection(&geo, body),
+                vec![CheckFailure::StaleBody(body)]
+            );
+        }
+
+        /// A clash reaches the combined entry point too — the pass is wired
+        /// in, not merely available.
+        #[test]
+        fn the_combined_check_reports_a_clash() {
+            let (mut store, mut geo, body, shell) = sheet();
+            free_triangle(
+                &mut store,
+                &mut geo,
+                shell,
+                [p(0.0, 0.0, 0.0), p(4.0, 0.0, 0.0), p(0.0, 4.0, 0.0)],
+            );
+            free_triangle(
+                &mut store,
+                &mut geo,
+                shell,
+                [p(1.0, 1.0, -1.0), p(3.0, 1.0, -1.0), p(1.0, 1.0, 2.0)],
+            );
+            assert!(
+                store
+                    .check_with_geometry(&geo, body)
+                    .iter()
+                    .any(|f| matches!(f, CheckFailure::SelfIntersection { .. })),
+                "the combined check runs the self-intersection pass"
             );
         }
     }

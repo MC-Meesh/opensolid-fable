@@ -488,8 +488,14 @@ pub fn body_has_nurbs_face(
 // ---------------------------------------------------------------------
 
 /// Invertible parameterization of the supported analytic surfaces.
+///
+/// Crate-visible because [`crate::check`]'s self-intersection pass trims
+/// intersection curves against the very same face regions this pipeline
+/// clips imprints against, and a second periodic-cover embedder — with its
+/// own seam unwrapping and pole conventions — is the last thing the kernel
+/// needs two of.
 #[derive(Debug, Clone)]
-enum Chart {
+pub(crate) enum Chart {
     Plane {
         origin: Point3,
         e_u: Vector3,
@@ -599,7 +605,7 @@ impl Chart {
     /// would need a `pole_u` the pipeline does not have) or an interior
     /// singularity (whose location is not known in closed form). Rejecting
     /// the patch here routes it to F-Rep intact.
-    fn build(surface: &Surface3, tol: &ToleranceContext) -> CoreResult<Self> {
+    pub(crate) fn build(surface: &Surface3, tol: &ToleranceContext) -> CoreResult<Self> {
         match surface {
             Surface3::Nurbs(nurbs) => {
                 let poles = nurbs
@@ -719,7 +725,7 @@ impl Chart {
     /// keeps a continuous longitude across the pole instead of snapping to
     /// an arbitrary `atan2` of near-zero components, which would otherwise
     /// spawn a zero-width UV wedge (a degenerate region) at the pole.
-    fn param(&self, p: &Point3, hint: Option<(f64, f64)>) -> CoreResult<(f64, f64)> {
+    pub(crate) fn param(&self, p: &Point3, hint: Option<(f64, f64)>) -> CoreResult<(f64, f64)> {
         Ok(match self {
             Chart::Nurbs {
                 surface,
@@ -1295,10 +1301,10 @@ fn sample_edge(edge: &SolidEdge) -> SampledCurve {
 /// Per-face discretized boundary in parameter space, kept alongside its 3D
 /// points; loop polylines close implicitly (last point connects to first).
 #[derive(Debug, Clone)]
-struct FaceRegionPoly {
-    chart: Chart,
+pub(crate) struct FaceRegionPoly {
+    pub(crate) chart: Chart,
     /// One closed polyline per loop: (uv, 3D point).
-    loops: Vec<Vec<((f64, f64), Point3)>>,
+    pub(crate) loops: Vec<Vec<((f64, f64), Point3)>>,
 }
 
 impl FaceRegionPoly {
@@ -1328,7 +1334,7 @@ impl FaceRegionPoly {
     /// nudged off the seam by a sub-tolerance step (`snap`, a model-space
     /// length, expressed as an angle via the local arc-length scale); a
     /// point genuinely outside the region stays outside under the nudge.
-    fn contains_for_clip(&self, uv: (f64, f64), snap: f64) -> bool {
+    pub(crate) fn contains_for_clip(&self, uv: (f64, f64), snap: f64) -> bool {
         let local = self.localize(uv);
         if self.contains(local) {
             return true;
@@ -1455,7 +1461,7 @@ const POLE_TURN_EPS: f64 = 1e-6;
 /// south pole (mirrored when `ccw` is `false`); a departure meridian
 /// within [`POLE_TURN_EPS`] of the arrival meridian is a doubling-back
 /// (e.g. the seam tip of a full sphere) and sweeps the full period.
-struct CoverEmbedder<'c> {
+pub(crate) struct CoverEmbedder<'c> {
     chart: &'c Chart,
     /// Intended chart winding of the walk's cycles. `reconstruct` traces
     /// every cycle CCW-in-chart; stored face loops are CCW only when the
@@ -1467,7 +1473,7 @@ struct CoverEmbedder<'c> {
 }
 
 impl<'c> CoverEmbedder<'c> {
-    fn new(chart: &'c Chart, ccw: bool) -> Self {
+    pub(crate) fn new(chart: &'c Chart, ccw: bool) -> Self {
         CoverEmbedder {
             chart,
             ccw,
@@ -1482,7 +1488,7 @@ impl<'c> CoverEmbedder<'c> {
     ///
     /// # Errors
     /// Propagates [`Chart::param`]'s failure to invert `p` (NURBS only).
-    fn push(&mut self, p: Point3, out: &mut Vec<CoverPoint>) -> CoreResult<()> {
+    pub(crate) fn push(&mut self, p: Point3, out: &mut Vec<CoverPoint>) -> CoreResult<()> {
         if let Some(vp) = self.chart.pole_v(&p) {
             let u = self
                 .last_uv
@@ -1741,7 +1747,7 @@ struct Atom {
 /// below the f64 spacing of the coordinates themselves cannot be
 /// resolved, so a tighter snap would fail to merge points that differ
 /// only by rounding noise.
-fn geometric_snap<I: IntoIterator<Item = Point3>>(points: I) -> f64 {
+pub(crate) fn geometric_snap<I: IntoIterator<Item = Point3>>(points: I) -> f64 {
     let mut lo = [f64::INFINITY; 3];
     let mut hi = [f64::NEG_INFINITY; 3];
     for p in points {
@@ -2050,7 +2056,7 @@ fn marched_ssi_supported(a: &Surface3, b: &Surface3) -> bool {
 /// [`marched_ssi_supported`] must keep reporting `false` for NURBS so the
 /// pipeline does not send it to [`intersect_marched`] first — that path would
 /// grid an infinite domain.
-fn is_bounded_marched(a: &Surface3, b: &Surface3) -> bool {
+pub(crate) fn is_bounded_marched(a: &Surface3, b: &Surface3) -> bool {
     use Surface3::*;
     matches!(
         (a, b),
@@ -3866,7 +3872,11 @@ fn append_directed(out: &mut Vec<Point3>, sampled: &SampledCurve, forward: bool)
 }
 
 /// Clip the line `origin + t·dir` to an axis-aligned box (slab method).
-fn clip_line_to_box(origin: &Point3, dir: &Vector3, bx: &BoundingBox3) -> Option<(f64, f64)> {
+pub(crate) fn clip_line_to_box(
+    origin: &Point3,
+    dir: &Vector3,
+    bx: &BoundingBox3,
+) -> Option<(f64, f64)> {
     let (mut t0, mut t1) = (f64::NEG_INFINITY, f64::INFINITY);
     for k in 0..3 {
         let (o, d, lo, hi) = (origin[k], dir[k], bx.min[k], bx.max[k]);
@@ -4339,7 +4349,7 @@ struct KeptRegion {
 type DartChain = Vec<(usize, bool)>;
 
 /// A polyline vertex in a face's parameter cover: `(uv, 3D point)`.
-type CoverPoint = ((f64, f64), Point3);
+pub(crate) type CoverPoint = ((f64, f64), Point3);
 
 /// Directed 3D endpoints of an atom traversal.
 fn dart_endpoints(atom: &Atom, forward: bool) -> (Point3, Point3) {

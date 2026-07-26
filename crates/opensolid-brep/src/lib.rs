@@ -9,8 +9,9 @@
 //! ([`TopologyStore`]: Body > Shell > Face > Loop > Fin > Edge > Vertex),
 //! the Euler operators ([`euler`]: MVFS/MEV/MEF/KEMR/KFMRH with
 //! Euler-Poincaré invariant checking), body validation
-//! ([`check`]: [`TopologyStore::check`] for the topology graph and
-//! [`TopologyStore::check_geometry`] for the geometry hung off it, both
+//! ([`check`]: [`TopologyStore::check`] for the topology graph,
+//! [`TopologyStore::check_geometry`] for the geometry hung off it, and
+//! [`TopologyStore::check_self_intersection`] for faces that clash, all
 //! returning structured [`CheckFailure`]s), the sweep constructors ([`sweep`]: [`extrude`]
 //! and [`revolve`] planar profiles into solids), the geometry store
 //! ([`GeometryStore`] backing [`Edge::curve`]/[`Face::surface`]/
