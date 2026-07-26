@@ -309,6 +309,30 @@ impl BoundedShape {
         }
     }
 
+    /// Placed by an arbitrary rigid transform (rotation then translation).
+    /// The tracked box is the AABB of the transformed corners
+    /// (conservative), as for [`rotate`](Self::rotate).
+    ///
+    /// This is the placement form STEP assembly instances arrive in
+    /// ([`PlacedSolid::transform`](opensolid_kernel::io::step::product::PlacedSolid::transform)),
+    /// which the axis-angle `rotate`/`translate` pair cannot express in one
+    /// step without decomposing it.
+    pub fn transform(&self, placement: &Transform3) -> Self {
+        let b = &self.bounds;
+        let corners = (0..8).map(|i| {
+            placement
+                * Point3::new(
+                    if i & 1 == 0 { b.min.x } else { b.max.x },
+                    if i & 2 == 0 { b.min.y } else { b.max.y },
+                    if i & 4 == 0 { b.min.z } else { b.max.z },
+                )
+        });
+        Self {
+            shape: Shape::new(self.shape.clone().transformed(*placement)),
+            bounds: BoundingBox3::from_points(corners),
+        }
+    }
+
     /// Scaled per-axis about the origin (each factor `> 0`). Sign-exact
     /// but not metric-exact — see [`opensolid_frep::AnisotropicScale`].
     ///

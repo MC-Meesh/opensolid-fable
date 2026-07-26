@@ -85,6 +85,7 @@ persistence. Exports and screenshots are written to `OPENSOLID_MCP_OUTPUT_DIR`.
 | Tool             | Input (required **bold**)                          | Returns |
 |------------------|----------------------------------------------------|---------|
 | `create_model`   | **`script`**, `name`, `exact`                      | `model_id` + mesh stats + validation summary |
+| `import_step`    | `path` \| `text`, `name`, `circle_segments`        | `model_id` + per-solid outcomes + diagnostics + measure/validate summary |
 | `get_screenshot` | **`model_id`**, `view`, `width`, `height`          | inline PNG image |
 | `export`         | **`model_id`**, **`format`**, `path`, `accuracy`, `unit` | file path + byte size |
 | `measure`        | **`model_id`**, `query`, `accuracy`                | mass properties |
@@ -92,9 +93,11 @@ persistence. Exports and screenshots are written to `OPENSOLID_MCP_OUTPUT_DIR`.
 | `validate`       | **`model_id`**, `accuracy`                          | structural report |
 | `get_capabilities` | `section`                                        | machine-readable manifest of every tool and script op |
 | `list_models`    | —                                                  | models registered this session |
+| `get_model`      | **`model_id`**                                      | the model's own source: its script, or where it was imported from |
 
-Every tool except `create_model`, `get_capabilities`, and `list_models` takes a
-`model_id` handed back by an earlier `create_model` call.
+Every tool except `create_model`, `import_step`, `get_capabilities`, and
+`list_models` takes a `model_id` handed back by an earlier `create_model` or
+`import_step` call.
 
 ### `create_model`
 
@@ -126,6 +129,72 @@ response is the agent's first oracle — it arrives without rendering anything:
   Anything outside it falls back to the SDF path automatically. Default `false`.
 - `valid` / `issues` are the same check `validate` runs — a failed boolean shows
   up here immediately, not as a silently-wrong mesh downstream.
+
+### `import_step`
+
+Reads an existing STEP (Part 21) file and registers it as a model — the other
+way to get a `model_id`, for when the job starts from a part someone handed you
+rather than from a script. Pass `path` (a file: absolute, or relative to the
+output dir, so a file `export` just wrote reads back by bare name) **or** `text`
+(the contents inline). Not both.
+
+```json
+{
+  "model_id": "model-3-1c4d",
+  "name": "bracket",
+  "exact": true,
+  "source": { "path": "/out/bracket.step", "bytes": 48213 },
+  "solids": [
+    { "index": 0, "step_id": 503, "name": "bracket", "outcome": "brep",
+      "exact": true, "triangles": 1284, "model_id": "model-2-9be1" }
+  ],
+  "counts": { "brep": 1, "mesh": 0, "failed": 0 },
+  "healing": { "operations": 0 },
+  "units": { "lengthScale": 1, "angleScale": 1, "note": "…already applied…" },
+  "assembly": { "isAssembly": false, "instances": 1 },
+  "diagnostics": { "error": 0, "warning": 0, "info": 2, "items": [ … ] },
+  "mesh": { "triangles": 1284, "vertices": 646 },
+  "boundingBox": { "min": [...], "max": [...], "size": [60, 40, 8] },
+  "volume": 17280, "valid": true, "issues": []
+}
+```
+
+Read it in this order:
+
+- **`outcome`, per solid.** `brep` means the exact path won: analytic surfaces,
+  and an `export` of that model writes analytic STEP rather than facets. `mesh`
+  means the file is valid but holds geometry the kernel cannot represent
+  exactly, so the solid arrives as a closed tessellation wrapped as an SDF —
+  fine to measure, render and boolean against, but its surfaces are gone.
+  `failed` means the solid did not survive; the diagnostics say why. A solid can
+  also come back `brep` with a `shapeError`: the body imported but the
+  tessellator could not handle a face, so there is no shape to hand you.
+- **`volume` / `valid` / `issues`.** The same oracle `create_model` returns.
+  An import is where the trust loop starts, so it runs immediately: a part that
+  arrives measuring the wrong volume is the failure worth catching in the first
+  call, not the fifth.
+- **`diagnostics`.** The reader's per-entity findings, `error`/`warning`/`info`
+  counted in full with a bounded, severity-first sample in `items`. `healing.operations`
+  counts the repairs the importer applied to make bodies valid.
+- **`units`.** What the file *declared*, already applied: imported geometry is
+  millimetres whatever the header said. An inch file's 20-unit box arrives 508 mm
+  across — that is correct, not a bug, and it is why the field is reported.
+
+Every solid also gets its own `model_id`, so a multi-solid file is addressable
+part by part. The top-level `model_id` is the whole file: for an assembly, every
+occurrence placed into root coordinates (`assembly.isAssembly`,
+`assembly.instances`), while the per-solid models stay part-local, exactly as the
+file stores them. Its volume sums the placed parts, so interpenetrating parts
+count twice — for an assembly of solid parts that is the total material.
+
+`circle_segments` (default 32, clamped 3..512) sets how finely imported bodies
+are tessellated. That mesh is what every measurement and screenshot of the import
+reads, so raise it when a curved part measures short; it does not touch the
+analytic surfaces, so `export` of a `brep` solid is unaffected.
+
+Imported models work with `measure`, `validate`, `get_screenshot` and `export`
+like any other. They carry no `param()`s — nothing about an imported file is
+parametric — so `optimize` has nothing to move.
 
 ### `get_screenshot`
 
@@ -261,8 +330,34 @@ outlive the op it names.
 
 ### `list_models`
 
-Returns `{ models: [{ model_id, name, exact, createdAt }] }` for everything
-registered this session.
+Returns `{ models: [{ model_id, name, exact, source, createdAt }] }` for
+everything registered this session. `source` is `script` or `step` — which kind
+of origin `get_model` will hand back for that id.
+
+### `get_model`
+
+Returns a model's own source: the `script` it was built from, verbatim and ready
+to edit and re-submit, or where it was `imported` from. Also its params **with
+their current values**.
+
+That last part is the point. `optimize` writes the converged numbers back into
+the model, and until you ask for them here they exist only in that one response
+— so a session that ends takes the design with it. `get_model` turns a
+`model_id` back into the two things that reproduce the part: the script, and the
+numbers to run it at.
+
+```json
+{
+  "model_id": "model-1-8f3a", "name": "plate", "exact": false,
+  "source": "script",
+  "script": "const t = param('thickness', 4, {min: 2, max: 8});\nreturn Shape.box3(t, 10, 10);",
+  "params": [{ "name": "thickness", "value": 6.31, "default": 4, "min": 2, "max": 8 }]
+}
+```
+
+For an imported model there is no script — nothing generated it — so `imported`
+carries the provenance instead: the file, its size, and for a per-solid model
+which solid of it (`solidIndex`, `stepId`, `outcome`).
 
 ---
 
@@ -518,6 +613,22 @@ specific, actionable cause.
 
 Fix the script and call `create_model` again — nothing is registered on failure.
 
+### Import problems — graded by `import_step`
+
+An import has three degrees of failure, and only the first is an `isError`:
+
+| Situation | Reported as |
+|-----------|-------------|
+| Not syntactically valid Part 21, or the file cannot be read | `isError` — `Error: import failed: STEP import failed: <detail>` / `Error: cannot read STEP file: <detail>` |
+| Valid file, but nothing usable in it (no solids, or none survived) | `isError` — a JSON payload with `error`, the per-solid outcomes, and the diagnostics |
+| Valid file, some solids degraded | **not** an error — the model registers, and the per-solid `outcome` / `shapeError` and the `diagnostics` say what was lost |
+
+The third row is the one to actually read. `counts: { brep, mesh, failed }` is the
+one-line summary: a solid that came back `mesh` is real geometry with its analytic
+surfaces gone (it will export STEP as facets), and a `failed` one is not there at
+all — so a part that "imported fine" can still be missing a boss the file
+described. Check `counts` and `valid` before treating an import as the part.
+
 ### Degenerate geometry — caught by `valid` / `validate`
 
 A boolean that produces something that *isn't* a solid does **not** error. The
@@ -578,8 +689,10 @@ Other export errors:
 
 ### The recommended loop
 
-1. **`create_model`** → read `valid` and `volume`. If `valid: false`, fix the
-   script before doing anything else.
+1. **`create_model`** (or **`import_step`**, when the part already exists) →
+   read `valid` and `volume`. If `valid: false`, fix the script before doing
+   anything else; on an import, read the per-solid `outcome` first — a `mesh`
+   fallback is a different part from a `brep` one in everything but shape.
 2. **`validate`** (or trust `create_model`'s summary) to confirm a closed
    manifold after a nontrivial boolean.
 3. **`measure`** to check intent — a volume delta proves a cut removed material;

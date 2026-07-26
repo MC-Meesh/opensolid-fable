@@ -16,6 +16,7 @@ produces the identical shape in the GUI, and vice-versa.
 | Tool             | Purpose |
 |------------------|---------|
 | `create_model`   | Build a model from a playground JS script → `model_id` + mesh stats + validation summary. |
+| `import_step`    | Read an existing STEP file → `model_id` (plus one per solid) + per-solid outcomes + diagnostics + measure/validate summary. |
 | `get_screenshot` | Render a model to a PNG from a named view (`iso`, `front`, `top`, …). |
 | `export`         | Write a model to a file: `step` \| `stl` \| `obj`, with the document `unit` declared in the STEP header. |
 | `measure`        | Mass properties: volume, surface area, centroid, inertia, bounding box. |
@@ -23,10 +24,25 @@ produces the identical shape in the GUI, and vice-versa.
 | `optimize`       | Drive a model's `param()` design variables onto a mass/volume/centroid target under constraints, and write the result back. |
 | `get_capabilities` | The machine-readable manifest: every tool's input schema and every script op's signature. |
 | `list_models`    | List the models registered this session. |
+| `get_model`      | A model's own source: the script it was built from (with its params' current values), or where it was imported from. |
 
-Every tool except `create_model`, `get_capabilities`, and `list_models` takes a
-`model_id` returned by an earlier `create_model` call. Models live for the
-lifetime of the server process (in memory, no persistence).
+Every tool except `create_model`, `import_step`, `get_capabilities`, and
+`list_models` takes a `model_id` returned by an earlier `create_model` or
+`import_step` call. Models live for the lifetime of the server process (in
+memory, no persistence) — `get_model` is how a design leaves the session as
+something reproducible.
+
+### Importing an existing part
+
+`import_step` takes a `path` or the file `text`. Each `MANIFOLD_SOLID_BREP`
+comes back as `brep` (exact B-Rep — analytic surfaces, re-exports as analytic
+STEP), `mesh` (valid STEP the kernel cannot represent exactly, imported as a
+closed tessellation wrapped as an SDF) or `failed`, alongside the reader's
+per-entity diagnostics, the repairs it applied, the units the file declared, and
+an immediate measure/validate summary of the part. Every solid gets its own
+`model_id`; the top-level one is the whole file, with assembly occurrences
+placed. See the [agent guide](../../docs/AGENT_GUIDE.md#import_step) for the
+full payload.
 
 ## The script format
 

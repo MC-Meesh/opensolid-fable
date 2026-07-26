@@ -24,6 +24,21 @@ export const Path = wasm.WasmPath3D;
 export const OpenPath = wasm.WasmOpenPath2D;
 
 /**
+ * Read a STEP Part 21 file into shapes (of-2y4.7).
+ *
+ * Takes the file's *bytes*, not a string: STEP is ASCII/Latin-1 and a legal
+ * file need not be valid UTF-8. Returns a `WasmStepImport` — `report` (JSON
+ * string), `solidCount()`, `solid(i)` and `assembled()`. Throws only when the
+ * file is not syntactically valid Part 21; every geometric problem arrives as
+ * a per-solid outcome plus diagnostics in the report.
+ *
+ * @param {Uint8Array} bytes
+ * @param {number} [circleSegments] tessellation fidelity of imported bodies
+ * @returns {object}
+ */
+export const importStep = wasm.importStep;
+
+/**
  * Build the `param()` helper a script uses to declare a design variable, plus
  * the array it records declarations into.
  *
@@ -135,13 +150,13 @@ function newId() {
 }
 
 /**
- * In-memory registry of built models. Each entry keeps the shape, the source
- * script (so exports/screenshots are reproducible), the requested name, the
- * exact-booleans flag, and the creation time.
+ * In-memory registry of built models. Each entry keeps the shape, its origin
+ * (the script it was built from, or the STEP file it was imported from), the
+ * requested name, the exact-booleans flag, and the creation time.
  */
 export class ModelStore {
   constructor() {
-    /** @type {Map<string, {id:string, name:string, script:string, shape:object, exact:boolean, createdAt:string}>} */
+    /** @type {Map<string, {id:string, name:string, script:?string, origin:object, shape:object, exact:boolean, createdAt:string}>} */
     this._models = new Map();
   }
 
@@ -159,6 +174,10 @@ export class ModelStore {
       id,
       name: name || id,
       script,
+      // How this model came to exist, so `get_model` can hand the source
+      // back. A script model's origin is its script; an imported one's is
+      // the file (see `registerImported`).
+      origin: { kind: 'script' },
       shape,
       // The design variables the script declared via `param()`, kept so the
       // `optimize` tool knows what may move and within what bounds, and so
@@ -167,6 +186,39 @@ export class ModelStore {
       // `applyOptimized` writes an optimised point back.
       params,
       exact: Boolean(exact),
+      createdAt: new Date().toISOString(),
+    };
+    this._models.set(id, entry);
+    return entry;
+  }
+
+  /**
+   * Register a shape the server built without a script — today, a solid
+   * read back from a STEP file (of-2y4.7).
+   *
+   * An imported model has no script and no params: nothing about it is
+   * parametric, and pretending otherwise would offer it to `optimize`,
+   * which can only move numbers a script declared. Its `origin` carries the
+   * provenance instead, so `get_model` can still answer "where did this
+   * come from?" — the question `create_model` answers with a script.
+   *
+   * @param {{shape:object, name?:string, origin:object, exact?:boolean}} req
+   */
+  registerImported({ shape, name, origin, exact = false }) {
+    const id = newId();
+    const entry = {
+      id,
+      name: name || id,
+      script: null,
+      origin,
+      shape,
+      params: [],
+      // Not a request but an observation: whether this shape kept the file's
+      // analytic surfaces (and so exports analytic STEP). Note this is
+      // *narrower* than `shape.isExact()`, which answers a different
+      // question — whether meshing serves a stored tessellation, which a
+      // mesh-fallback solid also does.
+      exact,
       createdAt: new Date().toISOString(),
     };
     this._models.set(id, entry);
@@ -216,6 +268,10 @@ export class ModelStore {
       model_id: m.id,
       name: m.name,
       exact: m.exact,
+      // Which kind of source `get_model` will hand back for this id — a
+      // script, or an imported file. Without it a listing of ten ids says
+      // nothing about which of them an agent can still read the source of.
+      source: m.origin.kind,
       createdAt: m.createdAt,
     }));
   }

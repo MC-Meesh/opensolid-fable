@@ -2,10 +2,10 @@
 // so the tools can be unit-tested directly. Each handler returns an MCP
 // content result: `{ content: [...], isError? }`.
 
-import { writeFileSync, mkdirSync, statSync } from 'node:fs';
+import { writeFileSync, readFileSync, mkdirSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { resolve, isAbsolute, join } from 'node:path';
-import { ModelStore } from './kernel.js';
+import { resolve, isAbsolute, join, basename } from 'node:path';
+import { ModelStore, importStep } from './kernel.js';
 import { getMesh, buildBinaryStl, buildObj } from './mesh.js';
 import { renderPng, VIEW_NAMES } from './render.js';
 import { optimize } from './optimize.js';
@@ -69,6 +69,36 @@ function withMassError(view, full) {
         'before concluding the model itself is bad.';
   }
   return annotated;
+}
+
+// How many per-entity diagnostics an import reports inline. A NIST test part
+// can produce hundreds of `Info` lines about trimming decisions; the counts
+// are always complete, and the items are the sample an agent reads. Errors and
+// warnings are kept ahead of info so a truncation can never hide the finding
+// that mattered.
+const MAX_DIAGNOSTIC_ITEMS = 40;
+const SEVERITY_RANK = { error: 0, warning: 1, info: 2 };
+
+/** The diagnostics view: complete counts, a bounded, severity-first sample. */
+function diagnosticsView(report) {
+  const items = [...report.diagnostics]
+    .map((d, i) => ({ d, i }))
+    .sort((a, b) => SEVERITY_RANK[a.d.severity] - SEVERITY_RANK[b.d.severity] || a.i - b.i)
+    .slice(0, MAX_DIAGNOSTIC_ITEMS)
+    .map(({ d }) => d);
+  return {
+    ...report.diagnosticCounts,
+    items,
+    ...(items.length < report.diagnostics.length
+      ? {
+          truncated: {
+            shown: items.length,
+            total: report.diagnostics.length,
+            note: 'Highest severity first; the counts above are complete.',
+          },
+        }
+      : {}),
+  };
 }
 
 /** Resolve where an export should be written. */
@@ -165,6 +195,217 @@ export function createTools(config = {}) {
             measure,
           ),
         );
+      },
+    },
+
+    import_step: {
+      definition: {
+        name: 'import_step',
+        description:
+          'Read an existing STEP (Part 21) file and register it as a model, so an ' +
+          'agent can start from a part it was given instead of only from a script it ' +
+          'wrote. Pass `path` (a file) or `text` (the file contents). Every ' +
+          'MANIFOLD_SOLID_BREP comes back on one of three outcomes: `brep` (exact ' +
+          'B-Rep — analytic surfaces, re-exports as analytic STEP), `mesh` (valid ' +
+          'STEP the kernel cannot represent exactly, imported as a closed ' +
+          'tessellation wrapped as an SDF), or `failed`. Returns the whole file as ' +
+          'one `model_id`, a per-solid `model_id` for each solid, the reader\'s ' +
+          'per-entity diagnostics, how many repairs the healer applied, the file\'s ' +
+          'declared units, and an immediate measure/validate summary of the imported ' +
+          'part — the same oracle `create_model` returns, because an import is where ' +
+          'the trust loop starts. Imported models work with every other tool ' +
+          '(measure, validate, get_screenshot, export); they carry no `param()`s, so ' +
+          '`optimize` has nothing to move.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            path: {
+              type: 'string',
+              description:
+                'STEP file to read (absolute, or relative to the server output dir — ' +
+                'so a file just written by `export` can be read back by bare name). ' +
+                'Mutually exclusive with `text`.',
+            },
+            text: {
+              type: 'string',
+              description:
+                'The STEP file contents inline, for a file the server cannot reach on ' +
+                'disk. Mutually exclusive with `path`.',
+            },
+            name: { type: 'string', description: 'Optional friendly name for the model.' },
+            circle_segments: {
+              type: 'number',
+              description:
+                'Tessellation fidelity of imported bodies, as segments around a full ' +
+                'circle (default 32, clamped to 3..512). This is the mesh every ' +
+                'measurement and screenshot of the import reads, so raise it when a ' +
+                'curved part measures short. It does not affect the analytic surfaces ' +
+                'themselves — an `export` of a `brep` solid is unaffected.',
+            },
+          },
+        },
+      },
+      handler(args) {
+        const hasPath = typeof args.path === 'string' && args.path !== '';
+        const hasText = typeof args.text === 'string' && args.text !== '';
+        if (hasPath === hasText) {
+          return fail(
+            hasPath
+              ? "pass either 'path' or 'text', not both"
+              : "nothing to import: pass 'path' (a STEP file) or 'text' (its contents)",
+          );
+        }
+
+        let bytes;
+        let origin;
+        if (hasPath) {
+          const src = isAbsolute(args.path) ? args.path : resolve(outputDir, args.path);
+          try {
+            bytes = readFileSync(src);
+          } catch (err) {
+            return fail(`cannot read STEP file: ${errMessage(err)}`);
+          }
+          origin = { kind: 'step', path: src, bytes: bytes.length };
+        } else {
+          // STEP is a Latin-1 format, so encode the string as Latin-1 rather
+          // than UTF-8: a degree sign in a product name is one byte in a
+          // STEP file, and encoding it as two would corrupt the name the
+          // reader hands back.
+          bytes = Buffer.from(args.text, 'latin1');
+          origin = { kind: 'step', path: null, bytes: bytes.length };
+        }
+
+        let imported;
+        try {
+          imported = importStep(bytes, positiveArg(args.circle_segments));
+        } catch (err) {
+          return fail(`import failed: ${errMessage(err)}`);
+        }
+
+        try {
+          const report = JSON.parse(imported.report);
+          const baseName =
+            args.name || (origin.path ? basename(origin.path).replace(/\.(stp|step)$/i, '') : 'imported');
+
+          // One model per solid, so an agent can address a single part of a
+          // multi-solid file, and one for the file as a whole (placed by its
+          // assembly occurrences — see `assembled`).
+          const solids = report.solids.map((solid, index) => {
+            const shape = imported.solid(index);
+            const registered = shape
+              ? store.registerImported({
+                  shape,
+                  name: solid.name || `${baseName}-solid-${index}`,
+                  origin: { ...origin, solidIndex: index, stepId: solid.stepId, outcome: solid.outcome },
+                  exact: solid.exact,
+                })
+              : null;
+            return {
+              index,
+              step_id: solid.stepId,
+              name: solid.name,
+              outcome: solid.outcome,
+              exact: solid.exact,
+              triangles: solid.triangles,
+              ...(registered ? { model_id: registered.id } : {}),
+              ...(solid.shapeError ? { shapeError: solid.shapeError } : {}),
+            };
+          });
+
+          const whole = imported.assembled();
+          if (!whole) {
+            // Valid Part 21, nothing usable in it. That is a real answer, not
+            // a crash — but it is an error for the caller, who asked for a
+            // part. Hand back the diagnostics that explain it.
+            return {
+              content: [
+                {
+                  type: 'text',
+                  text: JSON.stringify(
+                    {
+                      error:
+                        report.solids.length === 0
+                          ? 'the file parsed but declares no solids (no MANIFOLD_SOLID_BREP)'
+                          : report.counts.failed === report.solids.length
+                            ? 'the file parsed but no solid could be imported; see diagnostics'
+                            : 'the file\'s solids imported but none could be turned into a usable ' +
+                              'shape; see shapeError on each solid',
+                      solids,
+                      counts: report.counts,
+                      diagnostics: diagnosticsView(report),
+                    },
+                    null,
+                    2,
+                  ),
+                },
+              ],
+              isError: true,
+            };
+          }
+
+          const model = store.registerImported({
+            shape: whole,
+            name: baseName,
+            origin,
+            exact: report.assembledExact,
+          });
+          const measure = JSON.parse(model.shape.measure(undefined));
+          const validation = JSON.parse(model.shape.validate(undefined));
+          return text(
+            withMassError(
+              {
+                model_id: model.id,
+                name: model.name,
+                exact: model.exact,
+                source: origin.path
+                  ? { path: origin.path, bytes: origin.bytes }
+                  : { text: true, bytes: origin.bytes },
+                solids,
+                counts: report.counts,
+                healing: {
+                  operations: report.healOperations,
+                  ...(report.healOperations
+                    ? {
+                        note:
+                          'Repairs the importer applied to make bodies valid; each one is ' +
+                          'also an info diagnostic naming the entity it touched.',
+                      }
+                    : {}),
+                },
+                units: {
+                  lengthScale: report.lengthScale,
+                  angleScale: report.angleScale,
+                  note:
+                    'Scale factors resolved from the file, already applied: the imported ' +
+                    'geometry is in millimetres (and radians) whatever the file declared.',
+                },
+                assembly: {
+                  isAssembly: report.isAssembly,
+                  instances: report.instances.length,
+                  ...(report.isAssembly
+                    ? {
+                        note:
+                          'This model is the placed assembly (every occurrence transformed ' +
+                          'into root coordinates). The per-solid model_ids above are ' +
+                          'part-local, as the file stores them.',
+                      }
+                    : {}),
+                },
+                diagnostics: diagnosticsView(report),
+                mesh: { triangles: measure.triangles, vertices: measure.vertices },
+                boundingBox: measure.boundingBox,
+                volume: measure.volume,
+                valid: validation.valid,
+                issues: validation.issues,
+              },
+              measure,
+            ),
+          );
+        } finally {
+          // The shapes handed out are independent objects; this releases the
+          // import's own wasm handle rather than waiting on a finalizer.
+          imported.free();
+        }
       },
     },
 
@@ -435,11 +676,69 @@ export function createTools(config = {}) {
     list_models: {
       definition: {
         name: 'list_models',
-        description: 'List the models registered this session (id, name, exact flag, creation time).',
+        description:
+          'List the models registered this session (id, name, exact flag, source kind, ' +
+          'creation time). `source` is `script` or `step`; `get_model` returns the ' +
+          'source itself.',
         inputSchema: { type: 'object', properties: {} },
       },
       handler() {
         return text({ models: store.list() });
+      },
+    },
+
+    get_model: {
+      definition: {
+        name: 'get_model',
+        description:
+          "Return a model's own source: the script it was built from (verbatim, ready " +
+          'to edit and re-submit to `create_model`), or the STEP file it was imported ' +
+          'from. Also its params with their current values — after `optimize` those ' +
+          'are the converged numbers, so this is how an optimized design is recovered ' +
+          'as something reproducible rather than as a `model_id` that dies with the ' +
+          'session.',
+        inputSchema: {
+          type: 'object',
+          properties: { model_id: { type: 'string' } },
+          required: ['model_id'],
+        },
+      },
+      handler(args) {
+        let model;
+        try {
+          model = store.get(args.model_id);
+        } catch (err) {
+          return fail(err.message);
+        }
+        return text({
+          model_id: model.id,
+          name: model.name,
+          exact: model.exact,
+          createdAt: model.createdAt,
+          source: model.origin.kind,
+          ...(model.origin.kind === 'script'
+            ? { script: model.script }
+            : {
+                imported: {
+                  ...(model.origin.path ? { path: model.origin.path } : { text: true }),
+                  bytes: model.origin.bytes,
+                  ...(model.origin.solidIndex !== undefined
+                    ? {
+                        solidIndex: model.origin.solidIndex,
+                        stepId: model.origin.stepId,
+                        outcome: model.origin.outcome,
+                      }
+                    : { note: 'The whole file: every solid, placed by its assembly occurrences.' }),
+                },
+              }),
+          params: model.params.map((p) => ({
+            name: p.name,
+            value: p.value,
+            default: p.default,
+            ...(p.min !== undefined ? { min: p.min } : {}),
+            ...(p.max !== undefined ? { max: p.max } : {}),
+          })),
+        });
       },
     },
 
@@ -534,6 +833,18 @@ export function createTools(config = {}) {
         } catch (err) {
           return fail(err.message);
         }
+        // An imported model has no script, so there is nothing to re-run at a
+        // new parameter point. Say that, rather than letting the search fail
+        // deeper in with a message about a script the model never had.
+        if (model.origin.kind !== 'script') {
+          return fail(
+            `model ${model.id} was imported from a file, not built from a script, so it ` +
+              'has no design variables to move. Optimization needs a `create_model` ' +
+              "script that declares them with param('name', default, {min, max}); an " +
+              'imported part can be measured, validated, rendered and exported, but not ' +
+              'rebuilt at a new parameter point.',
+          );
+        }
         let result;
         try {
           result = optimize(model, args);
@@ -566,6 +877,11 @@ export function createTools(config = {}) {
   };
 }
 
-function accuracyArg(value) {
+/** A positive finite number, or `undefined` to mean "use the default". */
+function positiveArg(value) {
   return Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
+function accuracyArg(value) {
+  return positiveArg(value);
 }

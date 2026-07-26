@@ -194,6 +194,42 @@ pub struct ExactBoolean {
     pub mesh: TriangleMesh,
 }
 
+/// The topology/geometry a single STEP file was read into. One file's
+/// solids share it (the reader maps them all into one store pair), so it
+/// is held behind an `Rc` and never mutated after the read — an import is
+/// a leaf, not an operand the exact pipeline extends, so unlike
+/// [`ExactBoolean`] no `RefCell` is needed.
+pub struct ImportedFile {
+    pub store: TopologyStore,
+    pub geo: GeometryStore,
+}
+
+// The stores are opaque arenas with no `Debug` of their own; `ExactRep`
+// derives `Debug`, so say what can be said and stop there.
+impl std::fmt::Debug for ImportedFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ImportedFile").finish_non_exhaustive()
+    }
+}
+
+/// One body read back from a STEP file, plus the tessellation the
+/// reader's exact path produced.
+///
+/// The mesh is kept because it *is* the part: an imported body's analytic
+/// tessellation is strictly better than re-meshing the
+/// [`MeshSdf`](opensolid_kernel::convert::MeshSdf) built from it, and
+/// nothing about that depends on the exact-boolean toggle (see
+/// [`ExactRep::measurement_mesh`]).
+#[derive(Debug)]
+pub struct ImportedBody {
+    /// The stores this body lives in, shared with its file's other solids.
+    pub file: Rc<ImportedFile>,
+    pub body: EntityId<Body>,
+    /// The reader's tessellation of [`body`](Self::body), served for
+    /// meshing and measurement.
+    pub mesh: TriangleMesh,
+}
+
 /// The exact companion of a playground shape.
 #[derive(Debug, Clone)]
 pub enum ExactRep {
@@ -201,16 +237,51 @@ pub enum ExactRep {
     Spec(ExactSpec),
     /// A boolean result, shared by every shape derived from it.
     Boolean(Rc<ExactBoolean>),
+    /// A body imported from STEP, shared by every shape derived from it.
+    Imported(Rc<ImportedBody>),
+    /// A shape whose authoritative tessellation is known but which carries
+    /// no analytic body: the mesh-fallback path of a STEP import, and a
+    /// placed assembly (its parts' tessellations, concatenated).
+    ///
+    /// It exists because "we already know this shape's real triangles" and
+    /// "we can write analytic STEP for this shape" are different claims,
+    /// and only the first one holds here. Meshing and measurement serve the
+    /// mesh; [`to_step`](Self::to_step) declines, so export falls back to
+    /// the faceted path like any other SDF-only shape.
+    Tessellated(Rc<TriangleMesh>),
 }
 
 impl ExactRep {
     /// The exact mesh this shape can serve instead of an SDF re-mesh, if
     /// any. Specs mesh via the SDF path (primitives dual-contour fine);
-    /// only boolean results carry a superior exact tessellation.
+    /// boolean results and STEP imports carry a superior exact
+    /// tessellation.
     pub fn exact_mesh(&self) -> Option<&TriangleMesh> {
         match self {
             ExactRep::Spec(_) => None,
             ExactRep::Boolean(b) => Some(&b.mesh),
+            ExactRep::Imported(b) => Some(&b.mesh),
+            ExactRep::Tessellated(mesh) => Some(mesh),
+        }
+    }
+
+    /// The mesh meshing and measurement should use, honouring the
+    /// exact-boolean mode.
+    ///
+    /// The mode gate is a statement about *booleans*: with it off, a
+    /// boolean composes SDFs and its mesh must come from that same SDF, or
+    /// `mesh()` and `measure()` would describe a different solid than the
+    /// one the script built. An import makes no such choice — the analytic
+    /// body is the part, and its tessellation is the accurate reading of
+    /// it whatever the toggle says — so it is served unconditionally.
+    /// (Re-meshing the mesh-derived SDF instead would report the round-off
+    /// of a round-trip as if it were the part.)
+    pub fn measurement_mesh(&self) -> Option<&TriangleMesh> {
+        match self {
+            ExactRep::Imported(b) => Some(&b.mesh),
+            ExactRep::Tessellated(mesh) => Some(mesh),
+            _ if !exact_enabled() => None,
+            rep => rep.exact_mesh(),
         }
     }
 
@@ -231,6 +302,12 @@ impl ExactRep {
                 let out = b.out.borrow();
                 write_step(&out.store, &out.geo, &[out.body], options).ok()
             }
+            ExactRep::Imported(b) => {
+                write_step(&b.file.store, &b.file.geo, &[b.body], options).ok()
+            }
+            // Knowing the triangles is not knowing the surfaces: there is no
+            // analytic body to write, so the caller takes the faceted path.
+            ExactRep::Tessellated(_) => None,
         }
     }
 }
@@ -265,6 +342,14 @@ pub fn exact_boolean(op: BooleanOp, a: &ExactRep, b: &ExactRep) -> Option<ExactB
         // Two boolean results live in two different owned stores; the
         // same-store requirement can't be met without a body import.
         (ExactRep::Boolean(_), ExactRep::Boolean(_)) => None,
+        // Same barrier for an imported body: it owns the stores it was read
+        // into, and copying a body between stores is the missing piece for
+        // both cases. Booleans against an import therefore compose SDFs —
+        // the import's `MeshSdf` is a true metric field, so the F-Rep result
+        // is sound; it just is not analytic (of-2y4.8 territory). A
+        // mesh-only shape has no body to offer the exact pipeline at all.
+        (ExactRep::Imported(_) | ExactRep::Tessellated(_), _)
+        | (_, ExactRep::Imported(_) | ExactRep::Tessellated(_)) => None,
     }
 }
 

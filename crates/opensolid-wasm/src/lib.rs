@@ -12,6 +12,7 @@
 
 pub mod bounded;
 pub mod exact;
+pub mod import;
 pub mod step;
 
 use bounded::{BoundedShape, flatten_mesh};
@@ -477,12 +478,13 @@ impl WasmShape {
     }
 
     /// The exact spec transformed by `f`, if this shape is still a
-    /// (transformed) primitive; boolean results drop exactness under
-    /// transforms (their store-backed body is shared — future work).
+    /// (transformed) primitive; boolean results and STEP imports drop
+    /// exactness under transforms (their store-backed body is shared —
+    /// future work).
     fn map_spec(&self, f: impl FnOnce(&ExactSpec) -> Option<ExactSpec>) -> Option<ExactRep> {
         match self.exact.as_ref()? {
             ExactRep::Spec(spec) => f(spec).map(ExactRep::Spec),
-            ExactRep::Boolean(_) => None,
+            ExactRep::Boolean(_) | ExactRep::Imported(_) | ExactRep::Tessellated(_) => None,
         }
     }
 
@@ -499,11 +501,14 @@ impl WasmShape {
     /// Whether `measure`/`validate` will read the validated exact
     /// tessellation rather than an adaptive SDF mesh.
     fn measured_exact(&self) -> bool {
-        exact::exact_enabled()
-            && self
-                .exact
-                .as_ref()
-                .is_some_and(|r| r.exact_mesh().is_some())
+        self.measurement_mesh().is_some()
+    }
+
+    /// The exact tessellation this shape resolves to, if any — an exact
+    /// boolean result with the mode on, or a STEP import unconditionally
+    /// (see [`ExactRep::measurement_mesh`]).
+    fn measurement_mesh(&self) -> Option<&TriangleMesh> {
+        self.exact.as_ref().and_then(|r| r.measurement_mesh())
     }
 
     /// Run `f` over the mesh that measurement should use: the validated
@@ -512,10 +517,8 @@ impl WasmShape {
     /// mesh at `accuracy` (non-finite/non-positive/absent falls back to 0.5%
     /// of the shape's extent — the same default as STEP export).
     fn with_measure_mesh<R>(&self, accuracy: Option<f64>, f: impl FnOnce(&TriangleMesh) -> R) -> R {
-        if exact::exact_enabled() {
-            if let Some(mesh) = self.exact.as_ref().and_then(|r| r.exact_mesh()) {
-                return f(mesh);
-            }
+        if let Some(mesh) = self.measurement_mesh() {
+            return f(mesh);
         }
         let size = self.inner.bounds.max - self.inner.bounds.min;
         let extent = size.x.max(size.y).max(size.z).max(1e-9);
@@ -994,15 +997,13 @@ impl WasmShape {
         exact::set_exact_enabled(enabled);
     }
 
-    /// Whether `mesh()` will serve a validated exact B-Rep tessellation
-    /// (this shape is an exact boolean result and the mode is on).
+    /// Whether `mesh()` will serve a validated exact B-Rep tessellation:
+    /// this shape is an exact boolean result and the mode is on, or it is a
+    /// body imported from STEP (which serves its analytic tessellation
+    /// whatever the mode says — the toggle is a statement about booleans).
     #[wasm_bindgen(js_name = isExact)]
     pub fn is_exact(&self) -> bool {
-        exact::exact_enabled()
-            && self
-                .exact
-                .as_ref()
-                .is_some_and(|rep| rep.exact_mesh().is_some())
+        self.measurement_mesh().is_some()
     }
 
     /// Mesh the shape. Exact boolean results (see `isExact`) serve their
@@ -1013,12 +1014,7 @@ impl WasmShape {
     /// otherwise bounds are derived from the shape's tracked bounding box
     /// with padding.
     pub fn mesh(&self, resolution: u32, bound: Option<f64>) -> MeshData {
-        let exact_mesh = if exact::exact_enabled() {
-            self.exact.as_ref().and_then(|rep| rep.exact_mesh())
-        } else {
-            None
-        };
-        match exact_mesh {
+        match self.measurement_mesh() {
             Some(mesh) => mesh_data(mesh),
             None => mesh_data(&self.inner.mesh(resolution as usize, bound)),
         }
@@ -1066,12 +1062,7 @@ impl WasmShape {
     /// tessellation, which ignores `accuracy` — it is already crisp.
     #[wasm_bindgen(js_name = meshAdaptive)]
     pub fn mesh_adaptive(&self, accuracy: f64, bound: Option<f64>) -> MeshData {
-        let exact_mesh = if exact::exact_enabled() {
-            self.exact.as_ref().and_then(|rep| rep.exact_mesh())
-        } else {
-            None
-        };
-        match exact_mesh {
+        match self.measurement_mesh() {
             Some(mesh) => mesh_data(mesh),
             None => mesh_data(&self.inner.mesh_adaptive(accuracy, bound)),
         }
@@ -1299,6 +1290,99 @@ impl WasmShape {
             )
         })
     }
+}
+
+/// The result of reading a STEP file: one shape per solid, the whole file
+/// as a single placed shape, and the import report.
+///
+/// Solids keep the file's own coordinates (part-local for an assembly);
+/// [`assembled`](Self::assembled) is the placed view. A solid the reader
+/// could not import at all is absent — `solid(i)` returns `undefined` — and
+/// the report says why.
+#[wasm_bindgen]
+pub struct WasmStepImport {
+    solids: Vec<Option<import::ImportedShape>>,
+    assembled: Option<import::ImportedShape>,
+    report: String,
+}
+
+fn to_shape(shape: &import::ImportedShape) -> WasmShape {
+    WasmShape {
+        inner: shape.inner.clone(),
+        exact: shape.exact.clone(),
+    }
+}
+
+#[wasm_bindgen]
+impl WasmStepImport {
+    /// The import report as a JSON object string: `{ solids, counts,
+    /// diagnostics, diagnosticCounts, healOperations, lengthScale,
+    /// angleScale, isAssembly, instances }`.
+    ///
+    /// `solids` is one entry per `MANIFOLD_SOLID_BREP` in file order —
+    /// `{ index, stepId, name, outcome, triangles, exact, shapeError }`,
+    /// where `outcome` is `brep` (analytic surfaces), `mesh` (a closed
+    /// tessellation; the surfaces are gone) or `failed`. `diagnostics` is
+    /// the reader's per-entity findings, `healOperations` the repairs it
+    /// applied. `lengthScale`/`angleScale` are the file's declared units —
+    /// reported, not to be applied: the geometry handed back is already
+    /// scaled to millimetres and radians.
+    #[wasm_bindgen(getter)]
+    pub fn report(&self) -> String {
+        self.report.clone()
+    }
+
+    /// How many solids the file declared, including ones that failed.
+    #[wasm_bindgen(js_name = solidCount)]
+    pub fn solid_count(&self) -> usize {
+        self.solids.len()
+    }
+
+    /// The shape of solid `index` in the file's own coordinates, or
+    /// `undefined` when that solid produced no usable shape.
+    pub fn solid(&self, index: usize) -> Option<WasmShape> {
+        self.solids.get(index)?.as_ref().map(to_shape)
+    }
+
+    /// The whole file as one shape: every usable solid placed by each of
+    /// its assembly occurrences, unioned. `undefined` when nothing
+    /// imported.
+    ///
+    /// A single-part file returns its one solid unchanged — analytic body
+    /// included, so it re-exports as analytic STEP. Anything genuinely
+    /// composed is an F-Rep union and exports faceted, like any other
+    /// multi-operand shape.
+    pub fn assembled(&self) -> Option<WasmShape> {
+        self.assembled.as_ref().map(to_shape)
+    }
+}
+
+/// Read a STEP Part 21 file into shapes (of-2y4.7).
+///
+/// `bytes` is the file verbatim — STEP is ASCII/Latin-1, and a legal file
+/// need not be valid UTF-8, so it is handed over as bytes rather than a
+/// string. `circleSegments` sets the tessellation fidelity of imported
+/// bodies as segments around a full circle (default 32, clamped to 3..512).
+///
+/// Never throws on geometry: a solid the kernel cannot represent exactly
+/// arrives as a closed mesh fallback, and one it cannot recover at all
+/// arrives as a `failed` entry with diagnostics. It throws only when the
+/// file is not syntactically valid Part 21 — the one failure that leaves
+/// nothing to report on.
+#[wasm_bindgen(js_name = importStep)]
+pub fn import_step(bytes: &[u8], circle_segments: Option<f64>) -> Result<WasmStepImport, String> {
+    let imported = import::import_step(bytes, circle_segments)?;
+    let assembled = imported.assembled();
+    let report = imported.report_json(assembled.as_ref().is_some_and(|s| s.is_analytic()));
+    Ok(WasmStepImport {
+        solids: imported
+            .solids
+            .into_iter()
+            .map(|s| s.shape)
+            .collect::<Vec<_>>(),
+        assembled,
+        report,
+    })
 }
 
 #[cfg(test)]
