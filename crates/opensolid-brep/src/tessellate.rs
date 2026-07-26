@@ -68,11 +68,12 @@ use crate::geometry::GeometryStore;
 use crate::nurbs::{NurbsCurve, NurbsSurface};
 use crate::project::SurfaceProject;
 use crate::surface::{Surface3, SurfaceEval};
-use crate::topology::{Body, Edge, Face, FaceSense, Fin, FinSense, Loop, TopologyStore};
+use crate::topology::{Body, Edge, Face, FaceSense, Fin, FinSense, Loop, TopologyStore, Vertex};
 use opensolid_core::error::{CoreError, CoreResult};
 use opensolid_core::mesh::TriangleMesh;
 use opensolid_core::tolerance::ToleranceContext;
 use opensolid_core::{EntityId, Point3, Vector3};
+use std::collections::{HashMap, HashSet};
 
 /// Fidelity controls for tessellation.
 ///
@@ -216,7 +217,108 @@ pub fn tessellate_body(
         .bounding_box()
         .map(|b| (b.max - b.min).norm() * 1e-9)
         .unwrap_or(0.0);
+    snap_to_tolerant_vertices(store, body, &mut mesh);
     Ok(mesh.weld(epsilon))
+}
+
+/// Pull every mesh position lying within a *tolerant* vertex's reach onto that
+/// vertex's point, so the exact weld above can stitch them (of-2jb).
+///
+/// [`sample_loop`] already emits the vertex point itself for the two arms that
+/// take their boundary from the loops (of-61f), but [`grid_face`] — cylinders,
+/// cones, spheres, tori — does not go through it at all. Its rim comes off the
+/// surface's own `u`/`v` lattice and consults neither the edge curves nor the
+/// vertices, so on a healed body its corner samples sit on the exact surface
+/// while the adjacent planar or NURBS face's sit at the displaced vertex. They
+/// then differ by the closed gap, and the mesh does not close.
+///
+/// The reach is `Vertex::tolerance` plus the widest tolerance among the edges
+/// meeting there, which is exactly what those two fields promise: the vertex
+/// point is within its own tolerance of every adjacent curve's endpoint, and
+/// the surface a grid samples is within the edge's tolerance of that curve. A
+/// sample further away than their sum is a different feature, not this vertex.
+/// Both are bounded by [`MAX_ALLOWED_TOLERANCE`](crate::check::MAX_ALLOWED_TOLERANCE),
+/// so the reach cannot grow past what the kernel already refuses to model.
+///
+/// Exact bodies pay one topology traversal and stop — nothing is tolerant, so
+/// there is nothing to snap. For the loop-sampled arms this is a no-op even on
+/// a tolerant body: those positions are already *at* the vertex point.
+fn snap_to_tolerant_vertices(store: &TopologyStore, body: EntityId<Body>, mesh: &mut TriangleMesh) {
+    let mut seen: HashSet<EntityId<Vertex>> = HashSet::new();
+    let mut targets: Vec<(Point3, f64)> = Vec::new();
+    for face in store.faces_of_body(body) {
+        for edge_id in store.edges_of_face(face) {
+            let Some(edge) = store.edge(edge_id) else {
+                continue;
+            };
+            for vertex_id in [edge.start_vertex, edge.end_vertex] {
+                if !seen.insert(vertex_id) {
+                    continue;
+                }
+                let Some(vertex) = store.vertex(vertex_id) else {
+                    continue;
+                };
+                if !vertex.is_tolerant() {
+                    continue;
+                }
+                let widest = vertex
+                    .edges
+                    .iter()
+                    .filter_map(|&e| store.edge(e))
+                    .map(|e| e.tolerance)
+                    .fold(0.0_f64, f64::max);
+                targets.push((vertex.point, vertex.tolerance + widest));
+            }
+        }
+    }
+    if targets.is_empty() {
+        return;
+    }
+
+    // Bucket the targets so each position tests only its own neighbourhood:
+    // a fully healed import can make every vertex tolerant, and scanning all
+    // of them per position would be quadratic in the body.
+    let cell = targets
+        .iter()
+        .map(|&(_, reach)| reach)
+        .fold(0.0_f64, f64::max);
+    let key = |p: &Point3| {
+        [
+            (p.x / cell).floor() as i64,
+            (p.y / cell).floor() as i64,
+            (p.z / cell).floor() as i64,
+        ]
+    };
+    let mut buckets: HashMap<[i64; 3], Vec<usize>> = HashMap::new();
+    for (i, (point, _)) in targets.iter().enumerate() {
+        buckets.entry(key(point)).or_default().push(i);
+    }
+
+    for position in &mut mesh.positions {
+        let [cx, cy, cz] = key(position);
+        // Nearest wins, so two tolerant vertices whose reaches overlap still
+        // resolve deterministically rather than by iteration order.
+        let mut best: Option<(f64, Point3)> = None;
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                for dz in -1..=1 {
+                    let Some(bucket) = buckets.get(&[cx + dx, cy + dy, cz + dz]) else {
+                        continue;
+                    };
+                    for &i in bucket {
+                        let (point, reach) = targets[i];
+                        let distance = (*position - point).norm();
+                        if distance <= reach && best.is_none_or(|(d, _)| distance < d) {
+                            best = Some((distance, point));
+                        }
+                    }
+                }
+            }
+        }
+        if let Some((_, point)) = best {
+            *position = point;
+        }
+    }
 }
 
 /// Tessellate a single face (unwelded, open along its boundary unless the
@@ -2322,6 +2424,96 @@ mod tests {
                              mesh — it would not weld to the face across that vertex"
                         );
                     }
+                }
+            }
+        }
+
+        /// Displace every vertex of `body` off its curves the way the healer
+        /// leaves a merged cluster — points moved to a centroid, curves and
+        /// surfaces untouched — and record the displacement as the tolerance,
+        /// which is what `Vertex::tolerance` means.
+        fn make_tolerant(store: &mut TopologyStore, gap: f64) {
+            let ids: Vec<_> = store.vertices.iter().map(|(id, _)| id).collect();
+            for (i, id) in ids.iter().enumerate() {
+                let vertex = store.vertices.get_mut(*id).expect("live vertex");
+                let d = gap * if i % 2 == 0 { 1.0 } else { -1.0 };
+                let shift = Vector3::new(d, d * 0.5, d * 0.25);
+                vertex.point += shift;
+                vertex.tolerance = shift.norm().max(SYSTEM_RESOLUTION);
+            }
+        }
+
+        /// A tolerant body whose faces are **quadrics** must still weld shut
+        /// (of-2jb).
+        ///
+        /// Those faces take [`grid_face`], which never reaches
+        /// [`sample_loop`]: its rim comes off the surface's own lattice and
+        /// consults neither the edge curves nor the vertices. So when of-61f
+        /// taught the loop-sampled arms to emit the vertex point, a healed
+        /// body's caps started landing at the displaced vertex while its walls
+        /// stayed on the exact surface — and the two split. Measured on this
+        /// cylinder: 64 positions welded and closed when exact, 66 and open at
+        /// a 1e-7 displacement. `snap_to_tolerant_vertices` closes it by
+        /// pulling any sample inside a tolerant vertex's reach onto its point.
+        ///
+        /// Every quadric arm is covered, because each grids differently:
+        /// cylinder (`u`-periodic band), cone (apex singularity), sphere (two
+        /// poles), torus (periodic in both).
+        #[test]
+        fn a_tolerant_quadric_body_welds_watertight() {
+            type Build = fn(&mut TopologyStore, &mut GeometryStore) -> CoreResult<EntityId<Body>>;
+            let cases: [(&str, Build); 4] = [
+                ("cylinder", |s, g| primitives::cylinder(s, g, 1.0, 2.0)),
+                ("cone", |s, g| primitives::cone(s, g, 1.0, 0.0, 2.0)),
+                ("sphere", |s, g| primitives::sphere(s, g, 1.0)),
+                ("torus", |s, g| primitives::torus(s, g, 2.0, 0.5)),
+            ];
+            for (name, build) in cases {
+                let (exact, exact_tris) = {
+                    let mut store = TopologyStore::new();
+                    let mut geo = GeometryStore::new();
+                    let body = build(&mut store, &mut geo).expect("primitive builds");
+                    let mesh = tessellate_body(&store, &geo, body, &TessellationOptions::default())
+                        .expect("exact body tessellates");
+                    assert!(mesh.is_closed_manifold(), "{name}: exact body must close");
+                    (mesh.positions.len(), mesh.indices.len())
+                };
+                // The last case sits just under MAX_ALLOWED_TOLERANCE — the
+                // widest displacement the kernel will model at all, since
+                // `make_tolerant` records a tolerance of 1.146 * gap and
+                // `check` rejects anything past 0.01. The snap must not start
+                // swallowing whole grid cells and dropping triangles at the
+                // top of its own range.
+                for gap in [1e-7, 1e-6, 1e-5, 1e-4, 8e-3] {
+                    let mut store = TopologyStore::new();
+                    let mut geo = GeometryStore::new();
+                    let body = build(&mut store, &mut geo).expect("primitive builds");
+                    make_tolerant(&mut store, gap);
+                    // These are legal bodies, not synthetic damage: the point
+                    // of of-61f/of-2jb is that a body the kernel accepts must
+                    // not mesh open.
+                    assert_eq!(
+                        store.check(body),
+                        vec![],
+                        "{name}, gap {gap:e}: the displaced body must still pass check"
+                    );
+                    let mesh = tessellate_body(&store, &geo, body, &TessellationOptions::default())
+                        .expect("tolerant body tessellates");
+                    assert_eq!(
+                        mesh.positions.len(),
+                        exact,
+                        "{name}, gap {gap:e}: tolerant body must weld to the same \
+                         positions as the exact one"
+                    );
+                    assert!(
+                        mesh.is_closed_manifold(),
+                        "{name}, gap {gap:e}: tolerant quadric body tessellated open"
+                    );
+                    assert_eq!(
+                        mesh.indices.len(),
+                        exact_tris,
+                        "{name}, gap {gap:e}: the snap dropped triangles"
+                    );
                 }
             }
         }
