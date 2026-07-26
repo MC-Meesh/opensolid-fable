@@ -9,13 +9,27 @@ import { ModelStore } from './kernel.js';
 import { getMesh, buildBinaryStl, buildObj } from './mesh.js';
 import { renderPng, VIEW_NAMES } from './render.js';
 import { optimize } from './optimize.js';
+import { buildManifest, SERVER_INFO, UNITS } from './capabilities.js';
 
 const EXPORT_FORMATS = ['step', 'stl', 'obj'];
 const MEASURE_QUERIES = ['all', 'volume', 'surface_area', 'bbox', 'centroid', 'mass'];
+// Document units the STEP writer can declare (docs/units.md). The kernel
+// defaults an unknown key to millimetres silently; the tool rejects it instead,
+// because "I asked for inches and got millimetres" is exactly the interop bug
+// the unit declaration exists to prevent.
+const UNIT_KEYS = UNITS.map((u) => u.key);
+const DEFAULT_UNIT = 'mm';
 
 function text(obj) {
   const body = typeof obj === 'string' ? obj : JSON.stringify(obj, null, 2);
   return { content: [{ type: 'text', text: body }] };
+}
+
+// Every other payload is small enough that indentation is free. The capability
+// manifest is not: pretty-printing the whole surface costs ~50 KB against ~29 KB
+// compact, and its reader is a machine.
+function compactText(obj) {
+  return { content: [{ type: 'text', text: JSON.stringify(obj) }] };
 }
 
 function fail(message) {
@@ -81,8 +95,10 @@ export function createTools(config = {}) {
         name: 'create_model',
         description:
           'Build a CAD model from a playground JS script and register it under a ' +
-          'model_id. The script has `Shape`, `Profile`, and `param` in scope and must ' +
-          '`return` a Shape (identical semantics to the browser playground). Declare a ' +
+          'model_id. The script has `Shape`, `Profile` (closed 2D profiles), `Path` ' +
+          '(3D polyline for `Shape.sweep`), `OpenPath` (open 2D polyline for ' +
+          '`Shape.rib`), and `param` in scope, and must `return` a Shape (playground ' +
+          'semantics). `get_capabilities` lists every callable op. Declare a ' +
           "design variable with `param(name, default, {min, max})` — e.g. " +
           "`const t = param('thickness', 4, {min: 2, max: 12});` — to make it " +
           'optimizable by the `optimize` tool; the call returns the value to use and ' +
@@ -203,7 +219,9 @@ export function createTools(config = {}) {
         description:
           'Export a model to a file. STEP serializes analytic surfaces (exact chains) ' +
           'or a faceted B-Rep; STL and OBJ write the current mesh. Returns the file path ' +
-          'and byte size.',
+          'and byte size. `unit` declares the document unit in the STEP header — the ' +
+          'kernel is unitless, so this is what tells the importer whether a coordinate ' +
+          'of 60 means 60 mm or 60 in.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -223,6 +241,15 @@ export function createTools(config = {}) {
                 'files, saturating once the octree hits its minimum depth (roughly ' +
                 'accuracy = extent/16). Ignored for STEP when the model has an exact B-Rep.',
             },
+            unit: {
+              type: 'string',
+              enum: UNIT_KEYS,
+              description:
+                'Document unit declared in the STEP header (default mm). Metadata only: ' +
+                'coordinates are written verbatim and never rescaled, so switching to ' +
+                '`in` makes a 60-unit part 60 inches wide, not 2.36. STL and OBJ carry no ' +
+                'unit declaration, so it does not apply to them.',
+            },
           },
           required: ['model_id', 'format'],
         },
@@ -232,6 +259,13 @@ export function createTools(config = {}) {
         if (!EXPORT_FORMATS.includes(format)) {
           return fail(`unsupported format '${args.format}'; use one of ${EXPORT_FORMATS.join(', ')}`);
         }
+        const requestedUnit = args.unit === undefined ? undefined : String(args.unit).toLowerCase();
+        if (requestedUnit !== undefined && !UNIT_KEYS.includes(requestedUnit)) {
+          return fail(
+            `unsupported unit '${args.unit}'; use one of ${UNIT_KEYS.join(', ')} ` +
+              '(the unit is a STEP header declaration, not a rescale)',
+          );
+        }
         let model;
         try {
           model = store.get(args.model_id);
@@ -240,10 +274,11 @@ export function createTools(config = {}) {
         }
         const dest = exportPath(args.path, outputDir, model, format);
         const accuracy = accuracyArg(args.accuracy);
+        const unit = requestedUnit || DEFAULT_UNIT;
         try {
           mkdirSync(resolve(dest, '..'), { recursive: true });
           if (format === 'step') {
-            writeFileSync(dest, model.shape.exportStep(accuracy), 'utf8');
+            writeFileSync(dest, model.shape.exportStep(accuracy, unit), 'utf8');
           } else if (format === 'stl') {
             const mesh = getMesh(model.shape, { accuracy });
             writeFileSync(dest, buildBinaryStl(mesh.positions, mesh.indices));
@@ -254,7 +289,22 @@ export function createTools(config = {}) {
         } catch (err) {
           return fail(`export failed: ${errMessage(err)}`);
         }
-        return text({ model_id: model.id, format, path: dest, bytes: statSync(dest).size });
+        return text({
+          model_id: model.id,
+          format,
+          path: dest,
+          bytes: statSync(dest).size,
+          // Report the unit only where it means something. Echoing "mm" on an
+          // STL would be a claim the file does not make.
+          ...(format === 'step' ? { unit } : {}),
+          ...(format !== 'step' && requestedUnit
+            ? {
+                note:
+                  `${format.toUpperCase()} carries no unit declaration, so 'unit' was not ` +
+                  'applied. Export STEP when the unit has to travel with the geometry.',
+              }
+            : {}),
+        });
       },
     },
 
@@ -333,6 +383,52 @@ export function createTools(config = {}) {
           return fail(err.message);
         }
         return text(JSON.parse(model.shape.validate(accuracyArg(args.accuracy))));
+      },
+    },
+
+    get_capabilities: {
+      definition: {
+        name: 'get_capabilities',
+        description:
+          'The full machine-readable capability manifest: every tool with its input ' +
+          'schema, and every script operation with its signature, argument names, and ' +
+          'notes — primitives, sketch features (extrude/revolve/sweep/loft/rib), ' +
+          'transforms, booleans, blends (smoothUnion/filletEdge/chamferEdge), shell, ' +
+          'patterns, in-script queries (distance/normalAt/bounds), the Profile / Path / ' +
+          'OpenPath builders, and `param`. Also the axis and half-extent conventions and ' +
+          'the document units `export` accepts. Call this first to learn the whole ' +
+          'surface without reading the prose docs. The full manifest is ~29 KB of ' +
+          'compact JSON; `section` narrows it to one part.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            section: {
+              type: 'string',
+              enum: ['all', 'tools', 'script', 'conventions', 'units'],
+              description: 'Which part of the manifest to return (default all).',
+            },
+          },
+        },
+      },
+      handler(args) {
+        const manifest = buildManifest(
+          SERVER_INFO,
+          Object.values(tools).map((t) => t.definition),
+        );
+        const section = args.section || 'all';
+        if (section === 'all') return compactText(manifest);
+        const view = {
+          tools: { tools: manifest.tools },
+          script: { script: manifest.script },
+          conventions: { conventions: manifest.conventions },
+          units: { units: manifest.units },
+        }[section];
+        if (!view) {
+          return fail(
+            `unknown section '${args.section}'; use one of all, tools, script, conventions, units`,
+          );
+        }
+        return compactText(view);
       },
     },
 

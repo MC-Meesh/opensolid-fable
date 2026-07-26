@@ -53,6 +53,16 @@ which importers resolve to the correct scale.
   `App.jsx` owns the setting (persisted in `localStorage`) and threads it to
   the toolbar unit picker (Export group), property panel, sketch canvas, and
   status bar.
+- **Agent layer** — the MCP server has no persistent document, so the unit is a
+  per-call argument: `export(model_id, format, …, unit)` in
+  `tools/mcp-server/src/tools.js`, defaulting to `mm`. Unlike the kernel bridge
+  it *rejects* an unrecognised key instead of falling back, because an agent
+  that asked for inches and silently got millimetres has no way to notice. The
+  keys are declared once in `src/capabilities.js` and surfaced through
+  `get_capabilities`.
+
+STL and OBJ carry no unit declaration in the format at all, so the setting
+reaches an importer only through STEP.
 
 ## Rebuilding after a WASM change
 

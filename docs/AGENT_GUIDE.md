@@ -86,14 +86,15 @@ persistence. Exports and screenshots are written to `OPENSOLID_MCP_OUTPUT_DIR`.
 |------------------|----------------------------------------------------|---------|
 | `create_model`   | **`script`**, `name`, `exact`                      | `model_id` + mesh stats + validation summary |
 | `get_screenshot` | **`model_id`**, `view`, `width`, `height`          | inline PNG image |
-| `export`         | **`model_id`**, **`format`**, `path`, `accuracy`   | file path + byte size |
+| `export`         | **`model_id`**, **`format`**, `path`, `accuracy`, `unit` | file path + byte size |
 | `measure`        | **`model_id`**, `query`, `accuracy`                | mass properties |
 | `optimize`       | **`model_id`**, **`params`**, **`objective`**, `constraints`, `options` | converged params + achieved objective + trajectory |
 | `validate`       | **`model_id`**, `accuracy`                          | structural report |
+| `get_capabilities` | `section`                                        | machine-readable manifest of every tool and script op |
 | `list_models`    | —                                                  | models registered this session |
 
-Every tool except `create_model` and `list_models` takes a `model_id` handed
-back by an earlier `create_model` call.
+Every tool except `create_model`, `get_capabilities`, and `list_models` takes a
+`model_id` handed back by an earlier `create_model` call.
 
 ### `create_model`
 
@@ -159,6 +160,15 @@ the default, 765 KB at `0.2` — and `0.5` is byte-identical to `0.2`.
 Accuracy also changes the meshing depth and grid, so it is worth trying when the
 faceted STEP path declines (§4) — though it is a coarse instrument, not a
 guaranteed fix.
+
+`unit` declares the **document unit** in the STEP header: `mm` (default), `cm`,
+`m`, or `in`. It is metadata, not a conversion — the kernel is unitless and
+coordinates are written verbatim, so exporting a 60-unit part as `in` declares a
+60-**inch** part, not 2.36. That is the point: without a declaration, an importer
+resolves the file as millimetres, inches, or metres essentially at random.
+Anything but the four keys is rejected rather than quietly defaulted. STL and OBJ
+carry no unit declaration at all, so passing `unit` with them returns a `note`
+saying so. See [units.md](units.md).
 
 ### `measure`
 
@@ -232,6 +242,23 @@ finite non-zero volume:
 Call it before trusting a boolean result. A model that looks right in a
 screenshot but isn't watertight will fail here with named `issues`.
 
+### `get_capabilities`
+
+The whole surface as JSON, for an agent that would rather read a manifest than
+prose. Returns the server identity, the conventions below, the export units,
+every tool with its real `inputSchema`, and every script op with its signature,
+argument names and notes — grouped by `kind` (`primitive`, `feature`,
+`transform`, `boolean`, `blend`, `pattern`, `query`, `builder`, `internal`).
+`section` narrows it to `tools`, `script`, `conventions`, or `units` — worth
+doing, since the whole manifest is ~29 KB of (compact) JSON.
+
+The inventory is not a hand-maintained copy of the docs: the tool entries *are*
+the live definitions, and
+[`test/capabilities.test.js`](../tools/mcp-server/test/capabilities.test.js)
+diffs the script inventory against the actually-bound classes in both
+directions, so a kernel op cannot ship undocumented and a manifest entry cannot
+outlive the op it names.
+
 ### `list_models`
 
 Returns `{ models: [{ model_id, name, exact, createdAt }] }` for everything
@@ -242,10 +269,19 @@ registered this session.
 ## 3. Script API crash course
 
 `create_model` takes a **JavaScript function body** (not a module) that must
-`return` a `Shape`. It runs in strict mode with three bindings in scope —
-`Shape`, `Profile`, and `param` — the first two identical to the playground's
-**Code** tab. No imports, no `require`, no filesystem or network. Because it's
-real JavaScript, patterns (loops, arrays, math) are just code:
+`return` a `Shape`. It runs in strict mode with five bindings in scope:
+
+| Binding | What it is |
+|---------|------------|
+| `Shape` | the solid — primitives, features, transforms, booleans, queries |
+| `Profile` | closed 2D profile builder, for `extrude` / `revolve` / `loft` |
+| `Path` | 3D polyline builder, for `sweep` |
+| `OpenPath` | open 2D polyline builder, for `rib` |
+| `param` | declare a design variable `optimize` may move |
+
+The first three match the playground's **Code** tab exactly. No imports, no
+`require`, no filesystem or network. Because it's real JavaScript, patterns
+(loops, arrays, math) are just code:
 
 ```js
 // A bolt boss with a hole, then four holes on a rectangular pattern.
@@ -311,36 +347,94 @@ half-heights** — the shape is centered on the origin.
 
 **`Shape` — primitives**
 
+| Call | Shape | Exact¹ |
+|------|-------|:--:|
+| `Shape.sphere(r)` | sphere, radius `r` | ✓ |
+| `Shape.box3(hx, hy, hz)` | box, half-extents (full size `2hx × 2hy × 2hz`) | ✓ |
+| `Shape.roundedBox(hx, hy, hz, r)` | box with every edge rounded to radius `r` (half-extents include the rounding) | |
+| `Shape.cylinder(r, hh)` | cylinder, radius `r`, half-height `hh`, axis **+Y** | ✓ |
+| `Shape.torus(major, minor)` | torus with its ring in the **XZ** plane | ✓ |
+| `Shape.cone(rBottom, rTop, hh)` | cone or frustum along **+Y**: `rBottom` at `y=-hh`, `rTop` at `y=+hh`. Either radius may be `0` for a point (not both) | ✓ |
+| `Shape.capsule(x1,y1,z1, x2,y2,z2, r)` | sphere swept along the segment between two points | |
+| `Shape.halfSpace(px,py,pz, nx,ny,nz)` | the solid half *behind* the plane through `(px,py,pz)` with outward normal `(nx,ny,nz)` — unbounded on its own | |
+
+¹ *Exact* marks ops that can carry an analytic B-Rep companion, so an
+`exact: true` model keeps crisp edges and exports analytic STEP. Everything else
+is SDF-only and exports a faceted-but-valid B-Rep.
+
+`halfSpace` is the "up to face" terminator: intersect a through-all extrude with
+one to clip the extrude at a plane, instead of guessing a height.
+
+**`Shape` — sketch features** (a `Profile`/`Path` becomes a solid)
+
 | Call | Shape |
 |------|-------|
-| `Shape.sphere(r)` | sphere, radius `r` |
-| `Shape.box3(hx, hy, hz)` | box, half-extents (full size `2hx × 2hy × 2hz`) |
-| `Shape.roundedBox(hx, hy, hz, r)` | box with fillet radius `r` |
-| `Shape.cylinder(r, hh)` | cylinder, radius `r`, half-height `hh`, axis **+Y** |
-| `Shape.torus(major, minor)` | torus with its ring in the **XZ** plane |
-| `Shape.capsule(x1,y1,z1, x2,y2,z2, r)` | capsule between two points |
-| `Shape.extrude(profile, height)` | extrude a `Profile` along **+Y**, from `y=0` to `y=height` |
-| `Shape.revolve(profile, angleDeg)` | revolve a `Profile` about the Y axis |
+| `Shape.extrude(profile, height, draftDeg?)` | profile swept along **+Y** from `y=0` to `y=height`; profile `(x,y)` → world `(x,z)`. Positive `draftDeg` narrows toward the top cap (mould-release draft), negative flares; its magnitude must stay under ~80° |
+| `Shape.revolve(profile, angleDeg)` | profile revolved about **Y** through `angleDeg` ∈ `(0,360]`, sweeping +X toward +Z. Profile `(x,y)` → `(radius, y)`, so it must lie in `x ≥ 0` |
+| `Shape.sweep(profile, path)` | profile swept along a 3D `Path` polyline, twist-free per segment; joints mitre by unioning the per-segment prisms. Constant profile, no twist |
+| `Shape.loft(bottom, top, height)` | blend between two closed profiles on parallel planes (`bottom` at `y=0`, `top` at `y=height`) by morphing their signed distances. Parallel planes, linear morph |
+| `Shape.rib(openPath, thickness, height, side)` | an **open** 2D path thickened into a support rib and swept **+Y**; path `(x,y)` → world `(x,z)`. `side` is `"both"` (`thickness/2` each way), `"first"` (full thickness left of travel) or `"second"` (right). Union it with the parent body yourself |
 
 **`Shape` — transforms** (return a new shape; never mutate)
 
+| Call | Effect | Exact |
+|------|--------|:--:|
+| `s.translate(x, y, z)` | translate | ✓ |
+| `s.rotate(ax, ay, az, angleDeg)` | rotate `angleDeg` about the axis `(ax,ay,az)` through the origin | ✓ |
+| `s.uniformScale(f)` | uniform scale about the origin (`f > 0`) | ✓ |
+| `s.scale(sx, sy, sz)` | per-axis scale. Booleans and meshing stay correct, but the field is no longer an exact distance, so blends applied *after* it are distorted — prefer `uniformScale` when the factors are equal | |
+| `s.taper(px,py,pz, nx,ny,nz, angleDeg)` | mould-release draft about a parting plane: walls flare toward the pull direction `(px,py,pz)` above the neutral plane through `(nx,ny,nz)` and pinch below. **Pull direction first, then the plane point.** Whole-body — the F-Rep approximation of a face-selective draft | |
+
+**`Shape` — booleans and blends**
+
+| Call | Effect | Exact |
+|------|--------|:--:|
+| `a.union(b)` / `a.subtract(b)` / `a.intersect(b)` | CSG | ✓ |
+| `a.smoothUnion(b, r)` | union with a smooth blend of radius `r` along the *whole* intersection curve (organic fillet). Omitting `r` picks 10% of the combined bounding box's largest extent | |
+| `a.filletEdge(b, r, edge)` | union of `a` and `b` with a rounded blend of radius `r` on **one selected edge**; every other edge stays sharp. `edge` is a flat `[x0,y0,z0, x1,y1,z1, …]` polyline of the picked feature edge | |
+| `a.chamferEdge(b, setback, edge)` | same selection, but a planar bevel of `setback` instead of a round | |
+
+`smoothUnion` blends everywhere the two bodies meet; `filletEdge`/`chamferEdge`
+are the edge-selective pair — reach for them when only one corner should break.
+
+**`Shape` — thin-wall and patterns**
+
 | Call | Effect |
 |------|--------|
-| `s.translate(x, y, z)` | translate |
-| `s.rotate(ax, ay, az, angleDeg)` | rotate `angleDeg` about axis `(ax,ay,az)` |
-| `s.scale(sx, sy, sz)` / `s.uniformScale(f)` | scale |
+| `s.shell(thickness)` | hollow into a shell of total wall `thickness`, **centred on the surface** (`thickness/2` each side, so the outer extent grows by `thickness/2`). Closed all round — intersect or subtract to open a face |
+| `s.linearPattern(dx, dy, dz, count)` | `count` copies, copy `k` translated by `k·(dx,dy,dz)`. Copy 0 is the original; `count` rounds to the nearest integer and must be ≥ 1 |
+| `s.circularPattern(ax,ay,az, cx,cy,cz, count, angleDeg?)` | `count` copies spaced evenly about the axis with direction `(ax,ay,az)` through the point `(cx,cy,cz)`, spanning `angleDeg` total (default `360`). **Axis direction first, then the axis point** |
+| `s.mirror(nx,ny,nz, px,py,pz)` | this shape **unioned with** its reflection across the plane through `(px,py,pz)` with normal `(nx,ny,nz)` — a mirrored *copy*, not a reflection in place. **Normal first, then the plane point** |
 
-**`Shape` — booleans**
+**`Shape` — in-script queries** (answer a question without a tool round trip)
 
-| Call | Effect |
-|------|--------|
-| `a.union(b)` / `a.subtract(b)` / `a.intersect(b)` | CSG |
-| `a.smoothUnion(b, r)` | union with a smooth blend of radius `r` (organic fillet) |
+| Call | Returns |
+|------|---------|
+| `s.distance(x, y, z)` | signed distance to the surface — negative inside, positive outside. After smooth blends or anisotropic scaling it is not an exact Euclidean distance, but the sign and zero set stay correct, so it still answers "is this point inside?" and "which point is nearer?" |
+| `s.normalAt(x, y, z)` | outward unit surface normal `[nx, ny, nz]` at the point — the frame for sketching on a curved face |
+| `s.bounds()` | tracked bounding box `[minX,minY,minZ, maxX,maxY,maxZ]`. **Conservative**: it encloses the surface and can overstate a blended or repeatedly-rotated part. For the part's real extent use `measure`'s `boundingBox`, which is measured off the mesh |
+| `s.isExact()` | whether this shape will serve a validated exact B-Rep tessellation |
 
-**`Profile` — 2D profiles for extrude / revolve**
+These run inside the script, so a script can *decide* with them — e.g. keep only
+the pattern copies that clear an obstacle:
 
-A closed polyline with optional circular-arc segments. `bulge` is
-`tan(θ/4)` for the arc's swept angle (`0` = straight):
+```js
+let part = Shape.box3(40, 4, 20);
+const keepOut = Shape.sphere(6).translate(20, 0, 0);
+for (let i = -3; i <= 3; i++) {
+  const at = [i * 10, 0, 0];
+  if (keepOut.distance(...at) > 3) {              // 3 units of clearance
+    part = part.subtract(Shape.cylinder(2, 6).translate(...at));
+  }
+}
+return part;
+```
+
+**`Profile` — closed 2D profiles for extrude / revolve / loft**
+
+A closed polyline with optional arc, elliptical-arc, and Bézier segments.
+`bulge` is `tan(θ/4)` for the arc's swept angle (`0` = straight, positive =
+counter-clockwise):
 
 ```js
 const p = new Profile(0, 0);   // start at the origin
@@ -348,12 +442,62 @@ p.lineTo(40, 0);
 p.lineTo(40, 10);
 p.arcTo(10, 40, 0.4);          // arc segment
 p.lineTo(0, 40);
-p.close();
+p.close();                     // required — building an unclosed profile errors
 return Shape.extrude(p, 20);
 ```
 
+| Call | Effect |
+|------|--------|
+| `new Profile(x, y)` | start a closed profile at `(x, y)` |
+| `p.lineTo(x, y)` | straight segment |
+| `p.arcTo(x, y, bulge)` | circular arc (`bulge` = `tan(θ/4)`) |
+| `p.ellipseArcTo(x, y, cx, cy, rx, ry, rotationDeg, ccw)` | elliptical arc. **Centre-parameterised, not SVG endpoint form**: both the current point and `(x,y)` must lie on the ellipse centred at `(cx,cy)` with semi-axes `rx`/`ry` rotated by `rotationDeg`; `ccw` picks the direction |
+| `p.cubicTo(c1x, c1y, c2x, c2y, x, y)` | cubic Bézier with the two control points |
+| `p.close()` | close the loop back to the start |
+
+Segments added after `close()` are ignored.
+
+**`Path` — 3D polyline for `Shape.sweep`**
+
+| Call | Effect |
+|------|--------|
+| `new Path(x, y, z)` | start the path at `(x, y, z)` |
+| `path.lineTo(x, y, z)` | straight segment to `(x, y, z)` — straight segments only, no arcs in 3D yet |
+
+```js
+const tube = new Profile(-2, -2);                  // 4×4 section
+tube.lineTo(2, -2); tube.lineTo(2, 2); tube.lineTo(-2, 2); tube.close();
+const route = new Path(0, 0, 0);
+route.lineTo(0, 30, 0);
+route.lineTo(20, 30, 0);                            // mitred elbow
+return Shape.sweep(tube, route);
+```
+
+**`OpenPath` — open 2D polyline for `Shape.rib`**
+
+Same segment vocabulary as `Profile` minus `close()` — it is never closed.
+
+| Call | Effect |
+|------|--------|
+| `new OpenPath(x, y)` | start the path at `(x, y)` |
+| `p.lineTo(x, y)` / `p.arcTo(x, y, bulge)` | straight / circular-arc segment |
+| `p.ellipseArcTo(x, y, cx, cy, rx, ry, rotationDeg, ccw)` | elliptical arc (as `Profile`) |
+| `p.cubicTo(c1x, c1y, c2x, c2y, x, y)` | cubic Bézier |
+
+```js
+const base = Shape.box3(20, 1, 20);                 // 40 × 2 × 40 plate
+const spine = new OpenPath(-15, 0);
+spine.lineTo(15, 0);
+return base.union(Shape.rib(spine, 2, 10, 'both')); // 2 thick, 10 tall
+```
+
+> `OpenPath` is bound here but not yet in the playground's **Code** tab, so a
+> script using `Shape.rib` is the one thing that will not paste straight into the
+> browser. Everything else in this section is common to both.
+
 Full reference (with the exact-vs-SDF discussion) lives in the
-[server README](../tools/mcp-server/README.md#the-script-format).
+[server README](../tools/mcp-server/README.md#the-script-format), and
+`get_capabilities` returns all of the above as JSON.
 
 ---
 
@@ -444,4 +588,5 @@ Other export errors:
 5. **`export`** to STEP/STL/OBJ, branching on `isError` for the STEP faceting
    limitation above.
 
-The five gallery transcripts each walk this loop on a real part. Start there.
+The seven gallery transcripts each walk this loop on a real part. Start there —
+or call `get_capabilities` first if you would rather have the surface as JSON.

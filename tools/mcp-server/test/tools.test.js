@@ -122,6 +122,68 @@ test('export writes step, stl, and obj files', () => {
   assert.match(readFileSync(step.path, 'utf8'), /ISO-10303-21/);
 });
 
+// The kernel is unitless, so the STEP header's length unit is the only thing
+// telling an importer whether 60 means millimetres or inches. The tool used to
+// call exportStep(accuracy) against a (accuracy, unit) signature, so every
+// export declared millimetres no matter what the caller asked for (of-2y4.4).
+describe('export threads the document unit into the STEP header', () => {
+  const DECLARATIONS = {
+    mm: /SI_UNIT\(\.MILLI\.,\.METRE\.\)/,
+    cm: /SI_UNIT\(\.CENTI\.,\.METRE\.\)/,
+    m: /SI_UNIT\(\$,\.METRE\.\)/,
+    in: /CONVERSION_BASED_UNIT\('INCH'/,
+  };
+
+  for (const [unit, declaration] of Object.entries(DECLARATIONS)) {
+    test(`unit '${unit}' reaches the file`, () => {
+      const t = freshTools();
+      const id = jsonOf(t.call('create_model', { script: 'return Shape.box3(1,1,1);' })).model_id;
+      const out = jsonOf(t.call('export', { model_id: id, format: 'step', unit, path: `u-${unit}.step` }));
+      assert.equal(out.unit, unit);
+      assert.match(readFileSync(out.path, 'utf8'), declaration);
+    });
+  }
+
+  test('the unit is metadata: coordinates are never rescaled', () => {
+    const t = freshTools();
+    const id = jsonOf(t.call('create_model', { script: 'return Shape.box3(30, 20, 4);' })).model_id;
+    const asMm = readFileSync(jsonOf(t.call('export', { model_id: id, format: 'step', path: 'a.step' })).path, 'utf8');
+    const asIn = readFileSync(
+      jsonOf(t.call('export', { model_id: id, format: 'step', unit: 'in', path: 'b.step' })).path,
+      'utf8',
+    );
+    const coords = (text) => text.replace(/^#\d+ = \( LENGTH_UNIT.*$/gm, '').match(/CARTESIAN_POINT[^;]*/g);
+    assert.deepEqual(coords(asIn), coords(asMm), 'switching the unit must not move a single coordinate');
+  });
+
+  test('omitting the unit declares millimetres', () => {
+    const t = freshTools();
+    const id = jsonOf(t.call('create_model', { script: 'return Shape.box3(1,1,1);' })).model_id;
+    const out = jsonOf(t.call('export', { model_id: id, format: 'step', path: 'default.step' }));
+    assert.equal(out.unit, 'mm');
+    assert.match(readFileSync(out.path, 'utf8'), DECLARATIONS.mm);
+  });
+
+  test('an unknown unit is refused, not silently defaulted', () => {
+    const t = freshTools();
+    const id = jsonOf(t.call('create_model', { script: 'return Shape.box3(1,1,1);' })).model_id;
+    const bad = t.call('export', { model_id: id, format: 'step', unit: 'furlong' });
+    assert.equal(bad.isError, true);
+    assert.match(bad.content[0].text, /unsupported unit 'furlong'; use one of mm, cm, m, in/);
+  });
+
+  test('a unit on STL/OBJ is reported as inapplicable, not echoed back', () => {
+    const t = freshTools();
+    const id = jsonOf(t.call('create_model', { script: 'return Shape.box3(1,1,1);' })).model_id;
+    const out = jsonOf(t.call('export', { model_id: id, format: 'stl', unit: 'in', path: 'x.stl' }));
+    assert.equal(out.unit, undefined);
+    assert.match(out.note, /no unit declaration/);
+    // No note when none was asked for.
+    const quiet = jsonOf(t.call('export', { model_id: id, format: 'obj', path: 'x.obj' }));
+    assert.equal(quiet.note, undefined);
+  });
+});
+
 test('export accuracy is the file-size lever on every faceted path', () => {
   // An organic shape has no exact B-Rep companion, so STEP takes the faceted
   // path and honours accuracy just as STL and OBJ do.

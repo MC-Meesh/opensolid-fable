@@ -17,22 +17,26 @@ produces the identical shape in the GUI, and vice-versa.
 |------------------|---------|
 | `create_model`   | Build a model from a playground JS script → `model_id` + mesh stats + validation summary. |
 | `get_screenshot` | Render a model to a PNG from a named view (`iso`, `front`, `top`, …). |
-| `export`         | Write a model to a file: `step` \| `stl` \| `obj`. |
+| `export`         | Write a model to a file: `step` \| `stl` \| `obj`, with the document `unit` declared in the STEP header. |
 | `measure`        | Mass properties: volume, surface area, centroid, inertia, bounding box. |
 | `validate`       | Structural check: is the mesh a closed, consistently-oriented manifold enclosing a finite non-zero volume? |
+| `optimize`       | Drive a model's `param()` design variables onto a mass/volume/centroid target under constraints, and write the result back. |
+| `get_capabilities` | The machine-readable manifest: every tool's input schema and every script op's signature. |
 | `list_models`    | List the models registered this session. |
 
-Every tool except `create_model` and `list_models` takes a `model_id` returned
-by an earlier `create_model` call. Models live for the lifetime of the server
-process (in memory, no persistence).
+Every tool except `create_model`, `get_capabilities`, and `list_models` takes a
+`model_id` returned by an earlier `create_model` call. Models live for the
+lifetime of the server process (in memory, no persistence).
 
 ## The script format
 
 `create_model` takes a `script`: a **JavaScript function body** (not a module)
-that must `return` a `Shape`. It runs in strict mode with exactly two bindings
-in scope — `Shape` and `Profile` — identical to the playground's **Code** tab
-(see [`runScript.js`](../../web/playground/src/lib/runScript.js)). No imports,
-no `require`, no filesystem or network.
+that must `return` a `Shape`. It runs in strict mode with five bindings in
+scope — `Shape`, `Profile` (closed 2D profiles), `Path` (3D polyline for
+`Shape.sweep`), `OpenPath` (open 2D polyline for `Shape.rib`), and `param`
+(design variables for `optimize`). The first three match the playground's
+**Code** tab (see [`runScript.js`](../../web/playground/src/lib/runScript.js)).
+No imports, no `require`, no filesystem or network.
 
 ```js
 // The classic "bolt boss": a cylinder with a bolt hole through it.
@@ -53,9 +57,14 @@ All dimensions are model units. Box/cylinder/torus arguments are **half-extents
 | `Shape.roundedBox(hx, hy, hz, r)` | box with fillet radius `r` |
 | `Shape.cylinder(r, hh)` | cylinder, radius `r`, half-height `hh` (full height `2·hh`), axis **+Y** |
 | `Shape.torus(major, minor)` | torus with its ring in the **XZ** plane |
+| `Shape.cone(rBottom, rTop, hh)` | cone or frustum along **+Y** (either radius may be `0`, not both) |
 | `Shape.capsule(x1,y1,z1, x2,y2,z2, r)` | capsule (swept sphere) between two points |
-| `Shape.extrude(profile, height)` | extrude a `Profile` along **+Y**, from `y=0` to `y=height` |
+| `Shape.halfSpace(px,py,pz, nx,ny,nz)` | the solid half behind a plane — unbounded; intersect it to clip a through-all extrude |
+| `Shape.extrude(profile, height, draftDeg?)` | extrude a `Profile` along **+Y**, from `y=0` to `y=height`, with optional mould draft |
 | `Shape.revolve(profile, angleDeg)` | revolve a `Profile` about the Y axis |
+| `Shape.sweep(profile, path)` | sweep a `Profile` along a 3D `Path` polyline |
+| `Shape.loft(bottom, top, height)` | blend two `Profile`s on parallel planes |
+| `Shape.rib(openPath, thickness, height, side)` | thicken an `OpenPath` into a support rib swept **+Y** (`side`: `both`/`first`/`second`) |
 
 > **⚠️ The axis convention is +Y — and getting it wrong fails silently.**
 >
@@ -82,20 +91,37 @@ All dimensions are model units. Box/cylinder/torus arguments are **half-extents
 | `s.rotate(ax, ay, az, angleDeg)` | rotate `angleDeg` about axis `(ax,ay,az)` |
 | `s.scale(sx, sy, sz)` | non-uniform scale |
 | `s.uniformScale(f)` | uniform scale |
+| `s.taper(px,py,pz, nx,ny,nz, angleDeg)` | mould draft about a parting plane (pull direction first, then the plane point) |
 
-### `Shape` — booleans
+### `Shape` — booleans and blends
 
 | Call | Effect |
 |------|--------|
 | `a.union(b)` | union |
 | `a.subtract(b)` | `a` minus `b` |
 | `a.intersect(b)` | intersection |
-| `a.smoothUnion(b, r)` | union with a smooth blend of radius `r` (organic fillet) |
+| `a.smoothUnion(b, r)` | union with a smooth blend of radius `r` along the whole intersection curve |
+| `a.filletEdge(b, r, edge)` | union with a rounded blend on **one selected edge** (`edge` = flat `[x0,y0,z0, …]` polyline) |
+| `a.chamferEdge(b, setback, edge)` | same, but a planar bevel |
 
-### `Profile` — 2D profiles for extrude / revolve
+### `Shape` — thin-wall, patterns, and queries
 
-A `Profile` is a closed polyline with optional circular-arc segments (`bulge` is
-the tangent of a quarter of the arc's swept angle; `0` = straight).
+| Call | Effect |
+|------|--------|
+| `s.shell(thickness)` | hollow to a wall of `thickness`, centred on the surface |
+| `s.linearPattern(dx, dy, dz, count)` | `count` copies, copy `k` at `k·(dx,dy,dz)` |
+| `s.circularPattern(ax,ay,az, cx,cy,cz, count, angleDeg?)` | `count` copies about an axis (direction, then point) spanning `angleDeg` (default 360) |
+| `s.mirror(nx,ny,nz, px,py,pz)` | union with the reflection across a plane (normal, then point) |
+| `s.distance(x, y, z)` | signed distance — negative inside |
+| `s.normalAt(x, y, z)` | outward unit normal `[nx,ny,nz]` |
+| `s.bounds()` | tracked (conservative) bounding box; use `measure` for the real extent |
+| `s.isExact()` | whether an exact B-Rep tessellation will be served |
+
+### `Profile` / `Path` / `OpenPath` — the sketch builders
+
+A `Profile` is a **closed** polyline with optional arc, elliptical-arc, and
+Bézier segments (`bulge` is the tangent of a quarter of the arc's swept angle;
+`0` = straight).
 
 ```js
 // An L-bracket profile, extruded 20mm thick.
@@ -111,10 +137,21 @@ return Shape.extrude(p, 20);
 
 | Call | Effect |
 |------|--------|
-| `new Profile(x, y)` | start a profile at `(x, y)` |
+| `new Profile(x, y)` | start a closed profile at `(x, y)` |
 | `p.lineTo(x, y)` | straight segment to `(x, y)` |
 | `p.arcTo(x, y, bulge)` | circular arc to `(x, y)` (`bulge` = tan(θ/4)) |
-| `p.close()` | close the loop back to the start |
+| `p.ellipseArcTo(x, y, cx, cy, rx, ry, rotationDeg, ccw)` | elliptical arc — centre-parameterised, **not** SVG endpoint form |
+| `p.cubicTo(c1x, c1y, c2x, c2y, x, y)` | cubic Bézier |
+| `p.close()` | close the loop back to the start (required before extrude/revolve/loft/sweep) |
+
+A `Path` is the 3D polyline `Shape.sweep` follows — `new Path(x, y, z)` then
+`path.lineTo(x, y, z)` per vertex (straight segments only). An `OpenPath` is the
+open 2D polyline `Shape.rib` thickens — `new OpenPath(x, y)` plus the same
+segment methods as `Profile` minus `close()`.
+
+`OpenPath` is bound here but not yet in the playground's Code tab, so a
+`Shape.rib` script is the one thing that will not paste straight into the
+browser.
 
 ### Exact vs. SDF booleans
 
@@ -192,10 +229,11 @@ installs cleanly and only fails on the user's machine.
 
 ## Examples
 
-[`examples/agent-gallery/`](examples/agent-gallery/) is a gallery of **five**
+[`examples/agent-gallery/`](examples/agent-gallery/) is a gallery of **seven**
 worked agent transcripts — a mounting bracket, a hinge leaf, a shelled enclosure
-with a press-fit lid, a toothed disk built from a circular pattern, and a
-revolved-and-shelled bottle. Each is real, unedited output from this server,
+with a press-fit lid, a toothed disk built from a circular pattern, a
+revolved-and-shelled bottle, a right-angle bracket with a gusset, and an
+optimize-to-mass-target run. Each is real, unedited output from this server,
 captured by [`build-gallery.mjs`](examples/agent-gallery/build-gallery.mjs): the
 agent writes a script, gets mesh stats and a validity flag, renders screenshots,
 measures mass properties, and exports STEP/STL/OBJ. They show the intended loop

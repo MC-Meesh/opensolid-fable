@@ -5,9 +5,9 @@
 
 import { createInterface } from 'node:readline';
 import { createTools } from './tools.js';
+import { SERVER_INFO } from './capabilities.js';
 
 const PROTOCOL_VERSION = '2024-11-05';
-const SERVER_INFO = { name: 'opensolid-mcp-server', version: '0.1.0' };
 
 const tools = createTools({ outputDir: process.env.OPENSOLID_MCP_OUTPUT_DIR });
 

@@ -16,8 +16,12 @@ const wasm = require(resolve(here, '..', 'pkg', 'opensolid_wasm.js'));
 
 /** The Shape class scripts build against (bound as `Shape`). */
 export const Shape = wasm.WasmShape;
-/** The 2D profile builder (bound as `Profile`) for extrude/revolve. */
+/** The closed 2D profile builder (bound as `Profile`) for extrude/revolve/loft. */
 export const Profile = wasm.WasmProfile2D;
+/** The 3D polyline builder (bound as `Path`) consumed by `Shape.sweep`. */
+export const Path = wasm.WasmPath3D;
+/** The open 2D polyline builder (bound as `OpenPath`) consumed by `Shape.rib`. */
+export const OpenPath = wasm.WasmOpenPath2D;
 
 /**
  * Build the `param()` helper a script uses to declare a design variable, plus
@@ -77,10 +81,19 @@ function makeParam(overrides = {}) {
 
 /**
  * Evaluate a playground script that must `return` a Shape. Runs in strict
- * mode with `Shape`, `Profile`, and `param` in scope — the same contract as
- * the playground's Code tab (see web/playground/src/lib/runScript.js), plus
- * `param()` for declaring design variables. Throws a message-only Error on
- * syntax errors, runtime errors, or a non-Shape return.
+ * mode with `Shape`, `Profile`, `Path`, `OpenPath`, and `param` in scope.
+ * `Shape`/`Profile`/`Path` are the playground Code tab's bindings (see
+ * web/playground/src/lib/runScript.js); `OpenPath` (the `Shape.rib` path
+ * builder) and `param()` (design variables for `optimize`) are additions
+ * here — a superset, so every playground script still runs unchanged.
+ *
+ * Binding the builder classes is what makes their consumers reachable at all:
+ * `Shape.sweep` needs a `Path` and `Shape.rib` needs an `OpenPath`, and a
+ * script cannot construct one it has no name for. Leaving either out silently
+ * strands the op (of-2y4.4).
+ *
+ * Throws a message-only Error on syntax errors, runtime errors, or a non-Shape
+ * return.
  *
  * @param {string} source script body (a function body, not a module)
  * @param {Record<string, number>} [overrides] param values to substitute
@@ -93,12 +106,19 @@ export function runScript(source, overrides = {}) {
   }
   let build;
   try {
-    build = new Function('Shape', 'Profile', 'param', `"use strict";\n${source}`);
+    build = new Function(
+      'Shape',
+      'Profile',
+      'Path',
+      'OpenPath',
+      'param',
+      `"use strict";\n${source}`,
+    );
   } catch (err) {
     throw new Error(`script has a syntax error: ${err.message}`);
   }
   const { param, declared } = makeParam(overrides);
-  const shape = build(Shape, Profile, param);
+  const shape = build(Shape, Profile, Path, OpenPath, param);
   if (!(shape instanceof Shape)) {
     throw new Error('script must return a Shape, e.g. end with:\n  return solid;');
   }
