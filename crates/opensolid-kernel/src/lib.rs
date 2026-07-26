@@ -28,6 +28,9 @@
 //!   [`MeshOptions`]) producing the shared [`TriangleMesh`].
 //! - [`massprops`] — exact polyhedral [`mass_properties`] (volume, centroid,
 //!   inertia) via the divergence theorem.
+//! - [`brep_massprops`] — the same quantities measured a second, independent
+//!   way ([`brep_mass_properties`]): surface integrals over the B-Rep faces
+//!   themselves, so no measurement depends on tessellation being right.
 //! - [`io`] — STL/OBJ writers ([`write_stl_binary`], [`write_obj`]).
 //! - [`session`] — a modeling [`Session`] with copy-on-write undo/redo and an
 //!   append-only journal.
@@ -35,6 +38,7 @@
 //! The three underlying crates are re-exported as [`core`], [`frep`], and
 //! [`brep`] for direct access.
 pub mod assembly;
+pub mod brep_massprops;
 pub mod builder;
 pub mod convert;
 pub mod hybrid;
@@ -56,6 +60,7 @@ pub use assembly::{
     InterferenceReport, Mate, MateError, MateKind, Part as AssemblyPart, SolveOptions, SolveResult,
     SolveStatus, seat_concentric_coincident, solve_mates,
 };
+pub use brep_massprops::{BrepMassPropertiesError, brep_mass_properties};
 pub use builder::{Part, shape};
 pub use convert::{MeshSdf, SdfToBrepOptions, sdf_to_brep};
 pub use hybrid::{

@@ -68,7 +68,7 @@ use opensolid_kernel::io::step::read::{
     Severity, SolidOutcome, StepImport, StepReadOptions, read_step, read_step_bytes,
 };
 use opensolid_kernel::io::step::write::{LengthUnit, StepWriteOptions, write_step};
-use opensolid_kernel::mass_properties;
+use opensolid_kernel::{brep_mass_properties, mass_properties};
 
 // ---------------------------------------------------------------------
 // Helpers
@@ -169,6 +169,21 @@ fn closed_volume(store: &TopologyStore, geo: &GeometryStore, body: EntityId<Body
     mass_properties(&mesh).ok().map(|mp| mp.volume)
 }
 
+/// Volume the second way (of-ipt.17): surface integrals over the B-Rep faces,
+/// reduced to contour integrals over each face's trim curves.
+///
+/// This is the corpus's only measurement of the bodies the standalone
+/// tessellator defers to the CDT pass — [`closed_volume`] returns `None` for
+/// those and every volume gate above silently skipped them. It is also the
+/// one that reads an imported body's **stored** pcurves, which nothing else
+/// in the round trip does: the writer emits them, the reader rebuilds them,
+/// and until now no gate ever measured anything through them.
+fn exact_volume(store: &TopologyStore, geo: &GeometryStore, body: EntityId<Body>) -> Option<f64> {
+    brep_mass_properties(store, geo, body)
+        .ok()
+        .map(|mp| mp.volume)
+}
+
 /// The full round-trip gate: write → read (exact B-Rep, no error
 /// diagnostics, clean check) → identical Euler counts → write again and
 /// require the byte-identical file (fixed point). Volume is compared when
@@ -258,6 +273,46 @@ fn assert_round_trip_gate(
         assert!(
             drift <= 1e-9,
             "{context}: volume drift {drift:e} exceeds 1e-9 ({v1} vs {v2})"
+        );
+    }
+
+    // The same two questions asked of the measurement that does not go
+    // through a mesh (of-ipt.17). It reaches the bodies `closed_volume`
+    // cannot, so this is the *only* volume gate several corpus files get, and
+    // on an imported body it is the only thing that reads the pcurves the
+    // round trip just wrote and re-read.
+    let (e1, e2) = (
+        exact_volume(store, geo, body),
+        exact_volume(&store2, &geo2, body2),
+    );
+    assert_eq!(
+        e1.is_some(),
+        e2.is_some(),
+        "{context}: B-Rep measurability must survive the round trip \
+         (original {e1:?}, re-imported {e2:?})"
+    );
+    if let (Some(v1), Some(v2)) = (e1, e2) {
+        assert!(
+            v1 > 0.0,
+            "{context}: original B-Rep volume must be positive, got {v1}"
+        );
+        let drift = (v1 - v2).abs() / v1.max(1.0);
+        assert!(
+            drift <= 1e-9,
+            "{context}: B-Rep volume drift {drift:e} exceeds 1e-9 ({v1} vs {v2})"
+        );
+    }
+    // Where both paths can measure, they must agree to the tessellation's own
+    // fidelity: the default 32 samples per circle sit a sagitta
+    // `R(1 − cos(π/32))` ≈ `4.8e-3·R` inside a curved face, which costs about
+    // 1.3% of a doubly-curved body's volume. 3% covers that with room for a
+    // body that is mostly curved surface.
+    if let (Some(meshed), Some(exact)) = (m1, e1) {
+        let gap = (meshed - exact).abs() / exact.abs().max(1e-300);
+        assert!(
+            gap <= 3e-2,
+            "{context}: meshed volume {meshed} and B-Rep-native volume {exact} \
+             disagree by {gap:e}, far past tessellation error"
         );
     }
 

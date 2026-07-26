@@ -51,7 +51,7 @@
 //! `HybridPath::Brep` for NURBS operands through the public entry point;
 //! this section proves the pipeline underneath it.
 
-use nalgebra::{Rotation3, Unit};
+use nalgebra::{Matrix3, Rotation3, Unit};
 use opensolid_brep::boolean::{InsideTest, boolean_with_inside_tests, intersect, subtract, unite};
 use opensolid_brep::curve::plane_basis;
 use opensolid_brep::{
@@ -65,7 +65,9 @@ use opensolid_core::error::{CoreError, CoreResult};
 use opensolid_core::mesh::TriangleMesh;
 use opensolid_core::tolerance::ToleranceContext;
 use opensolid_core::types::{BoundingBox3, Point3, Vector3};
-use opensolid_kernel::{MeshOptions, MeshSdf, mass_properties, mesh_sdf_indexed};
+use opensolid_kernel::{
+    MassProperties, MeshOptions, MeshSdf, brep_mass_properties, mass_properties, mesh_sdf_indexed,
+};
 use std::f64::consts::{FRAC_1_SQRT_2, FRAC_PI_2, FRAC_PI_4, PI};
 
 fn tol() -> ToleranceContext {
@@ -83,6 +85,28 @@ const PLANAR_VOLUME_RTOL: f64 = 1e-9;
 /// one): ~96 segments around and ~48 across lose ≈1.5e-3 of the volume.
 /// The same 0.5% budget as cylinders still covers it with margin.
 const CURVED_VOLUME_RTOL: f64 = 5e-3;
+/// Budget for the meshed volume against the B-Rep-native one (of-ipt.17), as
+/// a fraction of the result's own volume. The B-Rep number is exact to
+/// floating point, so the whole gap is the tessellation's.
+const CROSS_CHECK_VOLUME_RTOL: f64 = 5e-3;
+/// The same budget stated *absolutely*, for results a relative bound cannot
+/// fairly describe.
+///
+/// A tessellation inscribed in a curved face sits at most one sagitta inside
+/// it — `R(1 − cos(π/96))` ≈ `5.4e-4·R` at this suite's 96 samples per circle
+/// — so it can lose about `sagitta × curved area` of volume. That is a
+/// *fixed* amount set by the operands' curvature, not by the result: a
+/// spherical cap a thousandth of a radius tall is thinner than the sagitta
+/// itself, and the mesh misses tens of percent of it while being no less
+/// faithful to the sphere than usual. Scaling `R` by the result's bounding
+/// diagonal and allowing 4× for the several curved faces a result carries
+/// gives the slack below; a misclassified *region* is orders of magnitude
+/// larger than this and still fails.
+const CROSS_CHECK_CHORD_SLACK: f64 = 2e-3;
+/// Budget for a closed form weighed by the B-Rep-native path, which does not
+/// discretize anything. Loose only by the standards of an exact method: it
+/// still leaves four orders of magnitude to the meshed budget above.
+const EXACT_RTOL: f64 = 1e-9;
 
 // ---------------------------------------------------------------------
 // Closed-form volumes for sphere/torus configurations (of-7ld.3).
@@ -158,12 +182,64 @@ fn assert_valid(out: &BooleanOutput, context: &str) -> TriangleMesh {
     mesh
 }
 
-/// Volume of a valid boolean result via kernel mass properties.
+/// Volume of a valid boolean result via kernel mass properties, cross-checked
+/// against the B-Rep-native measurement (of-ipt.17).
+///
+/// Every closed-form assertion in this file routes through here, so every one
+/// of them now also asserts that the *two independent* measurement paths agree.
+/// That is the point: a tessellation bug consistent enough to move every
+/// meshed volume the same way is invisible to a suite that only ever weighs
+/// meshes, and this suite used to be exactly that.
 fn volume(out: &BooleanOutput, context: &str) -> f64 {
+    measured(out, context).0.volume
+}
+
+/// Both measurements of a valid boolean result: the meshed one first, the
+/// B-Rep-native one second, already asserted to agree.
+///
+/// The mesh volume is what the closed-form assertions weigh (they are tuned to
+/// the tessellation's discretization error, and holding the tessellator to
+/// them is half of what this suite is for); the B-Rep number is exact to
+/// floating point, so the gap between them is a pure measure of tessellation
+/// error and is held to the same budget the closed forms allow.
+fn measured(out: &BooleanOutput, context: &str) -> (MassProperties, MassProperties) {
     let mesh = assert_valid(out, context);
-    mass_properties(&mesh)
-        .unwrap_or_else(|e| panic!("{context}: mass_properties failed: {e}"))
-        .volume
+    let meshed =
+        mass_properties(&mesh).unwrap_or_else(|e| panic!("{context}: mass_properties failed: {e}"));
+    let exact = brep_mass_properties(&out.store, &out.geo, out.body)
+        .unwrap_or_else(|e| panic!("{context}: brep_mass_properties failed: {e}"));
+    let diagonal = mesh
+        .bounding_box()
+        .map(|b| (b.max - b.min).norm())
+        .unwrap_or(0.0);
+    assert_cross_checked(&meshed, &exact, diagonal, context);
+    (meshed, exact)
+}
+
+/// The meshed measurement against the exact one, allowed the larger of a
+/// relative budget and the absolute slack a chord-inscribed tessellation is
+/// entitled to (see [`CROSS_CHECK_CHORD_SLACK`]).
+fn assert_cross_checked(
+    meshed: &MassProperties,
+    exact: &MassProperties,
+    diagonal: f64,
+    context: &str,
+) {
+    let gap = (meshed.volume - exact.volume).abs();
+    let allowed = (CROSS_CHECK_VOLUME_RTOL * exact.volume.abs())
+        .max(CROSS_CHECK_CHORD_SLACK * exact.surface_area * diagonal);
+    assert!(
+        gap <= allowed,
+        "{context}: meshed volume {} differs from the B-Rep-native {} by {gap:.3e} \
+         (allowed {allowed:.3e}: {:.1e} relative or {:.1e} of chord slack over \
+         area {:.4} and diagonal {:.4})",
+        meshed.volume,
+        exact.volume,
+        CROSS_CHECK_VOLUME_RTOL,
+        CROSS_CHECK_CHORD_SLACK,
+        exact.surface_area,
+        diagonal,
+    );
 }
 
 fn assert_close(got: f64, want: f64, rtol: f64, context: &str) {
@@ -174,6 +250,148 @@ fn assert_close(got: f64, want: f64, rtol: f64, context: &str) {
          by {:.3e} relative (allowed {rtol:.1e})",
         ((got - want) / scale).abs()
     );
+}
+
+// ---------------------------------------------------------------------
+// Closed-form CENTROID and INERTIA for composite solids (of-ipt.17).
+//
+// Volume alone was this suite's whole oracle: `mass_properties` computes a
+// centroid and an inertia tensor for every result and nothing ever read them,
+// so a boolean that placed the right amount of material in the wrong place
+// passed. The fix is not a new integral but an algebra — mass properties are
+// additive over disjoint solids and subtractive over a cavity wholly inside
+// its host, and every primitive's own centroid and inertia are textbook — so
+// a configuration built from primitives has an exact expected tensor, not
+// just an expected number.
+//
+// Moments are carried about the ORIGIN because that is the frame in which
+// they add; the centroid and the centroidal inertia are recovered at the end.
+// ---------------------------------------------------------------------
+
+/// Closed-form mass properties of a homogeneous solid at unit density,
+/// expressed about the origin so that composites are sums.
+#[derive(Debug, Clone, Copy)]
+struct Rigid {
+    volume: f64,
+    /// First moment `∫x dV` about the origin.
+    moment: Vector3,
+    /// Inertia tensor about the origin.
+    inertia_origin: Matrix3<f64>,
+}
+
+impl Rigid {
+    /// Assemble from the textbook *centroidal* tensor plus a placement, via
+    /// the parallel-axis theorem `I_o = I_c + m(|c|²E − c cᵀ)`.
+    fn placed(volume: f64, centroid: Point3, inertia_centroid: Matrix3<f64>) -> Self {
+        let c = centroid.coords;
+        Rigid {
+            volume,
+            moment: c * volume,
+            inertia_origin: inertia_centroid
+                + (Matrix3::identity() * c.norm_squared() - c * c.transpose()) * volume,
+        }
+    }
+
+    /// Axis-aligned block of `size` centered at `center`.
+    fn block(center: Point3, size: Vector3) -> Self {
+        let m = size.x * size.y * size.z;
+        let sq = Vector3::new(size.x * size.x, size.y * size.y, size.z * size.z);
+        Self::placed(
+            m,
+            center,
+            Matrix3::from_diagonal(
+                &(Vector3::new(sq.y + sq.z, sq.x + sq.z, sq.x + sq.y) * (m / 12.0)),
+            ),
+        )
+    }
+
+    /// Circular cylinder about `+Z` of `radius` and `height`, centered at
+    /// `center`.
+    fn cylinder_z(center: Point3, radius: f64, height: f64) -> Self {
+        let m = PI * radius * radius * height;
+        let transverse = m * (3.0 * radius * radius + height * height) / 12.0;
+        Self::placed(
+            m,
+            center,
+            Matrix3::from_diagonal(&Vector3::new(
+                transverse,
+                transverse,
+                m * radius * radius / 2.0,
+            )),
+        )
+    }
+
+    /// Solid sphere of `radius` centered at `center`.
+    fn sphere(center: Point3, radius: f64) -> Self {
+        let m = 4.0 / 3.0 * PI * radius * radius * radius;
+        let i = 0.4 * m * radius * radius;
+        Self::placed(m, center, Matrix3::identity() * i)
+    }
+
+    /// Union with a solid whose interior is disjoint from this one's.
+    fn plus(self, other: Rigid) -> Self {
+        Rigid {
+            volume: self.volume + other.volume,
+            moment: self.moment + other.moment,
+            inertia_origin: self.inertia_origin + other.inertia_origin,
+        }
+    }
+
+    /// Difference from a solid wholly contained in this one.
+    fn minus(self, other: Rigid) -> Self {
+        Rigid {
+            volume: self.volume - other.volume,
+            moment: self.moment - other.moment,
+            inertia_origin: self.inertia_origin - other.inertia_origin,
+        }
+    }
+
+    fn centroid(self) -> Point3 {
+        Point3::from(self.moment / self.volume)
+    }
+
+    /// The tensor a measurement reports: about the composite's own centroid.
+    fn inertia_centroid(self) -> Matrix3<f64> {
+        let c = self.centroid().coords;
+        self.inertia_origin
+            - (Matrix3::identity() * c.norm_squared() - c * c.transpose()) * self.volume
+    }
+}
+
+/// Assert a measurement matches a closed-form composite in all three of
+/// volume, centroid and inertia.
+///
+/// Centroid error is scaled by the body's own size (`V^{1/3}`) rather than by
+/// its distance from the origin, which may be zero; inertia entries are scaled
+/// by the largest entry of the expected tensor, so a near-zero product of
+/// inertia is held to an absolute bound rather than an unmeetable relative one.
+fn assert_matches_rigid(got: &MassProperties, want: Rigid, rtol: f64, context: &str) {
+    assert_close(got.volume, want.volume, rtol, &format!("{context} volume"));
+
+    let scale = want.volume.abs().cbrt().max(1e-300);
+    let centroid_err = (got.centroid - want.centroid()).norm() / scale;
+    assert!(
+        centroid_err <= rtol,
+        "{context}: centroid {:?} differs from expected {:?} by {centroid_err:.3e} \
+         relative to the body size (allowed {rtol:.1e})",
+        got.centroid,
+        want.centroid()
+    );
+
+    let expected = want.inertia_centroid();
+    let magnitude = expected.iter().fold(0.0f64, |a, b| a.max(b.abs()));
+    for i in 0..3 {
+        for j in 0..3 {
+            let err = (got.inertia[(i, j)] - expected[(i, j)]).abs() / magnitude.max(1e-300);
+            assert!(
+                err <= rtol,
+                "{context}: I[{i}][{j}] = {} differs from expected {} by {err:.3e} \
+                 relative to the tensor's magnitude (allowed {rtol:.1e})",
+                got.inertia[(i, j)],
+                expected[(i, j)]
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -4617,5 +4835,546 @@ fn nurbs_box_sliver_trims_abut_knot_domain_boundary() {
         b,
         [Some(&inside_a), None],
         (8.0, 4.0 * 4.0 * 1.52, 2.0 * 2.0 * 0.02),
+    );
+}
+
+// =====================================================================
+// (15) The second measurement path: B-Rep-native mass properties, and
+//      centroid/inertia as first-class oracles (of-ipt.17).
+//
+// Two independent things are proved here.
+//
+// First, that `brep_mass_properties` — surface integrals over the faces
+// themselves, reduced to contour integrals over the trim curves — agrees with
+// `mass_properties` on a mesh. Every `volume()` call in this file already
+// asserts that pairwise; this section pins it to *closed forms* on both
+// sides, so an agreement between two paths that are both wrong the same way
+// cannot pass.
+//
+// Second, that the results are in the right *place* and have the right mass
+// *distribution*. Volume was the whole oracle before: a boolean that kept the
+// correct amount of material somewhere else entirely, or that mirrored a
+// pocket to the opposite side, weighed exactly the same. The `Rigid` algebra
+// above supplies the missing expectations in closed form.
+// =====================================================================
+
+/// Both measurements of a plain (non-boolean) body, cross-checked the same way
+/// [`measured`] does for boolean results.
+fn measured_body(
+    scene: &Scene,
+    body: EntityId<Body>,
+    context: &str,
+) -> (MassProperties, MassProperties) {
+    // Match the 96 samples per circle `BooleanOutput::tessellate` uses, so
+    // the cross-check budget below means the same thing here as it does for a
+    // boolean result.
+    let mesh = tessellate_body(
+        &scene.store,
+        &scene.geo,
+        body,
+        &TessellationOptions {
+            angular_step: 2.0 * PI / 96.0,
+        },
+    )
+    .unwrap_or_else(|e| panic!("{context}: tessellation failed: {e:?}"));
+    assert!(
+        mesh.is_closed_manifold(),
+        "{context}: tessellation is not a closed manifold"
+    );
+    let meshed =
+        mass_properties(&mesh).unwrap_or_else(|e| panic!("{context}: mass_properties failed: {e}"));
+    let exact = brep_mass_properties(&scene.store, &scene.geo, body)
+        .unwrap_or_else(|e| panic!("{context}: brep_mass_properties failed: {e}"));
+    let diagonal = mesh
+        .bounding_box()
+        .map(|b| (b.max - b.min).norm())
+        .unwrap_or(0.0);
+    assert_cross_checked(&meshed, &exact, diagonal, context);
+    (meshed, exact)
+}
+
+/// The operands themselves, before any boolean: the B-Rep path must land on
+/// the analytic volume and area to floating point, not merely near the mesh.
+///
+/// This is the check that would catch a tessellator whose parameter rectangle
+/// is wrong for a whole surface class — the mesh path cannot see its own bias,
+/// and comparing two meshes to each other never will.
+#[test]
+fn brep_path_hits_closed_form_on_every_operand_class() {
+    let mut scene = Scene::new();
+    let block = scene.block([-1.0, -1.5, -2.5], [1.0, 1.5, 2.5]);
+    let cylinder = scene.cylinder(Point3::new(0.0, 0.0, -2.0), Vector3::z(), 1.5, 4.0);
+    let sphere = scene.sphere(Point3::new(0.5, -0.25, 1.0), 1.25);
+    let torus = scene.torus(Point3::new(0.0, 0.0, 0.0), 3.0, 0.75);
+    let frustum = scene.cone(Point3::new(0.0, 0.0, -1.5), 2.0, 0.8, 3.0);
+    let cone = scene.cone(Point3::new(0.0, 0.0, -1.5), 2.0, 0.0, 3.0);
+
+    let cases: [(&str, EntityId<Body>, f64, f64); 6] = [
+        ("block", block, 2.0 * 3.0 * 5.0, 2.0 * (6.0 + 15.0 + 10.0)),
+        (
+            "cylinder",
+            cylinder,
+            PI * 1.5 * 1.5 * 4.0,
+            2.0 * PI * 1.5 * 1.5 + 2.0 * PI * 1.5 * 4.0,
+        ),
+        (
+            "sphere",
+            sphere,
+            sphere_volume(1.25),
+            4.0 * PI * 1.25 * 1.25,
+        ),
+        (
+            "torus",
+            torus,
+            torus_volume(3.0, 0.75),
+            4.0 * PI * PI * 3.0 * 0.75,
+        ),
+        (
+            "frustum",
+            frustum,
+            frustum_volume(2.0, 0.8, 3.0),
+            PI * (4.0 + 0.64) + PI * 2.8 * ((1.2f64 * 1.2 + 9.0).sqrt()),
+        ),
+        (
+            "pointed cone",
+            cone,
+            frustum_volume(2.0, 0.0, 3.0),
+            PI * 4.0 + PI * 2.0 * ((4.0f64 + 9.0).sqrt()),
+        ),
+    ];
+
+    for (name, body, want_volume, want_area) in cases {
+        let (_, exact) = measured_body(&scene, body, name);
+        assert_close(
+            exact.volume,
+            want_volume,
+            EXACT_RTOL,
+            &format!("{name} volume"),
+        );
+        assert_close(
+            exact.surface_area,
+            want_area,
+            EXACT_RTOL,
+            &format!("{name} area"),
+        );
+    }
+}
+
+/// The operands' centroids and inertia tensors, against the textbook
+/// composites. Nothing in this suite weighed either before.
+#[test]
+fn operand_centroids_and_inertia_match_closed_form() {
+    let mut scene = Scene::new();
+    let block = scene.block([-1.0, -1.5, -2.5], [1.0, 1.5, 2.5]);
+    let cylinder = scene.cylinder(Point3::new(0.0, 0.0, -2.0), Vector3::z(), 1.5, 4.0);
+    let sphere = scene.sphere(Point3::new(0.5, -0.25, 1.0), 1.25);
+
+    let (_, exact) = measured_body(&scene, block, "block");
+    assert_matches_rigid(
+        &exact,
+        Rigid::block(Point3::origin(), Vector3::new(2.0, 3.0, 5.0)),
+        EXACT_RTOL,
+        "block",
+    );
+
+    let (_, exact) = measured_body(&scene, cylinder, "cylinder");
+    assert_matches_rigid(
+        &exact,
+        Rigid::cylinder_z(Point3::origin(), 1.5, 4.0),
+        EXACT_RTOL,
+        "cylinder",
+    );
+
+    let (_, exact) = measured_body(&scene, sphere, "sphere");
+    assert_matches_rigid(
+        &exact,
+        Rigid::sphere(Point3::new(0.5, -0.25, 1.0), 1.25),
+        EXACT_RTOL,
+        "sphere",
+    );
+}
+
+/// A block with a **concentric** through-bore. Volume alone cannot tell this
+/// apart from the same bore drilled off-center, or from a bore of the same
+/// cross-section drilled along the wrong axis; the inertia tensor can, and
+/// here it is exactly `block − cylinder`.
+#[test]
+fn concentric_bore_matches_composite_inertia() {
+    let mut scene = Scene::new();
+    let block = scene.block([-2.0, -2.0, -0.75], [2.0, 2.0, 0.75]);
+    let drill = scene.cylinder(Point3::new(0.0, 0.0, -3.0), Vector3::z(), 0.9, 6.0);
+    let out = scene
+        .subtract(block, drill)
+        .expect("block minus a concentric through-bore");
+
+    let want = Rigid::block(Point3::origin(), Vector3::new(4.0, 4.0, 1.5))
+        .minus(Rigid::cylinder_z(Point3::origin(), 0.9, 1.5));
+
+    let (meshed, exact) = measured(&out, "concentric bore");
+    assert_matches_rigid(&exact, want, EXACT_RTOL, "concentric bore (B-Rep path)");
+    // The mesh path sees the same solid through a 96-gon bore; the budget is
+    // the discretization, and the *shape* of the tensor still has to be right.
+    assert_matches_rigid(&meshed, want, 1e-2, "concentric bore (mesh path)");
+}
+
+/// The same bore moved off the axis. The volume is identical to the
+/// concentric case to the last bit — only the centroid and the products of
+/// inertia move, and they move by an amount the closed form pins exactly.
+#[test]
+fn offset_bore_moves_the_centroid_and_wakes_the_products_of_inertia() {
+    let mut scene = Scene::new();
+    let block = scene.block([-2.0, -2.0, -0.75], [2.0, 2.0, 0.75]);
+    // Clear of every side face: at radius 0.9 the bore reaches x = 1.9 and
+    // y = 0.4, so nothing is tangent to the block and the cut stays transversal.
+    let hole_center = Point3::new(1.0, -0.5, 0.0);
+    let drill = scene.cylinder(
+        Point3::new(hole_center.x, hole_center.y, -3.0),
+        Vector3::z(),
+        0.9,
+        6.0,
+    );
+    let out = scene
+        .subtract(block, drill)
+        .expect("block minus an offset through-bore");
+
+    let want = Rigid::block(Point3::origin(), Vector3::new(4.0, 4.0, 1.5))
+        .minus(Rigid::cylinder_z(hole_center, 0.9, 1.5));
+
+    let (meshed, exact) = measured(&out, "offset bore");
+    assert_matches_rigid(&exact, want, EXACT_RTOL, "offset bore (B-Rep path)");
+    assert_matches_rigid(&meshed, want, 1e-2, "offset bore (mesh path)");
+
+    // The centroid really did move, and away from the hole: a test that
+    // passes with the expectation and the measurement both stuck at the
+    // origin would prove nothing.
+    let centroid = exact.centroid;
+    assert!(
+        centroid.x < -0.05 && centroid.y > 0.02,
+        "centroid {centroid:?} did not shift away from the hole"
+    );
+    // An off-axis bore breaks the block's symmetry about z, so Ixy is real.
+    let magnitude = exact.inertia[(2, 2)];
+    assert!(
+        exact.inertia[(0, 1)].abs() > 1e-3 * magnitude,
+        "off-axis bore left Ixy at {} (tensor magnitude {magnitude})",
+        exact.inertia[(0, 1)]
+    );
+}
+
+/// A stepped pedestal: two overlapping blocks united. Planar throughout, so
+/// *both* paths are exact and both are held to their exact budgets, and the
+/// union's centroid sits where inclusion–exclusion says — not at either
+/// operand's center, and not where a double-counted overlap would put it.
+#[test]
+fn stepped_blocks_union_matches_composite_inertia() {
+    let mut scene = Scene::new();
+    let lower = scene.block([-1.0, -1.0, -2.0], [1.0, 1.0, 0.0]);
+    let upper = scene.block([-0.5, -0.5, -0.3], [0.5, 0.5, 1.5]);
+    let out = scene.unite(lower, upper).expect("overlapping blocks");
+
+    // A ∪ B = A + B − A∩B, and the overlap of two axis-aligned blocks is a
+    // third block.
+    let want = Rigid::block(Point3::new(0.0, 0.0, -1.0), Vector3::new(2.0, 2.0, 2.0))
+        .plus(Rigid::block(
+            Point3::new(0.0, 0.0, 0.6),
+            Vector3::new(1.0, 1.0, 1.8),
+        ))
+        .minus(Rigid::block(
+            Point3::new(0.0, 0.0, -0.15),
+            Vector3::new(1.0, 1.0, 0.3),
+        ));
+
+    let (meshed, exact) = measured(&out, "stepped blocks");
+    assert_matches_rigid(&exact, want, EXACT_RTOL, "stepped blocks (B-Rep path)");
+    assert_matches_rigid(
+        &meshed,
+        want,
+        PLANAR_VOLUME_RTOL,
+        "stepped blocks (mesh path)",
+    );
+}
+
+/// Two separate bores through one plate: the annular caps carry *two* inner
+/// loops each, so the B-Rep path's contour integral has to see both holes
+/// subtract, and the composite pins where the remaining material sits.
+#[test]
+fn twin_bores_match_composite_inertia() {
+    let left = Point3::new(-1.5, 0.4, 0.0);
+    let right = Point3::new(1.7, -0.6, 0.0);
+
+    let mut scene = Scene::new();
+    let plate = scene.block([-3.0, -2.0, -0.5], [3.0, 2.0, 0.5]);
+    let first_drill = scene.cylinder(Point3::new(left.x, left.y, -3.0), Vector3::z(), 0.7, 6.0);
+    let once = scene.subtract(plate, first_drill).expect("first bore");
+
+    // The second bore is drilled into the result of the first: the boolean
+    // output's stores become the next scene's.
+    let mut next = Scene {
+        store: once.store,
+        geo: once.geo,
+    };
+    let second_drill = next.cylinder(Point3::new(right.x, right.y, -3.0), Vector3::z(), 0.55, 6.0);
+    let out = next.subtract(once.body, second_drill).expect("second bore");
+
+    let want = Rigid::block(Point3::origin(), Vector3::new(6.0, 4.0, 1.0))
+        .minus(Rigid::cylinder_z(left, 0.7, 1.0))
+        .minus(Rigid::cylinder_z(right, 0.55, 1.0));
+
+    let (meshed, exact) = measured(&out, "twin bores");
+    assert_matches_rigid(&exact, want, EXACT_RTOL, "twin bores (B-Rep path)");
+    assert_matches_rigid(&meshed, want, 1e-2, "twin bores (mesh path)");
+}
+
+/// A spherical pocket opened through the top of a block: the removed solid is
+/// a hemisphere, so the composite is exact and the result carries a trimmed
+/// sphere face — the class the mesh path handles least well and the B-Rep
+/// path handles by integrating the sphere's own parameterization.
+#[test]
+fn hemispherical_pocket_matches_composite_inertia() {
+    let mut scene = Scene::new();
+    let block = scene.block([-2.0, -2.0, -1.5], [2.0, 2.0, 0.0]);
+    let ball_center = Point3::new(0.3, -0.4, 0.0);
+    let ball = scene.sphere(ball_center, 1.0);
+    let out = scene
+        .subtract(block, ball)
+        .expect("block minus a ball on its face");
+
+    // The half of the ball below z = 0 is what leaves the block: a hemisphere
+    // of radius 1, centroid 3r/8 below the cut plane, with the textbook
+    // centroidal tensor ( Izz = 2mr²/5, transverse = 83mr²/320).
+    let r: f64 = 1.0;
+    let m = 2.0 / 3.0 * PI * r * r * r;
+    let transverse = 83.0 / 320.0 * m * r * r;
+    let hemisphere = Rigid::placed(
+        m,
+        Point3::new(ball_center.x, ball_center.y, ball_center.z - 3.0 * r / 8.0),
+        Matrix3::from_diagonal(&Vector3::new(transverse, transverse, 0.4 * m * r * r)),
+    );
+    let want =
+        Rigid::block(Point3::new(0.0, 0.0, -0.75), Vector3::new(4.0, 4.0, 1.5)).minus(hemisphere);
+
+    let (meshed, exact) = measured(&out, "hemispherical pocket");
+    assert_matches_rigid(
+        &exact,
+        want,
+        EXACT_RTOL,
+        "hemispherical pocket (B-Rep path)",
+    );
+    assert_matches_rigid(&meshed, want, 2e-2, "hemispherical pocket (mesh path)");
+}
+
+/// Rigid motion invariance, measured the exact way: rotating both operands
+/// rotates the result's centroid and conjugates its inertia tensor, and
+/// leaves volume and area alone. The mesh path could only ever check this to
+/// its own discretization; here it is a 1e-9 statement.
+#[test]
+fn brep_measurement_is_equivariant_under_rotation() {
+    let build = |scene: &mut Scene| {
+        let block = scene.block([-2.0, -2.0, -0.75], [2.0, 2.0, 0.75]);
+        let drill = scene.cylinder(Point3::new(1.0, -0.5, -3.0), Vector3::z(), 0.9, 6.0);
+        (block, drill)
+    };
+
+    let mut upright = Scene::new();
+    let (a, b) = build(&mut upright);
+    let plain = upright.subtract(a, b).expect("upright bore");
+    let (_, here) = measured(&plain, "upright bore");
+
+    let mut turned = Scene::new();
+    let (a, b) = build(&mut turned);
+    let axis = Unit::new_normalize(Vector3::new(0.3, -0.7, 0.5));
+    let angle = 0.9;
+    let rot = Rotation3::from_axis_angle(&axis, angle);
+    for body in [a, b] {
+        rotate_body(
+            &mut turned.store,
+            &mut turned.geo,
+            body,
+            Point3::origin(),
+            axis.into_inner(),
+            angle,
+        )
+        .expect("rigid rotation");
+    }
+    let spun = turned.subtract(a, b).expect("rotated bore");
+    let (_, there) = measured(&spun, "rotated bore");
+
+    assert_close(there.volume, here.volume, EXACT_RTOL, "rotated volume");
+    assert_close(
+        there.surface_area,
+        here.surface_area,
+        EXACT_RTOL,
+        "rotated area",
+    );
+
+    let want_centroid = Point3::from(rot * here.centroid.coords);
+    let scale = here.volume.cbrt();
+    assert!(
+        (there.centroid - want_centroid).norm() <= EXACT_RTOL * scale,
+        "rotated centroid {:?} is not the rotation of {:?}",
+        there.centroid,
+        here.centroid
+    );
+
+    let want_inertia = rot.matrix() * here.inertia * rot.matrix().transpose();
+    let magnitude = want_inertia.iter().fold(0.0f64, |a, b| a.max(b.abs()));
+    for i in 0..3 {
+        for j in 0..3 {
+            assert!(
+                (there.inertia[(i, j)] - want_inertia[(i, j)]).abs() <= EXACT_RTOL * magnitude,
+                "rotated I[{i}][{j}] = {} vs conjugated {}",
+                there.inertia[(i, j)],
+                want_inertia[(i, j)]
+            );
+        }
+    }
+}
+
+/// Inclusion–exclusion, weighed the exact way and on all ten moments at once:
+/// `props(A) + props(B) == props(A∪B) + props(A∩B)` holds for volume, for the
+/// first moments (hence the centroid), and for the full inertia tensor about
+/// the origin. Meshed, this identity is only ever true to the tessellation;
+/// exactly, it is an algebraic fact the pipeline either respects or does not.
+#[test]
+fn inclusion_exclusion_holds_for_every_moment() {
+    let mut scene = Scene::new();
+    let a = scene.block([-1.5, -1.5, -1.0], [1.5, 1.5, 1.0]);
+    let b = scene.cylinder(Point3::new(0.4, -0.3, -2.0), Vector3::z(), 1.0, 4.0);
+
+    let props =
+        |body: EntityId<Body>| brep_mass_properties(&scene.store, &scene.geo, body).unwrap();
+    let (pa, pb) = (props(a), props(b));
+
+    let union = scene.unite(a, b).expect("union");
+    let meet = scene.intersect(a, b).expect("intersection");
+    let (_, pu) = measured(&union, "inclusion-exclusion union");
+    let (_, pi) = measured(&meet, "inclusion-exclusion intersection");
+
+    // The cylinder overhangs the block, so operand B is not contained: this
+    // is a genuine four-way identity, not a restatement of A = A.
+    assert!(pi.volume < pb.volume * 0.99, "intersection is not proper");
+
+    assert_close(
+        pu.volume + pi.volume,
+        pa.volume + pb.volume,
+        EXACT_RTOL,
+        "inclusion-exclusion volume",
+    );
+
+    // First moments: `V·centroid` is the additive quantity, not the centroid.
+    let moment = |p: &MassProperties| p.centroid.coords * p.volume;
+    let lhs = moment(&pu) + moment(&pi);
+    let rhs = moment(&pa) + moment(&pb);
+    assert!(
+        (lhs - rhs).norm() <= EXACT_RTOL * rhs.norm().max(pa.volume * pa.volume.cbrt()),
+        "inclusion-exclusion first moments: {lhs:?} vs {rhs:?}"
+    );
+
+    // Inertia adds only about a common point, so undo each parallel-axis
+    // shift back to the origin before summing.
+    let about_origin = |p: &MassProperties| {
+        let c = p.centroid.coords;
+        p.inertia + (Matrix3::identity() * c.norm_squared() - c * c.transpose()) * p.volume
+    };
+    let lhs = about_origin(&pu) + about_origin(&pi);
+    let rhs = about_origin(&pa) + about_origin(&pb);
+    let magnitude = rhs.iter().fold(0.0f64, |m, x| m.max(x.abs()));
+    for i in 0..3 {
+        for j in 0..3 {
+            assert!(
+                (lhs[(i, j)] - rhs[(i, j)]).abs() <= EXACT_RTOL * magnitude,
+                "inclusion-exclusion I[{i}][{j}]: {} vs {}",
+                lhs[(i, j)],
+                rhs[(i, j)]
+            );
+        }
+    }
+}
+
+/// Freeform operands weighed the exact way. The B-Rep path integrates a NURBS
+/// patch by Gauss–Legendre over its knot spans rather than by any analytic
+/// shortcut, so these are the cases that prove the quadrature — and the
+/// knot-span panelling — rather than a closed-form arm.
+///
+/// All three carry a *known* answer: a bilinear patch over a rectangle is the
+/// rectangle, and `Scene::nurbs_cylinder`/`nurbs_cone` are exact quadrics
+/// built from rational quadratic quarter-arcs, not approximations of them.
+/// The cone additionally has a **collapsed control row** at its apex — the
+/// of-37i.7 shape the boolean chart rejects outright — which the measurement
+/// handles because the collapse is a parameterization singularity, exactly
+/// like a sphere's pole.
+#[test]
+fn brep_path_hits_closed_form_on_nurbs_operands() {
+    let (r, h) = (1.5, 4.0);
+
+    let mut scene = Scene::new();
+    let block = scene.nurbs_block([-1.0, -1.5, -2.5], [1.0, 1.5, 2.5]);
+    let (_, exact) = measured_body(&scene, block, "NURBS block");
+    assert_matches_rigid(
+        &exact,
+        Rigid::block(Point3::origin(), Vector3::new(2.0, 3.0, 5.0)),
+        EXACT_RTOL,
+        "NURBS block",
+    );
+
+    // The same box over three knot spans per direction on a `[3, 13]`-style
+    // domain: identical geometry, a parameterization that shares nothing with
+    // the default. A quadrature that priced panels by parameter rather than
+    // by knot span would drift here and nowhere else.
+    let mut scene = Scene::new();
+    let rescaled = scene.nurbs_hexahedron(
+        box_corners([-1.0, -1.5, -2.5], [1.0, 1.5, 2.5]),
+        [[(3.0, 13.0), (-7.0, -2.0)]; 6],
+        3,
+    );
+    let (_, exact) = measured_body(&scene, rescaled, "NURBS block, 3 spans on a shifted domain");
+    assert_matches_rigid(
+        &exact,
+        Rigid::block(Point3::origin(), Vector3::new(2.0, 3.0, 5.0)),
+        EXACT_RTOL,
+        "NURBS block, 3 spans on a shifted domain",
+    );
+
+    let mut scene = Scene::new();
+    let cylinder = scene.nurbs_cylinder(0.0, 0.0, r, -h / 2.0, h);
+    let (_, exact) = measured_body(&scene, cylinder, "NURBS cylinder");
+    assert_matches_rigid(
+        &exact,
+        Rigid::cylinder_z(Point3::origin(), r, h),
+        EXACT_RTOL,
+        "NURBS cylinder",
+    );
+    assert_close(
+        exact.surface_area,
+        2.0 * PI * r * r + 2.0 * PI * r * h,
+        EXACT_RTOL,
+        "NURBS cylinder area",
+    );
+
+    // The collapsed row is the one place the B-Rep path is *not* exact, and
+    // the reason is the trim, not the quadrature: at the apex every `u`
+    // projects to the same point, so `fit_pcurve` cannot resolve the seam's
+    // `u` there. Its last sample lands 2.9% of the domain off, the fit falls
+    // back to a polyline, and the region it bounds is wrong by that much in a
+    // neighbourhood of the apex — where the surface area goes to zero, which
+    // is why 2.9% of the trim costs 4e-6 of the volume. Raising the
+    // quadrature order does not move the number at all; only a trim that is
+    // not projected would. `NURBS_TRIM_RTOL` is set two orders above the
+    // error, so a real regression still fails and this stays a live test.
+    const NURBS_TRIM_RTOL: f64 = 1e-4;
+    let mut scene = Scene::new();
+    let cone = scene.nurbs_cone(0.0, 0.0, r, -h / 2.0, h);
+    let (_, exact) = measured_body(&scene, cone, "NURBS cone");
+    assert_close(
+        exact.volume,
+        frustum_volume(r, 0.0, h),
+        NURBS_TRIM_RTOL,
+        "NURBS cone volume",
+    );
+    assert_close(
+        exact.centroid.z,
+        -h / 2.0 + h / 4.0,
+        NURBS_TRIM_RTOL,
+        "NURBS cone centroid",
     );
 }
