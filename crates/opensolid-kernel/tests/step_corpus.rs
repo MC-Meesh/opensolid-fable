@@ -1677,9 +1677,11 @@ mod corpus {
                 );
             }
         }
-        // 2026-07-25 baseline: sg1, io1, nist_ctc_03 (both editions),
-        // nist_ftc_09, nist_ftc_11 — 6 of 17.
-        const FLOOR: usize = 6;
+        // 2026-07-26 baseline: 14 of 17. of-3qy.8 (exact NURBS) and
+        // of-3qy.11 (SURFACE_CURVE pcurves, of-t3k) took this from 6.
+        // The three still failing: nist_ctc_01_rd and nist_ftc_06_rd on
+        // VERTEX_LOOP bounds, nist_ctc_05_rd on edge/vertex disagreement.
+        const FLOOR: usize = 14;
         assert!(
             passed.len() >= FLOOR,
             "corpus pass count regressed below {FLOOR}: only {passed:?} pass"
@@ -1826,7 +1828,7 @@ mod corpus {
         // require the geometry to agree: each bounding edge must lie on
         // the face it bounds.
         for &body in &breps {
-            assert_edges_lie_on_faces(&store, &geo, body);
+            assert_edges_lie_on_faces(&store, &geo, body, 1e-6);
         }
 
         // The freeform loop closes here on *authored* CAD geometry rather
@@ -1847,15 +1849,28 @@ mod corpus {
             let breps2 = assert_all_outcomes_structured(&store2, &report2);
             assert_eq!(breps2.len(), 1, "re-import must be one exact B-Rep");
             assert_counts_equal(&store, body, &store2, breps2[0], "dm1 NURBS round trip");
-            assert_edges_lie_on_faces(&store2, &geo2, breps2[0]);
+            assert_edges_lie_on_faces(&store2, &geo2, breps2[0], 1e-6);
         }
     }
 
     /// Sample every face's bounding edges and require each sample to lie on
-    /// that face's surface. The tolerance is relative: this part's
-    /// coordinates are inches-scaled-to-mm, and STEP carries only finite
-    /// decimal text.
-    fn assert_edges_lie_on_faces(store: &TopologyStore, geo: &GeometryStore, body: EntityId<Body>) {
+    /// that face's surface, within `rel` of the sample's own magnitude. The
+    /// tolerance is relative because these parts are inches-scaled-to-mm and
+    /// STEP carries only finite decimal text.
+    ///
+    /// `rel` is per-file because it bounds what the *file* asserts, not what
+    /// the reader computes. Where a boundary is exact in the authoring
+    /// kernel — any analytic surface, and any freeform edge that also
+    /// bounds a plane — the residual is machine noise and 1e-6 is loose.
+    /// A freeform edge shared by two freeform faces is a different animal:
+    /// its 3D curve is an *approximated* intersection, and the gap is the
+    /// authoring system's fit error, not ours.
+    fn assert_edges_lie_on_faces(
+        store: &TopologyStore,
+        geo: &GeometryStore,
+        body: EntityId<Body>,
+        rel: f64,
+    ) {
         const SAMPLES: usize = 7;
         let mut checked = 0usize;
         for shell_id in &store.body(body).expect("imported body").shells {
@@ -1879,7 +1894,7 @@ mod corpus {
                                 + (edge.t_end - edge.t_start) * i as f64 / SAMPLES as f64;
                             let point = curve.point(t);
                             let distance = surface.project_point(&point).distance;
-                            let tol = 1e-6 * (1.0 + point.coords.norm());
+                            let tol = rel * (1.0 + point.coords.norm());
                             assert!(
                                 distance <= tol,
                                 "edge sample at t={t} is {distance} off its face's surface"
@@ -1893,12 +1908,65 @@ mod corpus {
         assert!(checked > 0, "body had no edge samples to check");
     }
 
+    #[test]
+    fn as1_oc_surface_curve_edges_import_exactly() {
+        // of-t3k: every edge in this STEPcode-authored assembly wraps its
+        // 3D curve in a `SURFACE_CURVE` carrying the pcurves on the two
+        // adjacent faces. The reader used to refuse the wrapper outright —
+        // 58 `unsupported: curve type SURFACE_CURVE` warnings, all five
+        // solids off the exact path and the tessellated fallback failing
+        // behind them. of-3qy.11 made the wrapper transparent (and reads
+        // the pcurves as real fin geometry), so all five must now land as
+        // exact B-Reps with no diagnostics at all.
+        let (store, geo, report) = import_bytes(&load("as1-oc-214.stp"));
+        assert_eq!(report.solids.len(), 5, "expected five solids");
+        assert!(
+            report.diagnostics.is_empty(),
+            "expected a clean exact import, got: {:?}",
+            report.diagnostics.iter().take(5).collect::<Vec<_>>()
+        );
+        let breps = assert_all_outcomes_structured(&store, &report);
+        assert_eq!(breps.len(), 5, "expected five exact B-Rep imports");
+
+        // Unwrapping a `SURFACE_CURVE` means taking its `curve_3d` and
+        // ignoring the `associated_geometry` pcurves' own parameterization.
+        // Take the wrong attribute — or the pcurve in place of the 3D curve
+        // — and the edge no longer lies on the face it bounds, which `check`
+        // (topological) would pass happily.
+        //
+        // 1e-5 rather than DM1's 1e-6 because of what this file authored,
+        // not what the reader did with it. Measured worst residual by
+        // geometry pair: plane/line exactly 0, plane/NURBS-curve 5.7e-14 —
+        // the same freeform curves, landing on planes at machine precision,
+        // which is what rules out a misread curve. Only NURBS-curve-on-
+        // NURBS-surface deviates (2.6e-5 at |p|=8), and there the 3D curve
+        // is STEPcode's approximated surface-surface intersection. The
+        // projection behind these numbers converges on orthogonality, so
+        // each is a true minimum distance rather than a solver residual.
+        for &body in &breps {
+            assert_edges_lie_on_faces(&store, &geo, body, 1e-5);
+        }
+
+        // These bodies have been through an import, so they carry the fin
+        // pcurves a kernel-built body lacks: the byte fixed point is
+        // immediate rather than one trip out (of-3qy.11).
+        for (index, &body) in breps.iter().enumerate() {
+            assert_round_trip_gate(
+                &store,
+                &geo,
+                body,
+                &format!("as1-oc-214.stp solid #{index}"),
+                FixedPoint::Immediate,
+            );
+        }
+    }
+
     // -----------------------------------------------------------------
     // Assembly structure (of-3qy.13)
     // -----------------------------------------------------------------
     // Product structure is resolved independently of whether the geometry
-    // imports, so these gates hold even while AS1's SURFACE_CURVE edges
-    // and DM1's NURBS surfaces still defeat the geometry mapper.
+    // imports, so these gates hold for a file whose solids fail to map at
+    // all — as several NIST parts still do.
 
     /// Every solid a file declares must be accounted for by at least one
     /// placed occurrence, and every placement must be a finite rigid
