@@ -1386,26 +1386,18 @@ mod healing {
         );
     }
 
-    /// Signed volume by the divergence theorem, straight off the
-    /// tessellation. Unlike [`closed_volume`] this does not require the mesh
-    /// to weld watertight — a *tolerant* healed body (one whose curves still
-    /// pass through the pre-merge points) tessellates to rim samples that
-    /// disagree by the closed gap, which is far above the tessellator's
-    /// exact weld epsilon. Tolerance-aware welding is of-61f.
-    fn mesh_volume(store: &TopologyStore, geo: &GeometryStore, body: EntityId<Body>) -> f64 {
-        let mesh = tessellate_body(store, geo, body, &TessellationOptions::default())
-            .expect("healed body tessellates");
-        mesh.indices
-            .iter()
-            .map(|tri| {
-                let [a, b, c] = tri.map(|i| mesh.positions[i].coords);
-                a.dot(&b.cross(&c)) / 6.0
-            })
-            .sum()
-    }
-
     /// Gaps at the last written decimal, plus two faces authored backwards:
     /// both passes together, still exact, still the right way out.
+    ///
+    /// Gated through [`closed_volume`], which needs the tessellation to weld
+    /// watertight. That used to be impossible here (of-61f): the healed
+    /// vertices sit at their cluster centroids while each adjacent edge's
+    /// curve still runs to its own pre-merge endpoint, so faces meeting at one
+    /// reached it along different edges and landed up to the closed gap apart
+    /// — 1.17e-7 here against a weld epsilon of 1.7e-9. The test measured
+    /// volume with a local divergence sum to sidestep it. `sample_loop` now
+    /// starts each fin's run at the fin's *vertex* point, so every loop
+    /// through a vertex emits the identical corner and the weld is exact.
     #[test]
     fn gapped_and_misoriented_shell_heals_completely() {
         let (store, geo, report) = import(&unsewn_tetrahedron(1e-7, &[1, 2]));
@@ -1413,11 +1405,51 @@ mod healing {
         let body = only_brep(&report);
         let counts = store.euler_counts(body);
         assert_eq!((counts.vertices, counts.edges, counts.faces), (4, 6, 4));
-        let volume = mesh_volume(&store, &geo, body);
+        let volume = closed_volume(&store, &geo, body)
+            .expect("a healed tolerant body must still weld watertight (of-61f)");
         assert!(
             (volume - 1.0 / 6.0).abs() < 1e-6,
             "outward, not inside out: got {volume}"
         );
+    }
+
+    /// The weld itself, across the whole range of gaps healing will close: a
+    /// tolerant body tessellates to exactly the vertex count of the exact one
+    /// and closes, instead of leaving one rim sample per (face, vertex) pair
+    /// stranded. of-61f — the regression gate for the corner-snapping in
+    /// `sample_loop`, measured before the fix at 8 unwelded vertices and
+    /// `NotClosedManifold` for every gap from 1e-9 up.
+    #[test]
+    fn a_healed_tolerant_body_welds_watertight_at_every_gap() {
+        let exact = {
+            let (store, geo, report) = import(&unsewn_tetrahedron(0.0, &[]));
+            let body = only_brep(&report);
+            tessellate_body(&store, &geo, body, &TessellationOptions::default())
+                .expect("exact body tessellates")
+                .positions
+                .len()
+        };
+        for gap in [1e-9, 1e-8, 1e-7, 1e-6, 1e-5] {
+            let (store, geo, report) = import(&unsewn_tetrahedron(gap, &[]));
+            assert_structured(&report);
+            let body = only_brep(&report);
+            let mesh = tessellate_body(&store, &geo, body, &TessellationOptions::default())
+                .expect("healed body tessellates");
+            assert_eq!(
+                mesh.positions.len(),
+                exact,
+                "gap {gap:e}: a tolerant body must weld to the same vertices as an exact one"
+            );
+            assert!(
+                mesh.is_closed_manifold(),
+                "gap {gap:e}: healed body tessellated to an open mesh"
+            );
+            let volume = closed_volume(&store, &geo, body).expect("welded mesh measures");
+            assert!(
+                (volume - 1.0 / 6.0).abs() < 1e-4,
+                "gap {gap:e}: volume {volume}"
+            );
+        }
     }
 
     /// A file that is consistently oriented but wholly inside out passes

@@ -496,6 +496,10 @@ fn fan_planar_face(
 
 /// Sample a loop's boundary as a closed polygon, in loop order, one open
 /// run of points per fin (each fin's end point is supplied by the next).
+///
+/// Each run *starts* at the fin's own vertex point rather than at the curve
+/// evaluated there — see [`fin_start_point`] for why that distinction is the
+/// whole of of-61f.
 fn sample_loop(
     store: &TopologyStore,
     geo: &GeometryStore,
@@ -516,12 +520,48 @@ fn sample_loop(
             Curve3::Polyline { .. } => ((t_to - t_from).abs().ceil() as usize).max(1),
             Curve3::Nurbs(nurbs) => nurbs_curve_segments(nurbs, t_from, t_to, options),
         };
+        let corner = fin_start_point(store, fin_id);
         for k in 0..segments {
             let t = t_from + (t_to - t_from) * k as f64 / segments as f64;
-            points.push(curve.point(t));
+            match corner.filter(|_| k == 0) {
+                Some(point) => points.push(point),
+                None => points.push(curve.point(t)),
+            }
         }
     }
     Ok(points)
+}
+
+/// The point of the vertex a fin *starts* at, in traversal direction.
+///
+/// This is the one boundary sample that cannot come from the curve. On an
+/// exact body the two agree to float noise, but on a **tolerant** one they do
+/// not: after healing closes a gap the surviving vertex sits at the cluster
+/// centroid while each adjacent edge's curve still runs to its own pre-merge
+/// endpoint — precisely the displacement [`Vertex::tolerance`] records
+/// (`spec/08-tolerances.md`). Two faces meeting at such a vertex reach it
+/// along *different* edges, so sampling each edge's curve at its corner gave
+/// them points up to the closed gap apart (1e-9..1e-5 mm measured), far above
+/// `tessellate_body`'s weld epsilon of `bbox_diagonal * 1e-9`. The mesh then
+/// failed to stitch and a healed import read as an open shell even though the
+/// body passed [`TopologyStore::check`] — of-61f.
+///
+/// Taking the vertex's own point instead makes every loop through it emit the
+/// identical corner, so the weld succeeds by construction rather than by
+/// tolerance luck. The edge *interior* never needed this: the two faces across
+/// an edge share its curve and sample it at the same parameters.
+///
+/// `None` when the vertex id is stale, which leaves the curve's endpoint in
+/// place — a body that tessellated before must not start erroring over a
+/// corner refinement.
+fn fin_start_point(store: &TopologyStore, fin_id: EntityId<Fin>) -> Option<Point3> {
+    let fin = store.fin(fin_id)?;
+    let edge = store.edge(fin.edge)?;
+    let vertex = match fin.sense {
+        FinSense::Forward => edge.start_vertex,
+        FinSense::Reversed => edge.end_vertex,
+    };
+    store.vertex(vertex).map(|v| v.point)
 }
 
 /// A fin's curve and its parameter sweep in traversal direction.
@@ -1985,6 +2025,54 @@ mod tests {
             face
         }
 
+        /// [`quad_face`] made **tolerant**: the vertices sit on the true
+        /// corners, but every edge's curve runs between corners displaced by
+        /// `gap` along a per-edge direction — the state a healed body is left
+        /// in, where the surviving vertex is the cluster centroid and each
+        /// adjacent curve still passes through its own pre-merge endpoint.
+        /// The displacement is what `Vertex::tolerance` records, so the
+        /// vertices carry it.
+        fn tolerant_quad_face(
+            store: &mut TopologyStore,
+            geo: &mut GeometryStore,
+            surface: Surface3,
+            corners: [Point3; 4],
+            gap: f64,
+        ) -> EntityId<Face> {
+            let body = store.create_body(BodyType::Solid);
+            let shell = store.create_shell(body, true, ShellOrientation::Outward);
+            let face = store.create_face(shell, FaceSense::Positive);
+            store.faces.get_mut(face).expect("just created").surface =
+                Some(geo.add_surface(surface));
+            let vertices = corners.map(|p| store.create_vertex(p, gap));
+            // Each edge is pulled off its corners in a different in-plane
+            // direction, so the two edges meeting at a corner disagree there
+            // by O(gap) — exactly how two faces across a healed vertex used
+            // to disagree.
+            let drift = |i: usize| {
+                let angle = FRAC_PI_2 * i as f64;
+                Vector3::new(gap * angle.cos(), gap * angle.sin(), 0.0)
+            };
+            let fins: Vec<_> = (0..4)
+                .map(|i| {
+                    let j = (i + 1) % 4;
+                    let (a, b) = (corners[i] + drift(i), corners[j] + drift(j));
+                    let curve = geo.add_curve(Curve3::line(a, b - a).expect("distinct corners"));
+                    let edge = store.create_edge_with_curve(
+                        vertices[i],
+                        vertices[j],
+                        gap,
+                        curve,
+                        0.0,
+                        (b - a).norm(),
+                    );
+                    (edge, FinSense::Forward)
+                })
+                .collect();
+            store.create_loop(face, LoopType::Outer, &fins);
+            face
+        }
+
         /// A quarter-cylinder wall face of radius `r` and height `h` on the
         /// given surface, bounded the way a real body binds one: two circle
         /// arc edges for the rims and two straight seams. Unlike
@@ -2191,6 +2279,51 @@ mod tests {
                  {regular_gon}"
             );
             assert_within(area, exact, 2e-3, "quarter-cylinder wall area");
+        }
+
+        /// A tolerant face's boundary must land on its **vertices**, not on
+        /// its edge curves' endpoints (of-61f).
+        ///
+        /// On an exact body the two coincide, so nothing distinguished them.
+        /// On a healed one they do not: the vertex is the merged cluster's
+        /// centroid and each adjacent curve still runs to its own pre-merge
+        /// point. Two faces meeting at that vertex arrive along *different*
+        /// edges, so sampling each curve at its corner put them up to the
+        /// closed gap apart — orders of magnitude above `tessellate_body`'s
+        /// `bbox_diagonal * 1e-9` weld epsilon, which left a healed import
+        /// meshing as an open shell.
+        ///
+        /// Both arms are checked, because both source their boundary from
+        /// [`sample_loop`]: the planar ear-clip and the NURBS CDT. The CDT
+        /// pass (of-37i.6) did not fix this on its own — it made a NURBS
+        /// face's boundary come from the edge curves, which cured of-dvj (a
+        /// grid sampling the *same* edge at different parameters), while this
+        /// is a disagreement between *distinct* edges at a shared corner.
+        #[test]
+        fn a_tolerant_face_samples_its_vertices_not_its_curve_ends() {
+            let corners = unit_square_corners();
+            for gap in [1e-8, 1e-6, 1e-4] {
+                for (arm, surface) in [
+                    (
+                        "planar",
+                        Surface3::plane(Point3::origin(), Vector3::z()).expect("valid plane"),
+                    ),
+                    ("nurbs cdt", flat_patch((0.0, 1.0))),
+                ] {
+                    let mut store = TopologyStore::new();
+                    let mut geo = GeometryStore::new();
+                    let face = tolerant_quad_face(&mut store, &mut geo, surface, corners, gap);
+                    let mesh = tessellate_face(&store, &geo, face, &TessellationOptions::default())
+                        .expect("a tolerant face tessellates");
+                    for corner in corners {
+                        assert!(
+                            mesh.positions.iter().any(|p| (p - corner).norm() == 0.0),
+                            "{arm}, gap {gap:e}: corner {corner:?} is absent from the face \
+                             mesh — it would not weld to the face across that vertex"
+                        );
+                    }
+                }
+            }
         }
 
         /// A *trimmed* NURBS face — its boundary cuts diagonally across the

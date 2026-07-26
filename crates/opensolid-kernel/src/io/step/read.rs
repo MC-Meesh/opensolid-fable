@@ -6294,7 +6294,11 @@ REPRESENTATION_CONTEXT('2D SPACE','') );
     }
 
     /// Gaps at the last written decimal are closed and carried as tolerance,
-    /// not snapped away silently.
+    /// not snapped away silently — and the tolerant body that results still
+    /// tessellates watertight, to the exact volume. The mesh gate here used to
+    /// be loosened to 1e-4 with no manifold check at all, because the healed
+    /// vertices' adjacent curves still ran to their pre-merge endpoints and
+    /// the rim would not weld (of-61f, fixed in `tessellate::sample_loop`).
     #[test]
     fn healing_closes_written_precision_gaps() {
         let src = unsewn_block_step(2.0, 3.0, 4.0, 1e-6, &[]);
@@ -6311,7 +6315,21 @@ REPRESENTATION_CONTEXT('2D SPACE','') );
             "the closed gap must live on as edge tolerance"
         );
         let mesh = tessellate_body(&store, &geo, body, &TessellationOptions::default()).unwrap();
-        assert!((signed_volume(&mesh) - 24.0).abs() < 1e-4);
+        assert!(
+            mesh.is_closed_manifold(),
+            "a tolerant healed body must weld watertight (of-61f)"
+        );
+        // What remains is the healing displacement itself, not a meshing
+        // artifact: each corner now sits at its cluster centroid, up to the
+        // 1e-6 closed gap from where it was authored, which moves the volume
+        // of a 2x3x4 block (52 mm^2 of surface) by O(area * gap). Measured
+        // 3.5e-6 — so this gate is ~3x the real error, where the old 1e-4 was
+        // 30x it and hid a fully open mesh.
+        let volume = signed_volume(&mesh);
+        assert!(
+            (volume - 24.0).abs() < 1e-5,
+            "healed volume off by more than the closed gap can explain: {volume}"
+        );
     }
 
     /// Unsewn *and* misoriented: gap closure makes the shell shareable, then
