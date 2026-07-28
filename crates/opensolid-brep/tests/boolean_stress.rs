@@ -28,7 +28,20 @@
 //! fallback. The campaigns' history — the bugs they filed and the fixes
 //! that retired them — is in the git log, not here.
 //!
-//! Every case here is live. The of-9ia `#[ignore]`
+//! Sections (1)-(15) are entirely live. Section (16) is not, and that is
+//! the protocol working rather than failing: it is the of-ipt.19 numerical
+//! robustness campaign, and seven of its cases are `#[ignore]`d against four
+//! defects it found and filed — of-ukcq (mesh `mass_properties` integrates
+//! tetrahedra from the absolute origin, 191× wrong at offset 1e6), of-oygs
+//! (`ray_classify` gives up on operands past ~1e3 length/radius for
+//! cylinders, ~1e7 for blocks), of-6viu (`unite` rejects a coincident-face
+//! imprint that forms an island, i.e. a boss centred on a face), and
+//! of-y8qc (`brep_mass_properties` on a trimmed sphere degrades with the
+//! angle between the trim and the pole axis, reaching 1.3e-3 at 90°). Each
+//! `#[ignore]`d case has a live sibling that fences the working range, so a
+//! fix has a boundary to move rather than a single case to flip.
+//!
+//! The of-9ia `#[ignore]`
 //! (`skew_frustums_inclusion_exclusion`) lifted with of-37i.5: its two
 //! blockers were both in imprint hosting and neither was specific to the
 //! marched cone-cone arc, which had been correct all along. The coaxial
@@ -436,14 +449,40 @@ impl Rng {
 struct Scene {
     store: TopologyStore,
     geo: GeometryStore,
+    /// The tolerance every boolean run through this scene uses. Defaults to
+    /// [`tol`]; section (16) varies it, because a tolerance is a length and a
+    /// model whose features are 1e-6 mm across cannot be judged by the same
+    /// absolute 1e-6 as one whose features are metres.
+    tol: ToleranceContext,
 }
 
 impl Scene {
     fn new() -> Self {
+        Scene::with_tolerance(tol())
+    }
+
+    fn with_tolerance(tol: ToleranceContext) -> Self {
         Scene {
             store: TopologyStore::new(),
             geo: GeometryStore::new(),
+            tol,
         }
+    }
+
+    /// Re-open a boolean result as a scene, so further operands can be built
+    /// alongside it and the result fed back into another boolean. This is what
+    /// makes an N-operation chain possible (section 16.6): the boolean entry
+    /// points take two bodies in a *shared* store pair, and a result owns its
+    /// own pair.
+    fn adopt(out: BooleanOutput, tol: ToleranceContext) -> (Self, EntityId<Body>) {
+        (
+            Scene {
+                store: out.store,
+                geo: out.geo,
+                tol,
+            },
+            out.body,
+        )
     }
 
     /// Axis-aligned block spanning `min`..`max` (the primitive builder
@@ -800,6 +839,32 @@ impl Scene {
         face_domains: [[(f64, f64); 2]; 6],
         spans: usize,
     ) -> EntityId<Body> {
+        let knots =
+            face_domains.map(|d| [deg1_knots(spans + 1, d[0]), deg1_knots(spans + 1, d[1])]);
+        self.nurbs_hexahedron_knots(corners, knots)
+    }
+
+    /// [`Scene::nurbs_hexahedron`] with each face's `(u, v)` knot vectors given
+    /// outright, so degree and knot spacing are free rather than fixed at
+    /// "degree 1, evenly spaced". Control points go at the **Greville
+    /// abscissae** of the supplied knots, normalized to the patch domain and
+    /// pushed through the same bilinear blend.
+    ///
+    /// That placement is what keeps the geometry exact at any degree: a
+    /// B-spline reproduces an affine map of its parameter exactly when its
+    /// control points are that map evaluated at the Greville abscissae (the
+    /// linear-precision property), and the bilinear blend of a *planar*
+    /// quadrilateral is affine in `(u, v)`. So a degree-5 patch with wildly
+    /// unequal knot spans traces the same flat rectangle, to floating point,
+    /// as the degree-1 one — and any behavioural difference between them is a
+    /// basis, span-search or parameterization bug, never geometry. For degree
+    /// 1 with evenly spaced knots the Greville abscissae are `i / spans`, so
+    /// [`Scene::nurbs_hexahedron`] delegating here is a rename, not a change.
+    fn nurbs_hexahedron_knots(
+        &mut self,
+        corners: [Point3; 8],
+        face_knots: [[KnotVector; 2]; 6],
+    ) -> EntityId<Body> {
         /// Undirected edges as (low, high) corner-index pairs: bottom ring,
         /// top ring, verticals (identical to `primitives::block`).
         const EDGE_PAIRS: [(usize, usize); 12] = [
@@ -867,18 +932,18 @@ impl Scene {
             (edges[index], sense)
         };
 
-        for (cycle, domains) in face_cycles.into_iter().zip(face_domains) {
-            // Row-major grid `[i][j]` with `i↔u`, `j↔v`: the bilinear blend
-            // of the cycle's corners sampled uniformly, so for `spans = 1`
-            // row u=0 is (v=0, v=1) = (c0, c3) and row u=1 is (c1, c2),
-            // reproducing the original 2×2 layout.
-            let n = spans + 1;
-            let grid: Vec<Vec<Point3>> = (0..n)
-                .map(|i| {
-                    let u = i as f64 / spans as f64;
-                    (0..n)
-                        .map(|j| {
-                            let v = j as f64 / spans as f64;
+        for (cycle, [knots_u, knots_v]) in face_cycles.into_iter().zip(face_knots) {
+            // Row-major grid `[i][j]` with `i↔u`, `j↔v`: the bilinear blend of
+            // the cycle's corners at the normalized Greville abscissae, so for
+            // degree 1 with `spans` even spans row u=0 is (v=0, v=1) = (c0, c3)
+            // and row u=spans is (c1, c2), reproducing the original layout.
+            let us = normalized_grevilles(&knots_u);
+            let vs = normalized_grevilles(&knots_v);
+            let grid: Vec<Vec<Point3>> = us
+                .iter()
+                .map(|&u| {
+                    vs.iter()
+                        .map(|&v| {
                             bilerp(
                                 corners[cycle[0]],
                                 corners[cycle[1]],
@@ -892,8 +957,7 @@ impl Scene {
                 })
                 .collect();
             let patch =
-                NurbsSurface::bspline(grid, deg1_knots(n, domains[0]), deg1_knots(n, domains[1]))
-                    .expect("rectangular bilinear grid");
+                NurbsSurface::bspline(grid, knots_u, knots_v).expect("rectangular bilinear grid");
             let surface = geo.add_surface(Surface3::nurbs(patch));
             let face = store.create_face(shell, FaceSense::Positive);
             store.faces.get_mut(face).expect("just created").surface = Some(surface);
@@ -1235,15 +1299,15 @@ impl Scene {
     }
 
     fn unite(&self, a: EntityId<Body>, b: EntityId<Body>) -> CoreResult<BooleanOutput> {
-        unite(&self.store, &self.geo, a, b, &tol())
+        unite(&self.store, &self.geo, a, b, &self.tol)
     }
 
     fn subtract(&self, a: EntityId<Body>, b: EntityId<Body>) -> CoreResult<BooleanOutput> {
-        subtract(&self.store, &self.geo, a, b, &tol())
+        subtract(&self.store, &self.geo, a, b, &self.tol)
     }
 
     fn intersect(&self, a: EntityId<Body>, b: EntityId<Body>) -> CoreResult<BooleanOutput> {
-        intersect(&self.store, &self.geo, a, b, &tol())
+        intersect(&self.store, &self.geo, a, b, &self.tol)
     }
 }
 
@@ -1282,6 +1346,24 @@ fn deg1_knots(control_count: usize, (a, b): (f64, f64)) -> KnotVector {
     }
     knots.push(b);
     KnotVector::new(1, knots).expect("valid clamped degree-1 knots")
+}
+
+/// The Greville abscissae of `knots`, rescaled so the patch domain runs
+/// `0..1`. Control point `i` of a degree-`p` B-spline sits at
+/// `(U[i+1] + … + U[i+p]) / p`; placing it at the affine image of that value
+/// makes the spline reproduce the affine map exactly, at any degree and any
+/// knot spacing (see [`Scene::nurbs_hexahedron_knots`]).
+fn normalized_grevilles(knots: &KnotVector) -> Vec<f64> {
+    let p = knots.degree();
+    let u = knots.knots();
+    let control_count = u.len() - p - 1;
+    let (lo, hi) = (u[p], u[u.len() - p - 1]);
+    (0..control_count)
+        .map(|i| {
+            let g = u[i + 1..=i + p].iter().sum::<f64>() / p as f64;
+            (g - lo) / (hi - lo)
+        })
+        .collect()
 }
 
 // =====================================================================
@@ -5109,12 +5191,9 @@ fn twin_bores_match_composite_inertia() {
 
     // The second bore is drilled into the result of the first: the boolean
     // output's stores become the next scene's.
-    let mut next = Scene {
-        store: once.store,
-        geo: once.geo,
-    };
+    let (mut next, once_body) = Scene::adopt(once, tol());
     let second_drill = next.cylinder(Point3::new(right.x, right.y, -3.0), Vector3::z(), 0.55, 6.0);
-    let out = next.subtract(once.body, second_drill).expect("second bore");
+    let out = next.subtract(once_body, second_drill).expect("second bore");
 
     let want = Rigid::block(Point3::origin(), Vector3::new(6.0, 4.0, 1.0))
         .minus(Rigid::cylinder_z(left, 0.7, 1.0))
@@ -5376,5 +5455,1181 @@ fn brep_path_hits_closed_form_on_nurbs_operands() {
         -h / 2.0 + h / 4.0,
         NURBS_TRIM_RTOL,
         "NURBS cone centroid",
+    );
+}
+
+// =====================================================================
+// (16) Numerical robustness families (of-ipt.19)
+//
+// Section (5) proved the pipeline works over three decades of scale, all
+// of them clustered around 1. That is the easy part of the range. This
+// section covers the families the epic contemplates and (5) does not:
+//
+//   16.1  six decades of absolute scale, 1e-6 to 1e6 model units;
+//   16.2  geometry far from the origin, where a small feature is the
+//         difference of two large coordinates (catastrophic cancellation);
+//   16.3  operands whose sizes differ by up to six decades;
+//   16.4  extreme aspect ratios — plates and needles;
+//   16.5  near-parallel surface pairs, where the SSI direction
+//         `n_a × n_b` is the ill-conditioned quantity;
+//   16.6  repeated booleans, where the question is whether error
+//         *accumulates* over a chain rather than whether one op is right;
+//   16.7  high-degree and near-degenerate-knot NURBS operands.
+//
+// A recurring theme is that f64 sets a floor on what any of these can be
+// asserted to, and the floor is different for each family. Where it binds,
+// the helper that computes the bound is written out rather than a magic
+// constant being pasted in, because the bound *is* the finding: it says
+// what precision the pipeline is entitled to at that configuration, and a
+// failure means the pipeline did worse than arithmetic forced it to.
+//
+// What the campaign found, in short. The B-Rep pipeline itself came through
+// the scale families intact: it reproduces `32 − 2π` to twelve digits at
+// every decade from 1e-6 to 1e6 and at every offset out to 1e6, holds an
+// eight-deep boolean chain to the same budget at step eight as at step one,
+// and swallows degree-5 patches, C0 knots and knots 1e-9 apart without a
+// wobble. What broke was mostly *around* it — the mesh measurement path
+// (of-ukcq), region seeding for slender operands (of-oygs), island imprints
+// (of-6viu), and the trimmed-sphere measurement (of-y8qc) — which is why
+// four of the five beads this section filed are outside `boolean.rs`.
+// =====================================================================
+
+/// The tolerance context a model whose features are `scale` model units
+/// across deserves — the default one with its *linear* term scaled, since a
+/// linear tolerance is a length and 1e-6 mm means "coincident" for a
+/// millimetre-sized part and "the whole part" for a micron-sized one. The
+/// angular and parametric terms are dimensionless and do not scale.
+///
+/// Note the floor this runs into at the small end: `effective_linear` never
+/// returns below [`SYSTEM_RESOLUTION`] (1e-10), so at `scale = 1e-6` the
+/// requested 1e-12 is clamped back up to 1e-10 — a relative tolerance of
+/// 1e-4 of the feature rather than the 1e-6 every larger decade gets. The
+/// bottom decade is therefore working four decades above the kernel's
+/// precision floor rather than six. In the event that costs nothing
+/// measurable: the exact path reproduces the closed form to twelve digits
+/// there just as it does at 1e6.
+fn tol_at_scale(scale: f64) -> ToleranceContext {
+    ToleranceContext {
+        linear: tol().linear * scale,
+        ..tol()
+    }
+}
+
+/// The six decades of absolute scale the epic contemplates, in model units.
+const DECADES: [f64; 5] = [1e-6, 1e-3, 1.0, 1e3, 1e6];
+
+/// Volume by the B-Rep-native path alone, skipping [`measured`]'s meshed
+/// cross-check.
+///
+/// Every other section weighs results both ways and asserts the two agree,
+/// which is the right default. This section cannot always do that, because
+/// two of its families put the mesh path outside its own domain of validity:
+/// `mass_properties` integrates tetrahedra referenced to the absolute origin
+/// (of-ukcq), so it loses `|p|³/V` worth of digits on geometry far from the
+/// origin — 191× wrong at offset 1e6 — while `brep_mass_properties`
+/// integrates each face's own parameterization and is unaffected. Where the
+/// far field is the thing under test, the B-Rep number is the oracle and the
+/// mesh path's behaviour is of-ukcq's business, asserted separately by
+/// [`mesh_mass_properties_survives_far_from_origin`].
+///
+/// `check()` and closed-manifold validity are still asserted; only the
+/// numerical cross-check is skipped.
+fn brep_volume(out: &BooleanOutput, context: &str) -> f64 {
+    assert_valid(out, context);
+    brep_mass_properties(&out.store, &out.geo, out.body)
+        .unwrap_or_else(|e| panic!("{context}: brep_mass_properties failed: {e}"))
+        .volume
+}
+
+// ---------------------------------------------------------------------
+// 16.1 Extreme scale: the same configuration over six decades.
+// ---------------------------------------------------------------------
+
+/// The through-hole scenario of section (5) run over the epic's full range
+/// rather than its middle three decades, and asserted the stronger way: not
+/// merely that each decade matches its own closed form, but that the
+/// *scale-normalized* volume `V / s³` is the same number at every decade.
+///
+/// Each decade uses the tolerance context its own size deserves
+/// ([`tol_at_scale`]). The cross-decade comparison is made on the B-Rep-native
+/// measurement, which is where an exact scale invariance can honestly be
+/// demanded: it reproduces `32 − 2π` to twelve digits at every decade from
+/// 1e-6 to 1e6, so `EXACT_RTOL` is not a generous budget here but a very
+/// tight one.
+///
+/// The *meshed* volume is deliberately not compared across decades. It splits
+/// into two groups — 25.717972 for the two decades whose tolerance context is
+/// tighter than 1e-6, 25.721229 for the three that are looser — with the
+/// triangle count identical (6352) in all five. That is a tolerance-driven
+/// trim refinement, not a scale defect: the tighter group sits closer to the
+/// exact 25.716815, which is the direction a finer fit should move it. Each
+/// decade is still held to the closed form on both paths.
+#[test]
+fn through_hole_over_six_decades() {
+    let mut normalized = Vec::new();
+    for scale in DECADES {
+        let context = format!("block minus cylinder at {scale:e}× scale");
+        let s = scale;
+        let mut scene = Scene::with_tolerance(tol_at_scale(s));
+        let slab = scene.block([0.0, 0.0, 0.0], [4.0 * s, 4.0 * s, 2.0 * s]);
+        let tool = scene.cylinder(Point3::new(2.0 * s, 2.0 * s, -s), Vector3::z(), s, 4.0 * s);
+        let out = scene
+            .subtract(slab, tool)
+            .unwrap_or_else(|e| panic!("{context}: subtract failed: {e:?}"));
+        assert_eq!(
+            out.store.euler_counts(out.body).genus,
+            1,
+            "{context}: through hole must give genus 1"
+        );
+        let (meshed, exact) = measured(&out, &context);
+        let want = (32.0 - 2.0 * PI) * s * s * s;
+        assert_close(
+            meshed.volume,
+            want,
+            CYL_VOLUME_RTOL,
+            &format!("{context} (mesh path)"),
+        );
+        assert_close(
+            exact.volume,
+            want,
+            EXACT_RTOL,
+            &format!("{context} (B-Rep path)"),
+        );
+        normalized.push((scale, exact.volume / (s * s * s)));
+    }
+
+    let reference = normalized
+        .iter()
+        .find(|(s, _)| *s == 1.0)
+        .expect("unit scale is one of the decades")
+        .1;
+    for &(scale, value) in &normalized {
+        assert_close(
+            value,
+            reference,
+            EXACT_RTOL,
+            &format!("normalized through-hole volume at {scale:e}× vs unit scale"),
+        );
+    }
+}
+
+/// Seeded random transversal block pairs at the two decades section (5)
+/// does not reach. Purely planar, so the identities hold to floating point
+/// and the only thing that can break them is a length comparison that
+/// stopped meaning what it means at unit scale.
+#[test]
+fn block_pair_identity_at_the_outer_decades() {
+    for scale in [1e-6f64, 1e6] {
+        let mut rng = Rng::new(0x0DEC_ADE5 ^ scale.to_bits());
+        for case in 0..6 {
+            let pair = BlockPair::random(&mut rng);
+            let repro = format!("scale {scale:e}×, {}", pair.repro(case));
+            let s = scale;
+            let mut scene = Scene::with_tolerance(tol_at_scale(s));
+            let a = scene.block(
+                [0.0, 0.0, 0.0],
+                [pair.a_max[0] * s, pair.a_max[1] * s, pair.a_max[2] * s],
+            );
+            let b = scene.block(
+                [pair.b_min[0] * s, pair.b_min[1] * s, pair.b_min[2] * s],
+                [pair.b_max[0] * s, pair.b_max[1] * s, pair.b_max[2] * s],
+            );
+            let union = scene
+                .unite(a, b)
+                .unwrap_or_else(|e| panic!("{repro}: unite failed: {e:?}"));
+            let inter = scene
+                .intersect(a, b)
+                .unwrap_or_else(|e| panic!("{repro}: intersect failed: {e:?}"));
+            let s3 = s * s * s;
+            let vol_union = volume(&union, &format!("{repro}: union"));
+            let vol_inter = volume(&inter, &format!("{repro}: intersection"));
+            assert_close(
+                vol_union + vol_inter,
+                (pair.vol_a() + pair.vol_b()) * s3,
+                PLANAR_VOLUME_RTOL,
+                &format!("{repro}: inclusion–exclusion identity"),
+            );
+            assert_close(
+                vol_inter,
+                pair.vol_overlap() * s3,
+                PLANAR_VOLUME_RTOL,
+                &format!("{repro}: intersection vs analytic overlap"),
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// 16.2 Geometry far from the origin: catastrophic cancellation.
+// ---------------------------------------------------------------------
+
+/// Roundings, in units of the coordinate's own ULP, that a length is allowed
+/// to accumulate on its way from a caller's `min`/`max` to a face plane.
+///
+/// It is not one: [`Scene::block`] builds a primitive from *extents* and
+/// then translates it by a *centre*, so a face plane is reached through
+/// several additions and halvings, each rounding at the magnitude of the
+/// coordinates rather than of the feature. The boolean then differences
+/// those planes. 128 leaves room for that chain with margin and is still
+/// tight enough to be a real constraint — at the family's worst corner
+/// (offset 1e6, a 1e-4 feature) it demands the slab be resolved to better
+/// than three parts in ten thousand, where f64 offers about one in a
+/// million.
+const FAR_FIELD_ULPS: f64 = 128.0;
+
+/// Relative volume budget for a configuration whose smallest interesting
+/// length is `feature` but whose coordinates sit `offset` from the origin.
+///
+/// A feature length is recovered as the difference of two coordinates, and
+/// f64 spacing at magnitude `offset` is `offset · EPSILON`, so the length
+/// carries a relative error of at least `offset · EPSILON / feature` before
+/// the kernel does anything at all — [`FAR_FIELD_ULPS`] times that, given
+/// how many roundings sit between a caller's numbers and a face plane. Never
+/// tighter than the flat planar budget, which dominates near the origin
+/// where `offset · EPSILON` is nothing.
+///
+/// This is a bound on the *inputs*, not a fudge factor: a failure means the
+/// pipeline lost precision that the arithmetic did not force it to lose.
+fn far_field_rtol(offset: f64, feature: f64) -> f64 {
+    PLANAR_VOLUME_RTOL.max(FAR_FIELD_ULPS * offset * f64::EPSILON / feature)
+}
+
+/// The mesh measurement path's own far-field behaviour, which the rest of
+/// this family routes around by weighing results with [`brep_volume`].
+///
+/// `mass_properties` sums tetrahedra whose apex is the absolute origin, so
+/// its intermediate magnitudes are `|p|³` where the answer is `feature³`.
+/// At offset 1e6 a 4×4×2 slab with a unit bore measures 4921 instead of
+/// 25.72 — 191× — while `brep_mass_properties` returns 25.716814691 at every
+/// offset from 0 to 1e6. Tracked as of-ukcq, whose fix is to integrate
+/// relative to a reference point and shift the moments back afterwards.
+#[test]
+#[ignore = "of-ukcq: mesh mass_properties integrates tetrahedra from the absolute origin"]
+fn mesh_mass_properties_survives_far_from_origin() {
+    for offset in FAR_OFFSETS {
+        let context = format!("block minus cylinder at offset {offset:e}");
+        let o = offset;
+        let mut scene = Scene::new();
+        let slab = scene.block([o, o, o], [o + 4.0, o + 4.0, o + 2.0]);
+        let tool = scene.cylinder(
+            Point3::new(o + 2.0, o + 2.0, o - 1.0),
+            Vector3::z(),
+            1.0,
+            4.0,
+        );
+        let out = scene
+            .subtract(slab, tool)
+            .unwrap_or_else(|e| panic!("{context}: subtract failed: {e:?}"));
+        // `measured` is what asserts the two paths agree; that is the
+        // assertion of-ukcq breaks.
+        let (meshed, _) = measured(&out, &context);
+        assert_close(meshed.volume, 32.0 - 2.0 * PI, CYL_VOLUME_RTOL, &context);
+    }
+}
+
+/// Distances from the origin at which the same unit-sized configuration is
+/// rebuilt. At 1e6 the f64 grid is 1.2e-10 wide, so a unit feature is
+/// resolved to ~10 significant digits rather than 16: six of the sixteen
+/// digits have gone into naming *where* the part is instead of what it is.
+///
+/// The offsets are irrational on purpose. Integer offsets are a trap: with
+/// coordinates like `1000002.0` every product in a volume integrand is an
+/// exact integer well inside f64's 2^53, so the arithmetic is *exact* and
+/// the family silently tests nothing. The `+ 1/π` makes every coordinate an
+/// ordinary inexact float, which is the case a real model is in.
+const FAR_OFFSETS: [f64; 4] = [
+    0.0,
+    1e2 + std::f64::consts::FRAC_1_PI,
+    1e4 + std::f64::consts::FRAC_1_PI,
+    1e6 + std::f64::consts::FRAC_1_PI,
+];
+
+/// A transversal block pair rebuilt at increasing distance from the origin.
+/// The configuration is congruent at every offset, so the analytic answers
+/// are literally the same numbers; only the coordinates naming them grow.
+///
+/// This is the cheapest possible catastrophic-cancellation probe and the
+/// one most likely to catch an absolute epsilon: a comparison written as
+/// `|a - b| < 1e-9` is fine at the origin and meaningless at 1e6, where
+/// 1e-9 is eight times the representable spacing.
+#[test]
+fn far_from_origin_block_pair_identity() {
+    let (a_max, b_min, b_max) = ([2.0, 3.0, 2.5], [1.0, -1.0, 0.5], [4.0, 2.0, 3.0]);
+    // x overlap [1,2] = 1, y overlap [0,2] = 2, z overlap [0.5,2.5] = 2.
+    let (vol_a, vol_b, overlap) = (15.0, 22.5, 4.0);
+
+    for offset in FAR_OFFSETS {
+        let context = format!("transversal block pair at offset {offset:e}");
+        let d = |p: [f64; 3]| [p[0] + offset, p[1] + offset, p[2] + offset];
+        let mut scene = Scene::new();
+        let a = scene.block(d([0.0, 0.0, 0.0]), d(a_max));
+        let b = scene.block(d(b_min), d(b_max));
+
+        let union = scene
+            .unite(a, b)
+            .unwrap_or_else(|e| panic!("{context}: unite failed: {e:?}"));
+        let inter = scene
+            .intersect(a, b)
+            .unwrap_or_else(|e| panic!("{context}: intersect failed: {e:?}"));
+        let diff = scene
+            .subtract(a, b)
+            .unwrap_or_else(|e| panic!("{context}: subtract failed: {e:?}"));
+
+        // The smallest length in play is the unit-wide x overlap.
+        let rtol = far_field_rtol(offset, 1.0);
+        let vol_inter = brep_volume(&inter, &format!("{context}: intersection"));
+        assert_close(
+            vol_inter,
+            overlap,
+            rtol,
+            &format!("{context}: intersection vs analytic overlap"),
+        );
+        assert_close(
+            brep_volume(&union, &format!("{context}: union")) + vol_inter,
+            vol_a + vol_b,
+            rtol,
+            &format!("{context}: inclusion–exclusion identity"),
+        );
+        assert_close(
+            brep_volume(&diff, &format!("{context}: difference")),
+            vol_a - overlap,
+            rtol,
+            &format!("{context}: difference identity"),
+        );
+    }
+}
+
+/// The sharp version of the family: a feature far *smaller* than the
+/// coordinates that locate it. A slab of thickness `t` is shaved off a
+/// 2-unit cube sitting `offset` from the origin, so the cut plane and the
+/// face it parallels are two nearly equal large numbers whose difference is
+/// the entire answer.
+///
+/// At the extreme corner (`offset = 1e6`, `t = 1e-4`) the thickness is
+/// recovered from coordinates whose spacing is 1.2e-10 — about a millionth
+/// of `t`, and only a hundred times the effective linear tolerance there.
+/// This is the configuration the epic means by "large translation + small
+/// feature", and it is the one where an absolute tolerance that does not
+/// scale with magnitude either swallows the slab or fails to close it.
+#[test]
+fn small_feature_far_from_origin() {
+    for offset in [0.0, 1e3, 1e6] {
+        for thickness in [1e-2, 1e-4] {
+            let context = format!("{thickness:e}-thick shave off a 2-cube at offset {offset:e}");
+            let o = offset;
+            let t = thickness;
+            let mut scene = Scene::new();
+            let a = scene.block([o, o, o], [o + 2.0, o + 2.0, o + 2.0]);
+            // B covers everything from `x = o + 2 - t` outward, so the
+            // overlap is exactly the slab `t × 2 × 2`.
+            let b = scene.block([o + 2.0 - t, o - 1.0, o - 1.0], [o + 4.0, o + 3.0, o + 3.0]);
+
+            let inter = scene
+                .intersect(a, b)
+                .unwrap_or_else(|e| panic!("{context}: intersect failed: {e:?}"));
+            let diff = scene
+                .subtract(a, b)
+                .unwrap_or_else(|e| panic!("{context}: subtract failed: {e:?}"));
+
+            let overlap = t * 4.0;
+            assert_close(
+                brep_volume(&inter, &format!("{context}: intersection")),
+                overlap,
+                far_field_rtol(offset, t),
+                &format!("{context}: the slab itself"),
+            );
+            // The remainder is a 2-unit body, so it is entitled to the
+            // 2-unit budget rather than the slab's.
+            assert_close(
+                brep_volume(&diff, &format!("{context}: remainder")),
+                8.0 - overlap,
+                far_field_rtol(offset, 2.0),
+                &format!("{context}: remainder"),
+            );
+        }
+    }
+}
+
+/// A curved operand far from the origin. Planes are the forgiving case:
+/// their SSI is closed form and never iterates. A cylinder's wall drives
+/// projection and marching, both of which carry running error that grows
+/// with the coordinates being manipulated, so the through-hole is the
+/// harder far-field test even though the configuration is tamer.
+///
+/// It is also the case that separates the two measurement paths most
+/// sharply: the B-Rep number asserted here is right to nine digits at every
+/// offset, while the mesh number for the very same result is 191× too large
+/// at 1e6 (of-ukcq, held by
+/// [`mesh_mass_properties_survives_far_from_origin`]).
+#[test]
+fn far_from_origin_through_hole() {
+    for offset in FAR_OFFSETS {
+        let context = format!("block minus cylinder at offset {offset:e}");
+        let o = offset;
+        let mut scene = Scene::new();
+        let slab = scene.block([o, o, o], [o + 4.0, o + 4.0, o + 2.0]);
+        let tool = scene.cylinder(
+            Point3::new(o + 2.0, o + 2.0, o - 1.0),
+            Vector3::z(),
+            1.0,
+            4.0,
+        );
+        let out = scene
+            .subtract(slab, tool)
+            .unwrap_or_else(|e| panic!("{context}: subtract failed: {e:?}"));
+        assert_eq!(
+            out.store.euler_counts(out.body).genus,
+            1,
+            "{context}: through hole must give genus 1"
+        );
+        assert_close(
+            brep_volume(&out, &context),
+            32.0 - 2.0 * PI,
+            EXACT_RTOL.max(far_field_rtol(offset, 1.0)),
+            &context,
+        );
+    }
+}
+
+// ---------------------------------------------------------------------
+// 16.3 Mixed-scale operands: a tool six decades smaller than its target.
+// ---------------------------------------------------------------------
+
+/// A 1000-unit cube dented by a cube `ratio` times smaller, straddling one
+/// face so exactly half the tool overlaps.
+///
+/// The interesting bound is what can be asserted about the *difference*.
+/// `vol(A)` is 1e9 and the bite at the widest ratio is 5e-10; f64 cannot
+/// represent their difference distinctly, and no measurement of a 1e9-volume
+/// mesh resolves 1e-10 of absolute volume. So the difference is held to an
+/// absolute budget of `1e-12 · vol(A)` — the precision a number that size
+/// carries — while the *intersection*, which is a small body measured on its
+/// own, is held to the full planar budget. The two together say the right
+/// thing: the tool removed exactly the right material, and it did not
+/// disturb the host beyond what arithmetic allows.
+#[test]
+fn tiny_tool_dents_a_huge_block() {
+    const L: f64 = 1000.0;
+    for ratio in [1e2, 1e3, 1e4, 1e5, 1e6] {
+        let w = L / ratio;
+        let context = format!("{L}-unit cube dented by a {w:e}-unit cube (ratio {ratio:e})");
+        let mut scene = Scene::new();
+        let a = scene.block([0.0, 0.0, 0.0], [L, L, L]);
+        // Straddles the `x = L` face, centered on it in y and z.
+        let b = scene.block(
+            [L - w / 2.0, L / 2.0 - w / 2.0, L / 2.0 - w / 2.0],
+            [L + w / 2.0, L / 2.0 + w / 2.0, L / 2.0 + w / 2.0],
+        );
+
+        let inter = scene
+            .intersect(a, b)
+            .unwrap_or_else(|e| panic!("{context}: intersect failed: {e:?}"));
+        let diff = scene
+            .subtract(a, b)
+            .unwrap_or_else(|e| panic!("{context}: subtract failed: {e:?}"));
+
+        let overlap = w * w * w / 2.0;
+        let vol_a = L * L * L;
+        assert_close(
+            brep_volume(&inter, &format!("{context}: intersection")),
+            overlap,
+            far_field_rtol(L, w),
+            &format!("{context}: the bite itself"),
+        );
+
+        let vol_diff = brep_volume(&diff, &format!("{context}: dented host"));
+        let allowed = (PLANAR_VOLUME_RTOL * overlap).max(1e-12 * vol_a);
+        assert!(
+            (vol_diff - (vol_a - overlap)).abs() <= allowed,
+            "{context}: dented host measured {vol_diff} against an expected \
+             {} — off by {:.3e}, allowed {allowed:.3e}",
+            vol_a - overlap,
+            (vol_diff - (vol_a - overlap)).abs()
+        );
+    }
+}
+
+// ---------------------------------------------------------------------
+// 16.4 Extreme aspect ratios: plates and needles.
+// ---------------------------------------------------------------------
+
+/// A plate a millionth as thick as it is wide, crossed by a needle a
+/// millionth as thick as it is long. Their intersection is a 1e-3 cube of
+/// volume 1e-9 — nine decades below either operand — and every face of it
+/// comes from a surface whose own extent is six decades away in the
+/// perpendicular direction.
+///
+/// The inclusion–exclusion identity is a real constraint here and not a
+/// tautology: the sum is ~1000 and the needle contributes 1e-3 of it, a
+/// million times the budget, so a boolean that lost the needle entirely
+/// still fails.
+///
+/// The needle is slender in *two* directions at once, which is what puts it
+/// past of-oygs's limit — `ray_classify` reports that every ray from its
+/// region seed hits a degenerate case. Its one-thin-direction sibling
+/// [`crossed_thin_plates_share_a_ribbon`] is the same aspect ratio and is
+/// live, so this test isolates the second thin direction as the trigger.
+#[test]
+#[ignore = "of-oygs: ray_classify gives up on operands slender in two directions"]
+fn crossed_plate_and_needle() {
+    let context = "1e6-aspect plate crossed by a 1e6-aspect needle";
+    let mut scene = Scene::new();
+    let plate = scene.block([-500.0, -500.0, -5e-4], [500.0, 500.0, 5e-4]);
+    let needle = scene.block([-5e-4, -5e-4, -500.0], [5e-4, 5e-4, 500.0]);
+
+    let union = scene
+        .unite(plate, needle)
+        .unwrap_or_else(|e| panic!("{context}: unite failed: {e:?}"));
+    let inter = scene
+        .intersect(plate, needle)
+        .unwrap_or_else(|e| panic!("{context}: intersect failed: {e:?}"));
+
+    let (vol_plate, vol_needle) = (1000.0 * 1000.0 * 1e-3, 1e-3 * 1e-3 * 1000.0);
+    let overlap = 1e-3 * 1e-3 * 1e-3;
+    let vol_inter = brep_volume(&inter, &format!("{context}: intersection"));
+    assert_close(
+        vol_inter,
+        overlap,
+        far_field_rtol(500.0, 1e-3),
+        &format!("{context}: intersection is the shared 1e-3 cube"),
+    );
+    assert_close(
+        brep_volume(&union, &format!("{context}: union")) + vol_inter,
+        vol_plate + vol_needle,
+        PLANAR_VOLUME_RTOL,
+        &format!("{context}: inclusion–exclusion identity"),
+    );
+}
+
+/// Two thin plates meeting edge-on at a right angle: the shared region is a
+/// 1e-3 × 1000 × 1e-3 ribbon, extreme in two directions at once rather than
+/// one. A tessellator that triangulates by any area-based heuristic, or a
+/// classifier that seeds interior points by bounding-box midpoints, meets a
+/// region here whose bounding box is a million times its own thickness.
+#[test]
+fn crossed_thin_plates_share_a_ribbon() {
+    let context = "two 1e6-aspect plates crossing edge-on";
+    let mut scene = Scene::new();
+    let flat = scene.block([-500.0, -500.0, -5e-4], [500.0, 500.0, 5e-4]);
+    let upright = scene.block([-5e-4, -500.0, -500.0], [5e-4, 500.0, 500.0]);
+
+    let inter = scene
+        .intersect(flat, upright)
+        .unwrap_or_else(|e| panic!("{context}: intersect failed: {e:?}"));
+    assert_close(
+        brep_volume(&inter, &format!("{context}: intersection")),
+        1e-3 * 1000.0 * 1e-3,
+        far_field_rtol(500.0, 1e-3),
+        &format!("{context}: the shared ribbon"),
+    );
+}
+
+/// The live fence under of-oygs: the slenderness the pipeline *does* handle,
+/// so a fix (or a regression) has a boundary to move rather than a single
+/// broken case to flip.
+///
+/// The two arms of the family have wildly different limits, which is itself
+/// the finding. Planar operands survive to aspect 1e7 and fail at 1e8;
+/// cylindrical ones survive to aspect 1e3 and fail by 4e3, at every absolute
+/// radius and every linear tolerance tried (1e-5 through 1e-9) — so the
+/// curved seeding path is about four orders of magnitude weaker than the
+/// planar one, and the limit is a pure shape property rather than anything
+/// to do with tolerance. Both arms are exact inside their range, which is
+/// why the failures read as a cliff and not as decay.
+#[test]
+fn high_aspect_operands_inside_the_working_range() {
+    // Planar arm: two 1000-wide plates at aspect 1e6 and 1e7.
+    for thickness in [1e-3, 1e-4] {
+        let context = format!("crossing 1000-wide plates, thickness {thickness:e}");
+        let t = thickness;
+        let mut scene = Scene::new();
+        let flat = scene.block([-500.0, -500.0, -t / 2.0], [500.0, 500.0, t / 2.0]);
+        let upright = scene.block([-t / 2.0, -500.0, -500.0], [t / 2.0, 500.0, 500.0]);
+        let inter = scene
+            .intersect(flat, upright)
+            .unwrap_or_else(|e| panic!("{context}: intersect failed: {e:?}"));
+        assert_close(
+            brep_volume(&inter, &context),
+            t * 1000.0 * t,
+            far_field_rtol(500.0, t),
+            &format!("{context}: the shared ribbon"),
+        );
+    }
+
+    // Cylindrical arm: three bores all at aspect 1000 — the deepest of-oygs
+    // allows — at three different absolute radii, under one fixed 1e-6
+    // tolerance context. Passing all three is the statement that the limit
+    // is the drill's own shape and neither its size nor the tolerance.
+    //
+    // These three are the one place in the suite that does not tessellate its
+    // result, and the reason is cost, not doubt: the triangulator's time
+    // climbs steeply as a face's hole shrinks relative to the face (a plain
+    // 4 × 4 slab with a unit bore already takes ~1s in a debug build; a
+    // thousandth-radius bore is far worse — of-mpk0), and it would dominate
+    // the whole suite for no coverage. What is being fenced happens strictly
+    // inside `subtract`: of-oygs is a `ray_classify` refusal, so reaching a
+    // result at all is most of the assertion. `check()` and the exact volume
+    // still confirm the result is a well-formed solid of the right size.
+    for (radius, height) in [(1e-2, 10.0), (1e-3, 1.0), (1e-4, 0.1)] {
+        let (width, thickness) = (100.0 * radius, height / 2.0);
+        let context = format!(
+            "bore r={radius:e}, depth {height} (aspect {:e})",
+            height / radius
+        );
+        let mut scene = Scene::new();
+        let plate = scene.block(
+            [-width / 2.0, -width / 2.0, -thickness / 2.0],
+            [width / 2.0, width / 2.0, thickness / 2.0],
+        );
+        let drill = scene.cylinder(
+            Point3::new(0.0, 0.0, -height / 2.0),
+            Vector3::z(),
+            radius,
+            height,
+        );
+        let out = scene
+            .subtract(plate, drill)
+            .unwrap_or_else(|e| panic!("{context}: subtract failed: {e:?}"));
+        let failures = out.check();
+        assert!(
+            failures.is_empty(),
+            "{context}: check() reported {} failures: {failures:#?}",
+            failures.len()
+        );
+        assert_eq!(
+            out.store.euler_counts(out.body).genus,
+            1,
+            "{context}: the bore must go through"
+        );
+        let measured = brep_mass_properties(&out.store, &out.geo, out.body)
+            .unwrap_or_else(|e| panic!("{context}: brep_mass_properties failed: {e}"));
+        assert_close(
+            measured.volume,
+            (width * width - PI * radius * radius) * thickness,
+            EXACT_RTOL,
+            &context,
+        );
+    }
+}
+
+/// A needle *drill*: a cylinder of radius 1e-3 bored clean through a
+/// 100 × 100 plate. The hole is 3.1e-10 of the plate's volume — far below
+/// what any measurement of the plate can resolve — so the difference is
+/// asserted topologically (it must be genus 1: the hole exists and goes all
+/// the way through) and the removed material is weighed as the intersection,
+/// which is a body of its own and measurable on its own terms.
+///
+/// The drill is 4 long and 1e-3 in radius: aspect 4000, just past the ~1e3
+/// of-oygs allows. Shortening it to aspect 1000 with everything else
+/// unchanged makes it pass exactly — that variant is the live fence in
+/// [`high_aspect_operands_inside_the_working_range`]. So this test isolates
+/// the drill's own slenderness, not its size relative to the plate.
+#[test]
+#[ignore = "of-oygs: ray_classify gives up on cylinders past ~1e3 length/radius"]
+fn needle_drill_through_a_wide_plate() {
+    let context = "1e-3-radius drill through a 100-unit plate";
+    let mut scene = Scene::new();
+    let plate = scene.block([-50.0, -50.0, -0.5], [50.0, 50.0, 0.5]);
+    let drill = scene.cylinder(Point3::new(0.0, 0.0, -2.0), Vector3::z(), 1e-3, 4.0);
+
+    let diff = scene
+        .subtract(plate, drill)
+        .unwrap_or_else(|e| panic!("{context}: subtract failed: {e:?}"));
+    assert_valid(&diff, context);
+    assert_eq!(
+        diff.store.euler_counts(diff.body).genus,
+        1,
+        "{context}: the drill must leave a through hole"
+    );
+
+    let inter = scene
+        .intersect(plate, drill)
+        .unwrap_or_else(|e| panic!("{context}: intersect failed: {e:?}"));
+    assert_close(
+        brep_volume(&inter, &format!("{context}: swarf")),
+        PI * 1e-6,
+        EXACT_RTOL,
+        &format!("{context}: removed material"),
+    );
+}
+
+// ---------------------------------------------------------------------
+// 16.5 Near-parallel surface pairs.
+//
+// An SSI's direction is `n_a × n_b`, whose magnitude is `sin` of the angle
+// between the surfaces. As that angle shrinks the direction is recovered
+// from the difference of two nearly equal unit vectors, and the *position*
+// of the intersection moves like `separation / angle` — so a tolerance-sized
+// uncertainty in where the surfaces sit becomes a `tol / sin θ`-sized
+// uncertainty in where they cross. These tests put a real, closed-form
+// answer on the far side of that amplification.
+// ---------------------------------------------------------------------
+
+/// A knife-edge wedge shaved off a block by a plane that misses being
+/// parallel to its top face by `angle` radians.
+///
+/// The block is `[0,2] × [0,2] × [0,1]`; the tool is a large block whose
+/// bottom face starts `δ = 0.1·sin θ` below the top face and tilts by `θ`
+/// about the `y` axis through `(1, 1, 1)`. Working the rotation through, the
+/// tool's bottom plane is `z = 1 − δ/cos θ − tan θ·(x − 1)`, so the material
+/// it removes has height `h(x) = 0.1·tan θ + tan θ·(x − 1)` above it — zero
+/// at `x = 0.9` and rising to `1.1·tan θ` at `x = 2`. That is a triangular
+/// prism of volume `2 · ½ · 1.1 · 1.1 tan θ = 1.21 tan θ`, exactly, for every
+/// angle in the family.
+///
+/// `δ` is tied to `θ` on purpose: it keeps the knife edge at `x = 0.9` at
+/// every angle, so the three cases differ *only* in how sharp the edge is
+/// and not in where it lands.
+fn near_parallel_wedge(angle: f64) {
+    let context = format!("wedge shaved by a plane {angle:e} rad off parallel");
+    let (m, delta) = (angle.tan(), 0.1 * angle.sin());
+    let expected = 1.21 * m;
+
+    let mut scene = Scene::new();
+    let a = scene.block([0.0, 0.0, 0.0], [2.0, 2.0, 1.0]);
+    let b = scene.block([-1.0, -1.0, 1.0 - delta], [3.0, 3.0, 3.0]);
+    let rot = Rotation3::from_axis_angle(&Unit::new_normalize(Vector3::y()), angle);
+    scene.rotate(b, &rot, &Point3::new(1.0, 1.0, 1.0));
+
+    let inter = scene
+        .intersect(a, b)
+        .unwrap_or_else(|e| panic!("{context}: intersect failed: {e:?}"));
+    assert_eq!(
+        inter.shell_count(),
+        1,
+        "{context}: the wedge is one connected solid"
+    );
+
+    // Near the knife edge the two planes are within the linear tolerance of
+    // each other, so which side a point falls on is genuinely undecidable
+    // there. That band is `|h(x)| <= tol`, an x-window of half-width
+    // `tol / m`, and the material inside it is at most `2 (the y extent) ×
+    // 2 tol/m × tol`. No implementation can do better; anything worse is a
+    // real error. Note this is the quantity that blows up as `m → 0` — it is
+    // the whole reason near-parallel SSI is its own robustness family.
+    let ambiguous = 4.0 * tol().linear * tol().linear / m;
+    let allowed = (PLANAR_VOLUME_RTOL * expected).max(ambiguous);
+    let (meshed, exact) = measured(&inter, &context);
+    for (label, got) in [("B-Rep path", exact.volume), ("mesh path", meshed.volume)] {
+        assert!(
+            (got - expected).abs() <= allowed,
+            "{context} ({label}): wedge volume {got} differs from the exact \
+             {expected} by {:.3e}, allowed {allowed:.3e}",
+            (got - expected).abs()
+        );
+    }
+}
+
+#[test]
+fn near_parallel_wedge_1e_2_rad() {
+    near_parallel_wedge(1e-2);
+}
+
+#[test]
+fn near_parallel_wedge_1e_3_rad() {
+    near_parallel_wedge(1e-3);
+}
+
+#[test]
+fn near_parallel_wedge_1e_4_rad() {
+    near_parallel_wedge(1e-4);
+}
+
+/// Two unit spheres whose centers are `d` apart, with `d` small: the curved
+/// counterpart of the wedge. At their intersection circle the two normals
+/// point at each center, so they differ by an angle of about `d` — the
+/// surfaces cross at a hair, and over most of their area they sit within `d`
+/// of each other without being coincident.
+///
+/// The lens has a closed form ([`sphere_lens_volume`]), and the pair is
+/// almost the whole of either sphere, so the assertion is stated against the
+/// **B-Rep-native** measurement: the meshed budget for curved results
+/// (0.5%) is larger than the gap between the lens and a whole sphere at
+/// these separations, and would pass a boolean that simply returned one of
+/// the operands. The exact path does not discretize, so it can tell them
+/// apart.
+fn near_concentric_spheres(d: f64) {
+    let context = format!("unit spheres {d:e} apart");
+    let mut scene = Scene::new();
+    let a = scene.sphere(Point3::origin(), 1.0);
+    let b = scene.sphere(Point3::new(d, 0.0, 0.0), 1.0);
+
+    let inter = scene
+        .intersect(a, b)
+        .unwrap_or_else(|e| panic!("{context}: intersect failed: {e:?}"));
+    let (_, exact) = measured(&inter, &context);
+    let lens = sphere_lens_volume(1.0, 1.0, d);
+    assert_close(
+        exact.volume,
+        lens,
+        EXACT_RTOL,
+        &format!("{context}: lens volume (B-Rep path)"),
+    );
+    // A whole sphere is what a boolean that gave up would return; the lens
+    // must be distinguishable from it by orders of magnitude more than the
+    // budget just used.
+    assert!(
+        (exact.volume - sphere_volume(1.0)).abs() > 1e3 * EXACT_RTOL * lens,
+        "{context}: the lens is indistinguishable from a whole sphere, so \
+         the assertion above proves nothing"
+    );
+
+    let union = scene
+        .unite(a, b)
+        .unwrap_or_else(|e| panic!("{context}: unite failed: {e:?}"));
+    let (_, exact_union) = measured(&union, &format!("{context}: union"));
+    assert_close(
+        exact_union.volume + exact.volume,
+        2.0 * sphere_volume(1.0),
+        EXACT_RTOL,
+        &format!("{context}: inclusion–exclusion identity (B-Rep path)"),
+    );
+}
+
+/// All three separations miss the closed form by 1.3e-3, 1.5e-3 and 1.6e-3
+/// — and the cause is not the near-parallelism this family was aiming at.
+/// The lens's trim circle lies perpendicular to the line of centers, i.e.
+/// 90° off the spheres' pole axis, and of-y8qc is a *systematic*
+/// measurement error on trimmed spheres that grows smoothly with exactly
+/// that angle: 5.7e-16 at 0°, 5.1e-5 at 45°, 1.3e-3 at 90°, on a plain
+/// sphere-minus-half-space with no near-parallelism anywhere in it.
+///
+/// So these stay written as they are. Softening them to a 1e-2 budget would
+/// make them pass while measuring nothing, and re-aiming the trim at the
+/// poles would dodge the defect instead of pinning it.
+#[test]
+#[ignore = "of-y8qc: trimmed-sphere measurement degrades as the trim tilts off the pole axis"]
+fn near_concentric_spheres_1e_1_apart() {
+    near_concentric_spheres(1e-1);
+}
+
+#[test]
+#[ignore = "of-y8qc: trimmed-sphere measurement degrades as the trim tilts off the pole axis"]
+fn near_concentric_spheres_1e_2_apart() {
+    near_concentric_spheres(1e-2);
+}
+
+#[test]
+#[ignore = "of-y8qc: trimmed-sphere measurement degrades as the trim tilts off the pole axis"]
+fn near_concentric_spheres_1e_3_apart() {
+    near_concentric_spheres(1e-3);
+}
+
+// ---------------------------------------------------------------------
+// 16.6 Repeated booleans: does error accumulate over a chain?
+//
+// Every test above weighs a single operation. That is not the question a
+// modelling history asks. A part is fifty features deep, each built on the
+// output of the last, and the failure mode is not that any one of them is
+// wrong but that each is slightly wrong in the same direction. The spec's
+// propagation rules (`spec/08-tolerances.md` §3) say an operation may raise
+// an entity's tolerance; nothing says the *volume* may drift, and these
+// tests hold every step of a chain to the same budget as its first step —
+// the tolerance deliberately does not widen with depth.
+// ---------------------------------------------------------------------
+
+/// Eight bores drilled one after another into a plate, each into the output
+/// of the last. After step `k` the plate must be genus `k` and have lost
+/// exactly `k` bores' worth of material — to the *same* budget at `k = 8` as
+/// at `k = 1`.
+#[test]
+fn chained_bores_do_not_accumulate_volume_error() {
+    const BORES: usize = 8;
+    const RADIUS: f64 = 0.4;
+    const THICKNESS: f64 = 1.0;
+    let plate_volume = 12.0 * 12.0 * THICKNESS;
+    let bore_volume = PI * RADIUS * RADIUS * THICKNESS;
+
+    let mut scene = Scene::new();
+    let mut body = scene.block([-6.0, -6.0, -0.5], [6.0, 6.0, 0.5]);
+
+    for k in 1..=BORES {
+        let context = format!("bore {k} of {BORES}");
+        let theta = 2.0 * PI * (k - 1) as f64 / BORES as f64;
+        let drill = scene.cylinder(
+            Point3::new(3.5 * theta.cos(), 3.5 * theta.sin(), -3.0),
+            Vector3::z(),
+            RADIUS,
+            6.0,
+        );
+        let out = scene
+            .subtract(body, drill)
+            .unwrap_or_else(|e| panic!("{context}: subtract failed: {e:?}"));
+        assert_eq!(
+            out.store.euler_counts(out.body).genus,
+            k,
+            "{context}: each bore must add exactly one handle"
+        );
+        let want = plate_volume - k as f64 * bore_volume;
+
+        // Every step is weighed the exact way, at a budget that does not
+        // widen with depth — that is the whole assertion, and it is sharp to
+        // nine digits. Only the last step is also tessellated and
+        // cross-checked: the mesh path answers nothing here the exact path
+        // has not already answered a million times more precisely, and
+        // of-mpk0 makes tessellating a plate with k small bores cost more
+        // than every other test in this file combined.
+        if k == BORES {
+            let (meshed, exact) = measured(&out, &context);
+            assert_close(
+                exact.volume,
+                want,
+                EXACT_RTOL,
+                &format!("{context} (B-Rep path)"),
+            );
+            assert_close(
+                meshed.volume,
+                want,
+                CYL_VOLUME_RTOL,
+                &format!("{context} (mesh path)"),
+            );
+        } else {
+            let failures = out.check();
+            assert!(
+                failures.is_empty(),
+                "{context}: check() reported {} failures: {failures:#?}",
+                failures.len()
+            );
+            let exact = brep_mass_properties(&out.store, &out.geo, out.body)
+                .unwrap_or_else(|e| panic!("{context}: brep_mass_properties failed: {e}"));
+            assert_close(
+                exact.volume,
+                want,
+                EXACT_RTOL,
+                &format!("{context} (B-Rep path)"),
+            );
+        }
+
+        let (next, next_body) = Scene::adopt(out, tol());
+        scene = next;
+        body = next_body;
+    }
+}
+
+/// A null-op cycle repeated six times: unite a boss sitting flush on the
+/// 4 × 4 × 2 block's top face, then subtract the same boss. Because the boss
+/// shares only a face with the block and no volume, `(A ∪ B) − B` is `A` —
+/// every cycle must return the *identical* solid.
+///
+/// What makes it a drift test rather than a triviality is the imprint. The
+/// first union splits the block's top face along the boss footprint, and
+/// every later cycle re-imprints onto faces that are already split, so the
+/// arrangement being merged is different (and messier) at cycle six than at
+/// cycle one. If coincident-face handling nudges a vertex by a tolerance each
+/// time, the volume walks; the assertion is that it does not move at all —
+/// the budget is the same at cycle six as at cycle one, deliberately.
+///
+/// `boss_half` is the boss's half-width. At 2.0 the footprint reaches the
+/// top face's edges and the imprint is four boundary-to-boundary chains; at
+/// 1.0 it is a closed island strictly inside the face, which is of-6viu.
+/// The two differ in nothing else.
+fn unite_subtract_cycles(boss_half: f64, label: &str) {
+    const CYCLES: usize = 6;
+    let block_volume = 4.0 * 4.0 * 2.0;
+    let boss = |h: f64| ([-h, -h, 1.0], [h, h, 2.0]);
+    let mut counts = Vec::new();
+
+    let mut scene = Scene::new();
+    let mut body = scene.block([-2.0, -2.0, -1.0], [2.0, 2.0, 1.0]);
+
+    for cycle in 1..=CYCLES {
+        let context = format!("{label}: unite/subtract cycle {cycle} of {CYCLES}");
+        let (lo, hi) = boss(boss_half);
+        let tool = scene.block(lo, hi);
+        let united = scene
+            .unite(body, tool)
+            .unwrap_or_else(|e| panic!("{context}: unite failed: {e:?}"));
+        let (mut next, united_body) = Scene::adopt(united, tol());
+        let tool_again = next.block(lo, hi);
+        let out = next
+            .subtract(united_body, tool_again)
+            .unwrap_or_else(|e| panic!("{context}: subtract failed: {e:?}"));
+
+        assert_eq!(out.shell_count(), 1, "{context}: one shell");
+        assert_eq!(
+            out.store.euler_counts(out.body).genus,
+            0,
+            "{context}: no handles"
+        );
+        let (meshed, exact) = measured(&out, &context);
+        assert_close(
+            exact.volume,
+            block_volume,
+            EXACT_RTOL,
+            &format!("{context} (B-Rep path)"),
+        );
+        assert_close(
+            meshed.volume,
+            block_volume,
+            PLANAR_VOLUME_RTOL,
+            &format!("{context} (mesh path)"),
+        );
+        assert!(
+            exact.centroid.coords.norm() <= 1e-9,
+            "{context}: centroid drifted to {:?}",
+            exact.centroid
+        );
+        counts.push(out.face_count());
+
+        let (next, next_body) = Scene::adopt(out, tol());
+        scene = next;
+        body = next_body;
+    }
+
+    // The topological half of the same question: a cycle that leaves the
+    // solid geometrically identical but structurally larger every time is how
+    // a modelling history grinds to a halt after fifty features, and no
+    // volume assertion can see it. The bar is deliberately weak — not "the
+    // count returns to six" (an imprint may legitimately survive as a split
+    // face) but "the count stops growing".
+    assert_eq!(
+        counts.last(),
+        counts.get(1),
+        "{label}: face count did not settle over {CYCLES} identical cycles: {counts:?}"
+    );
+}
+
+/// The boss reaches the top face's edges, so every imprint chain runs
+/// boundary to boundary. Live, and the fence of-6viu's fix must not move.
+#[test]
+fn edge_reaching_boss_unite_subtract_cycles_do_not_drift() {
+    unite_subtract_cycles(2.0, "edge-reaching boss");
+}
+
+/// The same cycle with a 2 × 2 boss centred on the 4 × 4 top face, so the
+/// imprint is a closed island touching no edge — a pad in the middle of a
+/// face, which is about as ordinary as CAD features get. `unite` rejects it
+/// outright (of-6viu) on cycle one, so nothing about drift is learned yet;
+/// the test is written to the same standard as its live sibling so that
+/// fixing of-6viu turns it on unchanged.
+#[test]
+#[ignore = "of-6viu: unite fails when a coincident-face imprint forms an island"]
+fn island_boss_unite_subtract_cycles_do_not_drift() {
+    unite_subtract_cycles(1.0, "island boss");
+}
+
+// ---------------------------------------------------------------------
+// 16.7 High-degree and near-degenerate-knot NURBS operands.
+//
+// Section (14) proved the NURBS path on degree-1 patches with evenly spaced
+// knots. Degree 1 is the case where the basis is a hat function, the span
+// search is a bisection over equal intervals, and no denominator in the
+// Cox–de Boor recurrence is ever small. None of that survives at degree 5
+// with knots 1e-9 apart.
+//
+// The geometry is held fixed on purpose: every operand here is the *same*
+// flat-faced box as `Scene::nurbs_block`, reproduced exactly because the
+// control points sit at the Greville abscissae (see
+// [`Scene::nurbs_hexahedron_knots`]). So every case has the same right
+// answer as `nurbs_box_half_overlapped_by_nurbs_box`, and any difference is
+// a parameterization defect with nowhere to hide.
+// ---------------------------------------------------------------------
+
+/// Clamped knot vector of `degree` over `[0, 1]` with the given interior
+/// knots — the general form `KnotVector::clamped_uniform` specializes.
+fn clamped_knots(degree: usize, interior: &[f64]) -> KnotVector {
+    let mut knots = vec![0.0; degree + 1];
+    knots.extend_from_slice(interior);
+    knots.extend(std::iter::repeat_n(1.0, degree + 1));
+    KnotVector::new(degree, knots).expect("valid clamped knot vector")
+}
+
+/// The half-overlap fixture of section (14), run with both NURBS boxes
+/// carrying the given `(u, v)` knot vectors on all six faces.
+fn nurbs_half_overlap_with_knots(label: &str, knots_u: KnotVector, knots_v: KnotVector) {
+    let context = format!("NURBS box half-overlap, {label}");
+    let a_box = ([0.0, 0.0, 0.0], [2.0, 2.0, 2.0]);
+    let b_box = ([1.0, -1.0, -1.0], [3.0, 3.0, 3.0]);
+    let mut scene = Scene::new();
+    let per_face = || std::array::from_fn(|_| [knots_u.clone(), knots_v.clone()]);
+    let a = scene.nurbs_hexahedron_knots(box_corners(a_box.0, a_box.1), per_face());
+    let b = scene.nurbs_hexahedron_knots(box_corners(b_box.0, b_box.1), per_face());
+    let inside_a = box_inside_test(a_box.0, a_box.1);
+    let inside_b = box_inside_test(b_box.0, b_box.1);
+    assert_half_overlap_identity(
+        &context,
+        &scene,
+        a,
+        b,
+        [Some(&inside_a), Some(&inside_b)],
+        8.0,
+        32.0,
+    );
+}
+
+/// Degree 3 in both directions with evenly spaced interior knots: the first
+/// case where the basis has real support across spans and the imprint has to
+/// cross knot lines it did not choose.
+#[test]
+fn nurbs_half_overlap_degree_3() {
+    nurbs_half_overlap_with_knots(
+        "degree 3, three interior knots",
+        clamped_knots(3, &[0.25, 0.5, 0.75]),
+        clamped_knots(3, &[0.25, 0.5, 0.75]),
+    );
+}
+
+/// Degree 5 — the highest degree any of this suite's operands reach, and
+/// enough that the Cox–de Boor recurrence is six levels deep.
+#[test]
+fn nurbs_half_overlap_degree_5() {
+    nurbs_half_overlap_with_knots(
+        "degree 5, two interior knots",
+        clamped_knots(5, &[1.0 / 3.0, 2.0 / 3.0]),
+        clamped_knots(5, &[1.0 / 3.0, 2.0 / 3.0]),
+    );
+}
+
+/// Anisotropic degree: cubic in `u`, linear in `v`. Nothing about a patch
+/// forces its two directions to match, and code that reads one degree where
+/// it meant the other passes every symmetric test in the suite.
+#[test]
+fn nurbs_half_overlap_mixed_degrees() {
+    nurbs_half_overlap_with_knots(
+        "degree 3 in u, degree 1 in v",
+        clamped_knots(3, &[0.25, 0.5, 0.75]),
+        clamped_knots(1, &[0.3, 0.8]),
+    );
+}
+
+/// A full-multiplicity interior knot: repeated `degree` times, which drops
+/// the surface to C0 there. The patch is still exactly flat, so the kink is
+/// purely parametric — the derivative is discontinuous across a line the
+/// geometry knows nothing about, which is the state a marcher stepping by
+/// tangent direction handles worst.
+#[test]
+fn nurbs_half_overlap_c0_interior_knot() {
+    nurbs_half_overlap_with_knots(
+        "degree 3 with a C0 (triple) interior knot at u = 1/2",
+        clamped_knots(3, &[0.5, 0.5, 0.5]),
+        clamped_knots(3, &[0.5, 0.5, 0.5]),
+    );
+}
+
+/// Interior knots 1e-9 apart: not repeated, so every Cox–de Boor denominator
+/// is nonzero, but nine orders below the span they sit in. This is the
+/// near-degenerate case the epic names — the one where a span search that
+/// compares with an absolute epsilon lands in the wrong span, and where the
+/// basis is computed as a ratio of two quantities that are individually
+/// meaningless.
+#[test]
+fn nurbs_half_overlap_near_coincident_knots() {
+    nurbs_half_overlap_with_knots(
+        "degree 3 with interior knots 1e-9 apart",
+        clamped_knots(3, &[0.5, 0.5 + 1e-9, 0.5 + 2e-9]),
+        clamped_knots(3, &[0.5, 0.5 + 1e-9, 0.5 + 2e-9]),
+    );
+}
+
+/// A knot span a millionth of the domain wide, hard against the clamped end.
+/// The two failure modes it separates are a span search that skips spans
+/// narrower than its epsilon, and a projection whose parametric step size is
+/// chosen from the domain length rather than the local span.
+#[test]
+fn nurbs_half_overlap_tiny_first_span() {
+    nurbs_half_overlap_with_knots(
+        "degree 4 with a 1e-6-wide first span",
+        clamped_knots(4, &[1e-6, 0.5]),
+        clamped_knots(4, &[1e-6, 0.5]),
     );
 }
