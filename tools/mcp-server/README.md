@@ -17,7 +17,7 @@ produces the identical shape in the GUI, and vice-versa.
 |------------------|---------|
 | `create_model`   | Build a model from a playground JS script → `model_id` + mesh stats + validation summary. |
 | `import_step`    | Read an existing STEP file → `model_id` (plus one per solid) + per-solid outcomes + diagnostics + measure/validate summary. |
-| `get_screenshot` | Render a model to a PNG from a named view (`iso`, `front`, `top`, …). |
+| `get_screenshot` | Render a model to a PNG: named or arbitrary view, framed on a feature (`region`/`target`/`zoom`), optionally cut by a `section` plane or drawn as hidden-line-removed `edges`. Deterministic — same request, same bytes. |
 | `export`         | Write a model to a file: `step` \| `stl` \| `obj`, with the document `unit` declared in the STEP header. |
 | `measure`        | Mass properties: volume, surface area, centroid, inertia, bounding box. |
 | `validate`       | Structural check: is the mesh a closed, consistently-oriented manifold enclosing a finite non-zero volume — and does the exact B-Rep body pass the kernel's own validation? |

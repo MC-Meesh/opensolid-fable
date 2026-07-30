@@ -7,7 +7,13 @@ import { tmpdir } from 'node:os';
 import { resolve, isAbsolute, join, basename } from 'node:path';
 import { ModelStore, importStep } from './kernel.js';
 import { getMesh, buildBinaryStl, buildObj } from './mesh.js';
-import { renderPng, VIEW_NAMES } from './render.js';
+import {
+  renderScene,
+  viewDirection,
+  VIEW_NAMES,
+  RENDER_MODES,
+  SECTION_AXES,
+} from './render.js';
 import { optimize } from './optimize.js';
 import { buildManifest, SERVER_INFO, UNITS } from './capabilities.js';
 import { inspect as inspectTopology, probeAxis } from './topology.js';
@@ -164,6 +170,30 @@ function toleranceFor(spec, expected) {
     throw new Error(`relative_tolerance must be a non-negative number, got ${rel}`);
   }
   return rel * Math.abs(expected);
+}
+
+/**
+ * The line-work a screenshot's edge modes draw: the mesh's crease/boundary
+ * feature edges (view-independent, already in hand from meshing) plus the
+ * shape's silhouette for this camera (view-dependent, a separate kernel call).
+ *
+ * Both are asked at the *same* accuracy the render meshes at, or the outline
+ * traces a different tessellation than the surface underneath it and lands a
+ * pixel or two off.
+ *
+ * A shape whose silhouette the kernel declines (a mesh-fallback body, say) is
+ * not a failed screenshot — the feature edges alone still draw a usable
+ * drawing, so the silhouette is dropped rather than raised.
+ */
+function edgesFor(shape, mesh, args) {
+  let silhouette;
+  try {
+    const [vx, vy, vz] = viewDirection({ view: args.view, direction: args.direction });
+    silhouette = shape.silhouetteEdges(vx, vy, vz, mesh.accuracy);
+  } catch {
+    silhouette = undefined;
+  }
+  return { feature: mesh.featureEdges, silhouette };
 }
 
 /** One assertion result, in the shape every `assert_model` check returns. */
@@ -870,13 +900,105 @@ export function createTools(config = {}) {
       definition: {
         name: 'get_screenshot',
         description:
-          'Render a model to a PNG image from a named view. Returns the image inline. ' +
-          `Views: ${VIEW_NAMES.join(', ')} (default iso).`,
+          'Render a model to a PNG image and return it inline, followed by a text block ' +
+          'naming the exact camera that produced it. This is the visual-inspection ' +
+          'channel: a smoke test that catches geometry which is topologically valid but ' +
+          'semantically wrong (a hole on the wrong axis, a pocket that broke through), ' +
+          'which no measurement flags on its own. ' +
+          `Views: ${VIEW_NAMES.join(', ')} (default iso), or pass an arbitrary ` +
+          '`direction`. Framing: `region` frames a world-space box (paste the ' +
+          '`boundingBox` from `measure`), `target` re-centres on a point (paste a hole or ' +
+          "boss `center` from `inspect_topology`) and `zoom` magnifies. `section` cuts an " +
+          'axis-aligned clip plane and shades the cut face ' +
+          `so interior geometry is visible. \`mode\`: ${RENDER_MODES.join(', ')} — ` +
+          'edge modes draw feature + silhouette line-work with hidden lines removed, ' +
+          'which reads like a dimension drawing. Rendering is deterministic: the same ' +
+          'arguments against the same model produce byte-identical PNGs.',
         inputSchema: {
           type: 'object',
           properties: {
             model_id: { type: 'string' },
-            view: { type: 'string', enum: VIEW_NAMES, description: 'Camera view (default iso).' },
+            view: { type: 'string', enum: VIEW_NAMES, description: 'Named camera view (default iso).' },
+            direction: {
+              type: 'array',
+              items: { type: 'number' },
+              minItems: 3,
+              maxItems: 3,
+              description:
+                'Arbitrary view direction [x,y,z] — the way the camera looks, so [0,-1,0] ' +
+                'looks down. Overrides `view`. Use it for three-quarter shots a named view ' +
+                'cannot reach.',
+            },
+            up: {
+              type: 'array',
+              items: { type: 'number' },
+              minItems: 3,
+              maxItems: 3,
+              description:
+                'Screen-up vector for a custom `direction` (default +Y, or +/-Z when the ' +
+                'direction is vertical).',
+            },
+            region: {
+              type: 'object',
+              description:
+                'World-space box to frame, {min:[x,y,z], max:[x,y,z]} — the same shape ' +
+                '`measure` and `inspect_topology` report a bounding box in. Zooms to that ' +
+                'box instead of the whole model, which is how you inspect one feature.',
+              properties: {
+                min: { type: 'array', items: { type: 'number' }, minItems: 3, maxItems: 3 },
+                max: { type: 'array', items: { type: 'number' }, minItems: 3, maxItems: 3 },
+              },
+              required: ['min', 'max'],
+            },
+            target: {
+              type: 'array',
+              items: { type: 'number' },
+              minItems: 3,
+              maxItems: 3,
+              description:
+                'World point to place at the centre of the frame (default: the centre of ' +
+                'whatever is being fitted).',
+            },
+            zoom: {
+              type: 'number',
+              description:
+                'Magnification on top of the fit: 1 (default) fits, 2 is twice as close ' +
+                'and shows a quarter of the area, 0.5 pulls back.',
+            },
+            mode: {
+              type: 'string',
+              enum: RENDER_MODES,
+              description:
+                'shaded (default) | shaded_edges (solid plus line-work) | edges ' +
+                '(line-work on a light ground, hidden lines removed).',
+            },
+            section: {
+              type: 'object',
+              description:
+                'Axis-aligned section cut. Keeps the half with the smaller coordinate on ' +
+                '`axis`; `flip` keeps the other. The cut face is shaded amber so it can ' +
+                'never be mistaken for material.',
+              properties: {
+                axis: { type: 'string', enum: SECTION_AXES, description: 'X | Y | Z (default X).' },
+                offset: {
+                  type: 'number',
+                  description:
+                    'Where the plane sits on that axis, in model units (default: the ' +
+                    "model's midpoint on that axis, which is guaranteed to cut it).",
+                },
+                flip: { type: 'boolean', description: 'Keep the other half (default false).' },
+              },
+            },
+            line_width: {
+              type: 'number',
+              description: 'Line-work thickness in px, 1..8 (default 2 in `edges`, 1 overlaid).',
+            },
+            accuracy: {
+              type: 'number',
+              description:
+                'Chordal deviation of the rendered mesh in model units (default 0.5% of ' +
+                'the extent). Pin it when a series of shots must be compared facet-for-facet.',
+            },
             width: { type: 'number', description: 'Image width in px (default 800).' },
             height: { type: 'number', description: 'Image height in px (default 600).' },
           },
@@ -890,21 +1012,50 @@ export function createTools(config = {}) {
         } catch (err) {
           return fail(err.message);
         }
-        const mesh = getMesh(model.shape);
+        if (args.accuracy !== undefined && (!Number.isFinite(args.accuracy) || args.accuracy <= 0)) {
+          return fail('accuracy must be a positive number of model units');
+        }
+        const mesh = getMesh(model.shape, { accuracy: args.accuracy });
         if (mesh.triangles === 0) {
           return fail('model produced an empty mesh; nothing to render');
         }
-        const png = renderPng(mesh, model.shape.bounds(), {
-          view: args.view,
-          width: args.width,
-          height: args.height,
-        });
+        const mode = args.mode === undefined ? 'shaded' : args.mode;
+        let result;
+        try {
+          result = renderScene(mesh, model.shape.bounds(), {
+            view: args.view,
+            direction: args.direction,
+            up: args.up,
+            region: args.region,
+            target: args.target,
+            zoom: args.zoom,
+            mode,
+            section: args.section,
+            lineWidth: args.line_width,
+            edges: mode === 'shaded' ? undefined : edgesFor(model.shape, mesh, args),
+            width: args.width,
+            height: args.height,
+          });
+        } catch (err) {
+          return fail(errMessage(err));
+        }
         return {
           content: [
             {
               type: 'image',
-              data: png.toString('base64'),
+              data: result.png.toString('base64'),
               mimeType: 'image/png',
+            },
+            // The resolved camera, not the requested one. A shot an agent
+            // cannot reproduce is not evidence: this is what turns "looks
+            // wrong" into a second, tighter shot of the same thing.
+            {
+              type: 'text',
+              text: JSON.stringify({
+                model_id: model.id,
+                accuracy: mesh.accuracy,
+                camera: result.camera,
+              }),
             },
           ],
         };

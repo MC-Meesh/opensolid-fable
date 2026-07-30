@@ -7,20 +7,18 @@
  * budget tracks surface complexity); exact boolean results serve their
  * validated analytic tessellation regardless of `accuracy`.
  *
+ * `featureEdges` rides along: the mesh's crease/boundary segments as a flat
+ * `[x0,y0,z0, x1,y1,z1, …]` buffer. It is the line-work source for the
+ * renderer's edge modes, and it comes out of the same `meshAdaptive` call the
+ * triangles do — asking the kernel for it separately would remesh.
+ *
  * @param {object} shape a WasmShape
  * @param {{accuracy?:number}} [opts]
- * @returns {{positions:Float32Array, normals:Float32Array, indices:Uint32Array, triangles:number, vertices:number}}
+ * @returns {{positions:Float32Array, normals:Float32Array, indices:Uint32Array,
+ *   featureEdges:Float32Array, accuracy:number, triangles:number, vertices:number}}
  */
 export function getMesh(shape, opts = {}) {
-  const bounds = shape.bounds();
-  const extent = Math.max(
-    bounds[3] - bounds[0],
-    bounds[4] - bounds[1],
-    bounds[5] - bounds[2],
-    1e-9,
-  );
-  const accuracy =
-    Number.isFinite(opts.accuracy) && opts.accuracy > 0 ? opts.accuracy : 5e-3 * extent;
+  const accuracy = meshAccuracy(shape, opts.accuracy);
   const data = shape.meshAdaptive(accuracy, undefined);
   const positions = data.positions;
   const normals = data.normals;
@@ -29,9 +27,34 @@ export function getMesh(shape, opts = {}) {
     positions,
     normals,
     indices,
+    featureEdges: data.featureEdges,
+    // The accuracy actually used, so a caller that needs a *second* kernel
+    // query against the same tessellation (silhouette edges, say) can pin it
+    // rather than re-deriving the default and hoping the two agree.
+    accuracy,
     triangles: indices.length / 3,
     vertices: positions.length / 3,
   };
+}
+
+/**
+ * The chordal-deviation target a mesh request resolves to: the caller's
+ * `accuracy` when it is a positive finite number, otherwise 0.5% of the
+ * shape's largest extent.
+ *
+ * @param {object} shape a WasmShape
+ * @param {number} [requested]
+ * @returns {number}
+ */
+export function meshAccuracy(shape, requested) {
+  const bounds = shape.bounds();
+  const extent = Math.max(
+    bounds[3] - bounds[0],
+    bounds[4] - bounds[1],
+    bounds[5] - bounds[2],
+    1e-9,
+  );
+  return Number.isFinite(requested) && requested > 0 ? Number(requested) : 5e-3 * extent;
 }
 
 /**

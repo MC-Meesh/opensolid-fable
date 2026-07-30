@@ -86,7 +86,7 @@ persistence. Exports and screenshots are written to `OPENSOLID_MCP_OUTPUT_DIR`.
 |------------------|----------------------------------------------------|---------|
 | `create_model`   | **`script`**, `name`, `exact`                      | `model_id` + mesh stats + validation summary |
 | `import_step`    | `path` \| `text`, `name`, `circle_segments`        | `model_id` + per-solid outcomes + diagnostics + measure/validate summary |
-| `get_screenshot` | **`model_id`**, `view`, `width`, `height`          | inline PNG image |
+| `get_screenshot` | **`model_id`**, `view` \| `direction`, `region` \| `target` + `zoom`, `mode`, `section`, `accuracy`, `line_width`, `width`, `height` | inline PNG image + the camera that produced it |
 | `export`         | **`model_id`**, **`format`**, `path`, `accuracy`, `unit` | file path + byte size |
 | `measure`        | **`model_id`**, `query`, `accuracy`                | mass properties |
 | `optimize`       | **`model_id`**, **`params`**, **`objective`**, `constraints`, `options` | converged params + achieved objective + trajectory |
@@ -125,6 +125,7 @@ making:
 | Does the finished part match what I intended? | `assert_model` |
 | Do two parts collide? Does the solid stay clear of a keep-out? | `measure_clearance` |
 | Do the several meshers agree this is a solid? | `validate` (`mesher` field), `meshAgreement` in-script |
+| Does the part *look* like the thing I described? Is a feature on the wrong face? | `get_screenshot` — framed on the feature, and sectioned if the feature is interior. The one probabilistic oracle: it is a smoke test between the machine checks and a human, and it never overrules a measurement |
 
 ### `create_model`
 
@@ -225,11 +226,112 @@ parametric — so `optimize` has nothing to move.
 
 ### `get_screenshot`
 
-Renders a model to a PNG from a named view and returns the image inline (no file
-written). Views: `iso` (default), `front`, `back`, `right`, `left`, `top`,
-`bottom`. `width`/`height` default to 800×600. The renderer is a pure-JS
-software rasterizer — a screenshot is a few milliseconds, no GPU, no headless
-browser.
+Renders a model to a PNG and returns it inline (no file written), followed by a
+short text block naming the exact camera that produced it. The renderer is a
+pure-JS software rasterizer — a screenshot is a few milliseconds, no GPU, no
+headless browser.
+
+**This is a probabilistic oracle, and it sits below the machine checks, not
+above them.** A screenshot cannot adjudicate a hole's axis, a wall thickness, or
+a 0.2 mm interference — `inspect_topology`, `assert_model` and
+`measure_clearance` can. What it *can* do is catch the class of defect that
+passes every scalar check because the scalar was never wrong: a pocket in the
+right place on the wrong face, a rib that fused into its neighbour, a fillet
+that ate a feature. Take the shot after the assertions pass, not instead of
+them.
+
+| Argument | Effect |
+|---|---|
+| `view` | `iso` (default), `front`, `back`, `right`, `left`, `top`, `bottom` |
+| `direction` | arbitrary `[x,y,z]` the camera looks *along* — overrides `view` |
+| `up` | screen-up for a custom `direction` (default `+Y`, or `±Z` looking straight down/up) |
+| `region` | `{min:[x,y,z], max:[x,y,z]}` world box to frame instead of the whole part |
+| `target` | world point to put at the centre of the frame |
+| `zoom` | magnification on top of the fit — `2` is twice as close, `0.5` pulls back |
+| `mode` | `shaded` (default), `shaded_edges`, `edges` |
+| `section` | `{axis:'X'\|'Y'\|'Z', offset, flip}` — an axis-aligned cut |
+| `line_width` | ink thickness in px, 1..8 (default 2 in `edges`, 1 overlaid) |
+| `accuracy` | chordal deviation of the rendered mesh (default 0.5% of the extent) |
+| `width`/`height` | pixels, default 800×600 |
+
+**Framing.** By default the whole part is fitted to the frame, which at 800×600
+gives a 3 mm hole in a 200 mm plate about four pixels. That is not an image
+anything can be judged from. Frame from what the machine tools already told you:
+
+- `region` takes the same `{min, max}` shape `measure`'s `boundingBox` comes in,
+  so a box you measured can be pasted straight back in.
+- `inspect_topology` reports a hole or boss as `{center, axis, diameter}`, not as
+  a box — for one of those, `target: center` with `zoom` is the direct
+  translation, and `view`/`direction` set to its `axis` is the shot that shows
+  whether the axis is the one you meant.
+- `zoom` is a multiplier on the fit: `2` is twice as close and shows a quarter of
+  the area, `0.5` pulls back.
+
+**Sections.** `section` cuts the model with an axis-aligned plane and shades the
+cut face **amber**, so a cut surface can never be mistaken for material. It
+keeps the half with the *smaller* coordinate on that axis; `flip` keeps the
+other. An omitted `offset` puts the plane at the model's midpoint on that axis,
+which is the only offset guaranteed to actually intersect the part. This is the
+only way to see interior geometry: a blind hole's floor, a wall's real
+thickness, whether two internal pockets broke into each other.
+
+A cut plane the camera lies *in* has no visible area — a `front` view with an
+`X` section shows the kept half but no cut face. Look along the plane's normal,
+or from `iso`, to see the cut.
+
+**Edge modes.** `edges` draws feature (crease) and silhouette line-work in black
+on a light ground, with hidden lines removed — the dimension-drawing look, where
+a boundary is a line rather than a shading gradient. It is markedly easier to
+read than shading for anything with parallel faces or a shallow step.
+`shaded_edges` overlays the same line-work on the solid, which is the best
+single shot of a part with both curved and prismatic features.
+
+**Determinism.** The same arguments against the same model produce
+byte-identical PNGs: the palette, the light, the margin and the rasterizer
+settings are fixed constants, not options, and every framing input is explicit.
+Two shots are therefore comparable — a pixel that changed means the *geometry*
+changed. Pin `accuracy` when the comparison spans a model rebuild at a different
+size, since the default accuracy tracks the part's extent.
+
+The trailing text block reports what was resolved, not what was asked:
+
+```jsonc
+{"model_id":"model-1-8f3a","accuracy":0.1,
+ "camera":{"view":"top","direction":[0,-1,0],"up":[0,0,-1],"target":[12,0,0],
+           "zoom":3,"scale":36,"visibleExtent":[22.2,16.7],"width":800,"height":600,
+           "mode":"shaded_edges","lineWidth":1,"section":null}}
+```
+
+`scale` is pixels per model unit and `visibleExtent` is how much of the world the
+frame covers — together they say whether the feature you meant to inspect is
+actually big enough on screen to judge. Re-issue with the same values to
+reproduce a shot exactly, or nudge one of them to move.
+
+#### Framing a purposeful inspection shot
+
+A shot is worth taking when it could come back *wrong*. Pick the framing from
+what the feature would look like if it had failed:
+
+| What you built | Shot that could show it wrong |
+|---|---|
+| A through-hole | `view` along the hole's axis, `region` = the hole's bbox padded ~2×, `shaded` — a hole that goes through is a *dark* disc (you are seeing the background through it); one that stopped short is a disc lit like the face around it, and a mis-axised one is an ellipse or is simply absent. Do not take this shot in an edge mode: the near and far rims project to the same circle, so blind and through draw identically |
+| A blind hole or pocket | `section` on an axis perpendicular to it, `offset` through its centre — the only view where the floor exists, and the only reliable way to read its depth |
+| A wall between two features | `section` across the wall, `mode: 'shaded_edges'` — a wall that broke through is a gap, not a thin line |
+| A fillet or chamfer | `region` on the edge, `zoom: 2`+, `mode: 'shaded_edges'` — a radius that swallowed a neighbouring feature is obvious close up and invisible whole-part |
+| A boss, rib or lug | `view` face-on to the face it stands on, plus one `iso` — a rib that fused into a wall loses its outline in exactly one of the two |
+| A pattern (linear/circular) | whole-part `view` down the pattern's axis, `mode: 'edges'` — miscounts and overlaps are countable in line-work and mush in shading |
+| A thin plate or bracket | `mode: 'edges'` from `front`/`top`/`right` — three orthographic line drawings, the way a machinist would read it |
+| An imported STEP body | `iso` `shaded_edges` first (does it look like a part at all?), then `section` through the middle (is it a solid or a hollow shell?) |
+
+Two habits that make the difference:
+
+- **Take a pair, not a shot.** One view answers "does this look right"; two
+  views at right angles answer "is this the right shape". A feature that is
+  wrong on one axis usually looks perfect from the axis it is wrong about.
+- **Frame before and after.** Screenshot the same `region` from the same camera
+  before and after a cut. Identical bytes means the cut did nothing — which is a
+  real and otherwise quiet failure mode, and cheaper to check than
+  `diff_models` when you already have both models.
 
 ### `export`
 
@@ -936,8 +1038,11 @@ Other export errors:
    geometry actually is: the hole axes, the genus, the shell count. Or
    **`diff_models`** against the model before the cut, to check the cut removed
    what it should have.
-5. **`get_screenshot`** for a human-readable gut check from any named view. Useful
-   for framing and proportion; it cannot adjudicate a hole's axis.
+5. **`get_screenshot`** for a gut check — *framed on the feature you are unsure
+   of*, not on the whole part, and `section`ed when the feature is interior. It
+   cannot adjudicate a hole's axis, but it is the only oracle that sees a
+   feature on the wrong face, a rib fused into a wall, or a fillet that ate its
+   neighbour. Whole-part `iso` thumbnails are the shot that missed the bracket.
 6. **`export`** to STEP/STL/OBJ, branching on `isError` for the STEP faceting
    limitation above.
 
