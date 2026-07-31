@@ -30,13 +30,11 @@
 //!
 //! Sections (1)-(15) are entirely live. Section (16) is not, and that is
 //! the protocol working rather than failing: it is the of-ipt.19 numerical
-//! robustness campaign, and two of its cases are `#[ignore]`d against two
-//! defects it found and filed — of-ukcq (mesh `mass_properties` integrates
-//! tetrahedra from the absolute origin, 191× wrong at offset 1e6) and
-//! of-6viu (`unite` rejects a coincident-face imprint that forms an island,
-//! i.e. a boss centred on a face). Each `#[ignore]`d case has a live sibling
-//! that fences the working range, so a fix has a boundary to move rather
-//! than a single case to flip.
+//! robustness campaign, and one of its cases is `#[ignore]`d against one
+//! defect it found and filed — of-6viu (`unite` rejects a coincident-face
+//! imprint that forms an island, i.e. a boss centred on a face). The
+//! `#[ignore]`d case has a live sibling that fences the working range, so a
+//! fix has a boundary to move rather than a single case to flip.
 //!
 //! A third defect it filed, of-oygs (`ray_classify` gives up on operands
 //! past ~1e3 length/radius for cylinders, ~1e7 for blocks), is fixed and
@@ -62,6 +60,13 @@
 //! (the sphere-sphere lens volume is 4.4e-4 off its closed form, and
 //! frame-dependent — invisible to the meshed 5e-3 budgets sections (6)-(9)
 //! weigh against).
+//!
+//! The fourth defect the campaign filed, of-ukcq, is retired: mesh
+//! `mass_properties` integrated tetrahedra from the absolute origin and was
+//! 191× wrong at offset 1e6, and now references them to the mesh's own
+//! bounding-box centre. `mesh_mass_properties_survives_far_from_origin` is
+//! live, and §16's far-field families no longer skip the mesh-vs-B-Rep
+//! cross-check to work around it.
 //!
 //! The of-9ia `#[ignore]`
 //! (`skew_frustums_inclusion_exclusion`) lifted with of-37i.5: its two
@@ -5511,13 +5516,13 @@ fn brep_path_hits_closed_form_on_nurbs_operands() {
 // eight-deep boolean chain to the same budget at step eight as at step one,
 // and swallows degree-5 patches, C0 knots and knots 1e-9 apart without a
 // wobble. What broke was mostly *around* it — the mesh measurement path
-// (of-ukcq), island imprints (of-6viu), and the trimmed-sphere measurement
-// (of-y8qc). The one defect that was squarely inside it, of-oygs, turned out
-// to be a band sized off the wrong quantity rather than anything about
-// seeding: `near_face_boundary` scaled its "too close to trust" distance by
-// the whole face's bounding box, so a slender face's own length made its
-// interior unreachable. It now measures each boundary polyline's own chord
-// error instead, and both of its cases are live.
+// (of-ukcq, since fixed), island imprints (of-6viu), and the trimmed-sphere
+// measurement (of-y8qc). The one defect that was squarely inside it,
+// of-oygs, turned out to be a band sized off the wrong quantity rather than
+// anything about seeding: `near_face_boundary` scaled its "too close to
+// trust" distance by the whole face's bounding box, so a slender face's own
+// length made its interior unreachable. It now measures each boundary
+// polyline's own chord error instead, and both of its cases are live.
 // =====================================================================
 
 /// The tolerance context a model whose features are `scale` model units
@@ -5544,27 +5549,26 @@ fn tol_at_scale(scale: f64) -> ToleranceContext {
 /// The six decades of absolute scale the epic contemplates, in model units.
 const DECADES: [f64; 5] = [1e-6, 1e-3, 1.0, 1e3, 1e6];
 
-/// Volume by the B-Rep-native path alone, skipping [`measured`]'s meshed
-/// cross-check.
+/// Volume by the B-Rep-native path, still cross-checked against the mesh.
 ///
-/// Every other section weighs results both ways and asserts the two agree,
-/// which is the right default. This section cannot always do that, because
-/// two of its families put the mesh path outside its own domain of validity:
-/// `mass_properties` integrates tetrahedra referenced to the absolute origin
-/// (of-ukcq), so it loses `|p|³/V` worth of digits on geometry far from the
-/// origin — 191× wrong at offset 1e6 — while `brep_mass_properties`
-/// integrates each face's own parameterization and is unaffected. Where the
-/// far field is the thing under test, the B-Rep number is the oracle and the
-/// mesh path's behaviour is of-ukcq's business, asserted separately by
-/// [`mesh_mass_properties_survives_far_from_origin`].
+/// The distinction from [`volume`] is only *which of the two numbers is
+/// returned*, not whether they are compared: both paths are measured and
+/// asserted to agree exactly as everywhere else. Where the far field is the
+/// thing under test the B-Rep number is the better oracle to weigh closed
+/// forms against, because it integrates each face's own parameterization and
+/// so carries no discretization error at all.
 ///
-/// `check()` and closed-manifold validity are still asserted; only the
-/// numerical cross-check is skipped.
+/// This function used to skip the cross-check outright. `mass_properties`
+/// referenced its tetrahedra to the absolute origin, which cost `|p|³/V`
+/// worth of digits on geometry far from home — 191× wrong at offset 1e6 —
+/// putting the mesh path outside its own domain of validity for two of this
+/// section's families. of-ukcq moved the apex to the mesh's bounding-box
+/// centre; the two paths now agree here as well, so there is nothing left to
+/// route around and the check is back on.
+/// [`mesh_mass_properties_survives_far_from_origin`] holds the mesh path to
+/// the closed form directly.
 fn brep_volume(out: &BooleanOutput, context: &str) -> f64 {
-    assert_valid(out, context);
-    brep_mass_properties(&out.store, &out.geo, out.body)
-        .unwrap_or_else(|e| panic!("{context}: brep_mass_properties failed: {e}"))
-        .volume
+    measured(out, context).1.volume
 }
 
 // ---------------------------------------------------------------------
@@ -5723,14 +5727,15 @@ fn far_field_rtol(offset: f64, feature: f64) -> f64 {
 /// The mesh measurement path's own far-field behaviour, which the rest of
 /// this family routes around by weighing results with [`brep_volume`].
 ///
-/// `mass_properties` sums tetrahedra whose apex is the absolute origin, so
-/// its intermediate magnitudes are `|p|³` where the answer is `feature³`.
-/// At offset 1e6 a 4×4×2 slab with a unit bore measures 4921 instead of
-/// 25.72 — 191× — while `brep_mass_properties` returns 25.716814691 at every
-/// offset from 0 to 1e6. Tracked as of-ukcq, whose fix is to integrate
-/// relative to a reference point and shift the moments back afterwards.
+/// `mass_properties` used to sum tetrahedra whose apex was the absolute
+/// origin, so its intermediate magnitudes were `|p|³` where the answer is
+/// `feature³`. At offset 1e6 a 4×4×2 slab with a unit bore measured 4921
+/// instead of 25.72 — 191× — while `brep_mass_properties` returned
+/// 25.716814691 at every offset from 0 to 1e6. of-ukcq moved the apex to the
+/// mesh's own bounding-box centre, which bounds the cancellation by the
+/// body's diameter instead of by its distance from the origin; this test is
+/// what holds that.
 #[test]
-#[ignore = "of-ukcq: mesh mass_properties integrates tetrahedra from the absolute origin"]
 fn mesh_mass_properties_survives_far_from_origin() {
     for offset in FAR_OFFSETS {
         let context = format!("block minus cylinder at offset {offset:e}");
@@ -5747,7 +5752,7 @@ fn mesh_mass_properties_survives_far_from_origin() {
             .subtract(slab, tool)
             .unwrap_or_else(|e| panic!("{context}: subtract failed: {e:?}"));
         // `measured` is what asserts the two paths agree; that is the
-        // assertion of-ukcq breaks.
+        // assertion of-ukcq used to break.
         let (meshed, _) = measured(&out, &context);
         assert_close(meshed.volume, 32.0 - 2.0 * PI, CYL_VOLUME_RTOL, &context);
     }
@@ -5882,11 +5887,12 @@ fn small_feature_far_from_origin() {
 /// with the coordinates being manipulated, so the through-hole is the
 /// harder far-field test even though the configuration is tamer.
 ///
-/// It is also the case that separates the two measurement paths most
+/// It is also the case that used to separate the two measurement paths most
 /// sharply: the B-Rep number asserted here is right to nine digits at every
-/// offset, while the mesh number for the very same result is 191× too large
-/// at 1e6 (of-ukcq, held by
-/// [`mesh_mass_properties_survives_far_from_origin`]).
+/// offset, while the mesh number for the very same result was 191× too large
+/// at 1e6 until of-ukcq. They now agree — [`brep_volume`] cross-checks them,
+/// and [`mesh_mass_properties_survives_far_from_origin`] holds the mesh path
+/// to the closed form on this exact configuration.
 #[test]
 fn far_from_origin_through_hole() {
     for offset in FAR_OFFSETS {
@@ -6744,8 +6750,8 @@ fn nurbs_half_overlap_tiny_first_span() {
 // `check()` — on every call below, and additionally cross-checks the meshed
 // measurement against the B-Rep-native one, so each case is gated three ways.
 // The single exception is `overlapping_coaxial_cylinders_far_from_origin`,
-// which borrows §16's `brep_volume` because at offset 1e6 the mesh path is
-// outside its own domain of validity (of-ukcq); see its own comment.
+// which borrows §16's `brep_volume` to weigh the exact number rather than the
+// meshed one at offset 1e6; it is cross-checked the same three ways.
 //
 // What is NEW here is not the classification but the *chart*. Curved
 // coincident faces brought three failures that planar ones structurally
@@ -7015,16 +7021,19 @@ fn overlapping_coaxial_cylinders_are_scale_invariant() {
 /// and the overlap would vanish.
 ///
 /// Weighed with §16's [`brep_volume`] rather than [`volume`], for §16.2's
-/// reason and not for any reason of this section's own: `mass_properties`
-/// integrates tetrahedra referenced to the absolute origin, so at offset 1e6
-/// the mesh path is outside its own domain of validity (of-ukcq) and its
-/// disagreement with the exact number measures that bug rather than anything
-/// about coincident faces. Independently confirmed here before of-ipt.19
-/// landed — a BARE cylinder at this offset, no boolean anywhere, meshes to
-/// 33.3 instead of π. `check()` and closed-manifoldness are still asserted,
-/// and the B-Rep-native volume is exact to floating point, so the
-/// classification is held to `1.5π` at `EXACT_RTOL` — a tighter budget than
-/// the meshed cases in this section get, not a looser one.
+/// reason and not for any reason of this section's own: the B-Rep-native
+/// volume is exact to floating point where the meshed one still carries the
+/// tessellator's discretization error, so the classification can be held to
+/// `1.5π` at `EXACT_RTOL` — a tighter budget than the meshed cases in this
+/// section get, not a looser one. `check()`, closed-manifoldness, and the
+/// mesh-vs-exact cross-check all still run.
+///
+/// Until of-ukcq the mesh path was simply invalid out here — a BARE cylinder
+/// at this offset, no boolean anywhere, measured 33.3 instead of π, so its
+/// disagreement with the exact number measured that bug rather than anything
+/// about coincident faces. With the tetrahedra referenced to the mesh's own
+/// bbox centre the two paths agree at this offset, and the cross-check is no
+/// longer something this test has to opt out of.
 #[test]
 fn overlapping_coaxial_cylinders_far_from_origin() {
     let context = "coaxial cylinders overlapping at (1e6, -3e5, 7e5), unite";
