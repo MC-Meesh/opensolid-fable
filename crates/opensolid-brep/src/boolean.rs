@@ -3458,7 +3458,7 @@ impl<'a> Pipeline<'a> {
                     if period.is_none() {
                         continue;
                     }
-                    for seam_point in seam_crossings(
+                    for (crossing, level) in seam_crossings(
                         fp,
                         &imp.curve,
                         &imp.sampled.points,
@@ -3466,6 +3466,10 @@ impl<'a> Pipeline<'a> {
                         axis,
                         self.snap,
                     )? {
+                        // A marched imprint is its own chords, so the
+                        // bisected crossing sits a sagitta off the seam
+                        // meridian it is supposed to be on (of-ntkk).
+                        let seam_point = self.polish_seam_crossing(imp, s, axis, level, crossing);
                         events.push((CurveSource::Imprint { index: ii }, seam_point));
                         // Exact-curve edge matching: sphere/torus seam edges
                         // are circular arcs whose sampled polylines sag far
@@ -3485,6 +3489,96 @@ impl<'a> Pipeline<'a> {
             self.seam_barriers.entry(key).or_default().push(p);
         }
         Ok(())
+    }
+
+    /// Put a **marched** imprint's seam crossing back onto the seam it
+    /// crosses, by re-solving the intersection with the host surface's
+    /// seam coordinate pinned to `level` (of-ntkk).
+    ///
+    /// [`seam_crossings`] bisects the imprint's own curve, which for an
+    /// analytic imprint is the conic itself and lands the crossing exactly
+    /// where it belongs. A marched imprint's curve *is* its sampled
+    /// polyline, so the bisection converges onto a CHORD: the crossing
+    /// comes out one polyline sagitta — ~1e-4 on a unit-scale body, four
+    /// orders above the pipeline's welding snap — off both host surfaces,
+    /// and therefore off the seam edge it is meant to split. The edge
+    /// match then misses, the seam edge keeps no vertex there, and the
+    /// chord the imprint should have become has no cover boundary to
+    /// anchor to: [`apply_chain`] files it as an interior ring instead,
+    /// producing a zero-area "region" whose interior sample lands on the
+    /// partner solid's surface and cannot be classified by ray parity at
+    /// all.
+    ///
+    /// The seam is an iso-curve of the host surface — `u = level` on a
+    /// cylinder/sphere/cone/torus cover, `v = level` on the torus's second
+    /// one — so the crossing is the intersection of the two surfaces with
+    /// that one parameter held fixed, which is exactly the pinned Newton
+    /// solve [`pin_intersection_point`] already runs for the tracer's own
+    /// domain-bound cuts. It returns the point evaluated on the *pinned*
+    /// surface, so the polished crossing sits on the seam meridian to
+    /// rounding error rather than to sampling error.
+    ///
+    /// Analytic imprints are left alone (their crossing is already exact),
+    /// as is a solve that does not converge — the unpolished point is what
+    /// the pipeline had before, so a failure here is no worse than not
+    /// trying.
+    ///
+    /// **A marched crossing that is already on the surface is left alone
+    /// too**, and that bar is not a shortcut. Most of them are: the tracer
+    /// cuts its rings at its own domain bounds, so where a body's seam edge
+    /// sits on that same meridian the crossing falls ON a marched sample
+    /// and the bisection returns it unmodified — exact, and often exactly a
+    /// coordinate the rest of the arrangement already agrees on bit for
+    /// bit. Re-solving those moves them by ~1e-16, which is nothing
+    /// geometrically and everything to a downstream weld that was relying
+    /// on the coincidence. Only a crossing that missed its own surface
+    /// needs the solve, and off-surface by more than the weld snap is
+    /// exactly the condition that says so.
+    fn polish_seam_crossing(
+        &self,
+        imp: &Imprint,
+        s: SolidTag,
+        axis: SeamAxis,
+        level: f64,
+        crossing: Point3,
+    ) -> Point3 {
+        if !matches!(imp.curve, Curve3::Polyline { .. }) {
+            return crossing;
+        }
+        // Seed the solve from the crossing's own host parameters. Its
+        // pinned entry is overwritten by `level`, so only the three free
+        // ones matter — and each is the projection of a point already
+        // within a sagitta of the root.
+        let Ok(uv_a) = self.face_polys[0][imp.face_a].chart.param(&crossing, None) else {
+            return crossing;
+        };
+        let Ok(uv_b) = self.face_polys[1][imp.face_b].chart.param(&crossing, None) else {
+            return crossing;
+        };
+        let (f, uv) = if s == 0 {
+            (imp.face_a, uv_a)
+        } else {
+            (imp.face_b, uv_b)
+        };
+        let chart = &self.face_polys[s][f].chart;
+        if (chart_point(chart, uv) - crossing).norm() <= self.snap {
+            return crossing;
+        }
+        let (sa, sb) = (
+            &self.solids[0].faces[imp.face_a].surface,
+            &self.solids[1].faces[imp.face_b].surface,
+        );
+        let pin = match (s, axis) {
+            (0, SeamAxis::U) => 0,
+            (0, SeamAxis::V) => 1,
+            (_, SeamAxis::U) => 2,
+            (_, SeamAxis::V) => 3,
+        };
+        let seed = [uv_a.0, uv_a.1, uv_b.0, uv_b.1];
+        match pin_intersection_point(sa, sb, seed, pin, level, self.snap * 0.5) {
+            Some((polished, _)) => polished,
+            None => crossing,
+        }
     }
 
     /// Canonicalize open imprints that terminate at a sphere pole of a
@@ -4409,15 +4503,22 @@ impl SeamAxis {
 
 /// Every point where a closed imprint on a periodic face crosses the
 /// face's seam along `axis` (the minimum side of its cover window on that
-/// axis). The sampled polyline `points` locates the bracketing samples;
-/// each crossing is then refined against the exact `curve` by bisecting
-/// `w(t) = level` (`w` the axis coordinate), so the returned points lie
-/// on the curve (and on the seam) to root-find precision. Interpolating
-/// the bracketing chord instead would leave the point off the curve by up
-/// to the sagitta `r * (1 - cos(pi / SAMPLES_PER_CIRCLE)) ≈ 5.4e-4 * r`,
-/// which crosses
+/// axis), each paired with the seam **level** it was found at (the
+/// unwrapped axis coordinate of that seam instance). The sampled polyline
+/// `points` locates the bracketing samples; each crossing is then refined
+/// against the exact `curve` by bisecting `w(t) = level` (`w` the axis
+/// coordinate), so the returned points lie on the curve (and on the seam)
+/// to root-find precision. Interpolating the bracketing chord instead
+/// would leave the point off the curve by up to the sagitta
+/// `r * (1 - cos(pi / SAMPLES_PER_CIRCLE)) ≈ 5.4e-4 * r`, which crosses
 /// [`MAX_ALLOWED_TOLERANCE`](crate::check::MAX_ALLOWED_TOLERANCE) once
 /// r ≳ 19 and would be recorded as the seam vertex's tolerance.
+///
+/// **A marched imprint has no exact curve to refine against**, and that is
+/// what the level is returned for: its [`Curve3::Polyline`] evaluates on
+/// its own chords, so bisecting it lands the crossing a full sagitta off
+/// both host surfaces however tightly the root is bracketed.
+/// [`Pipeline::polish_seam_crossing`] takes it from here.
 ///
 /// In unwrapped coordinates the seam is every level `seam_w + 2πk`, so
 /// all instances inside the polyline's range are scanned. A ring that
@@ -4443,7 +4544,7 @@ fn seam_crossings(
     closed: bool,
     axis: SeamAxis,
     snap: f64,
-) -> CoreResult<Vec<Point3>> {
+) -> CoreResult<Vec<(Point3, f64)>> {
     let uv = map_polyline(&face_poly.chart, points)?;
     // Closing segment: unwrap the first point relative to the last. An
     // open run has none — its last sample is an endpoint, not a neighbour
@@ -4525,7 +4626,7 @@ fn seam_crossings(
                 {
                     continue;
                 }
-                crossings.push(seam_point);
+                crossings.push((seam_point, level));
             }
         }
         level += TWO_PI;
@@ -9599,7 +9700,7 @@ mod tests {
         let points = ring_samples(&curve);
         let crossings = seam_crossings(&fp, &curve, &points, true, SeamAxis::U, SNAP).unwrap();
         assert_eq!(crossings.len(), 1, "wrap-once ring crosses the seam once");
-        let p = crossings[0];
+        let (p, _) = crossings[0];
         // Seam angle u = π on this ring is curve parameter t = π - phase.
         let expected = curve.point(std::f64::consts::PI - phase);
         assert!(
@@ -9629,7 +9730,7 @@ mod tests {
         let points = ring_samples(&curve);
         let crossings = seam_crossings(&fp, &curve, &points, true, SeamAxis::U, SNAP).unwrap();
         assert_eq!(crossings.len(), 1, "wrap-once ring crosses the seam once");
-        let p = crossings[0];
+        let (p, _) = crossings[0];
         // This section satisfies u(t) = t, so the seam angle is hit at
         // t = seam_u (mod 2π).
         let expected = curve.point(seam_u);
@@ -10058,7 +10159,7 @@ mod tests {
         let points = ring_samples(&curve);
         let crossings = seam_crossings(&fp, &curve, &points, true, SeamAxis::U, SNAP).unwrap();
         assert_eq!(crossings.len(), 1, "cap ring wraps the period once");
-        let p = crossings[0];
+        let (p, _) = crossings[0];
         assert!(
             (p - Point3::new(v0.cos(), 0.0, v0.sin())).norm() < 1e-9,
             "seam vertex must sit on the u = 0 meridian at the cap latitude, got {p:?}"
@@ -10107,7 +10208,7 @@ mod tests {
         let points = ring_samples(&curve);
         let crossings = seam_crossings(&fp, &curve, &points, true, SeamAxis::U, SNAP).unwrap();
         assert_eq!(crossings.len(), 1, "latitude ring wraps u once");
-        let p = crossings[0];
+        let (p, _) = crossings[0];
         let expected = Point3::new(2.4, 0.0, 0.3);
         assert!(
             (p - expected).norm() < 1e-9,
@@ -10134,7 +10235,7 @@ mod tests {
         let points = ring_samples(&curve);
         let crossings = seam_crossings(&fp, &curve, &points, true, SeamAxis::V, SNAP).unwrap();
         assert_eq!(crossings.len(), 1, "tube ring wraps v once");
-        let p = crossings[0];
+        let (p, _) = crossings[0];
         let expected = Point3::new(0.0, 2.5, 0.0);
         assert!(
             (p - expected).norm() < 1e-9,
@@ -10198,8 +10299,11 @@ mod tests {
             2,
             "winding-0 straddling ring crosses twice"
         );
-        crossings.sort_by(|a, b| a.z.total_cmp(&b.z));
-        for (p, z) in crossings.iter().zip([-alpha.sin(), alpha.sin()]) {
+        for (_, level) in &crossings {
+            assert_eq!(*level, 0.0, "both crossings sit on the u = 0 seam level");
+        }
+        crossings.sort_by(|a, b| a.0.z.total_cmp(&b.0.z));
+        for ((p, _), z) in crossings.iter().zip([-alpha.sin(), alpha.sin()]) {
             let expected = Point3::new(alpha.cos(), 0.0, z);
             assert!(
                 (p - expected).norm() < 1e-9,

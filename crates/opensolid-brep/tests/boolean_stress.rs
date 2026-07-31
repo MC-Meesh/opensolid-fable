@@ -64,11 +64,13 @@
 //! for each; (18) samples the parameters instead and leans on the volume
 //! identities, which hold for every pair of solids and so need no closed
 //! form at all, plus rigid-motion invariance, which compares the pipeline
-//! against itself. It found the section's two `#[ignore]`s: of-ntkk (the
-//! exact path fails outright on transversal cone+sphere pairs) and of-7bnv
-//! (the sphere-sphere lens volume is 4.4e-4 off its closed form, and
-//! frame-dependent — invisible to the meshed 5e-3 budgets sections (6)-(9)
-//! weigh against).
+//! against itself. It found two bugs. of-7bnv is still open and still
+//! `#[ignore]`d (the sphere-sphere lens volume is 4.4e-4 off its closed
+//! form, and frame-dependent — invisible to the meshed 5e-3 budgets
+//! sections (6)-(9) weigh against). of-ntkk is fixed and its two repros are
+//! live: the exact path failed outright on transversal cone+sphere pairs,
+//! whose marched imprint met the face cover's seam between two samples, and
+//! the `CurvedPair::ConeSphere` sampler is armed again with them.
 //!
 //! of-ukcq is retired as well: mesh
 //! `mass_properties` integrated tetrahedra from the absolute origin and was
@@ -7960,15 +7962,23 @@ impl CurvedPair {
     /// and mixing them in here would make a failure ambiguous between "the
     /// pipeline is wrong" and "the configuration is degenerate".
     ///
-    /// [`CurvedPair::ConeSphere`] is **excluded from the sampler** (the
-    /// `pick(4)` below, not `pick(5)`): the exact path fails outright on
-    /// transversal cone-sphere pairs with `boolean::classify` and
-    /// `boolean::ray_classify` `Degenerate` errors — of-ntkk. The variant is
-    /// kept, and its repro is pinned in
-    /// [`cone_sphere_union_takes_the_exact_path`]; restoring it here is the
-    /// one-character change that re-arms the campaign once the bead closes.
+    /// [`CurvedPair::ConeSphere`] is sampled here again as of of-ntkk. It
+    /// was excluded while the exact path failed on transversal cone-sphere
+    /// pairs with `boolean::classify` and `boolean::ray_classify`
+    /// `Degenerate` errors; both repros are now live tests
+    /// ([`cone_sphere_union_takes_the_exact_path`] and
+    /// [`rotated_cone_sphere_union_takes_the_exact_path`]).
+    ///
+    /// The variant is **not** clean everywhere yet, and re-arming it here
+    /// says only that these seeds are: a 240-configuration sweep of rotated
+    /// cone-sphere unions run while closing of-ntkk went from 30 passing to
+    /// 208, with the remaining 32 splitting into an impossible reconstructed
+    /// Euler characteristic, the same missing-interior-sample `classify`
+    /// error, and a non-manifold tessellation — of-kzhd. Widening the case
+    /// count or the seed here will find those; that is the campaign working,
+    /// not a regression of this one.
     fn random(rng: &mut Rng) -> Self {
-        match rng.pick(4) {
+        match rng.pick(5) {
             0 => {
                 let (r1, r2) = (rng.range(0.8, 1.6), rng.range(0.8, 1.6));
                 // Transversal lens: the spheres must overlap without either
@@ -8258,8 +8268,8 @@ fn random_curved_pairs_are_invariant_under_rigid_motion() {
     }
 }
 
-/// The exact path must handle a transversal cone/frustum + sphere pair. It
-/// does not (of-ntkk).
+/// The exact path must handle a transversal cone/frustum + sphere pair
+/// (of-ntkk).
 ///
 /// Minimal repro from `random_curved_pairs_satisfy_the_volume_identities`
 /// case 6 (seed `0xC01D_ED11`), reduced to a single `unite`. The sphere
@@ -8267,13 +8277,9 @@ fn random_curved_pairs_are_invariant_under_rigid_motion() {
 /// swallowed entirely (sphere cross-section 0.744 against a cap radius of
 /// 0.302), the sphere is strictly inside the cone at `z = 0` and strictly
 /// outside it at `z = 0.4`. Nothing is tangent; the surfaces cross cleanly.
-/// The union fails with `Degenerate { context: "boolean::classify", reason:
+/// It used to fail with `Degenerate { context: "boolean::classify", reason:
 /// "could not find an interior sample point for a face region" }`.
-///
-/// Kept live and `#[ignore]`d per the never-soften policy —
-/// `cargo test --test boolean_stress -- --ignored`.
 #[test]
-#[ignore = "of-ntkk: exact path fails with Degenerate on transversal cone+sphere pairs"]
 fn cone_sphere_union_takes_the_exact_path() {
     let pair = CurvedPair::ConeSphere {
         r0: 1.0968253795551284,
@@ -8292,6 +8298,93 @@ fn cone_sphere_union_takes_the_exact_path() {
     assert!(
         vol > vol_a,
         "the union must be larger than the cone alone ({vol} vs {vol_a})"
+    );
+}
+
+/// The same pair, in a frame that puts the marched imprint's seam crossing
+/// between two samples instead of on one (of-ntkk, the second failure mode).
+///
+/// Repro from `random_curved_pairs_are_invariant_under_rigid_motion` case 0
+/// (seed `0x0009_161D_C0DE`), which failed only *after* the rigid motion —
+/// the same configuration, classified in a different frame. The frame is the
+/// whole point, so it is spelled out rather than sampled:
+///
+/// A cone-sphere intersection ring is marched, not solved in closed form, so
+/// the imprint curve the arrangement hosts is its own polyline. In the plain
+/// frame the ring's chart seam crossing lands ON a sample — the marcher cuts
+/// the ring at the surface's `u = 0` domain bound, and the cone body's seam
+/// edge sits on that same meridian — so bisecting the polyline for it returns
+/// an exact point. Rotating the body moves its seam edge off `u = 0` (a
+/// chart's `e_u` is a function of the axis alone, so the branch cut does not
+/// follow the body), the cover's seam crossing falls strictly between two
+/// samples, and the bisection returns a point on a CHORD: ~1.3e-4 off the
+/// cone, off the sphere, and off the seam edge it has to split. Nothing then
+/// splits that edge, the imprint chord finds no cover boundary to anchor to,
+/// and it becomes a zero-area interior "ring" whose sample point lies on the
+/// sphere — where every classification ray is abandoned as ambiguous and the
+/// union dies in `boolean::ray_classify`.
+///
+/// Asserted as the campaign asserts it: congruent volume and an equivariant
+/// centroid, which is what says the rotated frame made the same decisions.
+#[test]
+fn rotated_cone_sphere_union_takes_the_exact_path() {
+    let pair = CurvedPair::ConeSphere {
+        r0: 1.0952025475553828,
+        r1: 0.5931842429784518,
+        h: 1.6395199750311114,
+        rs: 0.8091874686644958,
+        dz: 0.852652851914677,
+    };
+    let unit = Unit::new_normalize(Vector3::new(
+        0.07925103992110365,
+        -0.19878358920539282,
+        0.9768338432579234,
+    ));
+    let angle = 0.932_261;
+    let center = Point3::new(1.4383662767952683, -0.1977062367497382, 0.8164108953265043);
+    let rot = Rotation3::from_axis_angle(&unit, angle);
+
+    let mut plain = Scene::new();
+    let (a, b) = pair.build(&mut plain);
+
+    let mut turned = Scene::new();
+    let (ar, br) = pair.build(&mut turned);
+    for body in [ar, br] {
+        rotate_body(
+            &mut turned.store,
+            &mut turned.geo,
+            body,
+            center,
+            unit.into_inner(),
+            angle,
+        )
+        .expect("rotate_body");
+    }
+
+    let out = plain
+        .unite(a, b)
+        .unwrap_or_else(|e| panic!("plain cone+sphere union failed: {e:?}"));
+    let out_rot = turned
+        .unite(ar, br)
+        .unwrap_or_else(|e| panic!("rotated cone+sphere union failed: {e:?}"));
+
+    let plain_props = measured(&out, "cone+sphere union").1;
+    let rot_props = measured(&out_rot, "rotated cone+sphere union").1;
+    assert_close(
+        rot_props.volume,
+        plain_props.volume,
+        RIGID_MOTION_RTOL,
+        "rotated cone+sphere union volume",
+    );
+    let want = center + rot * (plain_props.centroid - center);
+    let gap = (rot_props.centroid - want).norm();
+    let scale = 1.0 + want.coords.norm();
+    assert!(
+        gap <= RIGID_MOTION_RTOL * scale,
+        "rotated union centroid {:?} is not the rigid image of {:?} \
+         (expected {want:?}, off by {gap:.3e})",
+        rot_props.centroid,
+        plain_props.centroid
     );
 }
 
