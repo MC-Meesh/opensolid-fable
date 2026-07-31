@@ -6633,3 +6633,713 @@ fn nurbs_half_overlap_tiny_first_span() {
         clamped_knots(4, &[1e-6, 0.5]),
     );
 }
+
+// =====================================================================
+// (17) Coincident CURVED faces (of-bxl.5)
+// =====================================================================
+//
+// Section (11) is this section's planar half, and its preamble on why
+// `check()` is the primary gate and volume the secondary one applies here
+// unchanged (COINCIDENT.md §7): a retained interior wall has zero volume, so
+// only the combinatorial gate sees it. `volume()` runs `assert_valid` — hence
+// `check()` — on every call below, and additionally cross-checks the meshed
+// measurement against the B-Rep-native one, so each case is gated three ways.
+// The single exception is `overlapping_coaxial_cylinders_far_from_origin`,
+// which borrows §16's `brep_volume` because at offset 1e6 the mesh path is
+// outside its own domain of validity (of-ukcq); see its own comment.
+//
+// What is NEW here is not the classification but the *chart*. Curved
+// coincident faces brought three failures that planar ones structurally
+// cannot express, and each of them is about what a trim edge IS rather than
+// about coincidence (COINCIDENT.md §3, of-bxl.5 amendment):
+//
+//   - a partner trim edge is an ARC, and stationing it over its conic's full
+//     period imprints a second curve that bounds nothing (`CurveSpan`);
+//   - a curved edge's SAMPLED polyline sags ≈5.4e-4·R off the true curve —
+//     five orders above the weld length — so the boundary-lying-run test has
+//     to measure against the exact curve (`exact_edge_distance`);
+//   - a chart SEAM is traversed twice in opposite senses by its own face, so
+//     the region lies on both sides of it and it is not part of any overlap
+//     boundary (`imprint_coincident` skips it).
+//
+// Every one of them is silent on a plane: planar trim edges are straight
+// (zero sag), bounded by the bbox clip that stands in for their span, and
+// planar faces have no seams. So the cases below are chosen to make each
+// failure reachable — arcs whose span is a strict sub-arc (sphere meridians),
+// full-wrap periodic regions (cylinder and cone walls), and two charts of the
+// SAME surface that disagree about where the seam goes (`cross_axis_spheres`).
+
+/// Cylinder axis ±Z, radius 1, spanning `z0..z1`.
+fn unit_cylinder(scene: &mut Scene, z0: f64, z1: f64) -> EntityId<Body> {
+    scene.cylinder(Point3::new(0.0, 0.0, z0), Vector3::z(), 1.0, z1 - z0)
+}
+
+/// Two coaxial equal-radius cylinders stacked end to end: A over `z ∈ [0,1]`,
+/// B over `z ∈ [1,2]`.
+///
+/// The curved analogue of `touching_cubes_unite_fuses_into_one_box`, and it
+/// carries TWO coincident pairs at once, of different kinds. A's top cap and
+/// B's bottom cap are coplanar with identical trims — ON(Opposite), the wall
+/// between them must vanish. The two *walls* are coincident too (same axis,
+/// same radius), but their trims only touch along the `z = 1` rim circle, so
+/// that pair is ordinary transversal work and must imprint nothing (§10's
+/// false-positive case, now on a periodic chart).
+#[test]
+fn coaxial_cylinders_stacked_unite_fuses() {
+    let context = "coaxial cylinders stacked at z = 1, unite";
+    let mut scene = Scene::new();
+    let a = unit_cylinder(&mut scene, 0.0, 1.0);
+    let b = unit_cylinder(&mut scene, 1.0, 2.0);
+    let out = scene
+        .unite(a, b)
+        .unwrap_or_else(|e| panic!("{context}: exact pipeline rejected the pair: {e:?}"));
+    assert_close(volume(&out, context), 2.0 * PI, CYL_VOLUME_RTOL, context);
+    // Each cylinder keeps its wall; the shared cap pair drops from both. A
+    // retained cap wall measures the same volume — the face count and
+    // `check()` inside `volume()` are what rule it out.
+    assert_eq!(
+        out.store.faces_of_body(out.body).len(),
+        4,
+        "{context}: two walls plus the two outer caps"
+    );
+}
+
+/// `A − B` where the two only touch: A's top cap is ON(Opposite), which
+/// subtract KEEPS (COINCIDENT.md §3, table row 5), so `A − B == A` whole.
+#[test]
+fn coaxial_cylinders_stacked_subtract_leaves_target_whole() {
+    let context = "coaxial cylinders stacked at z = 1, subtract";
+    let mut scene = Scene::new();
+    let a = unit_cylinder(&mut scene, 0.0, 1.0);
+    let b = unit_cylinder(&mut scene, 1.0, 2.0);
+    let out = scene
+        .subtract(a, b)
+        .unwrap_or_else(|e| panic!("{context}: exact pipeline rejected the pair: {e:?}"));
+    assert_close(volume(&out, context), PI, CYL_VOLUME_RTOL, context);
+    assert_eq!(
+        out.store.faces_of_body(out.body).len(),
+        3,
+        "{context}: A must come through whole"
+    );
+}
+
+/// Intersection of two merely-touching solids is EMPTY, not a zero-thickness
+/// disc (COINCIDENT.md §6). The curved reading of
+/// `touching_cubes_intersect_is_empty_not_a_sheet`.
+#[test]
+fn coaxial_cylinders_stacked_intersect_is_empty() {
+    let mut scene = Scene::new();
+    let a = unit_cylinder(&mut scene, 0.0, 1.0);
+    let b = unit_cylinder(&mut scene, 1.0, 2.0);
+    let out = scene
+        .intersect(a, b)
+        .expect("intersection of touching cylinders is empty, not an error");
+    assert_eq!(
+        out.store.faces_of_body(out.body).len(),
+        0,
+        "the shared disc must not survive as a zero-volume sheet"
+    );
+    assert!(
+        matches!(
+            out.check().as_slice(),
+            [CheckFailure::SolidWithoutShells(_)]
+        ),
+        "an empty solid is the correct answer here: {:?}",
+        out.check()
+    );
+}
+
+/// Coaxial equal-radius cylinders OVERLAPPING along the axis: A over
+/// `z ∈ [0,1]`, B over `z ∈ [0.5,1.5]`. The curved counterpart of
+/// `flush_overlapping_cubes`, and the case that actually needs the imprint.
+///
+/// The walls are a coincident pair whose trims overlap only partially, so the
+/// overlap's boundary runs through the middle of both: B's `z = 0.5` rim
+/// circle cuts A's wall, A's `z = 1` rim cuts B's. Those circles already lie
+/// exactly in the partner's surface — that is what coincidence means — so
+/// they are imprinted directly, with no intersection curve computed.
+///
+/// Two things here are unreachable on a plane. The imprint is a **closed
+/// ring** on a **periodic** chart, so it wraps the cover rather than ending
+/// on a boundary; and the wall region it cuts is a full wrap, closed by a
+/// seam edge that must NOT itself be imprinted (the region lies on both sides
+/// of it).
+fn overlapping_coaxial_cylinders(op: &str, expected: f64) {
+    let context = &format!("coaxial cylinders overlapping over z ∈ [0.5,1], {op}");
+    let mut scene = Scene::new();
+    let a = unit_cylinder(&mut scene, 0.0, 1.0);
+    let b = unit_cylinder(&mut scene, 0.5, 1.5);
+    let out = match op {
+        "unite" => scene.unite(a, b),
+        "subtract" => scene.subtract(a, b),
+        "intersect" => scene.intersect(a, b),
+        _ => unreachable!(),
+    }
+    .unwrap_or_else(|e| panic!("{context}: exact pipeline rejected the pair: {e:?}"));
+    assert_close(volume(&out, context), expected, CYL_VOLUME_RTOL, context);
+}
+
+#[test]
+fn overlapping_coaxial_cylinders_unite() {
+    // z ∈ [0, 1.5].
+    overlapping_coaxial_cylinders("unite", 1.5 * PI);
+}
+
+#[test]
+fn overlapping_coaxial_cylinders_subtract() {
+    // A minus the overlap: z ∈ [0, 0.5].
+    overlapping_coaxial_cylinders("subtract", 0.5 * PI);
+}
+
+#[test]
+fn overlapping_coaxial_cylinders_intersect() {
+    // The overlap itself: z ∈ [0.5, 1].
+    overlapping_coaxial_cylinders("intersect", 0.5 * PI);
+}
+
+/// Inclusion–exclusion over the overlapping coaxial pair. As in §(11) this is
+/// the sharpest oracle available, because it ties union and intersection to
+/// each other: a region kept from the wrong solid, or with a flipped normal,
+/// breaks it even where each operation's own volume looks plausible alone.
+#[test]
+fn overlapping_coaxial_cylinders_inclusion_exclusion() {
+    let context = "coaxial cylinders overlapping, inclusion-exclusion";
+    let mut scene = Scene::new();
+    let a = unit_cylinder(&mut scene, 0.0, 1.0);
+    let b = unit_cylinder(&mut scene, 0.5, 1.5);
+    let united = scene.unite(a, b).expect("unite of coaxial cylinders");
+    let intersected = scene
+        .intersect(a, b)
+        .expect("intersect of coaxial cylinders");
+    let sum = volume(&united, context) + volume(&intersected, context);
+    assert_close(sum, 2.0 * PI, CYL_VOLUME_RTOL, context);
+}
+
+/// B's wall trim NESTED strictly inside A's: A over `z ∈ [0,2]`, B over
+/// `z ∈ [0.5,1.5]`, same radius. The curved reading of
+/// `stacked_l_shape_unite_imprints_nested_face`.
+///
+/// The nesting is the point. BOTH of B's rim circles lie in A's wall
+/// interior, so both must be imprinted for the overlap to exist at all: A's
+/// wall splits into three bands, the middle one ON(Same) with B's wall and
+/// the outer two OUT. Failing to imprint gives the whole wall one verdict.
+///
+/// `subtract` is the sharp one: B sits wholly inside A, so `A − B` is two
+/// disjoint discs — a **two-component** result, which is why it is gated with
+/// `volume_checked` rather than `volume`.
+#[test]
+fn nested_coaxial_cylinders_all_three_ops() {
+    let build = |scene: &mut Scene| {
+        let a = unit_cylinder(scene, 0.0, 2.0);
+        let b = unit_cylinder(scene, 0.5, 1.5);
+        (a, b)
+    };
+    let context = "coaxial cylinders, B nested inside A's wall span";
+
+    let mut scene = Scene::new();
+    let (a, b) = build(&mut scene);
+    let united = scene
+        .unite(a, b)
+        .unwrap_or_else(|e| panic!("{context}, unite: rejected: {e:?}"));
+    // B adds nothing: the union is A.
+    assert_close(volume(&united, context), 2.0 * PI, CYL_VOLUME_RTOL, context);
+
+    let mut scene = Scene::new();
+    let (a, b) = build(&mut scene);
+    let intersected = scene
+        .intersect(a, b)
+        .unwrap_or_else(|e| panic!("{context}, intersect: rejected: {e:?}"));
+    // The intersection is B.
+    assert_close(volume(&intersected, context), PI, CYL_VOLUME_RTOL, context);
+
+    let mut scene = Scene::new();
+    let (a, b) = build(&mut scene);
+    let subtracted = scene
+        .subtract(a, b)
+        .unwrap_or_else(|e| panic!("{context}, subtract: rejected: {e:?}"));
+    assert_close(
+        volume_checked(&subtracted, 2, 0, context),
+        PI,
+        CYL_VOLUME_RTOL,
+        context,
+    );
+}
+
+/// Rotation invariance for the curved coincident path — the regression that
+/// catches snap-scaling bugs (of-lxk, of-260), rerun on a periodic chart.
+///
+/// Built on a tilted frame rather than by rotating a z-axis pair, because
+/// `Curve3::Circle`'s angular reference comes from `plane_basis(axis)` and is
+/// not rotation-equivariant (see [`Scene::cylinder`]). The point stands
+/// either way: coincidence is decided at the feature-derived weld length, so
+/// tilting both operands must not change which faces read as coincident.
+#[test]
+fn overlapping_coaxial_cylinders_are_frame_invariant() {
+    let context = "coaxial cylinders overlapping on an oblique axis, unite";
+    let mut scene = Scene::new();
+    let axis = Vector3::new(1.0, 1.0, 1.0);
+    let base = Point3::new(0.3, -0.4, 0.5);
+    let step = axis.normalize() * 0.5;
+    let a = scene.cylinder(base, axis, 1.0, 1.0);
+    let b = scene.cylinder(base + step, axis, 1.0, 1.0);
+    let out = scene
+        .unite(a, b)
+        .unwrap_or_else(|e| panic!("{context}: rejected after tilting: {e:?}"));
+    assert_close(volume(&out, context), 1.5 * PI, CYL_VOLUME_RTOL, context);
+}
+
+/// The same pair at 1e-3 and 1e3 scale. `snap` is a fraction of the feature
+/// extent, so both the coincidence test and the weld move with the part; an
+/// absolute epsilon anywhere in this path fails one end or the other.
+#[test]
+fn overlapping_coaxial_cylinders_are_scale_invariant() {
+    for s in [1e-3, 1e3] {
+        let context = &format!("coaxial cylinders overlapping at scale {s:e}, unite");
+        let mut scene = Scene::new();
+        let a = scene.cylinder(Point3::origin(), Vector3::z(), s, s);
+        let b = scene.cylinder(Point3::new(0.0, 0.0, 0.5 * s), Vector3::z(), s, s);
+        let out = scene
+            .unite(a, b)
+            .unwrap_or_else(|e| panic!("{context}: rejected: {e:?}"));
+        assert_close(
+            volume(&out, context),
+            1.5 * PI * s * s * s,
+            CYL_VOLUME_RTOL,
+            context,
+        );
+    }
+}
+
+/// The same pair a million units from the origin. `geometric_snap` is derived
+/// from the feature extent and must NOT grow with distance from the origin
+/// (of-lxk, of-260); if it did, the two rim circles here would weld into one
+/// and the overlap would vanish.
+///
+/// Weighed with §16's [`brep_volume`] rather than [`volume`], for §16.2's
+/// reason and not for any reason of this section's own: `mass_properties`
+/// integrates tetrahedra referenced to the absolute origin, so at offset 1e6
+/// the mesh path is outside its own domain of validity (of-ukcq) and its
+/// disagreement with the exact number measures that bug rather than anything
+/// about coincident faces. Independently confirmed here before of-ipt.19
+/// landed — a BARE cylinder at this offset, no boolean anywhere, meshes to
+/// 33.3 instead of π. `check()` and closed-manifoldness are still asserted,
+/// and the B-Rep-native volume is exact to floating point, so the
+/// classification is held to `1.5π` at `EXACT_RTOL` — a tighter budget than
+/// the meshed cases in this section get, not a looser one.
+#[test]
+fn overlapping_coaxial_cylinders_far_from_origin() {
+    let context = "coaxial cylinders overlapping at (1e6, -3e5, 7e5), unite";
+    let mut scene = Scene::new();
+    let o = Point3::new(1e6, -3e5, 7e5);
+    let a = scene.cylinder(o, Vector3::z(), 1.0, 1.0);
+    let b = scene.cylinder(o + Vector3::z() * 0.5, Vector3::z(), 1.0, 1.0);
+    let out = scene
+        .unite(a, b)
+        .unwrap_or_else(|e| panic!("{context}: rejected far from the origin: {e:?}"));
+    assert_close(brep_volume(&out, context), 1.5 * PI, EXACT_RTOL, context);
+}
+
+// ---------------------------------------------------------------------
+// Concentric spheres — the bead's named gate, and the case that broke.
+// ---------------------------------------------------------------------
+
+/// Two concentric equal-radius spheres, i.e. the SAME sphere twice.
+///
+/// `sphere_sphere` reports `Coincident` only for concentric equal radii, so
+/// this is the entire coincident sphere case — the whole surface overlaps and
+/// the answer is just the sphere. Trivial to state, and it was the
+/// configuration that exposed two of the three of-bxl.5 bugs:
+///
+///  - the seam meridian is HALF a great circle, and stationing the partner's
+///    seam over the conic's full period laid the OPPOSITE meridian across the
+///    host as well, splitting it for nothing (`chi = 2 - 2 + 5 = 5`);
+///  - the surviving seam imprint lies on the host's own outline, and the
+///    boundary-lying-run test measured against the sampled polyline, which
+///    sags a sagitta off a circular seam and so never recognized it.
+///
+/// A plane can express neither: its trim edges are straight and its faces
+/// have no seam.
+#[test]
+fn concentric_spheres_unite_is_one_sphere() {
+    let context = "identical concentric spheres, unite";
+    let mut scene = Scene::new();
+    let a = scene.sphere(Point3::origin(), 1.0);
+    let b = scene.sphere(Point3::origin(), 1.0);
+    let out = scene
+        .unite(a, b)
+        .unwrap_or_else(|e| panic!("{context}: exact pipeline rejected the pair: {e:?}"));
+    assert_close(
+        volume(&out, context),
+        sphere_volume(1.0),
+        CURVED_VOLUME_RTOL,
+        context,
+    );
+    // ON(Same) is kept from A only — the canonical tie-break. Two faces here
+    // would be the sphere emitted twice, which `check()` also faults.
+    assert_eq!(
+        out.store.faces_of_body(out.body).len(),
+        1,
+        "{context}: exactly one sphere face survives"
+    );
+}
+
+/// `A ∩ A == A`, by the same ON(Same) tie-break as the union.
+#[test]
+fn concentric_spheres_intersect_is_one_sphere() {
+    let context = "identical concentric spheres, intersect";
+    let mut scene = Scene::new();
+    let a = scene.sphere(Point3::origin(), 1.0);
+    let b = scene.sphere(Point3::origin(), 1.0);
+    let out = scene
+        .intersect(a, b)
+        .unwrap_or_else(|e| panic!("{context}: exact pipeline rejected the pair: {e:?}"));
+    assert_close(
+        volume(&out, context),
+        sphere_volume(1.0),
+        CURVED_VOLUME_RTOL,
+        context,
+    );
+    assert_eq!(out.store.faces_of_body(out.body).len(), 1, "{context}");
+}
+
+/// `A − A` is empty. ON(Same) drops from both solids under subtract
+/// (COINCIDENT.md §3, table rows 5 and 6), leaving no faces at all — and an
+/// empty solid is spelled `SolidWithoutShells`, which is the assertion here
+/// rather than a failure.
+#[test]
+fn concentric_spheres_subtract_is_empty() {
+    let mut scene = Scene::new();
+    let a = scene.sphere(Point3::origin(), 1.0);
+    let b = scene.sphere(Point3::origin(), 1.0);
+    let out = scene.subtract(a, b).expect("A − A is empty, not an error");
+    assert_eq!(
+        out.store.faces_of_body(out.body).len(),
+        0,
+        "A − A must keep no faces"
+    );
+    assert!(
+        matches!(
+            out.check().as_slice(),
+            [CheckFailure::SolidWithoutShells(_)]
+        ),
+        "an empty solid is the correct answer here: {:?}",
+        out.check()
+    );
+}
+
+/// The same sphere twice, but with the two operands' POLES ON DIFFERENT AXES
+/// — A's on ±Z, B's on ±X. This is the sharpest chart-sharing case the
+/// coincident path has, and the one that isolated the third of-bxl.5 bug.
+///
+/// The surfaces are identical, so SSI reports `Coincident` and the overlap is
+/// everything. But the two faces disagree about where the seam goes: B's seam
+/// meridian is a perfectly good curve on A's surface that runs from A's own
+/// seam out to a dead end in A's interior. Imprinted, it separates no region;
+/// `apply_chain` splits a zero-area sliver along it, the sliver has no
+/// interior sample, and the boolean dies in `classify`.
+///
+/// The fix is not a tolerance: a seam is traversed TWICE in opposite senses
+/// by its own face (`[seam+, seam−]`), so the region lies on both sides of it
+/// and it bounds nothing. `imprint_coincident` skips such edges, which leaves
+/// this pair with no imprints at all — correctly, since the overlap is a
+/// whole region already.
+///
+/// Nothing about this is expressible with planes, which is why of-bxl.4 could
+/// not have found it.
+#[test]
+fn cross_axis_spheres_unite_is_one_sphere() {
+    let context = "same sphere, poles on Z vs X, unite";
+    let mut scene = Scene::new();
+    let a = scene.sphere_with_axis(Point3::origin(), Vector3::z(), 1.0);
+    let b = scene.sphere_with_axis(Point3::origin(), Vector3::x(), 1.0);
+    let out = scene
+        .unite(a, b)
+        .unwrap_or_else(|e| panic!("{context}: exact pipeline rejected the pair: {e:?}"));
+    assert_close(
+        volume(&out, context),
+        sphere_volume(1.0),
+        CURVED_VOLUME_RTOL,
+        context,
+    );
+    assert_eq!(
+        out.store.faces_of_body(out.body).len(),
+        1,
+        "{context}: one sphere face, kept from A by the tie-break"
+    );
+}
+
+/// The intersection half of the cross-axis pair, and its inclusion–exclusion
+/// identity: `vol(A) + vol(B) == vol(A∪B) + vol(A∩B)` reads
+/// `2V == V + V` here, which is only satisfied if BOTH operations keep the
+/// sphere exactly once. Keeping it twice, or dropping it, breaks the identity
+/// while each volume alone might still look plausible.
+#[test]
+fn cross_axis_spheres_inclusion_exclusion() {
+    let context = "same sphere, poles on Z vs X, inclusion-exclusion";
+    let mut scene = Scene::new();
+    let a = scene.sphere_with_axis(Point3::origin(), Vector3::z(), 1.0);
+    let b = scene.sphere_with_axis(Point3::origin(), Vector3::x(), 1.0);
+    let united = scene.unite(a, b).expect("unite of cross-axis spheres");
+    let intersected = scene
+        .intersect(a, b)
+        .expect("intersect of cross-axis spheres");
+    let sum = volume(&united, context) + volume(&intersected, context);
+    assert_close(sum, 2.0 * sphere_volume(1.0), CURVED_VOLUME_RTOL, context);
+}
+
+/// Concentric spheres of DIFFERENT radii are the false-positive guard for the
+/// section: `sphere_sphere` reports `Empty` (no intersection curve, and the
+/// surfaces are not coincident), so the coincident path must not fire at all.
+/// The union is the outer ball and the intersection the inner one.
+#[test]
+fn concentric_spheres_of_unequal_radii_are_not_coincident() {
+    let context = "concentric spheres, radii 1 and 2";
+    let mut scene = Scene::new();
+    let a = scene.sphere(Point3::origin(), 2.0);
+    let b = scene.sphere(Point3::origin(), 1.0);
+    let united = scene
+        .unite(a, b)
+        .unwrap_or_else(|e| panic!("{context}, unite: rejected: {e:?}"));
+    assert_close(
+        volume(&united, context),
+        sphere_volume(2.0),
+        CURVED_VOLUME_RTOL,
+        context,
+    );
+    let intersected = scene
+        .intersect(a, b)
+        .unwrap_or_else(|e| panic!("{context}, intersect: rejected: {e:?}"));
+    assert_close(
+        volume(&intersected, context),
+        sphere_volume(1.0),
+        CURVED_VOLUME_RTOL,
+        context,
+    );
+}
+
+// ---------------------------------------------------------------------
+// Coaxial cones — `cone_cone` / `coaxial_profiles`.
+// ---------------------------------------------------------------------
+
+/// A full cone `r = 2 → 0` over `z ∈ [0,2]`, cut at `z = 1` into a frustum
+/// and a tip, then re-united. The two wall surfaces share an apex, an axis
+/// and a half-angle, so `cone_cone` reports `Coincident`; their trims touch
+/// along the `z = 1` rim and no more, so the pair imprints nothing and the
+/// coplanar cap pair does the fusing.
+///
+/// The apex is what makes this different from the cylinder stack: it is a
+/// chart pole, and the tip's wall region runs into it.
+#[test]
+fn coaxial_cones_stacked_unite_rebuilds_the_cone() {
+    let context = "cone split at z = 1 and re-united";
+    let mut scene = Scene::new();
+    let a = scene.cone(Point3::origin(), 2.0, 1.0, 1.0);
+    let b = scene.cone(Point3::new(0.0, 0.0, 1.0), 1.0, 0.0, 1.0);
+    let out = scene
+        .unite(a, b)
+        .unwrap_or_else(|e| panic!("{context}: exact pipeline rejected the pair: {e:?}"));
+    assert_close(
+        volume(&out, context),
+        frustum_volume(2.0, 0.0, 2.0),
+        CYL_VOLUME_RTOL,
+        context,
+    );
+    assert_eq!(
+        out.store.faces_of_body(out.body).len(),
+        3,
+        "{context}: two wall bands plus the base cap"
+    );
+}
+
+/// The same cone, but the two pieces OVERLAP over `z ∈ [1,1.5]`: A is the
+/// frustum `r = 2 → 0.5` over `z ∈ [0,1.5]`, B the tip `r = 1 → 0` over
+/// `z ∈ [1,2]`. Now the coincident wall pair's trims genuinely share area,
+/// so each partner's rim circle must be imprinted into the other's wall.
+///
+/// The union is the whole cone again, which is the oracle: an imprint placed
+/// wrong here shows up as a wall band kept twice or dropped, and `check()`
+/// sees both.
+fn overlapping_coaxial_cones(op: &str, expected: f64) {
+    let context = &format!("coaxial cone pieces overlapping over z ∈ [1,1.5], {op}");
+    let mut scene = Scene::new();
+    let a = scene.cone(Point3::origin(), 2.0, 0.5, 1.5);
+    let b = scene.cone(Point3::new(0.0, 0.0, 1.0), 1.0, 0.0, 1.0);
+    let out = match op {
+        "unite" => scene.unite(a, b),
+        "subtract" => scene.subtract(a, b),
+        "intersect" => scene.intersect(a, b),
+        _ => unreachable!(),
+    }
+    .unwrap_or_else(|e| panic!("{context}: exact pipeline rejected the pair: {e:?}"));
+    assert_close(volume(&out, context), expected, CYL_VOLUME_RTOL, context);
+}
+
+#[test]
+fn overlapping_coaxial_cones_unite() {
+    // The whole cone, r = 2 at z = 0 tapering to the apex at z = 2.
+    overlapping_coaxial_cones("unite", frustum_volume(2.0, 0.0, 2.0));
+}
+
+#[test]
+fn overlapping_coaxial_cones_subtract() {
+    // A minus the tip B: the frustum r = 2 → 1 over z ∈ [0,1].
+    overlapping_coaxial_cones("subtract", frustum_volume(2.0, 1.0, 1.0));
+}
+
+#[test]
+fn overlapping_coaxial_cones_intersect() {
+    // The overlap: the frustum r = 1 → 0.5 over z ∈ [1,1.5].
+    overlapping_coaxial_cones("intersect", frustum_volume(1.0, 0.5, 0.5));
+}
+
+/// Inclusion–exclusion over the overlapping cone pair.
+#[test]
+fn overlapping_coaxial_cones_inclusion_exclusion() {
+    let context = "coaxial cone pieces overlapping, inclusion-exclusion";
+    let mut scene = Scene::new();
+    let a = scene.cone(Point3::origin(), 2.0, 0.5, 1.5);
+    let b = scene.cone(Point3::new(0.0, 0.0, 1.0), 1.0, 0.0, 1.0);
+    let united = scene.unite(a, b).expect("unite of coaxial cone pieces");
+    let intersected = scene
+        .intersect(a, b)
+        .expect("intersect of coaxial cone pieces");
+    let sum = volume(&united, context) + volume(&intersected, context);
+    assert_close(
+        sum,
+        frustum_volume(2.0, 0.5, 1.5) + frustum_volume(1.0, 0.0, 1.0),
+        CYL_VOLUME_RTOL,
+        context,
+    );
+}
+
+/// The same cone twice: BOTH the wall pair and the base cap pair are
+/// coincident with identical trims, and the wall pair runs into a shared
+/// apex. `A ∪ A == A ∩ A == A`, one wall face and one cap.
+#[test]
+fn identical_cones_unite_and_intersect_are_the_cone() {
+    let context = "identical cones";
+    let expected = frustum_volume(2.0, 0.0, 2.0);
+    for op in ["unite", "intersect"] {
+        let mut scene = Scene::new();
+        let a = scene.cone(Point3::origin(), 2.0, 0.0, 2.0);
+        let b = scene.cone(Point3::origin(), 2.0, 0.0, 2.0);
+        let out = match op {
+            "unite" => scene.unite(a, b),
+            _ => scene.intersect(a, b),
+        }
+        .unwrap_or_else(|e| panic!("{context}, {op}: rejected: {e:?}"));
+        assert_close(volume(&out, context), expected, CYL_VOLUME_RTOL, context);
+        assert_eq!(
+            out.store.faces_of_body(out.body).len(),
+            2,
+            "{context}, {op}: one wall and one cap, kept from A only"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------
+// The two tolerance questions COINCIDENT.md §9 left open, both closed here.
+// ---------------------------------------------------------------------
+
+/// The CONVERSE tolerance mismatch (COINCIDENT.md §9, first bullet): SSI
+/// reporting `Empty` for surfaces the arrangement would nonetheless weld.
+///
+/// Two boxes of extent 1e4 separated by a 5e-6 gap. `snap` is ~1e-9 of the
+/// feature extent, so here it is ~2.4e-5 — ABOVE `tol.linear = 1e-6`, which
+/// inverts the usual roles: SSI calls the two `x = 1e4` planes distinct (the
+/// gap exceeds `linear`), while every vertex and edge on them welds (the gap
+/// is under `snap`). Left alone, the fused shell is reconstructed from
+/// regions classified as if the faces never met, and the classifier runs out
+/// of usable rays: `Degenerate { context: "boolean::ray_classify" }`.
+///
+/// This is the only configuration in the suite where `snap > tol.linear`, and
+/// therefore the only one that can reach the `Empty`-arm re-test at all.
+#[test]
+fn sub_snap_gap_at_large_extent_welds_as_coincident() {
+    let context = "1e4-extent boxes with a 5e-6 (sub-snap) gap";
+    let mut scene = Scene::new();
+    let a = scene.block([0.0, 0.0, 0.0], [1e4, 1e4, 1e4]);
+    let b = scene.block([1e4 + 5e-6, 0.0, 0.0], [2e4, 1e4, 1e4]);
+    let united = scene
+        .unite(a, b)
+        .unwrap_or_else(|e| panic!("{context}, unite: rejected: {e:?}"));
+    // The 5e-6 gap contributes 5e2 of the 2e12 total — 2.5e-10 relative, an
+    // order under the planar budget, so the fused box is the exact answer to
+    // the precision this suite asserts anywhere.
+    assert_close(volume(&united, context), 2e12, PLANAR_VOLUME_RTOL, context);
+    assert_eq!(
+        united.store.faces_of_body(united.body).len(),
+        10,
+        "{context}: each box's five surviving faces, as for touching cubes"
+    );
+    let mut scene = Scene::new();
+    let a = scene.block([0.0, 0.0, 0.0], [1e4, 1e4, 1e4]);
+    let b = scene.block([1e4 + 5e-6, 0.0, 0.0], [2e4, 1e4, 1e4]);
+    let subtracted = scene
+        .subtract(a, b)
+        .unwrap_or_else(|e| panic!("{context}, subtract: rejected: {e:?}"));
+    assert_close(
+        volume(&subtracted, context),
+        1e12,
+        PLANAR_VOLUME_RTOL,
+        context,
+    );
+}
+
+/// The near-coaxial DECISION (COINCIDENT.md §9, second bullet), tested from
+/// the side that is reachable: an offset BELOW the weld length is coincident,
+/// and stays coincident.
+///
+/// §9 commits the kernel to a discontinuity at `snap` rather than snapping
+/// near-coaxial pairs to coaxial. The threshold has to be the weld length
+/// itself and nothing else — below it two surfaces are indistinguishable to
+/// every other predicate in the pipeline, so calling them coincident is the
+/// only self-consistent answer. Offsetting one cylinder by 1e-12 (against a
+/// `snap` of ~2e-9) must therefore land exactly the coaxial answer, unchanged
+/// from `overlapping_coaxial_cylinders_unite`.
+#[test]
+fn sub_snap_offset_cylinders_stay_coincident() {
+    for d in [1e-12, 1e-10] {
+        let context = &format!("coaxial cylinders with a {d:e} (sub-snap) axis offset, unite");
+        let mut scene = Scene::new();
+        let a = scene.cylinder(Point3::origin(), Vector3::z(), 1.0, 1.0);
+        let b = scene.cylinder(Point3::new(d, 0.0, 0.5), Vector3::z(), 1.0, 1.0);
+        let out = scene
+            .unite(a, b)
+            .unwrap_or_else(|e| panic!("{context}: rejected: {e:?}"));
+        assert_close(volume(&out, context), 1.5 * PI, CYL_VOLUME_RTOL, context);
+    }
+}
+
+/// The other side of the same threshold: an offset ABOVE the weld length is
+/// NOT coincident, and the pair is ordinary transversal work — two
+/// equal-radius cylinders whose walls meet in two full lines
+/// (`ssi/analytic.rs:512`), bounding a thin lune.
+///
+/// KNOWN BROKEN — of-m350, and NOT a coincident-face bug: the failures are
+/// byte-identical with of-bxl.5's changes reverted, so this is the
+/// transversal path. Kept as written rather than softened, per this file's
+/// protocol, because §9's decision to model the lune rather than snap it away
+/// assumes exactly this path works. `d = 1e-3` and `d = 1e-5` produce
+/// `OpenEdgeInClosedShell` and an impossible Euler characteristic
+/// respectively.
+#[test]
+#[ignore = "of-m350: near-coaxial equal-radius cylinders produce invalid booleans"]
+fn near_coaxial_cylinders_stay_transversal() {
+    for d in [1e-3, 1e-5] {
+        let context = &format!("cylinders with a {d:e} axis offset, inclusion-exclusion");
+        let mut scene = Scene::new();
+        let a = scene.cylinder(Point3::origin(), Vector3::z(), 1.0, 1.0);
+        let b = scene.cylinder(Point3::new(d, 0.0, 0.0), Vector3::z(), 1.0, 1.0);
+        let united = scene
+            .unite(a, b)
+            .unwrap_or_else(|e| panic!("{context}, unite: rejected: {e:?}"));
+        let intersected = scene
+            .intersect(a, b)
+            .unwrap_or_else(|e| panic!("{context}, intersect: rejected: {e:?}"));
+        // No closed form is needed: inclusion-exclusion pins the pair against
+        // each other, and both operands are unit cylinders.
+        let sum = volume(&united, context) + volume(&intersected, context);
+        assert_close(sum, 2.0 * PI, CYL_VOLUME_RTOL, context);
+    }
+}

@@ -139,6 +139,73 @@ special case of the arrangement we already build, not a parallel path.**
 >    condition, and a dart reusing the class representative's edge must flip
 >    its fin sense to preserve it.
 
+> **Amended by of-bxl.5 (curved implementation).** Of the four remaining
+> `Coincident` producers, three needed *nothing*: coaxial equal-radius
+> cylinders and coaxial cones — stacked, overlapping and nested — came out
+> right on the first run, exactly as of-bxl.4's design intent predicted, since
+> nothing in the path above keys off planes. Concentric equal-radius spheres
+> did not, and all three reasons are about what a **trim edge** is, not about
+> coincidence:
+>
+> 1. **A partner's trim edge is an arc, not the conic it lies on.**
+>    `clip_imprint` stations a closed conic over a full period, because an SSI
+>    intersection curve *is* the whole conic. A trim edge is a piece of
+>    topology with its own `[t0, t1]`. A sphere's seam meridian is the half
+>    great circle between the poles; imprinted over the full period it also
+>    lays down the *opposite* meridian — a curve nowhere on the partner's
+>    boundary — which cuts the host face in two for no reason (`chi = 5`, two
+>    spurious regions per sphere). Planes hid this: their trim edges are
+>    lines, and `clip_imprint`'s line arm clips to the joint bounding box,
+>    which on the box configurations of-bxl.4 was tested against reproduces
+>    the segment exactly. A circle has no such accidental bound. Fixed by
+>    `CurveSpan`, which carries the edge's own window into the stationing.
+> 2. **`on_trim_boundary` must measure against the exact curve.** Amendment
+>    item 2 above is what drops a run lying along the host's own outline, and
+>    it measured `polyline_distance` against the edge's *sampled* polyline.
+>    A sampled curved edge sags off the true curve by a chord sagitta,
+>    `≈ 5.4e-4·R` — five orders above `snap` — so a run sitting exactly on a
+>    curved edge reads as off-boundary and is kept. Straight edges sag
+>    identically zero, which is the whole reason of-bxl.4 could not see it.
+>    This is the same sag that forced `nearest_edge_of_face_exact` (of-7ld.5),
+>    and the fix is the same: project onto the edge's exact `Curve3`. Both
+>    tests are kept, because a point bisected onto the region boundary
+>    *polygon* sits on the chords instead.
+> 3. **A chart seam is not a trim edge.** The closed form this whole option
+>    rests on — "the overlap region's boundary is made of the other face's
+>    trim edges" — silently assumes every edge in a face's loops *bounds*
+>    something. On a periodic surface one does not. A face that closes on
+>    itself records the seam by traversing the **same edge twice in opposite
+>    senses**: a sphere's loop is `[seam+, seam−]`, a cylinder wall's
+>    `[rim+, seam+, rim−, seam−]`, a torus's the fundamental polygon
+>    `a b a⁻¹ b⁻¹`. The region lies on *both* sides of such an edge, so it is
+>    a slit in the chart, and the overlap's boundary does not name it.
+>    Imprinting one lays a curve across the host that separates no region;
+>    `apply_chain` splits a zero-area sliver along it, the sliver has no
+>    interior sample, and the boolean dies in `classify`. `imprint_coincident`
+>    now skips any partner edge its own face uses more than once.
+>
+>    The sharp demonstration is two spheres that are the **same sphere** but
+>    carry their poles on different axes. The surfaces are identical, the
+>    overlap is everything, and the answer is just the sphere — but the two
+>    faces disagree about where the seam goes, so B's seam meridian is a
+>    perfectly good curve on A's surface running from A's own seam to a dead
+>    end in A's interior. Not expressible with planes at all: a planar face
+>    has no seam, so every edge in its loops appears exactly once.
+>
+> None is coincidence-specific in principle, and none was reachable before
+> curved coincident faces existed.
+>
+> Item 3 **is** the chart-sharing risk §8 named, arriving one step earlier
+> than the row anticipated. The predicted form — a sample landing on a cover
+> polygon's seam meridian flipping the even-odd test — did *not* materialize,
+> for a structural reason worth recording: on a coincident pair the partner's
+> trim edges are the only imprints, they are `CoincidentEdge`-hosted, and the
+> partner's own containment test is therefore never asked. `contains_for_clip`
+> runs only against the *host*, where a seam-lying sample is rescued by the
+> existing nudge (`boolean.rs:873`). That hazard is real for transversal
+> imprints and was already handled there. What periodic charts actually broke
+> was one level up, in which edges are eligible to be imprinted at all.
+
 **Classification of the resulting regions.** Do *not* rediscover ON by
 sampling — that is precisely the degenerate case ray-parity evades.
 Coincidence is known by construction, so propagate it. For a region of
@@ -350,7 +417,7 @@ Child beads of of-bxl, in dependency order:
 | **of-bxl.2** | **Face-level transversality gate.** Move the `Coincident` rejection from surface level to face level: if the trimmed regions do not overlap, proceed as transversal. No new geometry, no verdict change. | coplanar-disjoint and edge-adjacent boxes pass; the three tripwires still fail (unchanged) |
 | **of-bxl.3** | **ON verdict.** `Verdict`/`Sense` enums, `coincident_partner_region`, `contains_point` returns `Verdict`, `keep_table` on `Verdict` (§3 table) + A-only tie-break. Dead code until of-bxl.4 produces ON regions. | unit tests on `keep_table`; no behaviour change |
 | **of-bxl.4** | **Coincident planar imprint.** *Done.* Imprint each coincident face with the partner's trim edges via `clip_imprint`, one-sided (`ImprintKind`). Reconcile the tolerance mismatch by re-running SSI at `snap` (§5, §9). Weld coincident atoms across solids in `build_output` (`canonical_atoms`) — not anticipated by §3, see its amendment. Four tripwires rewritten, not three. | full §7 matrix for planes in `boolean_stress.rs` §(11); `check()` clean; explicit volume asserts |
-| **of-bxl.5** | **Coincident curved surfaces.** Extend to the other four `Coincident` producers (`cylinder_cylinder:482`, `coaxial_profiles:586`, `sphere_sphere:654`, `cone_cone:980`). Chart-sharing on periodic surfaces is the new risk — seam handling per `contains_for_clip` (`boolean.rs:873`). | coaxial cylinders, concentric spheres; §7 matrix |
+| **of-bxl.5** | **Coincident curved surfaces.** *Done.* Extend to the other four `Coincident` producers (`cylinder_cylinder:482`, `coaxial_profiles:586`, `sphere_sphere:654`, `cone_cone:980`). Cylinders and cones needed no code at all; spheres needed three fixes, none of them about coincidence and all of them about what a *trim edge* is — see §3's of-bxl.5 amendment. Chart-sharing on periodic surfaces was the new risk, and it landed one step earlier than expected: not the even-odd test on the cover boundary, but the seam edge being imprinted as though it bounded something. Closes both of §9's open questions. | coaxial cylinders, concentric spheres, coaxial cones; full §7 matrix in `boolean_stress.rs` §(17) |
 | **of-bxl.6** | **Tangent triage (tier 1).** Contact locus outside trimmed regions → empty imprint, proceed. Tiers 2 and 3 stay `NotImplemented`. | tangent-outside-trim cases pass; non-manifold cases still fall back |
 | **of-bxl.7** | **Tangential curves (tier 3).** Deferred; open only if traffic justifies it against the F-Rep fallback. | — |
 
@@ -377,14 +444,66 @@ results.
   Those are now rejected as two distinct parallel surfaces. The converse —
   SSI reporting `Empty` for surfaces closer than `snap` — needs
   `snap > tol.linear`, i.e. a feature extent above ~1e3, and is not
-  reachable from the `Coincident` arm at all. Left to of-bxl.5 rather than
-  re-testing every `Empty` pair.
+  reachable from the `Coincident` arm at all. ~~Left to of-bxl.5 rather than
+  re-testing every `Empty` pair.~~ **Closed in of-bxl.5.** The `Empty` arm now
+  re-tests with `coincident_at_snap` too, under the guard
+  `snap > tol.linear` — which is not an optimization but the reachability
+  condition itself: below that extent `snap` is three orders tighter than
+  `linear`, so nothing SSI calls `Empty` can be coincident at `snap`, and
+  every ordinary part keeps its one SSI call per candidate pair. Above it the
+  roles invert and SSI becomes the *strict* one, calling two surfaces
+  distinct while every vertex and edge on them welds — leaving the fused
+  shell to be reconstructed from regions classified as if the faces never met.
 - **Partial coincidence of curved faces** — two cylinders coaxial and
   equal-radius are coincident over their whole surface; two *nearly*
   coaxial ones are transversal with a near-tangential curve. The
   transition is discontinuous in the inputs, and `snap` decides which
-  side we land on. Whether that discontinuity is acceptable, or whether
-  near-coaxial should snap to coaxial, is a of-bxl.5 question.
+  side we land on. ~~Whether that discontinuity is acceptable, or whether
+  near-coaxial should snap to coaxial, is a of-bxl.5 question.~~
+  **Decided in of-bxl.5: the discontinuity is accepted, and near-coaxial does
+  not snap to coaxial.** Four reasons, in the order they bind:
+
+  1. *It is not the near-degenerate case it looks like.* Two parallel
+     equal-radius cylinders whose axes are `d` apart meet in **two full
+     lines** (`cylinder_cylinder`, `ssi/analytic.rs:512`), at
+     `±sqrt(r² − d²/4)` across the radical plane, and those lines stay a
+     diameter apart as `d → 0`. The transversal answer for a near-coaxial
+     pair is a pair of lunes of width `~d` — thin, but exactly and
+     robustly representable. There is no numerical cliff to protect against;
+     only a topology that changes at `d = 0`, as it must.
+  2. *Snapping would move the user's geometry, and could not say whose.*
+     Fusing near-coaxial to coaxial means choosing which axis survives. That
+     is a healing decision about the model, not a boolean's business — it
+     belongs to import healing (`io/step/heal.rs`), where the provenance to
+     make it is available and where the result is visible as an edit rather
+     than as a boolean that quietly disagreed with its inputs.
+  3. *It would reintroduce exactly what of-bxl.4 removed.* Snapping
+     near-coaxial pairs to coincident is precisely re-running the coincidence
+     test at a tolerance looser than `snap`. That is the permissive direction
+     the first bullet above rejects: faces classified `ON` a boundary they are
+     visibly off, with the arrangement declining to weld them.
+  4. *The transition is where the rest of the kernel already puts it.* Below
+     `snap` two surfaces are indistinguishable to every other predicate in
+     the pipeline — vertices weld, edges merge — so calling them coincident
+     is the only self-consistent answer. Above it they are a feature the user
+     asked for. A boolean whose topology jumps exactly at the weld length is
+     not a wart; it is the same threshold stated once.
+
+  The discontinuity is inherent to exact B-Rep and not to this design. The
+  F-Rep fallback remains for the configurations where the exact answer is
+  unreachable, and the gate for this decision is a stress case on each side
+  of the threshold rather than a smoothing pass between them.
+
+  One honest caveat, and it belongs with the decision rather than buried in a
+  bug list: the *sub-snap* side is gated live
+  (`sub_snap_offset_cylinders_stay_coincident`), but the transversal side is
+  **currently broken** — of-m350, where a near-coaxial pair at `d` between
+  1e-8 and 1e-3 returns an open shell, an impossible Euler characteristic, or
+  a `classify` failure. That is the ordinary transversal path and it fails
+  identically with of-bxl.5's changes reverted, so it does not weigh on the
+  decision above; but reason 1 rests on the lune being representable, and
+  until of-m350 lands that claim is argued rather than demonstrated. Its
+  stress case is written and `#[ignore]`d against the bead.
 - **Non-manifold results** — §6 tier 2 is a rep limitation. If the
   roadmap ever admits non-manifold bodies, tier 2 reopens. Worth a
   pointer from the topology docs so the constraint is discoverable from

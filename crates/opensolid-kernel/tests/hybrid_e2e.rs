@@ -199,6 +199,48 @@ fn coincident_face_union_now_takes_the_exact_path() {
     );
 }
 
+/// The CURVED reading of the two tests above (of-bxl.5): two coaxial
+/// equal-radius cylinders overlapping along the axis, so their *walls* are a
+/// coincident pair on a periodic chart whose trims share area.
+///
+/// The pipeline proof is in `boolean_stress.rs` §(17); this is the public-API
+/// half, and it is what makes the feature observable to a caller. Without it
+/// nothing outside the brep crate asserts that a curved coincident contact
+/// takes `HybridPath::Brep` rather than being quietly served a mesh-derived
+/// answer — which is exactly the failure mode acceptance (2) exists to
+/// prevent, restated for curved surfaces.
+#[test]
+fn coincident_curved_faces_take_the_exact_path() {
+    let mut store = TopologyStore::new();
+    let mut geo = GeometryStore::new();
+    // `primitives::cylinder` centers its axis on the origin, so a 0.5 shift
+    // along +Z leaves the two walls overlapping over z ∈ [0, 0.5].
+    let a = primitives::cylinder(&mut store, &mut geo, 1.0, 1.0).unwrap();
+    let b = primitives::cylinder(&mut store, &mut geo, 1.0, 1.0).unwrap();
+    translate_body(&mut store, &mut geo, b, Vector3::new(0.0, 0.0, 0.5)).unwrap();
+
+    let out = hybrid::unite(
+        &HybridBody::brep(&store, &geo, a),
+        &HybridBody::brep(&store, &geo, b),
+        &opts(),
+    )
+    .unwrap();
+    assert!(
+        matches!(out.path, HybridPath::Brep(_)),
+        "of-bxl.5: coaxial coincident cylinder walls must take the exact path"
+    );
+    assert!(out.mesh.is_closed_manifold(), "result must be watertight");
+    // The union is one cylinder of radius 1 spanning z ∈ [-0.5, 1.0]. The
+    // tolerance is the tessellation's: a 96-gon prism loses ~7.2e-4 of a
+    // circular section, so this is a mesh budget, not a classification one.
+    assert_volume_within(
+        &out.mesh,
+        1.5 * PI,
+        5e-3,
+        "exact unite with coincident cylinder walls",
+    );
+}
+
 /// The F-Rep fallback acceptance the two tests above used to carry.
 ///
 /// Their coincident-block inputs no longer reach the fallback, but the

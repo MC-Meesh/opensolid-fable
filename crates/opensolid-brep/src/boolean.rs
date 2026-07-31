@@ -1268,7 +1268,29 @@ fn nurbs_spans_covered(nurbs: &NurbsCurve, t0: f64, t1: f64) -> usize {
 }
 
 fn sample_edge(edge: &SolidEdge) -> SampledCurve {
-    let n = match &edge.curve {
+    let n = edge_intervals(edge);
+    let count = if edge.closed { n } else { n + 1 };
+    let points = (0..count)
+        .map(|i| {
+            let t = edge.t0 + (edge.t1 - edge.t0) * i as f64 / n as f64;
+            edge.curve.point(t)
+        })
+        .collect();
+    SampledCurve {
+        points,
+        closed: edge.closed,
+    }
+}
+
+/// How many equal parameter intervals an edge's own span is sampled over.
+///
+/// Shared with [`Pipeline::imprint_coincident`], which stations an imprinted
+/// partner edge over the same span and needs the density the edge's own
+/// discretization was priced at — an arc's share of [`SAMPLES_PER_CIRCLE`]
+/// rather than a flat count, so a quarter arc is not sampled as heavily as a
+/// full circle (of-bxl.5).
+fn edge_intervals(edge: &SolidEdge) -> usize {
+    match &edge.curve {
         Curve3::Line { .. } => LINE_SAMPLES,
         // A freeform edge has no angular sweep to price samples off, so
         // spans are the unit instead: within one knot span the curve is a
@@ -1284,17 +1306,6 @@ fn sample_edge(edge: &SolidEdge) -> SampledCurve {
             let span = (edge.t1 - edge.t0).abs() / TWO_PI;
             ((SAMPLES_PER_CIRCLE as f64 * span).ceil() as usize).max(8)
         }
-    };
-    let count = if edge.closed { n } else { n + 1 };
-    let points = (0..count)
-        .map(|i| {
-            let t = edge.t0 + (edge.t1 - edge.t0) * i as f64 / n as f64;
-            edge.curve.point(t)
-        })
-        .collect();
-    SampledCurve {
-        points,
-        closed: edge.closed,
     }
 }
 
@@ -1606,6 +1617,33 @@ struct ImprintHosts<'a> {
     fb: usize,
     box_a: &'a BoundingBox3,
     box_b: &'a BoundingBox3,
+}
+
+/// The parameter window an imprint curve is stationed over, where the caller
+/// knows one (of-bxl.5).
+///
+/// Only [`Pipeline::imprint_coincident`] supplies it, and it is what makes the
+/// coincident path correct on *arcs*. An SSI intersection curve is unbounded
+/// or closed, so [`Pipeline::clip_imprint`] stations conics over a full
+/// period; but a coincident partner's trim edge is a **piece** of topology,
+/// and the imprint is the arc its edge spans — not the whole conic that arc
+/// lies on. A sphere's seam meridian is the half of a great circle between the
+/// poles: stationed over the full period it imprints the *other* half too, a
+/// curve that is nowhere on the partner's boundary and cuts the host face in
+/// two for no reason.
+///
+/// Planes are why this was invisible to of-bxl.4. Their trim edges are
+/// [`Curve3::Line`]s, which the untargeted arm clips to the joint bounding box
+/// — and for the box configurations that path was tested on, that clip
+/// reproduces the segment. A circle has no such accidental bound.
+#[derive(Debug, Clone, Copy)]
+struct CurveSpan {
+    t0: f64,
+    t1: f64,
+    /// Whether the span closes into a ring (`t1 - t0` is a full period).
+    closed: bool,
+    /// Equal parameter intervals to station it over.
+    intervals: usize,
 }
 
 /// Host parameters for every station of an imprint sample, in station
@@ -2082,6 +2120,27 @@ fn boolean(
     let solid_b = extract_solid(store, geo, b, "b")?;
     let mut pipe = Pipeline::new(&solid_a, &solid_b, tol, inside)?;
     pipe.find_imprints()?;
+    if std::env::var("OS_DEBUG_BXL5").is_ok() {
+        eprintln!(
+            "DEBUG snap={:e} coincident_pairs={:?} imprints={}",
+            pipe.snap,
+            pipe.coincident_pairs,
+            pipe.imprints.len()
+        );
+        for imp in &pipe.imprints {
+            eprintln!(
+                "  imprint fa={} fb={} kind={:?} closed={} npts={} len={:e} p0={:?} p1={:?}",
+                imp.face_a,
+                imp.face_b,
+                imp.kind,
+                imp.sampled.closed,
+                imp.sampled.points.len(),
+                polyline_length(&imp.sampled.points),
+                imp.sampled.points[0],
+                imp.sampled.points[imp.sampled.points.len() - 1],
+            );
+        }
+    }
     pipe.collect_splits()?;
     let (atoms, atoms_by_source) = pipe.build_atoms();
     pipe.reconstruct(op, atoms, atoms_by_source)
@@ -2182,33 +2241,38 @@ impl<'a> Pipeline<'a> {
             let sa = &self.solids[0].faces[fa].surface;
             let sb = &self.solids[1].faces[fb].surface;
             match ssi_intersect(sa, sb, &self.tol) {
-                Ok(SurfaceIntersection::Empty) => {}
-                Ok(SurfaceIntersection::Coincident) => {
-                    // Coincident *surfaces* only bar the transversal path
-                    // where the trimmed regions actually share area; faces
-                    // that merely touch or miss imprint nothing (of-bxl.2).
-                    if self.regions_overlap(fa, fb) && self.coincident_at_snap(sa, sb) {
-                        // The overlap's boundary IS the partner's trim edges:
-                        // coincidence means they already lie exactly in this
-                        // face's surface, so no intersection curve has to be
-                        // computed for them. Imprinting each onto the other
-                        // face cuts both regions down to the overlap, and
-                        // then the ordinary machinery — collect_splits,
-                        // build_atoms, merge_imprint_chains, apply_chain —
-                        // arranges them like any other imprint.
-                        //
-                        // Where no partner edge crosses the other's interior
-                        // the trims nest and every one of these calls clips
-                        // to nothing: the overlap is a whole region already
-                        // (two boxes meeting face to face), and the ON
-                        // verdict alone reconstructs it.
-                        self.imprint_coincident(fa, fb, box_a, box_b)?;
-                        self.coincident_pairs.push((fa, fb));
+                // The *converse* half of the tolerance mismatch
+                // [`Pipeline::coincident_at_snap`] documents (COINCIDENT.md
+                // §9, left open by of-bxl.4 and closed here): SSI reporting
+                // `Empty` for surfaces the arrangement would nonetheless
+                // weld. It needs `snap > tol.linear` — a feature extent
+                // above ~1e3, since `snap` is ~1e-9 of it — and there the
+                // roles from the `Coincident` arm invert: SSI becomes the
+                // *strict* one, calling two surfaces distinct while every
+                // vertex and edge on them welds together. Left alone the
+                // pair contributes no imprint and no ON region, so the
+                // welded shell is reconstructed from regions classified as
+                // if the faces never met.
+                //
+                // The guard is not an optimization. Below that extent the
+                // promotion is unreachable by construction (`snap` is
+                // three orders tighter than `linear`, so nothing SSI calls
+                // `Empty` is coincident at `snap`), and skipping the
+                // re-test keeps every ordinary part's cost exactly as it
+                // was — one SSI call per candidate pair, not two.
+                Ok(SurfaceIntersection::Empty) => {
+                    if self.snap > self.tol.linear && self.coincident_at_snap(sa, sb) {
+                        self.register_coincident_pair(fa, fb, box_a, box_b)?;
                     }
-                    // Regions disjoint (of-bxl.2), or coincident to SSI's
+                }
+                Ok(SurfaceIntersection::Coincident) => {
+                    // A pair that fails the re-test is coincident to SSI's
                     // absolute `linear` but further apart than the weld
-                    // length: two distinct parallel surfaces, so the pair
-                    // contributes no imprint and no ON region.
+                    // length: two distinct parallel surfaces, contributing
+                    // no imprint and no ON region.
+                    if self.coincident_at_snap(sa, sb) {
+                        self.register_coincident_pair(fa, fb, box_a, box_b)?;
+                    }
                 }
                 Ok(SurfaceIntersection::TangentPoint(p)) => {
                     // Likewise: a tangency of the infinite surfaces is only a
@@ -2259,6 +2323,7 @@ impl<'a> Pipeline<'a> {
                             },
                             ImprintKind::Transversal,
                             None,
+                            None,
                         )?;
                     }
                 }
@@ -2281,6 +2346,7 @@ impl<'a> Pipeline<'a> {
                                 },
                                 ImprintKind::Transversal,
                                 Some(&uv),
+                                None,
                             )?;
                         }
                     }
@@ -2307,6 +2373,7 @@ impl<'a> Pipeline<'a> {
                                 },
                                 ImprintKind::Transversal,
                                 Some(&uv),
+                                None,
                             )?;
                         }
                     }
@@ -2473,6 +2540,42 @@ impl<'a> Pipeline<'a> {
             .collect()
     }
 
+    /// Record a face pair whose surfaces are coincident *at the weld length*,
+    /// and imprint it — but only where the trimmed regions actually share
+    /// area.
+    ///
+    /// SSI decides coincidence from the infinite surfaces, so it reports it
+    /// for any two coplanar faces, including ones whose regions merely touch
+    /// along an edge or miss entirely (two boxes set corner to corner). Those
+    /// are ordinary transversal work and this is a no-op for them (of-bxl.2).
+    ///
+    /// Where the regions do overlap, the overlap's boundary IS the partner's
+    /// trim edges: coincidence means they already lie exactly in this face's
+    /// surface, so no intersection curve has to be computed for them.
+    /// Imprinting each onto the other face cuts both regions down to the
+    /// overlap, and then the ordinary machinery — `collect_splits`,
+    /// `build_atoms`, `merge_imprint_chains`, `apply_chain` — arranges them
+    /// like any other imprint. Where no partner edge crosses the other's
+    /// interior the trims nest and every one of those calls clips to nothing:
+    /// the overlap is a whole region already (two boxes meeting face to face,
+    /// two identical spheres), and the ON verdict alone reconstructs it.
+    ///
+    /// # Errors
+    /// Propagates [`Pipeline::imprint_coincident`]'s inversion failures.
+    fn register_coincident_pair(
+        &mut self,
+        fa: usize,
+        fb: usize,
+        box_a: &BoundingBox3,
+        box_b: &BoundingBox3,
+    ) -> CoreResult<()> {
+        if self.regions_overlap(fa, fb) {
+            self.imprint_coincident(fa, fb, box_a, box_b)?;
+            self.coincident_pairs.push((fa, fb));
+        }
+        Ok(())
+    }
+
     /// Imprint a coincident face pair with each other's trim edges
     /// (of-bxl.4, COINCIDENT.md §3).
     ///
@@ -2489,6 +2592,28 @@ impl<'a> Pipeline<'a> {
     /// only — see [`ImprintKind::CoincidentEdge`] for why the partner's own
     /// trim must neither clip nor host it.
     ///
+    /// **Chart seams are not trim edges and are skipped** (of-bxl.5). A face
+    /// on a periodic surface closes on itself along a seam, and its loop
+    /// records that by traversing the *same* edge twice in opposite senses: a
+    /// sphere's is `[seam+, seam−]`, a cylinder wall's
+    /// `[rim+, seam+, rim−, seam−]`, a torus's fundamental polygon
+    /// `a b a⁻¹ b⁻¹`. The region lies on **both** sides of such an edge, so it
+    /// bounds nothing — it is a slit in the chart, not an edge of the
+    /// overlap — and the closed form this whole path rests on ("the overlap's
+    /// boundary IS the partner's trim edges") simply does not name it.
+    ///
+    /// Imprinting one anyway lays a curve across the host that separates no
+    /// region. Two spheres that are the same sphere but carry their poles on
+    /// different axes are the clean demonstration: B's seam meridian is a
+    /// perfectly good curve on A's surface, running from A's own seam out to
+    /// a dead end in A's interior. `apply_chain` splits a zero-area sliver
+    /// along it, the sliver has no interior sample, and the boolean dies in
+    /// `classify` — for a pair whose answer is just "the sphere".
+    ///
+    /// This is exactly the periodic-chart hazard of-bxl.5 was scoped around,
+    /// and it is invisible on planes for a structural reason: a planar face
+    /// has no seam, so every edge in its loops appears exactly once.
+    ///
     /// # Errors
     /// Propagates [`Pipeline::clip_imprint`]'s inversion failures.
     fn imprint_coincident(
@@ -2501,15 +2626,43 @@ impl<'a> Pipeline<'a> {
         // B's edges cut A's face and vice versa. Collected first: clipping
         // borrows `self` mutably.
         for (host, other_s, other_f) in [(0, 1, fb), (1, 0, fa)] {
-            let curves: Vec<Curve3> = self.solids[other_s].faces[other_f]
+            let face = &self.solids[other_s].faces[other_f];
+            let uses = |e: usize| face.loops.iter().flatten().filter(|d| d.edge == e).count();
+            let edges: Vec<(Curve3, CurveSpan)> = face
                 .loops
                 .iter()
                 .flatten()
-                .map(|de| self.solids[other_s].edges[de.edge].curve.clone())
+                .filter(|de| uses(de.edge) == 1)
+                .map(|de| {
+                    let edge = &self.solids[other_s].edges[de.edge];
+                    (
+                        edge.curve.clone(),
+                        CurveSpan {
+                            t0: edge.t0,
+                            t1: edge.t1,
+                            closed: edge.closed,
+                            // The edge's own discretization density, floored
+                            // at what an imprint would otherwise get. The
+                            // floor matters for straight edges: a box edge is
+                            // sampled at [`LINE_SAMPLES`] because a line
+                            // needs no shape resolution, but an imprint is
+                            // *clipped* at its stations, and a run shorter
+                            // than one station step is one no station lands
+                            // in. The untargeted line arm below stations at
+                            // [`IMPRINT_LINE_SAMPLES`] for exactly that
+                            // reason, and taking the span must not quietly
+                            // coarsen it.
+                            intervals: edge_intervals(edge).max(IMPRINT_LINE_SAMPLES),
+                        },
+                    )
+                })
                 .collect();
-            for curve in curves {
+            for (curve, span) in edges {
                 // An existing trim edge, carried from the partner's
                 // topology rather than traced: no preimages travel with it.
+                // Its own parameter window travels with it instead — the
+                // imprint is the arc the edge spans, not the conic it lies
+                // on ([`CurveSpan`]).
                 self.clip_imprint(
                     &curve,
                     ImprintHosts {
@@ -2520,6 +2673,7 @@ impl<'a> Pipeline<'a> {
                     },
                     ImprintKind::CoincidentEdge { host },
                     None,
+                    Some(span),
                 )?;
             }
         }
@@ -2735,6 +2889,7 @@ impl<'a> Pipeline<'a> {
         hosts: ImprintHosts<'_>,
         kind: ImprintKind,
         station_uv: Option<&[Option<HostUv>]>,
+        span: Option<CurveSpan>,
     ) -> CoreResult<()> {
         let ImprintHosts {
             fa,
@@ -2742,12 +2897,25 @@ impl<'a> Pipeline<'a> {
             box_a,
             box_b,
         } = hosts;
-        // Sampling stations: the full period for closed conics, a bbox
+        // Sampling stations: the caller's own window where it has one
+        // ([`CurveSpan`]), else the full period for closed conics, a bbox
         // slab clip for lines, the vertices for (marched) polylines. For
         // closed curves the stations cover one period without repeating
         // the start, and `period` drives the wrap arithmetic below.
-        let (ts, closed_curve, period) = match curve {
-            Curve3::Line { origin, dir } => {
+        let (ts, closed_curve, period) = match (span, curve) {
+            // The caller's window wins over every default below.
+            (Some(span), _) => {
+                let count = if span.closed {
+                    span.intervals
+                } else {
+                    span.intervals + 1
+                };
+                let ts = (0..count)
+                    .map(|i| span.t0 + (span.t1 - span.t0) * i as f64 / span.intervals as f64)
+                    .collect::<Vec<f64>>();
+                (ts, span.closed, span.t1 - span.t0)
+            }
+            (None, Curve3::Line { origin, dir }) => {
                 let joint = box_a.intersection(box_b);
                 let Some((t_lo, t_hi)) = clip_line_to_box(origin, dir, &joint) else {
                     return Ok(());
@@ -2758,7 +2926,7 @@ impl<'a> Pipeline<'a> {
                     .collect::<Vec<f64>>();
                 (ts, false, 0.0)
             }
-            Curve3::Polyline { points, closed } => {
+            (None, Curve3::Polyline { points, closed }) => {
                 // Vertex-index parameterization: sampling at the integers
                 // walks the polyline exactly (the last vertex of a closed
                 // polyline repeats the first and is dropped).
@@ -2774,13 +2942,14 @@ impl<'a> Pipeline<'a> {
             // back marched, as polylines), and the conic arm below would
             // station it over the wrong interval. Refuse rather than clip
             // against a wrongly-parameterized curve; the boolean falls
-            // back to F-Rep.
-            Curve3::Nurbs(_) => {
+            // back to F-Rep. A caller-supplied span is exempt: it names the
+            // knot window explicitly, which is the only thing missing here.
+            (None, Curve3::Nurbs(_)) => {
                 return Err(CoreError::NotImplemented {
                     feature: "imprinting a NURBS intersection curve",
                 });
             }
-            _ => {
+            (None, _) => {
                 let n = SAMPLES_PER_CIRCLE;
                 let ts = (0..n)
                     .map(|i| TWO_PI * i as f64 / n as f64)
@@ -3392,22 +3561,7 @@ impl<'a> Pipeline<'a> {
         let mut best: Option<(f64, usize)> = None;
         for lp in &self.solids[s].faces[f].loops {
             for de in lp {
-                let edge = &self.solids[s].edges[de.edge];
-                let mut t = edge.curve.project_point(p).t;
-                if let Some(period) = edge.curve.period() {
-                    // Bring the projection into the edge's parameter
-                    // window [t0, t0 + period).
-                    t = edge.t0 + (t - edge.t0).rem_euclid(period);
-                }
-                // Off-range projections fall back to the nearer endpoint
-                // (periodic wraparound makes a plain clamp wrong).
-                let d = if t <= edge.t1 {
-                    (edge.curve.point(t.max(edge.t0)) - p).norm()
-                } else {
-                    (edge.curve.point(edge.t0) - p)
-                        .norm()
-                        .min((edge.curve.point(edge.t1) - p).norm())
-                };
+                let d = exact_edge_distance(&self.solids[s].edges[de.edge], p);
                 if best.is_none() || d < best.expect("checked").0 {
                     best = Some((d, de.edge));
                 }
@@ -3947,6 +4101,28 @@ fn refine_clip_crossing(
 /// point ON the outline — so the band is `snap`, the length at which the
 /// arrangement would weld `p` onto that edge anyway.
 ///
+/// Measured against each edge's **exact curve** as well as its sampled
+/// polyline, and the exact measurement is the load-bearing one wherever the
+/// edge is curved (of-bxl.5). A sampled polyline sags off the true curve by up
+/// to a chord sagitta — `R(1 − cos(π/n))` ≈ `5.4e-4·R` at this pipeline's
+/// sampling — which is *five orders* above `snap`, so a point sitting exactly
+/// on a curved edge reads as `snap`-far from its own polyline and the polyline
+/// test alone false-negatives. This is the same sag that forced
+/// [`Pipeline::nearest_edge_of_face_exact`] (of-7ld.5). Planes are why it went
+/// unnoticed: their edges are straight and sag is identically zero, so the
+/// polyline test was exact for every configuration of-bxl.4 could reach.
+///
+/// The failure direction was safe but lossy, which is why it presented as an
+/// unrelated bug. A boundary-lying run that is *not* dropped imprints noise
+/// along the host's own outline, `apply_chain` splits off a zero-area sliver,
+/// and the region has no interior sample — so the boolean died in `classify`
+/// or tripped the Euler gate rather than returning a wrong answer.
+///
+/// The polyline test is kept alongside it rather than replaced: a point
+/// bisected onto the *region boundary polygon* (which is what
+/// [`refine_clip_crossing`] produces) sits on the chords, a sagitta off the
+/// exact curve, so each test catches what the other misses.
+///
 /// Free rather than a `Pipeline` method so [`Pipeline::clip_imprint`]'s
 /// station closure can call it: a method call captures all of `*self`, which
 /// would collide with the `self.imprints` push that follows, while passing the
@@ -3961,7 +4137,33 @@ fn on_trim_boundary(
     solid.faces[f].loops.iter().flatten().any(|de| {
         let sampled = &edge_samples[de.edge];
         polyline_distance(&sampled.points, sampled.closed, p) <= snap
+            || exact_edge_distance(&solid.edges[de.edge], p) <= snap
     })
+}
+
+/// Distance from `p` to an edge's **exact curve**, restricted to the edge's
+/// own parameter range.
+///
+/// Off-range projections fall back to the nearer endpoint rather than clamping
+/// the parameter, because a periodic curve's projection wraps: a point just
+/// past `t1` on a circle projects to a parameter that a plain clamp would drag
+/// all the way back to `t0`. Shared by [`on_trim_boundary`] and
+/// [`Pipeline::nearest_edge_of_face_exact`], which ask the same question at
+/// different acceptance bands.
+fn exact_edge_distance(edge: &SolidEdge, p: &Point3) -> f64 {
+    let mut t = edge.curve.project_point(p).t;
+    if let Some(period) = edge.curve.period() {
+        // Bring the projection into the edge's parameter window
+        // [t0, t0 + period).
+        t = edge.t0 + (t - edge.t0).rem_euclid(period);
+    }
+    if t <= edge.t1 {
+        (edge.curve.point(t.max(edge.t0)) - p).norm()
+    } else {
+        (edge.curve.point(edge.t0) - p)
+            .norm()
+            .min((edge.curve.point(edge.t1) - p).norm())
+    }
 }
 
 fn polyline_distance(points: &[Point3], closed: bool, p: &Point3) -> f64 {
