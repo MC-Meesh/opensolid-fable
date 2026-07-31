@@ -30,17 +30,26 @@
 //!
 //! Sections (1)-(15) are entirely live. Section (16) is not, and that is
 //! the protocol working rather than failing: it is the of-ipt.19 numerical
-//! robustness campaign, and one of its cases is `#[ignore]`d against one
-//! defect it found and filed — of-6viu (`unite` rejects a coincident-face
-//! imprint that forms an island, i.e. a boss centred on a face). The
-//! `#[ignore]`d case has a live sibling that fences the working range, so a
-//! fix has a boundary to move rather than a single case to flip.
+//! robustness campaign, and it is now entirely live too, having got there
+//! the long way: each of the five defects it found and filed — of-ukcq,
+//! of-oygs, of-y8qc, of-6viu, and of-x8tn — has since been fixed or
+//! retired, its `#[ignore]`d cases going live as each boundary moved. The
+//! paragraphs below record what each defect was and what retired it.
 //!
-//! A third defect it filed, of-oygs (`ray_classify` gives up on operands
-//! past ~1e3 length/radius for cylinders, ~1e7 for blocks), is fixed and
-//! its two cases are live again.
+//! of-6viu — `unite` rejecting a coincident-face imprint that forms an
+//! island, i.e. a boss centred on a face — retired without a fix of its
+//! own: of-bxl.5's `CurveSpan` fixed it while scoped at something else. Its
+//! case is live, and section 16.6.1 is the fence built around it — which is
+//! where of-x8tn, the same island with a circular footprint, turned up.
+//! of-x8tn is fixed in turn (a full circle had two spellings in the
+//! arrangement — a flagged ring and a seam-to-seam polyline — and the
+//! operands contributed one each, so host and tool never fused), and
+//! section 16.6.2 holds its cases, live.//!
+//! of-oygs (`ray_classify` gives up on operands past ~1e3 length/radius
+//! for cylinders, ~1e7 for blocks) is fixed and its two cases are live
+//! again.
 //!
-//! The fourth defect it filed, of-y8qc, is retired: `brep_mass_properties`
+//! of-y8qc is retired: `brep_mass_properties`
 //! on a trimmed sphere degraded with the angle between the trim and the pole
 //! axis, reaching 1.3e-3 at 90°, because the trim's parameter-space image
 //! fits a `Curve2::Line` at 0° and nothing at all off it. `Curve2::Projected`
@@ -61,7 +70,7 @@
 //! frame-dependent — invisible to the meshed 5e-3 budgets sections (6)-(9)
 //! weigh against).
 //!
-//! The fourth defect the campaign filed, of-ukcq, is retired: mesh
+//! of-ukcq is retired as well: mesh
 //! `mass_properties` integrated tetrahedra from the absolute origin and was
 //! 191× wrong at offset 1e6, and now references them to the mesh's own
 //! bounding-box centre. `mesh_mass_properties_survives_far_from_origin` is
@@ -5516,14 +5525,16 @@ fn brep_path_hits_closed_form_on_nurbs_operands() {
 // eight-deep boolean chain to the same budget at step eight as at step one,
 // and swallows degree-5 patches, C0 knots and knots 1e-9 apart without a
 // wobble. What broke was mostly *around* it — the mesh measurement path
-// (of-ukcq, since fixed), island imprints (of-6viu), and the trimmed-sphere
-// measurement (of-y8qc). The one defect that was squarely inside it,
-// of-oygs, turned out to be a band sized off the wrong quantity rather than
-// anything about seeding: `near_face_boundary` scaled its "too close to
-// trust" distance by the whole face's bounding box, so a slender face's own
-// length made its interior unreachable. It now measures each boundary
-// polyline's own chord error instead, and both of its cases are live.
-// =====================================================================
+// (of-ukcq, since fixed), island imprints (of-6viu, since retired), and
+// the trimmed-sphere measurement (of-y8qc, since fixed) — which is why most
+// of the beads this section filed are outside `boolean.rs`. The exceptions
+// are of-oygs, a band sized off the wrong quantity rather than anything
+// about seeding — `near_face_boundary` scaled its "too close to trust"
+// distance by the whole face's bounding box, so a slender face's own length
+// made its interior unreachable; it now measures each boundary polyline's
+// own chord error instead, and both of its cases are live — and of-x8tn,
+// which 16.6.1 found in the imprint path itself while fencing of-6viu's
+// retirement, since fixed as well.// =====================================================================
 
 /// The tolerance context a model whose features are `scale` model units
 /// across deserves — the default one with its *linear* term scaled, since a
@@ -6526,8 +6537,8 @@ fn chained_bores_do_not_accumulate_volume_error() {
 ///
 /// `boss_half` is the boss's half-width. At 2.0 the footprint reaches the
 /// top face's edges and the imprint is four boundary-to-boundary chains; at
-/// 1.0 it is a closed island strictly inside the face, which is of-6viu.
-/// The two differ in nothing else.
+/// 1.0 it is a closed island strictly inside the face, which was of-6viu
+/// (retired — see section 16.6.1). The two differ in nothing else.
 fn unite_subtract_cycles(boss_half: f64, label: &str) {
     const CYCLES: usize = 6;
     let block_volume = 4.0 * 4.0 * 2.0;
@@ -6595,7 +6606,8 @@ fn unite_subtract_cycles(boss_half: f64, label: &str) {
 }
 
 /// The boss reaches the top face's edges, so every imprint chain runs
-/// boundary to boundary. Live, and the fence of-6viu's fix must not move.
+/// boundary to boundary. The case that already worked while of-6viu was
+/// open, kept as the near side of that boundary.
 #[test]
 fn edge_reaching_boss_unite_subtract_cycles_do_not_drift() {
     unite_subtract_cycles(2.0, "edge-reaching boss");
@@ -6603,18 +6615,156 @@ fn edge_reaching_boss_unite_subtract_cycles_do_not_drift() {
 
 /// The same cycle with a 2 × 2 boss centred on the 4 × 4 top face, so the
 /// imprint is a closed island touching no edge — a pad in the middle of a
-/// face, which is about as ordinary as CAD features get. `unite` rejects it
-/// outright (of-6viu) on cycle one, so nothing about drift is learned yet;
-/// the test is written to the same standard as its live sibling so that
-/// fixing of-6viu turns it on unchanged.
+/// face, which is about as ordinary as CAD features get. Was of-6viu, and
+/// turned on unchanged when that retired (section 16.6.1).
 #[test]
-#[ignore = "of-6viu: unite fails when a coincident-face imprint forms an island"]
 fn island_boss_unite_subtract_cycles_do_not_drift() {
     unite_subtract_cycles(1.0, "island boss");
 }
 
 // ---------------------------------------------------------------------
-// 16.6.1 Coincident-face islands whose boundary is a CONIC (of-x8tn).
+// 16.6.1 Coincident-face imprints that form an ISLAND (of-6viu, retired).
+//
+// A tool sharing part of a face with its host, with a footprint lying
+// strictly INSIDE that face and touching none of its edges: a boss in the
+// middle of a plate, and its dual, a pocket. The imprint is a closed ring
+// in the face interior rather than a set of boundary-to-boundary chords,
+// and `apply_chain` has to insert it as a hole + disk instead of splitting
+// the outer cycle.
+//
+// of-6viu was the bead for that case failing, and its cause is worth
+// recording because it is not where the error message pointed. The
+// coincident path imprints the partner's TRIM EDGES onto the host — but
+// before of-bxl.5 it handed `clip_imprint` a bare `Curve3::Line` with no
+// parameter window, and the untargeted line arm stations a line over the
+// operands' JOINT BOUNDING BOX. That box is the boss's footprint padded
+// out, so each of the four footprint edges was imprinted ~7% long at both
+// ends: a `#`, not a `□`. The four overshooting tails dead-ended in the
+// face interior, which is precisely what
+//
+//     "an imprint chain ends in a face interior without closing or
+//      reaching the face boundary"
+//
+// reports. An edge-reaching boss hid it perfectly — there the overshoot
+// runs off the host face and is trimmed at its boundary, so the chains
+// terminate legally and the arrangement is right by accident. of-bxl.5's
+// `CurveSpan` retired it by stationing a coincident partner edge over the
+// edge's own `[t0, t1]`; it was scoped at curved coincident faces and
+// closed this as a side effect, without a test naming it.
+//
+// Hence this section. The cases below are the ones an overshoot-shaped
+// regression would fail and the cycle test above would not necessarily
+// catch: an off-centre footprint (whose overshoot reaches the host
+// boundary on one side only), a pocket instead of a pad, a CLOSED conic
+// footprint (one ring atom rather than four chords), and a second island
+// applied to a face that already carries one.
+// ---------------------------------------------------------------------
+
+/// A valid boolean result weighed both ways against a closed form, with the
+/// shell and genus counts an island imprint must not disturb. `rtol` is the
+/// mesh path's budget; the B-Rep path is always held to [`EXACT_RTOL`].
+fn assert_island_result(out: &BooleanOutput, label: &str, want: f64, rtol: f64) {
+    assert_eq!(out.shell_count(), 1, "{label}: one shell");
+    assert_eq!(
+        out.store.euler_counts(out.body).genus,
+        0,
+        "{label}: no handles"
+    );
+    let (meshed, exact) = measured(out, label);
+    assert_close(
+        exact.volume,
+        want,
+        EXACT_RTOL,
+        &format!("{label} (B-Rep path)"),
+    );
+    assert_close(meshed.volume, want, rtol, &format!("{label} (mesh path)"));
+}
+
+/// The bead's own minimal repro, asserted rather than merely not erroring:
+/// a 2 × 2 × 1 boss flush on the centre of a 4 × 4 × 2 block's top face.
+/// The union is the two volumes with nothing double-counted, because they
+/// share a face and no volume.
+#[test]
+fn island_boss_unite_is_the_sum_of_both_volumes() {
+    let mut scene = Scene::new();
+    let block = scene.block([-2.0, -2.0, -1.0], [2.0, 2.0, 1.0]);
+    let boss = scene.block([-1.0, -1.0, 1.0], [1.0, 1.0, 2.0]);
+    let out = scene
+        .unite(block, boss)
+        .expect("island boss unite (of-6viu)");
+    assert_island_result(
+        &out,
+        "island boss unite",
+        4.0 * 4.0 * 2.0 + 2.0 * 2.0 * 1.0,
+        PLANAR_VOLUME_RTOL,
+    );
+}
+
+/// The same union with the footprint pushed off centre and made oblong, so
+/// it is 0.3 from one edge of the top face and 1.6 from the opposite one.
+/// Nothing about the topology changes — still one interior ring — but the
+/// symmetry that lets a wrong answer look plausible is gone, and a
+/// bounding-box-shaped overshoot would now cross the host boundary on one
+/// side while dead-ending on the other.
+#[test]
+fn off_centre_island_boss_unite_is_the_sum_of_both_volumes() {
+    let mut scene = Scene::new();
+    let block = scene.block([-2.0, -2.0, -1.0], [2.0, 2.0, 1.0]);
+    let boss = scene.block([-1.7, -0.3, 1.0], [-0.4, 1.1, 2.0]);
+    let out = scene.unite(block, boss).expect("off-centre island unite");
+    assert_island_result(
+        &out,
+        "off-centre island boss unite",
+        4.0 * 4.0 * 2.0 + 1.3 * 1.4 * 1.0,
+        PLANAR_VOLUME_RTOL,
+    );
+}
+
+/// The pad's dual: a tool whose TOP face is coincident with the block's top
+/// face and whose body reaches down into it, so the subtraction opens a
+/// blind pocket. The imprint is the same interior ring, but the region it
+/// bounds is removed rather than kept — the classification either side of
+/// the ring is inverted, and a fix that got the arrangement right by
+/// assuming which side survives fails here.
+#[test]
+fn island_pocket_subtract_removes_exactly_the_tool() {
+    let mut scene = Scene::new();
+    let block = scene.block([-2.0, -2.0, -1.0], [2.0, 2.0, 1.0]);
+    let tool = scene.block([-1.0, -1.0, 0.0], [1.0, 1.0, 1.0]);
+    let out = scene.subtract(block, tool).expect("island pocket subtract");
+    assert_island_result(
+        &out,
+        "island pocket subtract",
+        4.0 * 4.0 * 2.0 - 2.0 * 2.0 * 1.0,
+        PLANAR_VOLUME_RTOL,
+    );
+}
+
+
+/// Two disjoint bosses on one face, applied one after the other. The second
+/// union imprints its ring onto a top face that is ALREADY an outer cycle
+/// carrying a hole, so `apply_chain` has to place the new ring in the right
+/// region of a multi-cycle face rather than the only one there is — the
+/// step the single-island cases never reach.
+#[test]
+fn two_island_bosses_on_one_face_unite() {
+    let mut scene = Scene::new();
+    let block = scene.block([-2.0, -2.0, -1.0], [2.0, 2.0, 1.0]);
+    let first = scene.block([-1.5, -1.5, 1.0], [-0.5, -0.5, 2.0]);
+    let out = scene.unite(block, first).expect("first island boss unite");
+    let (mut scene, body) = Scene::adopt(out, tol());
+    let second = scene.block([0.5, 0.5, 1.0], [1.5, 1.5, 2.0]);
+    let out = scene.unite(body, second).expect("second island boss unite");
+    assert_island_result(
+        &out,
+        "two island bosses unite",
+        4.0 * 4.0 * 2.0 + 2.0 * 1.0 * 1.0 * 1.0,
+        PLANAR_VOLUME_RTOL,
+    );
+}
+
+// ---------------------------------------------------------------------
+// 16.6.2 Coincident-face islands whose boundary is a CONIC (of-x8tn).
 //
 // Everything above imprints straight chords: a square boss on a flat face
 // leaves four line segments that meet at their endpoints, and whether they
