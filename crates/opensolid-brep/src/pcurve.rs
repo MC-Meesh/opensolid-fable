@@ -38,7 +38,8 @@
 //! [`Curve2`] has no freeform variant. Since of-3qy.8 retired the B-spline
 //! mesh fallback, freeform faces *do* reach the exact path, so a trim curve
 //! that is genuinely a 2D NURBS is now reachable — it just has nowhere exact
-//! to go. [`fit_pcurve`] fits what it can as a line or a circle and
+//! to go. [`fit_pcurve`] fits what it can as a line or a circle, then as a
+//! [`Curve2::Projected`] wherever the surface has a closed-form inverse, and
 //! otherwise falls back to [`Curve2::Polyline`], whose error is bounded by
 //! the sample spacing rather than exact.
 //!
@@ -48,6 +49,27 @@
 //! same reason. It is *not* a correctness problem: a polyline pcurve
 //! describes a curve that really does lie on the surface, and no consumer is
 //! told it is exact.
+//!
+//! # Why a fitted pcurve is not enough (of-y8qc)
+//!
+//! `Line` and `Circle` between them cover the pcurves an *axis-aligned*
+//! model produces, and nothing else. Tilt one operand and they stop
+//! covering anything: a plane section of a sphere is a `v = const` latitude
+//! only while the cutting plane is perpendicular to the pole axis, and at
+//! any other angle its image in `(u, v)` is a transcendental curve that
+//! neither variant can hold. Every such trim used to land on the polyline
+//! fallback, whose region error is second order in the sample spacing —
+//! 1.3e-3 of the volume of a spherical cap trimmed at 90°, against 5.7e-16
+//! for the *congruent* cap trimmed at 0°.
+//!
+//! Sampling harder does not fix that: second order means 1e-9 costs some
+//! 36 000 vertices per trim. [`Curve2::Projected`] fixes it by not fitting.
+//! Every analytic surface here inverts in closed form — a sphere's `(u, v)`
+//! is a longitude and a latitude of the query point — so the exact image of
+//! the edge curve is available at any `t` for about the cost of an
+//! `atan2`, and the samples are demoted to what they are actually needed
+//! for: choosing the *branch* of a periodic direction, which only has to be
+//! right to within half a period.
 //!
 //! [`Fin`]: crate::topology::Fin
 
@@ -75,6 +97,24 @@ const FIT_TOL_REL: f64 = 1e-9;
 /// is barely determined — wobbles well past a fit tolerance. Nothing real
 /// sits in the gap, because no edge sweeps only a millionth of a period.
 const SEAM_CONSTANT_TOL_REL: f64 = 1e-6;
+
+/// How far a [`Curve2::Projected`] branch guide is allowed to move in one
+/// sample interval, as a fraction of the direction's period.
+///
+/// The guide's whole job is to say which representative of a periodic
+/// parameter the exact inverse belongs to, and it does that correctly as
+/// long as it is nearer the truth than half a period. A quarter period per
+/// interval leaves the linear interpolation between two exact samples at
+/// most an eighth of a period out, which is margin enough that no realistic
+/// trim can cross it.
+const GUIDE_STEP_FRACTION: f64 = 0.25;
+
+/// Ceiling on branch-guide vertices, so refinement of a pathological curve
+/// terminates. Reaching it means the guide is coarser than
+/// [`GUIDE_STEP_FRACTION`] somewhere, which costs a branch choice rather
+/// than accuracy — and an edge whose parameter winds that fast in `(u, v)`
+/// is under-resolved everywhere else in the pipeline too.
+const GUIDE_MAX_SAMPLES: usize = 4096;
 
 /// Evaluation interface for parameter-space curves, mirroring
 /// [`CurveEval`](crate::curve::CurveEval) in 2D.
@@ -109,6 +149,9 @@ pub trait Curve2Eval {
 /// - `Polyline`: parameterized by the explicit, strictly increasing `params`
 ///   attached to its vertices, so it can carry the edge's own parameter
 ///   range (see the module invariant).
+/// - `Projected`: parameterized by the 3D curve it is the image of, which
+///   is the module invariant stated as a definition rather than as a
+///   property to be maintained.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Curve2 {
     /// Infinite line through `origin` at parameter-space velocity `dir`.
@@ -129,6 +172,121 @@ pub enum Curve2 {
         params: Vec<f64>,
         points: Vec<Point2>,
     },
+    /// The exact image of a 3D curve on a surface, evaluated by inverting
+    /// the surface at the curve's point instead of by fitting anything.
+    ///
+    /// Boxed because it owns a curve, a surface and the guide's two
+    /// vectors, and inlining that would grow every `Curve2`.
+    Projected(Box<ProjectedCurve2>),
+}
+
+/// The payload of [`Curve2::Projected`]: everything needed to invert a
+/// surface at a curve's point and land on the right branch.
+///
+/// # What makes it exact
+///
+/// `point(t)` is `surface⁻¹(curve(t))`, computed rather than approximated.
+/// Every analytic [`Surface3`] has a closed-form inverse (a longitude and a
+/// latitude, an angle and a height), which
+/// [`project_point`](SurfaceProject::project_point) returns directly for a
+/// point that already lies on the surface. So the module invariant —
+/// `surface.point(pcurve(t)) == curve.point(t)` — holds to floating point at
+/// *every* `t`, not only at sampled ones, and the region a loop of these
+/// bounds is the true one.
+///
+/// # What the guide is for
+///
+/// An inverse is only unique up to a period: `u` and `u + 2π` name the same
+/// point on a cylinder, and a face's loop is a closed cycle in `(u, v)` only
+/// if each fin takes the representative its neighbours continue. Closed-form
+/// inversion cannot know which, so the guide — the same sampled polyline the
+/// fallback fit would have used, refined until no interval moves more than
+/// [`GUIDE_STEP_FRACTION`] of a period — says. The exact value snaps to the
+/// representative nearest the guide, which is right whenever the guide is
+/// within half a period, and never contributes its own error to the result.
+///
+/// `offset` carries whole-period translations applied after construction
+/// (a seam fin moved to the far branch, a loop stitched for continuity),
+/// kept separate from the guide so that shifting is exact and reversible.
+///
+/// # What it costs
+///
+/// The curve and the surface are owned copies, because a pcurve outlives
+/// any particular walk of the topology and [`Curve2`] has no handle on the
+/// [`GeometryStore`](crate::geometry::GeometryStore) to borrow them from.
+/// For the analytic pairings this variant exists to serve that is a
+/// stack-sized struct each; a [`Curve3::Nurbs`] trim on an analytic surface
+/// copies its control net, which is the one case where the polyline
+/// fallback was cheaper. Evaluation costs one curve evaluation and one
+/// closed-form inversion, against a polyline's binary search and lerp.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProjectedCurve2 {
+    /// The 3D curve this is the image of, in its own parameter.
+    curve: Box<Curve3>,
+    /// The surface inverted at each of the curve's points.
+    surface: Box<Surface3>,
+    /// Guide parameters, strictly increasing, spanning the fitted range.
+    guide_params: Vec<f64>,
+    /// Guide vertices, unwrapped across periodic branch cuts and *not*
+    /// carrying `offset`.
+    guide_points: Vec<Point2>,
+    /// Parameter-space translation applied after inversion.
+    offset: Vector2,
+}
+
+impl ProjectedCurve2 {
+    /// The 3D curve this is the image of.
+    pub fn curve(&self) -> &Curve3 {
+        &self.curve
+    }
+
+    /// The surface the curve is inverted against.
+    pub fn surface(&self) -> &Surface3 {
+        &self.surface
+    }
+
+    /// Parameter-space translation applied after inversion.
+    pub fn offset(&self) -> Vector2 {
+        self.offset
+    }
+
+    /// The branch guide as a plain polyline, `offset` included — what a
+    /// consumer that cannot evaluate an inverse (the STEP writer) should
+    /// fall back to, and where the panel breaks of a consumer that can
+    /// (`brep_massprops`) belong.
+    pub fn guide(&self) -> Curve2 {
+        Curve2::Polyline {
+            params: self.guide_params.clone(),
+            points: self.guide_points.iter().map(|p| p + self.offset).collect(),
+        }
+    }
+
+    /// Guide parameters — the sample breaks, for a consumer that wants to
+    /// panel between them without materializing [`Self::guide`].
+    pub fn guide_params(&self) -> &[f64] {
+        &self.guide_params
+    }
+
+    /// A copy translated by `shift` in parameter space.
+    pub fn shifted(&self, shift: Vector2) -> Self {
+        let mut out = self.clone();
+        out.offset += shift;
+        out
+    }
+
+    /// Linear interpolation of the guide at `t`, on the unwrapped branch and
+    /// without `offset`.
+    fn guide_point(&self, t: f64) -> Point2 {
+        let (i, frac) = polyline_segment(&self.guide_params, t);
+        self.guide_points[i] + (self.guide_points[i + 1] - self.guide_points[i]) * frac
+    }
+
+    /// The exact inverse at `t`, on the guide's branch, without `offset`.
+    fn inverse(&self, t: f64) -> Point2 {
+        let guide = self.guide_point(t);
+        let periods = (self.surface.period_u(), self.surface.period_v());
+        guide_sample(&self.surface, &self.curve, t, guide, periods)
+    }
 }
 
 impl Curve2 {
@@ -189,35 +347,70 @@ impl Curve2 {
     /// if the two vectors differ in length, or if `params` is not strictly
     /// increasing and finite.
     pub fn polyline(params: Vec<f64>, points: Vec<Point2>) -> CoreResult<Self> {
-        if points.len() < 2 {
-            return Err(CoreError::InvalidArgument {
-                argument: "points",
-                reason: format!("a polyline needs at least 2 vertices, got {}", points.len()),
-            });
-        }
-        if params.len() != points.len() {
-            return Err(CoreError::InvalidArgument {
-                argument: "params",
-                reason: format!(
-                    "one parameter per vertex required, got {} for {} vertices",
-                    params.len(),
-                    points.len()
-                ),
-            });
-        }
-        // NaN-safe: only a strictly increasing step passes the comparison.
-        if !params[0].is_finite()
-            || params
-                .windows(2)
-                .any(|w| w[1].partial_cmp(&w[0]) != Some(std::cmp::Ordering::Greater))
-        {
-            return Err(CoreError::InvalidArgument {
-                argument: "params",
-                reason: "must be finite and strictly increasing".to_string(),
-            });
-        }
+        check_samples(&params, &points)?;
         Ok(Curve2::Polyline { params, points })
     }
+
+    /// The image of `curve` on `surface`, evaluated by inversion rather than
+    /// fitted, with `params`/`points` the branch guide (see
+    /// [`ProjectedCurve2`]).
+    ///
+    /// The guide is *not* the geometry — it only picks the representative of
+    /// a periodic parameter — so it is accepted at whatever resolution the
+    /// caller sampled, subject to the same well-formedness a polyline needs.
+    ///
+    /// # Errors
+    /// [`CoreError::InvalidArgument`] if fewer than two guide vertices are
+    /// given, if the two vectors differ in length, or if `params` is not
+    /// strictly increasing and finite.
+    pub fn projected(
+        surface: &Surface3,
+        curve: &Curve3,
+        params: Vec<f64>,
+        points: Vec<Point2>,
+    ) -> CoreResult<Self> {
+        check_samples(&params, &points)?;
+        Ok(Curve2::Projected(Box::new(ProjectedCurve2 {
+            curve: Box::new(curve.clone()),
+            surface: Box::new(surface.clone()),
+            guide_params: params,
+            guide_points: points,
+            offset: Vector2::zeros(),
+        })))
+    }
+}
+
+/// The well-formedness every sampled pcurve needs: at least two vertices,
+/// one parameter each, and parameters finite and strictly increasing.
+fn check_samples(params: &[f64], points: &[Point2]) -> CoreResult<()> {
+    if points.len() < 2 {
+        return Err(CoreError::InvalidArgument {
+            argument: "points",
+            reason: format!("a polyline needs at least 2 vertices, got {}", points.len()),
+        });
+    }
+    if params.len() != points.len() {
+        return Err(CoreError::InvalidArgument {
+            argument: "params",
+            reason: format!(
+                "one parameter per vertex required, got {} for {} vertices",
+                params.len(),
+                points.len()
+            ),
+        });
+    }
+    // NaN-safe: only a strictly increasing step passes the comparison.
+    if !params[0].is_finite()
+        || params
+            .windows(2)
+            .any(|w| w[1].partial_cmp(&w[0]) != Some(std::cmp::Ordering::Greater))
+    {
+        return Err(CoreError::InvalidArgument {
+            argument: "params",
+            reason: "must be finite and strictly increasing".to_string(),
+        });
+    }
+    Ok(())
 }
 
 impl Curve2Eval for Curve2 {
@@ -237,6 +430,7 @@ impl Curve2Eval for Curve2 {
                 let (i, frac) = polyline_segment(params, t);
                 points[i] + (points[i + 1] - points[i]) * frac
             }
+            Curve2::Projected(p) => p.inverse(t) + p.offset,
         }
     }
 
@@ -253,6 +447,40 @@ impl Curve2Eval for Curve2 {
                 let (i, _) = polyline_segment(params, t);
                 (points[i + 1] - points[i]) / (params[i + 1] - params[i])
             }
+            // Differentiating `S(u(t), v(t)) = C(t)` gives
+            // `S_u u' + S_v v' = C'`, an overdetermined 3x2 system whose
+            // normal equations are the surface's first fundamental form:
+            //
+            //   [E F; F G] [u'; v'] = [C'·S_u; C'·S_v]
+            //
+            // `EG − F² = |S_u × S_v|²`, so the solve is exactly as
+            // well-posed as the parameterization is — it is singular only
+            // where the surface itself is, and there `u'` is genuinely
+            // undefined (every `u` names the same point at a pole) and the
+            // guide's slope is the honest answer.
+            Curve2::Projected(p) => {
+                let uv = p.inverse(t);
+                let guide_slope = || {
+                    let (i, _) = polyline_segment(&p.guide_params, t);
+                    (p.guide_points[i + 1] - p.guide_points[i])
+                        / (p.guide_params[i + 1] - p.guide_params[i])
+                };
+                if p.surface.is_singular(uv.x, uv.y) {
+                    return guide_slope();
+                }
+                let (su, sv) = (p.surface.du(uv.x, uv.y), p.surface.dv(uv.x, uv.y));
+                let (e, f, g) = (su.norm_squared(), su.dot(&sv), sv.norm_squared());
+                let det = e * g - f * f;
+                let d3 = p.curve.derivative(t);
+                let (a, b) = (d3.dot(&su), d3.dot(&sv));
+                let duv = Vector2::new((g * a - f * b) / det, (e * b - f * a) / det);
+                // NaN-safe: a non-finite component fails the test and defers.
+                if det > 0.0 && duv.x.is_finite() && duv.y.is_finite() {
+                    duv
+                } else {
+                    guide_slope()
+                }
+            }
         }
     }
 
@@ -261,6 +489,7 @@ impl Curve2Eval for Curve2 {
             Curve2::Line { .. } => (f64::NEG_INFINITY, f64::INFINITY),
             Curve2::Circle { .. } => (0.0, TWO_PI),
             Curve2::Polyline { params, .. } => (params[0], params[params.len() - 1]),
+            Curve2::Projected(p) => (p.guide_params[0], p.guide_params[p.guide_params.len() - 1]),
         }
     }
 }
@@ -326,15 +555,18 @@ pub enum SeamSide {
 /// unwrapped across periodic branch cuts (each sample takes the
 /// representative nearest its predecessor, so a curve that crosses the seam
 /// runs continuously past it rather than jumping a full period). The samples
-/// are then fitted, in order of preference, as a [`Curve2::Line`], a
-/// [`Curve2::Circle`], or a [`Curve2::Polyline`] through the samples
-/// themselves.
+/// are then fitted, in order of preference, as a [`Curve2::Line`] or a
+/// [`Curve2::Circle`]; failing that they become the branch guide of a
+/// [`Curve2::Projected`], or — where the pairing has no closed-form inverse
+/// — a [`Curve2::Polyline`] through the samples themselves.
 ///
-/// The first two cover essentially every analytic pairing an exact import
-/// produces — a line or circle on a plane, a cylinder's generators and
-/// cross-sections, a sphere's meridians and latitudes, a torus's two circle
-/// families, and every seam — exactly, not to a tolerance. The polyline
-/// fallback bounds the error of everything else by the sample spacing.
+/// The first two cover essentially every *axis-aligned* analytic pairing —
+/// a line or circle on a plane, a cylinder's generators and cross-sections,
+/// a sphere's meridians and latitudes, a torus's two circle families, and
+/// every seam — exactly, not to a tolerance. `Projected` covers everything
+/// else on an analytic surface just as exactly, which is what tilting one
+/// operand needs (see the module header, of-y8qc). Only a freeform surface
+/// is left on the polyline, whose error is bounded by the sample spacing.
 ///
 /// `seam` picks the branch for a seam edge, where projection returns one of
 /// two equally valid representatives a period apart. It has no effect on a
@@ -378,7 +610,130 @@ pub fn fit_pcurve(
     if let Some(circle) = fit_circle(&params, &points, tol) {
         return Ok(circle);
     }
+    if is_projectable(surface, curve) {
+        let (params, points) = refine_branch_guide(surface, curve, params, points);
+        return Curve2::projected(surface, curve, params, points);
+    }
     Curve2::polyline(params, points)
+}
+
+/// Whether this pairing can be inverted exactly at an arbitrary parameter,
+/// which is what a [`Curve2::Projected`] promises.
+///
+/// Two things have to hold, and both are about the *inverse* rather than
+/// about how nice the geometry looks:
+///
+/// - The surface must have a closed-form inverse. Every analytic variant
+///   does; [`Surface3::Nurbs`] does not, and iterating a Newton search per
+///   evaluation would trade a bounded error for an unbounded cost and a
+///   convergence question. Freeform trim fidelity stays under of-50u.
+/// - The curve must be smooth, so that the image has a derivative to report
+///   between guide vertices. A [`Curve3::Polyline`] is not, and it gains
+///   nothing anyway: it already interpolates its own vertices linearly, so
+///   the parameter-space polyline through those same vertices is the same
+///   order of approximation as anything else could be.
+fn is_projectable(surface: &Surface3, curve: &Curve3) -> bool {
+    !matches!(surface, Surface3::Nurbs(_)) && !matches!(curve, Curve3::Polyline { .. })
+}
+
+/// Subdivide the sampled parameters until no interval moves more than
+/// [`GUIDE_STEP_FRACTION`] of a period, so the guide can be trusted to name
+/// the branch anywhere between its vertices.
+///
+/// Only periodic directions are refined, because only they have a branch to
+/// choose: along an aperiodic direction the inverse is unique and the guide
+/// is inert. Nothing here improves the pcurve's *accuracy* — the exact
+/// inverse does that — so a curve whose samples are already within the step
+/// (which is nearly all of them) pays one comparison per interval.
+///
+/// Each pass re-unwraps the whole guide, which is what makes this terminate
+/// and what makes it *fix* branch mistakes rather than merely avoid new
+/// ones. Unwrapping takes every vertex to the representative nearest its
+/// predecessor, so afterwards no interval spans more than half a period —
+/// and the initial uniform samples of a curve that swings hard can be a
+/// hair the wrong side of that, which is precisely the case refining is for.
+fn refine_branch_guide(
+    surface: &Surface3,
+    curve: &Curve3,
+    mut params: Vec<f64>,
+    mut points: Vec<Point2>,
+) -> (Vec<f64>, Vec<Point2>) {
+    let (period_u, period_v) = (surface.period_u(), surface.period_v());
+    let step = |period: Option<f64>| period.map(|p| p * GUIDE_STEP_FRACTION);
+    let (step_u, step_v) = (step(period_u), step(period_v));
+    if step_u.is_none() && step_v.is_none() {
+        return (params, points);
+    }
+    let too_far = |a: &Point2, b: &Point2| {
+        step_u.is_some_and(|s| (b.x - a.x).abs() > s)
+            || step_v.is_some_and(|s| (b.y - a.y).abs() > s)
+    };
+
+    while points.len() < GUIDE_MAX_SAMPLES {
+        let mut split = false;
+        // Backwards, so an insertion never moves an interval still to visit.
+        for i in (1..points.len()).rev() {
+            if points.len() >= GUIDE_MAX_SAMPLES {
+                break;
+            }
+            if !too_far(&points[i - 1], &points[i]) {
+                continue;
+            }
+            let mid = 0.5 * (params[i - 1] + params[i]);
+            // A parameter interval too narrow to have a midpoint of its own
+            // cannot be split further, whatever it does in `(u, v)`.
+            if !(mid > params[i - 1] && mid < params[i]) {
+                continue;
+            }
+            let uv = guide_sample(surface, curve, mid, points[i - 1], (period_u, period_v));
+            params.insert(i, mid);
+            points.insert(i, uv);
+            split = true;
+        }
+        if !split {
+            break;
+        }
+        unwrap_in_place(&mut points, period_u, period_v);
+    }
+    (params, points)
+}
+
+/// Take every vertex after the first to the representative nearest its
+/// predecessor, leaving the first where it is (so a seam shift, which moves
+/// the whole guide together, survives).
+fn unwrap_in_place(points: &mut [Point2], period_u: Option<f64>, period_v: Option<f64>) {
+    for i in 1..points.len() {
+        let previous = points[i - 1];
+        points[i].x = nearest_representative(points[i].x, previous.x, period_u);
+        points[i].y = nearest_representative(points[i].y, previous.y, period_v);
+    }
+}
+
+/// One inversion of `surface` at `curve(t)`, taking the representative
+/// nearest `reference` and, at a parameterization singularity,
+/// `reference`'s own `u` — for the reason [`repair_singular_samples`] gives,
+/// and because at a singularity every `u` maps to the same point, so keeping
+/// the guide's costs the invariant nothing and keeps the pcurve continuous
+/// through it.
+///
+/// Used both to place a guide vertex and to evaluate the finished
+/// [`Curve2::Projected`], which is what makes the guide self-consistent:
+/// evaluating at a vertex's own parameter reproduces that vertex.
+fn guide_sample(
+    surface: &Surface3,
+    curve: &Curve3,
+    t: f64,
+    reference: Point2,
+    (period_u, period_v): (Option<f64>, Option<f64>),
+) -> Point2 {
+    let projection = surface.project_point_seeded(&curve.point(t), (reference.x, reference.y));
+    let v = nearest_representative(projection.v, reference.y, period_v);
+    let u = if surface.is_singular(projection.u, projection.v) {
+        reference.x
+    } else {
+        nearest_representative(projection.u, reference.x, period_u)
+    };
+    Point2::new(u, v)
 }
 
 /// Sample `curve` over `[t_start, t_end]` and invert each sample onto
@@ -972,6 +1327,254 @@ mod tests {
         // The samples land on the curve's own corners, so the piecewise-
         // linear fit reproduces it well inside the invariant tolerance.
         assert_invariant(&plane, &curve, &pcurve, (0.0, 3.0));
+    }
+
+    // --- Curve2::Projected --------------------------------------------
+
+    /// The `t = 0` end of a `Curve3::Circle` is fixed by [`plane_basis`], so
+    /// the frame the test wants has to be built explicitly. This is the
+    /// circle a plane at distance `1 - h` from the centre cuts on a unit
+    /// sphere whose pole axis is `tilt` radians off the cutting plane's
+    /// normal, i.e. the of-y8qc configuration.
+    fn tilted_sphere_cut(tilt: f64, h: f64) -> (Surface3, Curve3, f64) {
+        let axis = Vector3::new(tilt.cos(), 0.0, tilt.sin());
+        let sphere = Surface3::sphere(Point3::origin(), axis, 1.0).expect("valid");
+        let offset = 1.0 - h;
+        let radius = (1.0 - offset * offset).sqrt();
+        // The cut is the plane x = offset, whose normal is +x throughout.
+        let circle = Curve3::Ellipse {
+            center: Point3::new(offset, 0.0, 0.0),
+            axis: Vector3::x(),
+            major_dir: Vector3::y(),
+            major_radius: radius,
+            minor_radius: radius,
+        };
+        (sphere, circle, radius)
+    }
+
+    /// A latitude fits exactly as a line; tilt the same cut off the pole
+    /// axis and its image in `(u, v)` is transcendental, which is where
+    /// of-y8qc's 1.3e-3 came from. `Projected` is the answer, and it holds
+    /// the invariant to floating point rather than to a sample spacing.
+    #[test]
+    fn a_tilted_sphere_cut_is_inverted_exactly_instead_of_fitted() {
+        let (sphere, circle, _) = tilted_sphere_cut(0.0, 0.95);
+        let pole_aligned = fit_pcurve(&sphere, &circle, 0.0, TWO_PI, SeamSide::Low).expect("fits");
+        assert!(
+            matches!(pole_aligned, Curve2::Line { .. }),
+            "a latitude is still a line, got {pole_aligned:?}"
+        );
+
+        for tilt_deg in [1.0f64, 15.0, 45.0, 75.0, 90.0] {
+            let (sphere, circle, _) = tilted_sphere_cut(tilt_deg.to_radians(), 0.95);
+            let pcurve = fit_pcurve(&sphere, &circle, 0.0, TWO_PI, SeamSide::Low).expect("fits");
+            assert!(
+                matches!(pcurve, Curve2::Projected(_)),
+                "{tilt_deg}°: expected an inverted pcurve, got {pcurve:?}"
+            );
+            // Deliberately off the guide's vertices: 257 samples against a
+            // 33-sample guide, so almost none of these were ever projected
+            // while the pcurve was built. A fit would show its error here.
+            for i in 0..=256 {
+                let t = TWO_PI * (i as f64) / 256.0;
+                let uv = pcurve.point(t);
+                let gap = (sphere.point(uv.x, uv.y) - circle.point(t)).norm();
+                assert!(gap < 1e-14, "{tilt_deg}° at t = {t}: off by {gap:e}");
+            }
+        }
+    }
+
+    /// The derivative comes from the first fundamental form, not from the
+    /// guide's chords — so it is the true tangent even where the guide's
+    /// slope is badly wrong (the 90° cut swings nearly the whole `u` range
+    /// between two adjacent samples).
+    #[test]
+    fn an_inverted_pcurve_differentiates_by_the_metric() {
+        let (sphere, circle, _) = tilted_sphere_cut(std::f64::consts::FRAC_PI_2, 0.95);
+        let pcurve = fit_pcurve(&sphere, &circle, 0.0, TWO_PI, SeamSide::Low).expect("fits");
+        let eps = 1e-6;
+        for i in 0..=64 {
+            let t = 0.1 + (TWO_PI - 0.2) * (i as f64) / 64.0;
+            let central = (pcurve.point(t + eps) - pcurve.point(t - eps)) / (2.0 * eps);
+            let analytic = pcurve.derivative(t);
+            let scale = analytic.norm().max(1.0);
+            assert!(
+                (analytic - central).norm() < 1e-5 * scale,
+                "at t = {t}: analytic {analytic} vs central difference {central}"
+            );
+        }
+    }
+
+    /// A trim that crosses the seam has to keep climbing past `2π` rather
+    /// than snapping back, and the guide is what tells inversion — which
+    /// only ever returns the principal branch — which representative to
+    /// take.
+    #[test]
+    fn an_inverted_pcurve_stays_on_one_branch_across_the_seam() {
+        // Tilted so the pcurve is not a line or circle, and ranged so it
+        // sweeps a full turn starting away from t = 0.
+        let (sphere, circle, _) = tilted_sphere_cut(std::f64::consts::FRAC_PI_4, 0.95);
+        let (t0, t1) = (0.7, 0.7 + TWO_PI);
+        let pcurve = fit_pcurve(&sphere, &circle, t0, t1, SeamSide::Low).expect("fits");
+        assert!(matches!(pcurve, Curve2::Projected(_)));
+        assert_invariant(&sphere, &circle, &pcurve, (t0, t1));
+
+        // Continuous: no step anywhere near a whole period.
+        let mut previous = pcurve.point(t0);
+        for i in 1..=2048 {
+            let t = t0 + (t1 - t0) * (i as f64) / 2048.0;
+            let uv = pcurve.point(t);
+            assert!(
+                (uv - previous).norm() < 0.5,
+                "at t = {t}: jumped from {previous} to {uv}"
+            );
+            previous = uv;
+        }
+        // A closed trim comes back to where it started, one period along.
+        let (start, end) = (pcurve.point(t0), pcurve.point(t1));
+        assert!(
+            ((end.x - start.x).abs() - TWO_PI).abs() < 1e-9 && (end.y - start.y).abs() < 1e-9,
+            "start {start} and end {end} should differ by exactly one period in u"
+        );
+    }
+
+    /// Shifting rides on the offset, so the exact inverse is translated
+    /// afterwards rather than the guide being asked to carry it.
+    #[test]
+    fn shifting_an_inverted_pcurve_translates_it_exactly() {
+        let (sphere, circle, _) = tilted_sphere_cut(std::f64::consts::FRAC_PI_3, 0.95);
+        let pcurve = fit_pcurve(&sphere, &circle, 0.0, TWO_PI, SeamSide::Low).expect("fits");
+        let Curve2::Projected(p) = &pcurve else {
+            panic!("expected an inverted pcurve, got {pcurve:?}");
+        };
+        let shift = Vector2::new(TWO_PI, 0.25);
+        let moved = Curve2::Projected(Box::new(p.shifted(shift)));
+        for i in 0..=32 {
+            let t = TWO_PI * (i as f64) / 32.0;
+            assert_close(moved.point(t), pcurve.point(t) + shift);
+            assert_close(
+                Point2::from(moved.derivative(t)),
+                Point2::from(pcurve.derivative(t)),
+            );
+        }
+        assert_eq!(moved.domain(), pcurve.domain());
+    }
+
+    /// A plane section of a sphere never needs refining, however sharply it
+    /// swings: cut just past the centre, `u` covers half its range within a
+    /// couple of thousandths of `t`, and the two uniform samples straddling
+    /// that still land a quarter period apart, because the pile-up is
+    /// bounded by the geometry (the samples either side of the crossing sit
+    /// at `π ∓ atan(δ/a)` for the cut's offset `δ`, which cannot span more
+    /// than `π/2`). So the uniform samples are the answer here, and the test
+    /// says so rather than leaving it to chance.
+    #[test]
+    fn uniform_samples_already_name_the_branch_for_a_sphere_cut() {
+        let (sphere, circle, _) = tilted_sphere_cut(std::f64::consts::FRAC_PI_2, 1.001);
+        let pcurve = fit_pcurve(&sphere, &circle, 0.0, TWO_PI, SeamSide::Low).expect("fits");
+        let Curve2::Projected(p) = &pcurve else {
+            panic!("expected an inverted pcurve, got {pcurve:?}");
+        };
+        assert_eq!(p.guide_params().len(), FIT_SAMPLES);
+        assert_invariant(&sphere, &circle, &pcurve, (0.0, TWO_PI));
+    }
+
+    /// Started from a guide too coarse to name anything — three vertices
+    /// over a full turn, the middle one deliberately a whole period off the
+    /// branch its neighbours are on — refinement does both of its jobs: it
+    /// subdivides until every interval is inside the step, and it re-unwraps
+    /// as it goes, so the planted vertex is pulled back onto the right
+    /// branch instead of dragging a period-wide discontinuity through the
+    /// finished pcurve.
+    #[test]
+    fn refining_the_guide_subdivides_and_repairs_the_branch() {
+        let (sphere, circle, _) = tilted_sphere_cut(std::f64::consts::FRAC_PI_2, 1.001);
+        let coarse = vec![0.0, std::f64::consts::PI, TWO_PI];
+        let mut points: Vec<Point2> = coarse
+            .iter()
+            .map(|&t| {
+                let p = sphere.project_point(&circle.point(t));
+                Point2::new(p.u, p.v)
+            })
+            .collect();
+        // Continuous to start with, apart from the planted mistake.
+        unwrap_in_place(&mut points, sphere.period_u(), sphere.period_v());
+        points[1].x += TWO_PI;
+
+        let (params, points) = refine_branch_guide(&sphere, &circle, coarse, points);
+        assert!(
+            params.len() > 3,
+            "a three-vertex guide over a full turn must be subdivided"
+        );
+        for w in points.windows(2) {
+            assert!(
+                (w[1].x - w[0].x).abs() <= TWO_PI * GUIDE_STEP_FRACTION + TOL,
+                "guide step {} exceeds a quarter period",
+                (w[1].x - w[0].x).abs()
+            );
+        }
+
+        // The guide is only a guide, so the proof it is good enough is that
+        // the pcurve built on it is exact and continuous.
+        let pcurve = Curve2::projected(&sphere, &circle, params, points).expect("valid");
+        assert_invariant(&sphere, &circle, &pcurve, (0.0, TWO_PI));
+
+        // This cut's `u` genuinely moves fast — most of a radian within a
+        // few thousandths of `t` — so continuity is stated as "no step of
+        // half a period", which only a branch mistake can produce, and
+        // pinned down at the ends: this trim runs out along the branch cut
+        // and back rather than winding, so it must close on the `u` it
+        // started from, and a stray branch would leave it a period away.
+        let mut previous = pcurve.point(0.0);
+        for i in 1..=1024 {
+            let t = TWO_PI * (i as f64) / 1024.0;
+            let uv = pcurve.point(t);
+            assert!(
+                (uv - previous).norm() < std::f64::consts::PI,
+                "at t = {t}: jumped from {previous} to {uv}"
+            );
+            previous = uv;
+        }
+        assert_close(previous, pcurve.point(0.0));
+    }
+
+    /// A NURBS surface has no closed-form inverse, so the polyline fallback
+    /// stays exactly where it was — inverting it per evaluation would trade
+    /// a bounded error for an unbounded cost (of-50u).
+    #[test]
+    fn a_freeform_surface_keeps_the_polyline_fallback() {
+        use crate::nurbs::{KnotVector, NurbsSurface};
+
+        // A biquadratic patch with a bulge, so nothing about it is a plane.
+        let control = vec![
+            vec![
+                Point3::new(0.0, 0.0, 0.0),
+                Point3::new(0.0, 2.0, 1.0),
+                Point3::new(0.0, 4.0, 0.0),
+            ],
+            vec![
+                Point3::new(2.0, 0.0, 1.0),
+                Point3::new(2.0, 2.0, 3.0),
+                Point3::new(2.0, 4.0, 1.0),
+            ],
+            vec![
+                Point3::new(4.0, 0.0, 0.0),
+                Point3::new(4.0, 2.0, 1.0),
+                Point3::new(4.0, 4.0, 0.0),
+            ],
+        ];
+        let knots = KnotVector::new(2, vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0]).expect("valid knots");
+        let patch = NurbsSurface::bspline(control, knots.clone(), knots).expect("valid patch");
+        let surface = Surface3::Nurbs(Box::new(patch));
+        // A straight line in model space is not a straight line in this
+        // patch's parameters.
+        let curve =
+            Curve3::line(Point3::new(0.2, 0.3, 6.0), Vector3::new(1.0, 0.9, 0.0)).expect("valid");
+        let pcurve = fit_pcurve(&surface, &curve, 0.0, 3.0, SeamSide::Low).expect("fits");
+        assert!(
+            matches!(pcurve, Curve2::Polyline { .. }),
+            "expected the polyline fallback, got {pcurve:?}"
+        );
     }
 
     #[test]

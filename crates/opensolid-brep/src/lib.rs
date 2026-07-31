@@ -52,7 +52,7 @@ pub use curve::{Curve3, CurveEval};
 pub use euler::{EulerCounts, EulerError};
 pub use geometry::GeometryStore;
 pub use nurbs::{KnotVector, NurbsCurve, NurbsError, NurbsSurface};
-pub use pcurve::{Curve2, Curve2Eval, SeamSide, attach_body_pcurves, fit_pcurve};
+pub use pcurve::{Curve2, Curve2Eval, ProjectedCurve2, SeamSide, attach_body_pcurves, fit_pcurve};
 pub use project::{CurveProject, CurveProjection, SurfaceProject, SurfaceProjection};
 pub use ssi::{
     IntersectionCurve, IntersectionKind, MarchedCurve, SurfaceIntersection, intersect,

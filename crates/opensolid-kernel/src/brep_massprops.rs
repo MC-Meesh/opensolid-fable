@@ -53,10 +53,18 @@
 //! From [`Fin::pcurve`](opensolid_brep::topology::Fin::pcurve) when the body
 //! carries trim geometry (STEP imports do), and otherwise from
 //! [`fit_pcurve`], which projects the fin's 3D edge curve onto the face's
-//! surface. The fit is *exact* — a `Line` or a `Circle` in `(u, v)`, not a
-//! sampled approximation — for every analytic pairing the primitive, sweep
-//! and boolean constructors produce; a freeform trim falls back to a polyline
-//! whose error is bounded by the sample spacing (see [`opensolid_brep::pcurve`]).
+//! surface. That trim geometry is *exact*, not a sampled approximation, for
+//! every pairing on an analytic surface: a `Line` or a `Circle` in `(u, v)`
+//! where one fits, and otherwise a `Projected` curve that inverts the
+//! surface at each of the 3D curve's points. Only a freeform surface falls
+//! back to a polyline, whose error is bounded by the sample spacing (see
+//! [`opensolid_brep::pcurve`]).
+//!
+//! Which of those a trim gets is not cosmetic, and this module is where it
+//! shows: a spherical cap trimmed off the pole axis used to be measured
+//! 1.3e-3 wrong — twelve orders worse than the *congruent* cap trimmed on
+//! it — purely because one image fit a `Line` and the other did not
+//! (of-y8qc).
 //!
 //! Projection alone cannot place a **seam** fin, because both branches (`u`
 //! and `u ± 2π`) project to the same point. This module resolves seams
@@ -181,6 +189,12 @@ const NURBS_PANELS_PER_SPAN: usize = 2;
 
 /// Runaway guard on panels per integration interval.
 const MAX_PANELS: usize = 256;
+
+/// Bisection depth cap for the contour panel refinement. Adaptive bisection
+/// only descends where the curve is moving, so a single sharp feature costs
+/// about two panels per level rather than `2^depth` — twenty levels resolve
+/// a feature a millionth of the interval wide inside [`MAX_PANELS`].
+const MAX_PANEL_DEPTH: usize = 20;
 
 /// Samples used to measure how far a trim curve travels in `(u, v)` across a
 /// candidate panel.
@@ -347,6 +361,16 @@ fn u_integral(surface: &Surface3, u0: f64, u: f64, v: f64) -> Moments {
 /// covers in `(u, v)` is within the surface's panel widths — the smoothness
 /// that matters is the *surface's*, and a trim curve's parameter says nothing
 /// about how far it drags the integrand.
+///
+/// The refinement bisects rather than dividing a piece into equal parts,
+/// because a trim curve can put all of its motion in a corner of its
+/// parameter range and equal parts would spend their resolution where
+/// nothing happens. A sphere cut by a plane a distance `δ` from its centre
+/// does exactly that: `u` covers half its range within `δ` of the crossing,
+/// at a rate of `1/δ`, so a lens between two spheres 1e-3 apart needs its
+/// panels a thousand times finer *there* and nowhere else. Equal parts had
+/// that lens 5.6e-8 out; bisection puts it back at floating point, for
+/// about forty panels.
 fn t_panels(surface: &Surface3, pcurve: &Curve2, t0: f64, t1: f64) -> Vec<(f64, f64)> {
     let mut coarse = vec![t0];
     match pcurve {
@@ -364,6 +388,18 @@ fn t_panels(surface: &Surface3, pcurve: &Curve2, t0: f64, t1: f64) -> Vec<(f64, 
             }
         }
         Curve2::Line { .. } => {}
+        // The guide's vertices are where its samples were placed, which is
+        // the only structural hint an exactly-inverted curve carries. It is
+        // a hint and not a kink list — the curve is smooth through them —
+        // but the excursion refinement below is what actually sizes the
+        // panels, and starting it from the sample breaks costs nothing.
+        Curve2::Projected(p) => {
+            for &t in p.guide_params() {
+                if t > t0 && t < t1 {
+                    coarse.push(t);
+                }
+            }
+        }
     }
     coarse.push(t1);
 
@@ -374,23 +410,49 @@ fn t_panels(surface: &Surface3, pcurve: &Curve2, t0: f64, t1: f64) -> Vec<(f64, 
         if !exceeds(b, a) {
             continue;
         }
-        let (mut du, mut dv) = (0.0, 0.0);
-        let mut prev = pcurve.point(a);
-        for i in 1..=EXCURSION_SAMPLES {
-            let p = pcurve.point(a + (b - a) * (i as f64) / (EXCURSION_SAMPLES as f64));
-            du += (p.x - prev.x).abs();
-            dv += (p.y - prev.y).abs();
-            prev = p;
-        }
-        let n = subdivisions(du, us).max(subdivisions(dv, vs));
-        for i in 0..n {
-            out.push((
-                a + (b - a) * (i as f64) / (n as f64),
-                a + (b - a) * ((i + 1) as f64) / (n as f64),
-            ));
+        let mut pending = vec![(a, b, 0usize)];
+        let mut emitted = 0usize;
+        while let Some((a, b, depth)) = pending.pop() {
+            let mid = 0.5 * (a + b);
+            // A half that is not strictly inside its parent has run out of
+            // parameter to split, whatever it does in `(u, v)`.
+            let splittable = depth < MAX_PANEL_DEPTH
+                && emitted + pending.len() + 1 < MAX_PANELS
+                && exceeds(mid, a)
+                && exceeds(b, mid);
+            if splittable {
+                let (du, dv) = excursion(pcurve, a, b);
+                if exceeds(du, us) || exceeds(dv, vs) {
+                    // Right before left, so popping walks the interval
+                    // forwards and `out` comes back ordered — including
+                    // where the budget runs out and the rest is emitted
+                    // unsplit.
+                    pending.push((mid, b, depth + 1));
+                    pending.push((a, mid, depth + 1));
+                    continue;
+                }
+            }
+            out.push((a, b));
+            emitted += 1;
         }
     }
     out
+}
+
+/// How far `pcurve` travels in each parameter direction across `[a, b]`,
+/// measured as the total variation over [`EXCURSION_SAMPLES`] steps rather
+/// than as the distance between the ends — a panel the curve leaves and
+/// returns along has moved, whatever its endpoints say.
+fn excursion(pcurve: &Curve2, a: f64, b: f64) -> (f64, f64) {
+    let (mut du, mut dv) = (0.0, 0.0);
+    let mut prev = pcurve.point(a);
+    for i in 1..=EXCURSION_SAMPLES {
+        let p = pcurve.point(a + (b - a) * (i as f64) / (EXCURSION_SAMPLES as f64));
+        du += (p.x - prev.x).abs();
+        dv += (p.y - prev.y).abs();
+        prev = p;
+    }
+    (du, dv)
 }
 
 /// `∮ G dv` along `pcurve` over `[t0, t1]`, accumulated into `acc` with
@@ -445,6 +507,11 @@ fn shifted(curve: &Curve2, shift: Vector2) -> Curve2 {
             params: params.clone(),
             points: points.iter().map(|p| p + shift).collect(),
         },
+        // The shift rides on the projected curve's own offset, so the branch
+        // guide keeps naming the branch inversion lands on and the exact
+        // value is translated afterwards — which is the whole point of
+        // keeping the two apart.
+        Curve2::Projected(p) => Curve2::Projected(Box::new(p.shifted(shift))),
     }
 }
 

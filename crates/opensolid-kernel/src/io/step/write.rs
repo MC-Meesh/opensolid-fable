@@ -1027,6 +1027,14 @@ impl<'a> Emitter<'a> {
                         .join(",")
                 )))
             }
+            // Part 42 has no curve that means "invert this surface at that
+            // curve", so the exact form cannot cross the file boundary; the
+            // branch guide is the same polyline the fit would have produced
+            // without it, which is what this writer emitted before of-y8qc.
+            // The reader recovers the exact form anyway, because
+            // `attach_body_pcurves` re-derives every pcurve from the 3D
+            // geometry rather than reading the authored 2D curve.
+            Curve2::Projected(p) => self.emit_curve_2d(&p.guide()),
         }
     }
 

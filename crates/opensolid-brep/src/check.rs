@@ -1584,8 +1584,12 @@ fn pcurve_deviation(
 
 /// Parameters at which a pcurve is held to the invariant.
 ///
-/// [`Curve2::Line`] and [`Curve2::Circle`] are exact fits, so they are
-/// sampled evenly across the edge's range. A [`Curve2::Polyline`] only
+/// [`Curve2::Line`] and [`Curve2::Circle`] are exact fits and
+/// [`Curve2::Projected`] is an exact inverse, so all three are sampled
+/// evenly across the edge's range — for `Projected` that is not a courtesy
+/// but the strongest check available, since it is the only variant that
+/// claims the invariant at parameters nobody sampled while building it. A
+/// [`Curve2::Polyline`] only
 /// claims to lie on the surface *at its own vertices*: between them it is a
 /// chord, and the error there is bounded by the sample spacing — the
 /// documented, deliberate approximation of freeform trim (see

@@ -30,17 +30,27 @@
 //!
 //! Sections (1)-(15) are entirely live. Section (16) is not, and that is
 //! the protocol working rather than failing: it is the of-ipt.19 numerical
-//! robustness campaign, and five of its cases are `#[ignore]`d against three
+//! robustness campaign, and two of its cases are `#[ignore]`d against two
 //! defects it found and filed — of-ukcq (mesh `mass_properties` integrates
-//! tetrahedra from the absolute origin, 191× wrong at offset 1e6), of-6viu
-//! (`unite` rejects a coincident-face imprint that forms an island, i.e. a
-//! boss centred on a face), and of-y8qc (`brep_mass_properties` on a trimmed
-//! sphere degrades with the angle between the trim and the pole axis,
-//! reaching 1.3e-3 at 90°). A fourth, of-oygs (`ray_classify` refusing
-//! slender operands past ~1e3 length/radius for cylinders), is fixed and its
-//! two cases are live again. Each
-//! `#[ignore]`d case has a live sibling that fences the working range, so a
-//! fix has a boundary to move rather than a single case to flip.
+//! tetrahedra from the absolute origin, 191× wrong at offset 1e6) and
+//! of-6viu (`unite` rejects a coincident-face imprint that forms an island,
+//! i.e. a boss centred on a face). Each `#[ignore]`d case has a live sibling
+//! that fences the working range, so a fix has a boundary to move rather
+//! than a single case to flip.
+//!
+//! A third defect it filed, of-oygs (`ray_classify` gives up on operands
+//! past ~1e3 length/radius for cylinders, ~1e7 for blocks), is fixed and
+//! its two cases are live again.
+//!
+//! The fourth defect it filed, of-y8qc, is retired: `brep_mass_properties`
+//! on a trimmed sphere degraded with the angle between the trim and the pole
+//! axis, reaching 1.3e-3 at 90°, because the trim's parameter-space image
+//! fits a `Curve2::Line` at 0° and nothing at all off it. `Curve2::Projected`
+//! inverts the surface instead of fitting it, and adaptive contour panelling
+//! resolves what that exposed underneath. Its three `#[ignore]`d cases
+//! (`near_concentric_spheres_*`) went live unchanged, and
+//! `a_spherical_cap_measures_the_same_at_every_trim_angle` now walks the
+//! whole sweep the bug was filed on.
 //!
 //! Section (18) is the randomized *curved-operand* campaign (of-ipt.18).
 //! Sections (6)-(9) enumerate configurations and hand-derive a closed form
@@ -6270,6 +6280,62 @@ fn near_parallel_wedge_1e_4_rad() {
     near_parallel_wedge(1e-4);
 }
 
+/// The same spherical cap, measured at ten angles between its trim and the
+/// sphere's own pole axis — the sweep of-y8qc was filed on.
+///
+/// Every case here is the *congruent solid*: a unit sphere cut by a plane
+/// 0.05 from its centre, giving a cap of height 0.95. Only the sphere's
+/// parameterization turns underneath it, which no measurement is entitled to
+/// notice. It used to notice a great deal: 5.7e-16 at 0°, where the trim
+/// follows a latitude and fits exactly, degrading smoothly to 1.3e-3 at 90°,
+/// where the trim crosses every latitude and fell back to a 33-vertex
+/// polyline. Twelve orders of magnitude, for a rotation.
+///
+/// This is the test that keeps the exact path honest about *which* trims it
+/// is exact on. `EXACT_RTOL` is the same 1e-9 the pole-aligned cases in
+/// section (15) are held to, and it is asserted at every angle — an
+/// implementation that recovers the axis-aligned cases and fits the rest
+/// fails here rather than passing on a technicality.
+#[test]
+fn a_spherical_cap_measures_the_same_at_every_trim_angle() {
+    let (h, r) = (0.95, 1.0);
+    let exact = spherical_cap_volume(r, h);
+    let area = 2.0 * PI * r * h + PI * (r * r - (r - h) * (r - h));
+
+    for tilt_deg in [0.0f64, 1.0, 5.0, 15.0, 30.0, 45.0, 60.0, 75.0, 89.0, 90.0] {
+        let context = format!("cap trimmed {tilt_deg}° off the pole axis");
+        let tilt = tilt_deg.to_radians();
+        let mut scene = Scene::new();
+        // Pole axis tilted off +X, which is the cutting plane's normal
+        // throughout, so `tilt` is exactly the angle under test.
+        let ball = scene.sphere_with_axis(
+            Point3::origin(),
+            Vector3::new(tilt.cos(), 0.0, tilt.sin()),
+            r,
+        );
+        // A 6-cube whose −X face sits at x = r − h, so the intersection is
+        // the cap of height h and nothing else.
+        let half_space = scene.block([r - h, -3.0, -3.0], [r - h + 6.0, 3.0, 3.0]);
+
+        let cap = scene
+            .intersect(ball, half_space)
+            .unwrap_or_else(|e| panic!("{context}: intersect failed: {e:?}"));
+        let (_, measured) = measured(&cap, &context);
+        assert_close(
+            measured.volume,
+            exact,
+            EXACT_RTOL,
+            &format!("{context}: cap volume (B-Rep path)"),
+        );
+        assert_close(
+            measured.surface_area,
+            area,
+            EXACT_RTOL,
+            &format!("{context}: cap area (B-Rep path)"),
+        );
+    }
+}
+
 /// Two unit spheres whose centers are `d` apart, with `d` small: the curved
 /// counterpart of the wedge. At their intersection circle the two normals
 /// point at each center, so they differ by an angle of about `d` — the
@@ -6321,31 +6387,29 @@ fn near_concentric_spheres(d: f64) {
     );
 }
 
-/// All three separations miss the closed form by 1.3e-3, 1.5e-3 and 1.6e-3
-/// — and the cause is not the near-parallelism this family was aiming at.
-/// The lens's trim circle lies perpendicular to the line of centers, i.e.
-/// 90° off the spheres' pole axis, and of-y8qc is a *systematic*
-/// measurement error on trimmed spheres that grows smoothly with exactly
-/// that angle: 5.7e-16 at 0°, 5.1e-5 at 45°, 1.3e-3 at 90°, on a plain
-/// sphere-minus-half-space with no near-parallelism anywhere in it.
+/// All three separations used to miss the closed form by 1.3e-3, 1.5e-3 and
+/// 1.6e-3 — and the cause was not the near-parallelism this family was
+/// aiming at. The lens's trim circle lies perpendicular to the line of
+/// centers, i.e. 90° off the spheres' pole axis, and of-y8qc was a
+/// *systematic* measurement error on trimmed spheres that grew smoothly with
+/// exactly that angle: 5.7e-16 at 0°, 5.1e-5 at 45°, 1.3e-3 at 90°, on a
+/// plain sphere-minus-half-space with no near-parallelism anywhere in it.
 ///
-/// So these stay written as they are. Softening them to a 1e-2 budget would
-/// make them pass while measuring nothing, and re-aiming the trim at the
-/// poles would dodge the defect instead of pinning it.
+/// They were left written as they are rather than softened to a 1e-2 budget
+/// (which would have made them pass while measuring nothing) or re-aimed at
+/// the poles (which would have dodged the defect instead of pinning it), and
+/// they went live unchanged when `Curve2::Projected` retired it.
 #[test]
-#[ignore = "of-y8qc: trimmed-sphere measurement degrades as the trim tilts off the pole axis"]
 fn near_concentric_spheres_1e_1_apart() {
     near_concentric_spheres(1e-1);
 }
 
 #[test]
-#[ignore = "of-y8qc: trimmed-sphere measurement degrades as the trim tilts off the pole axis"]
 fn near_concentric_spheres_1e_2_apart() {
     near_concentric_spheres(1e-2);
 }
 
 #[test]
-#[ignore = "of-y8qc: trimmed-sphere measurement degrades as the trim tilts off the pole axis"]
 fn near_concentric_spheres_1e_3_apart() {
     near_concentric_spheres(1e-3);
 }
