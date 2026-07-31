@@ -1532,11 +1532,16 @@ impl Deviation {
 /// with the seeded variant. A seed picks a *branch*, and the question here
 /// is not which branch the curve is nearest — it is how far the curve is
 /// from the surface at all, which is the global minimum. Seeding from the
-/// previous sample is faster and correct for walking a known curve, but on a
-/// surface that closes on itself (a rational-quadratic full circle extruded
-/// into a ruled patch, all over the STEP corpus) the seeded iteration can
-/// settle on a stationary point that is not the nearest one and report a
-/// curve lying exactly on its surface as a whole diameter off it.
+/// previous sample is faster and right for walking a known curve, but it
+/// carries whatever branch the walk is on, and a checker that inherited the
+/// answer it is supposed to be auditing would not be measuring anything.
+///
+/// Until of-fid the gap was wider than a matter of principle: on a surface
+/// that closes on itself (a rational-quadratic full circle extruded into a
+/// ruled patch, all over the STEP corpus) the domain clamp pinned a seeded
+/// walk at the end of the knot domain and reported a curve lying exactly on
+/// its surface as a whole diameter off it. Projection wraps such a join now,
+/// so the two agree there — but blind is still what this asks for.
 ///
 /// Samples whose projection did not converge are skipped: a projection
 /// returns a point that genuinely is on the surface, so its distance is an

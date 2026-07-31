@@ -11,10 +11,14 @@
 //!   non-empty knot span (`degree + 2` samples per span) and Newton starts
 //!   from the best sample.
 //!
-//! Parameters are restricted to the domain each step: wrapped by the period
-//! for periodic directions, clamped at the ends otherwise, so projections
-//! onto bounded (e.g. clamped NURBS) geometry converge to the boundary when
-//! the unconstrained optimum lies outside.
+//! Parameters are restricted to the domain each step: wrapped where the two
+//! ends of a direction name the same surface point, clamped otherwise, so
+//! projections onto bounded geometry converge to the boundary when the
+//! unconstrained optimum lies outside. A direction wraps when the
+//! parameterization is periodic *or* when a clamped patch closes on itself
+//! ([`NurbsSurface::closure_u`]) — the second is not periodicity, but a step
+//! off one end still belongs at the other, and clamping there pins a query
+//! at a domain edge with its answer on the far side (of-fid).
 //!
 //! Results carry a `converged` flag instead of an error: the best parameter
 //! found is always returned, and `converged: false` marks the rare cases
@@ -189,6 +193,23 @@ struct SurfaceJet {
 /// Surfaces that expose second partial derivatives for Newton projection.
 trait NewtonSurface: SurfaceEval {
     fn jet(&self, u: f64, v: f64) -> SurfaceJet;
+
+    /// Period the iteration may wrap `u` by instead of clamping it, or
+    /// `None` when the domain has real ends.
+    ///
+    /// This is [`Surface3::wrap_period_u`]'s question, restated for the
+    /// solver: whether stepping off one end of the domain lands back on the
+    /// other *surface point*. A periodic parameterization qualifies, and so
+    /// does a clamped patch that closes on itself, which is why this is not
+    /// simply `is_periodic_u`.
+    fn wrap_u(&self) -> Option<f64> {
+        self.is_periodic_u().then(|| self.period_u()).flatten()
+    }
+
+    /// Period the iteration may wrap `v` by; see [`Self::wrap_u`].
+    fn wrap_v(&self) -> Option<f64> {
+        self.is_periodic_v().then(|| self.period_v()).flatten()
+    }
 }
 
 /// Newton iteration for `argmin_{u,v} |S(u,v) - P|²` from `(seed_u, seed_v)`.
@@ -208,20 +229,12 @@ fn newton_surface<S: NewtonSurface>(
     let bounds_u = ParamBounds {
         lo: u_lo,
         hi: u_hi,
-        period: if surface.is_periodic_u() {
-            surface.period_u()
-        } else {
-            None
-        },
+        period: surface.wrap_u(),
     };
     let bounds_v = ParamBounds {
         lo: v_lo,
         hi: v_hi,
-        period: if surface.is_periodic_v() {
-            surface.period_v()
-        } else {
-            None
-        },
+        period: surface.wrap_v(),
     };
     let mut u = bounds_u.restrict(seed_u);
     let mut v = bounds_v.restrict(seed_v);
@@ -447,6 +460,14 @@ impl NewtonSurface for Surface3 {
             svv,
         }
     }
+
+    fn wrap_u(&self) -> Option<f64> {
+        self.wrap_period_u()
+    }
+
+    fn wrap_v(&self) -> Option<f64> {
+        self.wrap_period_v()
+    }
 }
 
 impl SurfaceProject for Surface3 {
@@ -541,6 +562,16 @@ impl NewtonSurface for NurbsSurface {
             suv: ders[1][1],
             svv: ders[0][2],
         }
+    }
+
+    // A clamped patch is never periodic, but it can still close on itself,
+    // and then a step off one end of the knot domain belongs at the other.
+    fn wrap_u(&self) -> Option<f64> {
+        self.closure_u()
+    }
+
+    fn wrap_v(&self) -> Option<f64> {
+        self.closure_v()
     }
 }
 
@@ -1252,6 +1283,53 @@ mod tests {
                 proj.distance
             );
         }
+    }
+
+    /// A seed at one end of a closed patch's `u` domain must not pin the
+    /// iteration there when the answer sits just inside the other end
+    /// (of-fid). The two ends are the same surface point, so a step off one
+    /// belongs at the other; clamping instead leaves the query stuck a
+    /// diameter from its own surface.
+    #[test]
+    fn closed_patch_wraps_a_seed_off_the_domain_end() {
+        let patch = nurbs_cylinder_patch();
+        let (u_lo, u_hi) = patch.domain_u();
+        // A point exactly on the patch, a hair *below* the high end — the
+        // near side of the join from a seed at the low end.
+        let target = (u_lo, u_hi - 0.02 * (u_hi - u_lo));
+        let p = patch.point(target.1, 0.5);
+
+        let seeded = patch.project_point_seeded(&p, (target.0, 0.5));
+        check_surface_projection(&patch, &p, &seeded);
+        assert!(
+            seeded.distance < 1e-9,
+            "seed at u={} pinned {} from its own surface (converged to u={})",
+            target.0,
+            seeded.distance,
+            seeded.u
+        );
+        // Blind projection has to reach it too: the per-span seeding can
+        // land on the far side of the join just as easily.
+        let blind = patch.project_point(&p);
+        assert!(
+            blind.distance < 1e-9,
+            "blind projection off by {}",
+            blind.distance
+        );
+    }
+
+    /// The wrap is not a licence to leave an *open* direction: `v` runs
+    /// along the cylinder's axis and its ends are two different circles, so
+    /// a query past the end still clamps.
+    #[test]
+    fn closed_patch_still_clamps_its_open_direction() {
+        let patch = nurbs_cylinder_patch();
+        assert_eq!(patch.wrap_v(), None);
+        let p = Point3::new(1.0, 0.0, 5.0);
+        let proj = patch.project_point(&p);
+        assert!(proj.converged);
+        assert_near(proj.v, 1.0, "v pinned at the top of the patch");
+        assert_near(proj.distance, 3.0, "distance to the top rim");
     }
 
     #[test]

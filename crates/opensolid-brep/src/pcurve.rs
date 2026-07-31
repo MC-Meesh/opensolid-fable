@@ -552,13 +552,15 @@ pub enum SeamSide {
 ///
 /// The curve is sampled, each sample inverted onto the surface by
 /// closest-point projection, and the resulting parameter-space samples
-/// unwrapped across periodic branch cuts (each sample takes the
-/// representative nearest its predecessor, so a curve that crosses the seam
-/// runs continuously past it rather than jumping a full period). The samples
-/// are then fitted, in order of preference, as a [`Curve2::Line`] or a
-/// [`Curve2::Circle`]; failing that they become the branch guide of a
-/// [`Curve2::Projected`], or — where the pairing has no closed-form inverse
-/// — a [`Curve2::Polyline`] through the samples themselves.
+/// unwrapped across branch cuts (each sample takes the representative
+/// nearest its predecessor, so a curve that crosses the seam runs
+/// continuously past it rather than jumping a full period). A cut is either
+/// a periodic direction's or the join of a clamped patch that closes on
+/// itself — see [`Surface3::wrap_period_u`]. The samples are then fitted, in
+/// order of preference, as a [`Curve2::Line`] or a [`Curve2::Circle`];
+/// failing that they become the branch guide of a [`Curve2::Projected`], or
+/// — where the pairing has no closed-form inverse — a [`Curve2::Polyline`]
+/// through the samples themselves.
 ///
 /// The first two cover essentially every *axis-aligned* analytic pairing —
 /// a line or circle on a plane, a cylinder's generators and cross-sections,
@@ -737,7 +739,8 @@ fn guide_sample(
 }
 
 /// Sample `curve` over `[t_start, t_end]` and invert each sample onto
-/// `surface`, unwrapping periodic directions so the result is continuous.
+/// `surface`, unwrapping the wrapping directions so the result is continuous
+/// and then putting a clamped patch's samples back on its knot rectangle.
 fn sample_parameter_space(
     surface: &Surface3,
     curve: &Curve3,
@@ -745,7 +748,10 @@ fn sample_parameter_space(
     t_end: f64,
     seam: SeamSide,
 ) -> (Vec<f64>, Vec<Point2>) {
-    let (period_u, period_v) = (surface.period_u(), surface.period_v());
+    // Both branch cuts a walk may cross: a periodic parameterization's, and
+    // the join of a clamped patch that closes on itself. The second is why
+    // this is not `period_u`/`period_v` — see [`Surface3::wrap_period_u`].
+    let (period_u, period_v) = (surface.wrap_period_u(), surface.wrap_period_v());
     let mut params = Vec::with_capacity(FIT_SAMPLES);
     let mut points: Vec<Point2> = Vec::with_capacity(FIT_SAMPLES);
     let mut seed: Option<(f64, f64)> = None;
@@ -769,10 +775,73 @@ fn sample_parameter_space(
         points.push(uv);
     }
     repair_singular_samples(surface, &mut points);
+    recenter_on_knot_rectangle(surface, &mut points, period_u, period_v);
     if seam == SeamSide::High {
         shift_to_high_branch(&mut points, period_u, period_v);
     }
     (params, points)
+}
+
+/// Shift the unwrapped samples of a closed **NURBS** patch by whole periods
+/// until they sit on its knot rectangle.
+///
+/// Unwrapping keeps a walk continuous across a branch cut, at the price of
+/// letting it leave the domain: a boundary curve that starts *on* the join
+/// of a closed patch is projected to whichever of the two equal ends the
+/// search happened to return, and if that is the low one the rest of the
+/// walk trails off below it, down to a full period out.
+///
+/// For a periodic parameterization that costs nothing, because evaluation is
+/// periodic too — a cylinder's `u = 7` is its `u = 7 − 2π` and both are the
+/// same point. A clamped patch has no such luxury: outside its knot
+/// rectangle it does not extrapolate but *clamps*, so a `u` a period low
+/// evaluates to the domain edge and the pcurve reads as a curve that folds
+/// onto the seam. Hence the shift, and hence it applies only where
+/// evaluation is bounded.
+///
+/// A run already on the rectangle is left exactly where it is — including
+/// one lying *on* either end of the cut, which is what a seam edge is and
+/// which [`shift_to_high_branch`] is then free to move deliberately. Only a
+/// run that has left the rectangle is moved, and it is recentred rather than
+/// dragged in by its nearest sample, so a run that genuinely straddles the
+/// join — which a face boundary should not do without a seam edge, but which
+/// nothing here can rule out — ends up minimally outside on both sides
+/// instead of wholly outside on one.
+fn recenter_on_knot_rectangle(
+    surface: &Surface3,
+    points: &mut [Point2],
+    period_u: Option<f64>,
+    period_v: Option<f64>,
+) {
+    if !matches!(surface, Surface3::Nurbs(_)) {
+        return;
+    }
+    let axes = [
+        (period_u, surface.domain_u(), true),
+        (period_v, surface.domain_v(), false),
+    ];
+    for (period, (lo, hi), is_u) in axes {
+        let Some(period) = period else { continue };
+        let component = |p: &Point2| if is_u { p.x } else { p.y };
+        let (min, max) = points
+            .iter()
+            .map(component)
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(min, max), c| {
+                (min.min(c), max.max(c))
+            });
+        // NaN-safe: a non-finite sample leaves the fold's sentinels in place
+        // and there is nothing meaningful to shift by.
+        if !(min >= lo && max <= hi) && min.is_finite() && max.is_finite() {
+            let shift = period * ((0.5 * (lo + hi) - 0.5 * (min + max)) / period).round();
+            for p in points.iter_mut() {
+                if is_u {
+                    p.x += shift;
+                } else {
+                    p.y += shift;
+                }
+            }
+        }
+    }
 }
 
 /// Replace the `u` of samples that land on a parameterization singularity
@@ -1300,6 +1369,124 @@ mod tests {
             other => panic!("expected a line, got {other:?}"),
         }
         assert_invariant(&sphere, &curve, &pcurve, (t0, t1));
+    }
+
+    /// Exact NURBS cylinder of radius 1 about the z-axis, `v ∈ [0, 1]`
+    /// mapping to `z ∈ [0, 2]`, with the control ring wound **clockwise** so
+    /// that a counterclockwise edge curve runs in *decreasing* `u`. Closed
+    /// in `u`: first and last control row coincide.
+    fn clockwise_nurbs_cylinder() -> Surface3 {
+        let ring: Vec<(f64, f64)> = [
+            (1.0, 0.0),
+            (1.0, -1.0),
+            (0.0, -1.0),
+            (-1.0, -1.0),
+            (-1.0, 0.0),
+            (-1.0, 1.0),
+            (0.0, 1.0),
+            (1.0, 1.0),
+            (1.0, 0.0),
+        ]
+        .to_vec();
+        let control_points: Vec<Vec<Point3>> = ring
+            .iter()
+            .map(|&(x, y)| vec![Point3::new(x, y, 0.0), Point3::new(x, y, 2.0)])
+            .collect();
+        let s = std::f64::consts::FRAC_1_SQRT_2;
+        let weights: Vec<Vec<f64>> = [1.0, s, 1.0, s, 1.0, s, 1.0, s, 1.0]
+            .iter()
+            .map(|&w| vec![w, w])
+            .collect();
+        let knots_u = crate::nurbs::KnotVector::new(
+            2,
+            vec![
+                0.0, 0.0, 0.0, 0.25, 0.25, 0.5, 0.5, 0.75, 0.75, 1.0, 1.0, 1.0,
+            ],
+        )
+        .expect("valid knots");
+        let knots_v = crate::nurbs::KnotVector::clamped_uniform(1, 2).expect("valid knots");
+        Surface3::nurbs(
+            crate::nurbs::NurbsSurface::new(control_points, weights, knots_u, knots_v)
+                .expect("valid patch"),
+        )
+    }
+
+    /// of-fid: a boundary curve of a closed NURBS patch, starting *on* the
+    /// join and running away from it in decreasing `u`.
+    ///
+    /// The two ends of the `u` domain are the same point, so the first
+    /// sample may be projected to either; take the low one and every later
+    /// sample wants a `u` below the domain. Before of-fid the clamp pinned
+    /// them all at `u_min` and the pcurve ran a whole diameter from its own
+    /// edge — on a patch the edge lies exactly on.
+    #[test]
+    fn a_closed_patch_boundary_starting_on_the_join_tracks_its_edge() {
+        let surface = clockwise_nurbs_cylinder();
+        // The top rim, counterclockwise from (1, 0, 2) — which is the join.
+        let curve = Curve3::circle(Point3::new(0.0, 0.0, 2.0), Vector3::z(), 1.0).expect("valid");
+        let pcurve = fit_pcurve(&surface, &curve, 0.0, TWO_PI, SeamSide::Low).expect("fits");
+        assert_invariant(&surface, &curve, &pcurve, (0.0, TWO_PI));
+
+        // And it stays on the knot rectangle, which is the only place a
+        // clamped patch evaluates rather than saturating.
+        let (u_lo, u_hi) = surface.domain_u();
+        for i in 0..=32 {
+            let uv = pcurve.point(TWO_PI * (i as f64) / 32.0);
+            assert!(
+                uv.x >= u_lo - TOL && uv.x <= u_hi + TOL,
+                "sample {i} left the u domain at {}",
+                uv.x
+            );
+            assert!(
+                (uv.y - 1.0).abs() < TOL,
+                "the rim holds v = 1, got {}",
+                uv.y
+            );
+        }
+    }
+
+    /// The recentering shift moves the whole run or nothing: an in-domain
+    /// pcurve on the same patch must come back untouched.
+    #[test]
+    fn a_closed_patch_boundary_away_from_the_join_is_left_alone() {
+        let surface = clockwise_nurbs_cylinder();
+        let curve = Curve3::circle(Point3::new(0.0, 0.0, 2.0), Vector3::z(), 1.0).expect("valid");
+        // A quarter of the rim, well clear of the join at both ends.
+        let (t0, t1) = (0.5, 2.0);
+        let pcurve = fit_pcurve(&surface, &curve, t0, t1, SeamSide::Low).expect("fits");
+        assert_invariant(&surface, &curve, &pcurve, (t0, t1));
+        let (u_lo, u_hi) = surface.domain_u();
+        for i in 0..=16 {
+            let u = pcurve.point(t0 + (t1 - t0) * (i as f64) / 16.0).x;
+            assert!(u > u_lo && u < u_hi, "sample {i} left the u domain at {u}");
+        }
+    }
+
+    /// The seam edge of a closed patch lies *on* the cut, so its samples sit
+    /// at one end of the `u` domain — inside it, and exactly at the shift's
+    /// tie point. Recentering must leave them alone, or the two fins of the
+    /// seam would both be handed the same branch and the face's boundary
+    /// would not close in parameter space.
+    #[test]
+    fn a_closed_patch_seam_keeps_its_two_branches() {
+        let surface = clockwise_nurbs_cylinder();
+        // A generator: the ruling at the join, running up the patch.
+        let curve = Curve3::line(Point3::new(1.0, 0.0, 0.0), Vector3::z()).expect("valid");
+        let low = fit_pcurve(&surface, &curve, 0.0, 2.0, SeamSide::Low).expect("fits");
+        let high = fit_pcurve(&surface, &curve, 0.0, 2.0, SeamSide::High).expect("fits");
+        assert_invariant(&surface, &curve, &low, (0.0, 2.0));
+        assert_invariant(&surface, &curve, &high, (0.0, 2.0));
+
+        let (u_lo, u_hi) = surface.domain_u();
+        let period = u_hi - u_lo;
+        for i in 0..=8 {
+            let t = 2.0 * (i as f64) / 8.0;
+            let (a, b) = (low.point(t).x, high.point(t).x);
+            assert!(
+                (b - a - period).abs() < TOL,
+                "the two seam branches must sit a period apart, got {a} and {b}"
+            );
+        }
     }
 
     #[test]

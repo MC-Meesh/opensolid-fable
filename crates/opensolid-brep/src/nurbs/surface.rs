@@ -130,6 +130,83 @@ impl NurbsSurface {
         (self.knots_u.control_count(), self.knots_v.control_count())
     }
 
+    /// The `u`-domain extent, if the patch **closes on itself** in `u`:
+    /// `S(u_min, v) == S(u_max, v)` for every `v`, so the two ends of the
+    /// knot domain are the same locus and a `u` may be wrapped between them.
+    ///
+    /// This is not the same property as periodicity. A closed spline patch
+    /// is built here — and by every exporter this reader has seen — as a
+    /// *clamped* patch whose first and last control rows coincide, not as an
+    /// unclamped periodic one, and [`SurfaceEval::is_periodic_u`] reports
+    /// that faithfully: the parameterization has ends, and the topology cuts
+    /// the surface at a real seam edge rather than wrapping it. What closure
+    /// adds is that the ends meet, which is what a *closest-point search*
+    /// needs to know: without it the Newton domain restriction pins a query
+    /// at `u_min` and can never reach a nearer point sitting just below
+    /// `u_max`, though the two are neighbours on the surface (of-fid).
+    ///
+    /// Detection is structural, for the reason
+    /// [`Self::v_boundary_poles`] gives: a clamped patch interpolates its
+    /// boundary control rows exactly, so equal first and last rows (points
+    /// *and* weights) make the two ends equal exactly, whatever the basis.
+    /// A patch that is not clamped in `u` does not interpolate them and is
+    /// left alone.
+    pub fn closure_u(&self) -> Option<f64> {
+        let (rows, cols) = self.grid_size();
+        self.closure(&self.knots_u, rows, cols, |k, j| (k * (rows - 1), j))
+    }
+
+    /// The `v`-domain extent if the patch closes on itself in `v`; see
+    /// [`Self::closure_u`].
+    pub fn closure_v(&self) -> Option<f64> {
+        let (rows, cols) = self.grid_size();
+        self.closure(&self.knots_v, cols, rows, |k, i| (i, k * (cols - 1)))
+    }
+
+    /// Shared body of [`Self::closure_u`] and [`Self::closure_v`]: `across`
+    /// counts the control rows the direction runs through, `along` the
+    /// entries in one of them, and `index` maps "boundary `k` (0 or 1),
+    /// position `n` along it" to a grid cell.
+    fn closure(
+        &self,
+        knots: &KnotVector,
+        across: usize,
+        along: usize,
+        index: impl Fn(usize, usize) -> (usize, usize),
+    ) -> Option<f64> {
+        // One row is not two ends meeting; it is a direction the patch does
+        // not vary in at all, and wrapping it would say nothing.
+        if across < 2 {
+            return None;
+        }
+        let (lo, hi) = knots.domain();
+        // Only a clamped end interpolates its control row, which is what
+        // makes the structural test below decide the geometry.
+        let clamped = knots.multiplicity(lo) == knots.degree() + 1
+            && knots.multiplicity(hi) == knots.degree() + 1;
+        if !clamped {
+            return None;
+        }
+        let eps = self.collapse_eps();
+        for n in 0..along {
+            let (i0, j0) = index(0, n);
+            let (i1, j1) = index(1, n);
+            if (self.control_point(i0, j0) - self.control_point(i1, j1)).norm() > eps {
+                return None;
+            }
+            // Weights scale the same points differently, so equal positions
+            // alone do not make the ends equal; compare them relatively,
+            // since a weight is a ratio with no length scale of its own.
+            let (w0, w1) = (self.weight(i0, j0), self.weight(i1, j1));
+            if (w0 - w1).abs() > SYSTEM_RESOLUTION * w0.abs().max(w1.abs()) {
+                return None;
+            }
+        }
+        // A degenerate domain is not a wrap: it would make every step
+        // wrap to the same parameter.
+        (hi > lo).then_some(hi - lo)
+    }
+
     /// Map every control point through `f`, leaving weights and knots
     /// untouched.
     ///
@@ -670,6 +747,49 @@ mod tests {
         ];
         let knots = KnotVector::clamped_uniform(1, 2).unwrap();
         NurbsSurface::bspline(control_points, knots.clone(), knots).unwrap()
+    }
+
+    // --- Closure (of-fid) ---
+
+    /// The full-circle control row makes the cylinder patch close in `u`,
+    /// and closing means the two ends of the domain really are one locus —
+    /// which is the property a closest-point search wraps by.
+    #[test]
+    fn closed_patch_reports_its_u_domain_as_the_wrap() {
+        let surface = cylinder_patch();
+        let (lo, hi) = surface.knot_vector_u().domain();
+        assert_eq!(surface.closure_u(), Some(hi - lo));
+        for v in sample_params(10) {
+            let gap = (surface.point(lo, v) - surface.point(hi, v)).norm();
+            assert!(gap < TIGHT, "ends differ by {gap} at v={v}");
+        }
+    }
+
+    /// Closure is per direction: the same patch is a ruled strip in `v`,
+    /// whose ends are the two ends of the cylinder and nowhere near equal.
+    #[test]
+    fn an_open_direction_has_no_wrap() {
+        assert_eq!(cylinder_patch().closure_v(), None);
+        let flat = bilinear_patch();
+        assert_eq!((flat.closure_u(), flat.closure_v()), (None, None));
+    }
+
+    /// Equal control point *positions* do not close a rational patch: the
+    /// weights scale the same points differently, so the ends are two
+    /// different curves unless the weights match too.
+    #[test]
+    fn mismatched_end_weights_do_not_close_a_patch() {
+        let control_points: Vec<Vec<Point3>> = circle_row(1.0, 0.0)
+            .into_iter()
+            .zip(circle_row(1.0, CYL_HEIGHT))
+            .map(|(bottom, top)| vec![bottom, top])
+            .collect();
+        let mut weights: Vec<Vec<f64>> = circle_weights().iter().map(|&w| vec![w, w]).collect();
+        let last = weights.len() - 1;
+        weights[last] = vec![0.5, 0.5];
+        let knots_v = KnotVector::clamped_uniform(1, 2).unwrap();
+        let surface = NurbsSurface::new(control_points, weights, circle_knots(), knots_v).unwrap();
+        assert_eq!(surface.closure_u(), None);
     }
 
     // --- Cylinder patch vs analytic cylinder ---

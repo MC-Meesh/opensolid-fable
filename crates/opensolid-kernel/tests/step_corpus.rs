@@ -1793,9 +1793,9 @@ mod corpus {
     /// This is a much harder gate than `check` and part of the corpus does
     /// not clear it yet. That is the point of pinning it: the files that do
     /// are a floor a reader or checker regression cannot quietly drop below,
-    /// and the ones that do not are the campaign's work list (of-fid pcurve
-    /// branch selection, of-bb6 unmeasured import tolerances). Raise the
-    /// floor as those land.
+    /// and the ones that do not are the campaign's work list (of-bb6
+    /// unmeasured import tolerances). Raise the floor as those land —
+    /// of-fid did, bringing dm1-id-214 in.
     ///
     /// of-he8 came off that list without moving this count: choosing outer
     /// bounds by area silenced every `FaceSenseContradictsLoop` in the corpus
@@ -1830,9 +1830,12 @@ mod corpus {
                 );
             }
         }
-        // 2026-07-26 baseline: io1-cm-214, nist_ctc_03_asme1_ap242-e2,
-        // nist_ftc_11_asme1_rb, sg1-c5-214.
-        const FLOOR: usize = 4;
+        // 2026-07-30: 18 files clear this. dm1-id-214 is the newest, landed
+        // by of-fid — its 7 fins on closed NURBS patches had pcurves up to
+        // 13 mm off their own edges. The other 17 are the four analytic
+        // parts of the 2026-07-26 baseline plus the synthetic and OCC
+        // fixtures added since.
+        const FLOOR: usize = 18;
         assert!(
             clean.len() >= FLOOR,
             "geometrically clean corpus count regressed below {FLOOR}: only {clean:?} pass"

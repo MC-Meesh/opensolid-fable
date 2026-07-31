@@ -6740,7 +6740,6 @@ fn island_pocket_subtract_removes_exactly_the_tool() {
     );
 }
 
-
 /// Two disjoint bosses on one face, applied one after the other. The second
 /// union imprints its ring onto a top face that is ALREADY an outer cycle
 /// carrying a hole, so `apply_chain` has to place the new ring in the right

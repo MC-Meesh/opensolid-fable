@@ -264,6 +264,35 @@ impl Surface3 {
         Surface3::Nurbs(Box::new(surface))
     }
 
+    /// The amount a `u` may be shifted by without moving the surface point
+    /// it names, or `None` when the two ends of the `u` domain are distinct
+    /// places.
+    ///
+    /// This is deliberately weaker than [`SurfaceEval::period_u`], which
+    /// asks whether the *parameterization* repeats. A clamped NURBS patch
+    /// that closes on itself has a `u` domain with ends, and every seam
+    /// mechanism downstream depends on `is_periodic_u` continuing to say so
+    /// — but its two ends are nonetheless the same locus, and anything
+    /// *searching* parameter space for a nearby point has to know that or it
+    /// will stop dead at a domain edge with the answer on the other side
+    /// (of-fid). Use `period_u` to ask about the parameterization and this
+    /// to ask what a search may wrap.
+    pub fn wrap_period_u(&self) -> Option<f64> {
+        match self {
+            Surface3::Nurbs(nurbs) => nurbs.closure_u(),
+            _ => self.period_u(),
+        }
+    }
+
+    /// The amount a `v` may be shifted by without moving the surface point
+    /// it names; see [`Self::wrap_period_u`].
+    pub fn wrap_period_v(&self) -> Option<f64> {
+        match self {
+            Surface3::Nurbs(nurbs) => nurbs.closure_v(),
+            _ => self.period_v(),
+        }
+    }
+
     /// Exact axis-aligned bounding box of the full surface, for the
     /// bounded primitives (sphere, torus) and the NURBS control hull;
     /// `None` for the unbounded ones (plane, cylinder, cone).
