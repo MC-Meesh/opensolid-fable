@@ -58,8 +58,8 @@
 
 use opensolid_kernel::brep::boolean::{BooleanOutput, intersect, subtract, unite};
 use opensolid_kernel::brep::{
-    Body, Curve3, CurveEval, GeometryStore, Surface3, SurfaceProject, TessellationOptions,
-    TopologyStore, primitives, tessellate_body, translate_body,
+    Body, CheckFailure, Curve3, CurveEval, GeometryStore, Surface3, SurfaceProject,
+    TessellationOptions, TopologyStore, primitives, tessellate_body, translate_body,
 };
 use opensolid_kernel::core::EntityId;
 use opensolid_kernel::core::tolerance::ToleranceContext;
@@ -1790,12 +1790,17 @@ mod corpus {
     /// pcurves tracking their edges, face senses agreeing with their
     /// boundaries.
     ///
-    /// This is a much harder gate than `check` and most of the corpus does
-    /// not clear it yet. That is the point of pinning it: the four files
-    /// that do are a floor a reader or checker regression cannot quietly
-    /// drop below, and the twelve that do not are the campaign's work list
-    /// (of-he8 outer-bound designation, of-fid pcurve branch selection,
-    /// of-bb6 unmeasured import tolerances). Raise the floor as those land.
+    /// This is a much harder gate than `check` and part of the corpus does
+    /// not clear it yet. That is the point of pinning it: the files that do
+    /// are a floor a reader or checker regression cannot quietly drop below,
+    /// and the ones that do not are the campaign's work list (of-fid pcurve
+    /// branch selection, of-bb6 unmeasured import tolerances). Raise the
+    /// floor as those land.
+    ///
+    /// of-he8 came off that list without moving this count: choosing outer
+    /// bounds by area silenced every `FaceSenseContradictsLoop` in the corpus
+    /// (see `no_imported_face_contradicts_its_outer_loop`), but the four NIST
+    /// files it fixed still fail this gate on the defects above.
     #[test]
     fn corpus_geometric_pass_rate_does_not_regress() {
         let mut clean = Vec::new();
@@ -1831,6 +1836,57 @@ mod corpus {
         assert!(
             clean.len() >= FLOOR,
             "geometrically clean corpus count regressed below {FLOOR}: only {clean:?} pass"
+        );
+    }
+
+    /// No imported face may disagree with its own outer boundary (of-he8).
+    ///
+    /// A face's sense and the winding of its outer loop are two statements of
+    /// the same fact, so a contradiction means one of them was read wrong.
+    /// It was always the loop: the reader took the outer bound to be the one
+    /// the file tagged, or the first one listed, and on a face with holes
+    /// both land on a hole often enough to matter. 61 faces reported across
+    /// four NIST files before the outer bound was chosen by parameter-space
+    /// area instead — 38 of them untagged (nist_ctc_01, nist_ctc_03,
+    /// nist_ftc_06), 23 mis-tagged (nist_stc_06).
+    ///
+    /// This is an absolute gate, not a floor: unlike the pass-rate tests
+    /// above, zero is reachable today and there is no reason for a file to
+    /// take it back off zero.
+    #[test]
+    fn no_imported_face_contradicts_its_outer_loop() {
+        let mut offenders: Vec<(String, usize)> = Vec::new();
+        for file in &corpus_files() {
+            let bytes = std::fs::read(file).unwrap_or_else(|e| panic!("read {file:?}: {e}"));
+            let (store, geo, report) = import_bytes(&bytes);
+            let contradictions: usize = report
+                .solids
+                .iter()
+                .filter_map(|s| match &s.outcome {
+                    SolidOutcome::BRep(body) => Some(*body),
+                    _ => None,
+                })
+                .map(|body| {
+                    store
+                        .check_geometry(&geo, body)
+                        .iter()
+                        .filter(|f| matches!(f, CheckFailure::FaceSenseContradictsLoop { .. }))
+                        .count()
+                })
+                .sum();
+            if contradictions > 0 {
+                offenders.push((
+                    file.file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned(),
+                    contradictions,
+                ));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "faces whose sense contradicts their outer loop (file, count): {offenders:?}"
         );
     }
 

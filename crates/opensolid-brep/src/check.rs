@@ -1320,7 +1320,11 @@ impl TopologyStore {
     /// a cylinder wall's boundary arrives as four runs that jump a whole
     /// period between them. Continuing each run from the previous one's end
     /// unrolls those jumps and recovers the rectangle the wall really is.
-    fn loop_winding(
+    ///
+    /// The sign answers "which way is this loop wound"; the magnitude answers
+    /// "how much does it enclose", which is how a reader tells a face's outer
+    /// bound from its holes when the source file does not say.
+    pub fn loop_winding(
         &self,
         geo: &GeometryStore,
         surface: &Surface3,

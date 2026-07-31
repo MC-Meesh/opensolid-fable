@@ -2236,6 +2236,10 @@ struct SolidBuilder<'a> {
     /// Plane-angle factor (rad per file angle unit) applied to angle measures.
     angle_scale: f64,
     created: Created,
+    /// Faces with more than one real bound, so which one is the outer bound
+    /// was an open question at mapping time. [`choose_outer_bounds`] settles
+    /// it from parameter-space area once pcurves exist.
+    multi_bound_faces: Vec<EntityId<Face>>,
     /// `VERTEX_POINT` #id → mapped vertex (shared between edges).
     vertices: HashMap<u64, EntityId<Vertex>>,
     /// `EDGE_CURVE` #id → mapped edge (shared between faces, so mated
@@ -2337,12 +2341,27 @@ impl SolidBuilder<'_> {
         }
 
         // At most one FACE_OUTER_BOUND; without one, the first bound plays
-        // the outer role (AP203 permits plain FACE_BOUNDs only). A degenerate
-        // VERTEX_LOOP has no extent and so cannot bound the face's region:
-        // whenever a real loop is available it takes the outer role, whatever
-        // the file tags. A face bounded *only* by vertex loops still needs an
-        // outer loop, so there the first bound plays it (as the sweep
-        // constructors do for a pole face).
+        // the outer role (AP203 permits plain FACE_BOUNDs only).
+        //
+        // Neither answer is trustworthy on a face with holes, and the NIST
+        // corpus fails both ways: nist_ctc_01/nist_ctc_03/nist_ftc_06 tag no
+        // outer bound at all on any of their 108 multi-bound faces, so "the
+        // first" decides and lands on a hole 38 times; nist_stc_06 tags all
+        // 64 of its multi-bound faces and points at a hole on 23 of them.
+        // So a face with a real choice to make is noted here and the choice
+        // re-decided by area in `choose_outer_bounds`, once the pcurves that
+        // make its loops measurable exist. A tag that is right survives that
+        // — the outer bound encloses the most area, so measuring agrees with
+        // it — and one that is wrong does not. The mesh fallback has always
+        // worked this way (`mesh_planar_face` swaps its widest ring to the
+        // front rather than trusting the tag); this brings the exact path
+        // into line with it.
+        //
+        // A degenerate VERTEX_LOOP has no extent and so cannot bound the
+        // face's region: whenever a real loop is available it takes the outer
+        // role, whatever the file tags. A face bounded *only* by vertex loops
+        // still needs an outer loop, so there the first bound plays it (as the
+        // sweep constructors do for a pole face).
         let mut flagged_outer = None;
         let mut degenerate = Vec::with_capacity(bounds.len());
         for (i, &bound_ref) in bounds.iter().enumerate() {
@@ -2369,6 +2388,12 @@ impl SolidBuilder<'_> {
         };
         let face = self.store.create_face(shell, sense);
         self.created.faces.push(face);
+        // Only a face with two real bounds to choose between has anything to
+        // re-decide; one bound (with or without vertex loops beside it) is
+        // the outer one whatever the file says.
+        if degenerate.iter().filter(|&&d| !d).count() > 1 {
+            self.multi_bound_faces.push(face);
+        }
         let surface_id = self.geo.add_surface(surface);
         self.created.surfaces.push(surface_id);
         self.store
@@ -3686,7 +3711,8 @@ fn map_file(
 }
 
 /// Last step of an exact import: derive the 2D trim geometry the file's
-/// `PCURVE`s could not supply directly (see [`validate_associated_geometry`]).
+/// `PCURVE`s could not supply directly (see [`validate_associated_geometry`]),
+/// then settle which bound of each face is the outer one.
 ///
 /// This runs on the finished body, after validation and any healing, rather
 /// than face by face during mapping. Healing welds duplicate edges and
@@ -3699,10 +3725,92 @@ fn finish_exact_body(
     geo: &mut GeometryStore,
     body: EntityId<Body>,
     options: &StepReadOptions,
+    multi_bound_faces: &[EntityId<Face>],
+    msb_id: u64,
+    diagnostics: &mut Vec<Diagnostic>,
 ) {
     if options.pcurves {
         attach_body_pcurves(store, geo, body);
+        // Pcurves are what makes a loop measurable, so this can only follow
+        // them. With `pcurves` off there is nothing to measure and the faces
+        // keep whatever outer bound the file's bound order implied.
+        let redesignated = choose_outer_bounds(store, geo, multi_bound_faces);
+        if redesignated > 0 {
+            diagnostics.push(Diagnostic {
+                entity: Some(msb_id),
+                severity: Severity::Info,
+                message: format!(
+                    "outer bound re-chosen by parameter-space area on {redesignated} \
+                     of {} multi-bound face(s)",
+                    multi_bound_faces.len()
+                ),
+            });
+        }
     }
+}
+
+/// Settle the outer bound of each face in `faces` by the area its loops
+/// enclose in parameter space: the outer bound is the one containing the
+/// others, and containment shows up as the largest `|area|`. Returns how many
+/// faces changed.
+///
+/// This overrides `FACE_OUTER_BOUND` rather than deferring to it, because
+/// files get the tag wrong (see `map_face`) and geometry does not: on a face
+/// that is well formed at all, exactly one of its loops encloses the rest.
+///
+/// A face is left alone unless every one of its real loops can be measured.
+/// A partial comparison could hand the role to the largest of the *readable*
+/// loops while the true outer bound sits among the unreadable ones, which
+/// would be a worse answer than the one it replaced.
+fn choose_outer_bounds(
+    store: &mut TopologyStore,
+    geo: &GeometryStore,
+    faces: &[EntityId<Face>],
+) -> usize {
+    let mut redesignated = 0;
+    for &face_id in faces {
+        let Some(face) = store.face(face_id) else {
+            continue;
+        };
+        let Some(surface) = face.surface.and_then(|id| geo.surface(id)) else {
+            continue;
+        };
+        let Some(outer) = face.outer_loop else {
+            continue;
+        };
+        let loops: Vec<EntityId<Loop>> = std::iter::once(outer)
+            .chain(face.inner_loops.iter().copied())
+            .collect();
+
+        let mut largest: Option<(f64, EntityId<Loop>)> = None;
+        let mut all_readable = true;
+        for &loop_id in &loops {
+            // A degenerate loop encloses nothing and never competes; it is
+            // not a gap in the comparison either.
+            if store.loop_(loop_id).is_none_or(|lp| lp.fins.is_empty()) {
+                continue;
+            }
+            let Some(twice_signed_area) = store.loop_winding(geo, surface, loop_id) else {
+                all_readable = false;
+                break;
+            };
+            let area = twice_signed_area.abs();
+            if largest.is_none_or(|(best, _)| area > best) {
+                largest = Some((area, loop_id));
+            }
+        }
+
+        if !all_readable {
+            continue;
+        }
+        if let Some((_, winner)) = largest {
+            if winner != outer {
+                store.set_outer_loop(face_id, winner);
+                redesignated += 1;
+            }
+        }
+    }
+    redesignated
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3757,16 +3865,26 @@ fn map_solid(
         scale,
         angle_scale,
         created: Created::default(),
+        multi_bound_faces: Vec::new(),
         vertices: HashMap::new(),
         edges: HashMap::new(),
     };
     let built = builder.build(msb_id, shell_ref, &voids);
     let created = builder.created;
+    let multi_bound_faces = builder.multi_bound_faces;
     match built {
         Ok(body) => {
             let mut failures = store.check(body);
             if failures.is_empty() {
-                finish_exact_body(store, geo, body, options);
+                finish_exact_body(
+                    store,
+                    geo,
+                    body,
+                    options,
+                    &multi_bound_faces,
+                    msb_id,
+                    diagnostics,
+                );
                 return SolidOutcome::BRep(body);
             }
             // Import heals, it does not reject (`spec/06-step-io.md` §4): a
@@ -3792,7 +3910,15 @@ fn map_solid(
                 }
                 failures = result.remaining;
                 if failures.is_empty() {
-                    finish_exact_body(store, geo, body, options);
+                    finish_exact_body(
+                        store,
+                        geo,
+                        body,
+                        options,
+                        &multi_bound_faces,
+                        msb_id,
+                        diagnostics,
+                    );
                     return SolidOutcome::BRep(body);
                 }
             }
@@ -4622,6 +4748,154 @@ mod tests {
         assert_eq!(store.bodies.len(), 2);
         assert!(store.check(a).is_empty());
         assert!(store.check(b).is_empty());
+    }
+
+    // ---- outer-bound designation (of-he8) ----
+
+    /// A planar face bounded by two concentric squares: a wide 10×10 ring
+    /// and a narrow 2×2 one inside it. `wide_first` picks which of them the
+    /// face starts out calling its outer bound — the choice a file's bound
+    /// order or `FACE_OUTER_BOUND` tagging hands the reader, right or wrong.
+    ///
+    /// Returns the stores, the face, and the (wide, narrow) loops.
+    #[allow(clippy::type_complexity)]
+    fn face_with_two_rings(
+        wide_first: bool,
+    ) -> (
+        TopologyStore,
+        GeometryStore,
+        EntityId<Face>,
+        (EntityId<Loop>, EntityId<Loop>),
+    ) {
+        let mut store = TopologyStore::new();
+        let mut geo = GeometryStore::new();
+        let body = store.create_body(BodyType::Sheet);
+        let shell = store.create_shell(body, false, ShellOrientation::Outward);
+        let face = store.create_face(shell, FaceSense::Positive);
+        let plane =
+            geo.add_surface(Surface3::plane(Point3::origin(), Vector3::z()).expect("valid plane"));
+        store.faces.get_mut(face).expect("just created").surface = Some(plane);
+
+        // Counterclockwise in the plane's (u, v), so both rings wind the way
+        // a Positive face's outer bound should — the designation, not the
+        // winding, is what these tests are about.
+        let ring = |store: &mut TopologyStore, geo: &mut GeometryStore, half: f64| {
+            let corners = [
+                Point3::new(-half, -half, 0.0),
+                Point3::new(half, -half, 0.0),
+                Point3::new(half, half, 0.0),
+                Point3::new(-half, half, 0.0),
+            ];
+            let vertices: Vec<EntityId<Vertex>> = corners
+                .iter()
+                .map(|&p| store.create_vertex(p, SYSTEM_RESOLUTION))
+                .collect();
+            let edges: Vec<(EntityId<Edge>, FinSense)> = (0..4)
+                .map(|k| {
+                    let (from, to) = (corners[k], corners[(k + 1) % 4]);
+                    let step = to - from;
+                    let curve = geo.add_curve(Curve3::line(from, step).expect("valid line"));
+                    let edge = store.create_edge_with_curve(
+                        vertices[k],
+                        vertices[(k + 1) % 4],
+                        SYSTEM_RESOLUTION,
+                        curve,
+                        0.0,
+                        step.norm(),
+                    );
+                    (edge, FinSense::Forward)
+                })
+                .collect();
+            edges
+        };
+        let wide_edges = ring(&mut store, &mut geo, 5.0);
+        let narrow_edges = ring(&mut store, &mut geo, 1.0);
+
+        let (first, second) = if wide_first {
+            (&wide_edges, &narrow_edges)
+        } else {
+            (&narrow_edges, &wide_edges)
+        };
+        let first_loop = store.create_loop(face, LoopType::Outer, first);
+        let second_loop = store.create_loop(face, LoopType::Inner, second);
+        let (wide, narrow) = if wide_first {
+            (first_loop, second_loop)
+        } else {
+            (second_loop, first_loop)
+        };
+
+        let attached = attach_body_pcurves(&mut store, &mut geo, body);
+        assert_eq!(attached, 8, "both rings' fins must be fittable");
+        (store, geo, face, (wide, narrow))
+    }
+
+    /// The heart of of-he8: a file that hands the outer role to a hole gets
+    /// overruled by the geometry. The ring enclosing the other is the outer
+    /// bound whatever the file said.
+    #[test]
+    fn outer_bound_is_the_ring_that_encloses_the_other() {
+        let (mut store, geo, face, (wide, narrow)) = face_with_two_rings(false);
+        assert_eq!(store.face(face).unwrap().outer_loop, Some(narrow));
+
+        assert_eq!(choose_outer_bounds(&mut store, &geo, &[face]), 1);
+
+        let f = store.face(face).unwrap();
+        assert_eq!(f.outer_loop, Some(wide));
+        assert_eq!(f.inner_loops, vec![narrow]);
+        assert_eq!(store.loop_(wide).unwrap().loop_type, LoopType::Outer);
+        assert_eq!(store.loop_(narrow).unwrap().loop_type, LoopType::Inner);
+    }
+
+    /// The overwhelmingly common case: the file was right, and measuring
+    /// agrees with it rather than shuffling the loops for nothing.
+    #[test]
+    fn a_correct_outer_bound_survives_being_measured() {
+        let (mut store, geo, face, (wide, narrow)) = face_with_two_rings(true);
+
+        assert_eq!(choose_outer_bounds(&mut store, &geo, &[face]), 0);
+
+        let f = store.face(face).unwrap();
+        assert_eq!(f.outer_loop, Some(wide));
+        assert_eq!(f.inner_loops, vec![narrow]);
+    }
+
+    /// A loop that cannot be measured makes the comparison incomplete, and
+    /// half a comparison is worse than none: the largest *readable* ring may
+    /// not be the largest ring. The face keeps what it had.
+    #[test]
+    fn an_unreadable_loop_leaves_the_designation_alone() {
+        let (mut store, geo, face, (wide, narrow)) = face_with_two_rings(false);
+        let fin = store.fins_of_loop(wide)[0];
+        store.fins.get_mut(fin).expect("live fin").pcurve = None;
+
+        assert_eq!(choose_outer_bounds(&mut store, &geo, &[face]), 0);
+        assert_eq!(store.face(face).unwrap().outer_loop, Some(narrow));
+    }
+
+    /// A face whose surface never arrived cannot be measured either — there
+    /// is no parameter space to measure in.
+    #[test]
+    fn a_face_without_a_surface_leaves_the_designation_alone() {
+        let (mut store, geo, face, (_wide, narrow)) = face_with_two_rings(false);
+        store.faces.get_mut(face).expect("live face").surface = None;
+
+        assert_eq!(choose_outer_bounds(&mut store, &geo, &[face]), 0);
+        assert_eq!(store.face(face).unwrap().outer_loop, Some(narrow));
+    }
+
+    /// End to end through the reader: a face with one bound is never in
+    /// question, so an import of single-bound faces reports no re-choice.
+    #[test]
+    fn single_bound_faces_are_never_re_designated() {
+        let (_store, _geo, report) = import(&block_step(2.0, 3.0, 4.0));
+        assert!(
+            !report
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("outer bound re-chosen")),
+            "{:?}",
+            report.diagnostics
+        );
     }
 
     // ---- length units (of-83h) ----

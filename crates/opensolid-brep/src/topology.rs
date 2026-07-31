@@ -522,6 +522,56 @@ impl TopologyStore {
         loop_id
     }
 
+    /// Make `loop_id` the outer loop of `face`, demoting the loop that held
+    /// the role to an inner one. A no-op if it already is the outer loop.
+    ///
+    /// The loops themselves are untouched — their fins, senses and geometry
+    /// all stay as they are. Only the *role* moves, which is what a reader
+    /// needs when it learns which bound encloses the others after the fact:
+    /// a source file may leave the choice untagged (STEP's plain `FACE_BOUND`
+    /// list), and the answer is only readable once the parameter-space
+    /// geometry the loops are measured in has been attached.
+    ///
+    /// A degenerate loop type ([`LoopType::Vertex`], [`LoopType::Singular`])
+    /// describes the loop's own geometry rather than its role on the face, so
+    /// it is preserved across the move; any other type follows the role.
+    ///
+    /// # Panics
+    /// Panics if `face` is stale, or if `loop_id` is not one of the face's
+    /// own inner loops — the role can only move between loops the face
+    /// already has.
+    pub fn set_outer_loop(&mut self, face: EntityId<Face>, loop_id: EntityId<Loop>) {
+        let face_ref = self
+            .faces
+            .get_mut(face)
+            .expect("set_outer_loop: stale Face id");
+        if face_ref.outer_loop == Some(loop_id) {
+            return;
+        }
+        let position = face_ref
+            .inner_loops
+            .iter()
+            .position(|&id| id == loop_id)
+            .expect("set_outer_loop: loop is not an inner loop of this face");
+        face_ref.inner_loops.remove(position);
+        let demoted = face_ref.outer_loop.replace(loop_id);
+        if let Some(demoted) = demoted {
+            // Same slot the promoted loop vacated: the face's hole order is
+            // an import artifact, and keeping it stable keeps re-imports and
+            // round-trips comparable.
+            face_ref.inner_loops.insert(position, demoted);
+        }
+
+        for (id, role) in [(Some(loop_id), LoopType::Outer), (demoted, LoopType::Inner)] {
+            let Some(lp) = id.and_then(|id| self.loops.get_mut(id)) else {
+                continue;
+            };
+            if !matches!(lp.loop_type, LoopType::Vertex | LoopType::Singular) {
+                lp.loop_type = role;
+            }
+        }
+    }
+
     // ------------------------------------------------------------------
     // Direct lookup (Option-returning: usable as id-validity checks)
     // ------------------------------------------------------------------
@@ -1059,6 +1109,119 @@ mod tests {
         assert_eq!(f.inner_loops, vec![hole]);
         assert_eq!(store.loops_of_face(face), vec![outer, hole]);
         assert_eq!(store.loop_(hole).unwrap().loop_type, LoopType::Inner);
+    }
+
+    /// A reader that learns which bound really encloses the others can move
+    /// the outer role onto it; the two loops swap places and nothing else
+    /// about them changes.
+    #[test]
+    fn outer_role_moves_between_a_face_s_loops() {
+        let mut store = TopologyStore::new();
+        let body = store.create_body(BodyType::Sheet);
+        let shell = store.create_shell(body, false, ShellOrientation::Outward);
+        let face = store.create_face(shell, FaceSense::Positive);
+
+        let mut triangle = |offset: f64| {
+            let v: Vec<_> = [
+                Point3::new(offset, 0.0, 0.0),
+                Point3::new(offset + 1.0, 0.0, 0.0),
+                Point3::new(offset, 1.0, 0.0),
+            ]
+            .iter()
+            .map(|&p| store.create_vertex(p, SYSTEM_RESOLUTION))
+            .collect();
+            [
+                (
+                    store.create_edge(v[0], v[1], SYSTEM_RESOLUTION),
+                    FinSense::Forward,
+                ),
+                (
+                    store.create_edge(v[1], v[2], SYSTEM_RESOLUTION),
+                    FinSense::Forward,
+                ),
+                (
+                    store.create_edge(v[2], v[0], SYSTEM_RESOLUTION),
+                    FinSense::Forward,
+                ),
+            ]
+        };
+        let first = triangle(0.0);
+        let second = triangle(10.0);
+        let third = triangle(20.0);
+        let wrong_outer = store.create_loop(face, LoopType::Outer, &first);
+        let real_outer = store.create_loop(face, LoopType::Inner, &second);
+        let hole = store.create_loop(face, LoopType::Inner, &third);
+        let fins_before = store.fins_of_loop(real_outer).to_vec();
+
+        store.set_outer_loop(face, real_outer);
+
+        let f = store.face(face).unwrap();
+        assert_eq!(f.outer_loop, Some(real_outer));
+        // The demoted loop takes the slot the promoted one vacated, so the
+        // remaining holes keep their order.
+        assert_eq!(f.inner_loops, vec![wrong_outer, hole]);
+        assert_eq!(store.loop_(real_outer).unwrap().loop_type, LoopType::Outer);
+        assert_eq!(store.loop_(wrong_outer).unwrap().loop_type, LoopType::Inner);
+        assert_eq!(store.loop_(hole).unwrap().loop_type, LoopType::Inner);
+        assert_eq!(store.fins_of_loop(real_outer), fins_before);
+    }
+
+    /// Naming the loop that already holds the role changes nothing.
+    #[test]
+    fn setting_the_current_outer_loop_is_a_no_op() {
+        let mut store = TopologyStore::new();
+        let body = store.create_body(BodyType::Sheet);
+        let shell = store.create_shell(body, false, ShellOrientation::Outward);
+        let face = store.create_face(shell, FaceSense::Positive);
+        let a = store.create_vertex(Point3::origin(), SYSTEM_RESOLUTION);
+        let b = store.create_vertex(Point3::new(1.0, 0.0, 0.0), SYSTEM_RESOLUTION);
+        let edge = store.create_edge(a, b, SYSTEM_RESOLUTION);
+        let outer = store.create_loop(face, LoopType::Outer, &[(edge, FinSense::Forward)]);
+
+        store.set_outer_loop(face, outer);
+
+        assert_eq!(store.face(face).unwrap().outer_loop, Some(outer));
+        assert!(store.face(face).unwrap().inner_loops.is_empty());
+        assert_eq!(store.loop_(outer).unwrap().loop_type, LoopType::Outer);
+    }
+
+    /// A degenerate loop's type describes its own geometry, not its role, so
+    /// it survives being demoted — the face must not come back claiming a
+    /// cone apex is an ordinary hole.
+    #[test]
+    fn demoting_a_degenerate_outer_loop_keeps_its_type() {
+        let mut store = TopologyStore::new();
+        let body = store.create_body(BodyType::Sheet);
+        let shell = store.create_shell(body, false, ShellOrientation::Outward);
+        let face = store.create_face(shell, FaceSense::Positive);
+        let apex = store.create_vertex(Point3::new(0.0, 0.0, 1.0), SYSTEM_RESOLUTION);
+        let pole = store.create_vertex_loop(face, LoopType::Singular, apex, true);
+        let a = store.create_vertex(Point3::origin(), SYSTEM_RESOLUTION);
+        let b = store.create_vertex(Point3::new(1.0, 0.0, 0.0), SYSTEM_RESOLUTION);
+        let edge = store.create_edge(a, b, SYSTEM_RESOLUTION);
+        let ring = store.create_loop(face, LoopType::Inner, &[(edge, FinSense::Forward)]);
+
+        store.set_outer_loop(face, ring);
+
+        assert_eq!(store.face(face).unwrap().outer_loop, Some(ring));
+        assert_eq!(store.face(face).unwrap().inner_loops, vec![pole]);
+        assert_eq!(store.loop_(pole).unwrap().loop_type, LoopType::Singular);
+    }
+
+    #[test]
+    #[should_panic(expected = "not an inner loop of this face")]
+    fn outer_role_cannot_move_to_another_face_s_loop() {
+        let mut store = TopologyStore::new();
+        let body = store.create_body(BodyType::Sheet);
+        let shell = store.create_shell(body, false, ShellOrientation::Outward);
+        let face = store.create_face(shell, FaceSense::Positive);
+        let other = store.create_face(shell, FaceSense::Positive);
+        let a = store.create_vertex(Point3::origin(), SYSTEM_RESOLUTION);
+        let b = store.create_vertex(Point3::new(1.0, 0.0, 0.0), SYSTEM_RESOLUTION);
+        let edge = store.create_edge(a, b, SYSTEM_RESOLUTION);
+        let elsewhere = store.create_loop(other, LoopType::Outer, &[(edge, FinSense::Forward)]);
+
+        store.set_outer_loop(face, elsewhere);
     }
 
     /// A degenerate loop carries a vertex instead of fins, and takes either
