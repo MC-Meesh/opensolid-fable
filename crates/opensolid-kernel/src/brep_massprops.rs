@@ -100,6 +100,19 @@
 //! Surface area is the one quantity that is *not* signed, so it alone is
 //! multiplied by the winding, recovered from the same contour as the signed
 //! area of `D` in parameter space.
+//!
+//! [`FaceSense`] is read in exactly one place — [`seam_branch`], to say which
+//! side of a seam the interior is on — and that reading assumes the flag
+//! agrees with the loop it labels, which on a well-formed body it does
+//! ([`CheckFailure::FaceSenseContradictsLoop`](opensolid_brep::CheckFailure)
+//! is what enforces it). On a body where it does not, this is the one place
+//! the disagreement shows: a seam fin lands a period from where the walk
+//! wants it, and the loop fails to close by twice the period. That is what
+//! of-hrgt was — a STEP import whose sense flag had been flipped without its
+//! loops, reported here as `OpenParameterLoop { gap: 4π }` on a cylinder wall.
+//! The repair is in the reader
+//! ([`reconcile_face_senses`](crate::io::step::heal::reconcile_face_senses));
+//! nothing about the integration below needed changing.
 
 use std::collections::HashMap;
 

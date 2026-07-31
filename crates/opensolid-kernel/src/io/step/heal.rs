@@ -32,6 +32,14 @@
 //!   component. A shell that comes out consistently oriented but *inside out*
 //!   (its enclosed signed volume has the wrong sign for its
 //!   [`ShellOrientation`]) is then reversed wholesale.
+//! - **Sense reconciliation** ([`reconcile_face_senses`]) — set each face's
+//!   [`FaceSense`] to whatever the winding of its own outer loop says it must
+//!   be. This one is *not* reachable from [`GeometryHealer::heal`], because it
+//!   reads a winding and pcurves do not exist yet at that point; the reader
+//!   calls it directly as the last step of an exact import. It is also the
+//!   only pass that catches a face whose sense flag alone is wrong, which the
+//!   two-colouring above is structurally blind to — see its own docs, and
+//!   of-hrgt for what that blindness cost.
 //!
 //! Pcurve recompute is not a repair here: the reader derives fin trim
 //! geometry for every exactly mapped face as it builds it
@@ -196,6 +204,13 @@ pub enum HealOperation {
     /// A face was reversed (surface sense and every loop's traversal) to agree
     /// with its neighbours.
     FaceReoriented { face: EntityId<Face> },
+    /// A face's surface sense alone was corrected to agree with the winding of
+    /// its own outer loop — the loops were left exactly as authored.
+    FaceSenseCorrected {
+        face: EntityId<Face>,
+        /// The sense the face now carries.
+        sense: FaceSense,
+    },
     /// A whole shell was reversed: consistently oriented, but enclosing a
     /// signed volume of the wrong sign for its [`ShellOrientation`].
     ShellReversed {
@@ -222,6 +237,10 @@ impl fmt::Display for HealOperation {
             HealOperation::FaceReoriented { face } => {
                 write!(f, "reversed {face:?} to match its neighbours")
             }
+            HealOperation::FaceSenseCorrected { face, sense } => write!(
+                f,
+                "corrected {face:?} surface sense to {sense:?} to match its outer loop's winding"
+            ),
             HealOperation::ShellReversed { shell, faces } => write!(
                 f,
                 "reversed {shell:?} ({faces} faces): enclosed volume had the wrong sign"
@@ -1114,6 +1133,98 @@ fn plan_shell_reversals(
         }
     }
     reversals
+}
+
+/// Correct every face whose surface sense contradicts the winding of its own
+/// outer loop, and report what was corrected.
+///
+/// # The defect this repairs
+///
+/// A face carries its orientation twice over: in [`FaceSense`], which says
+/// whether the face normal is `S_u × S_v` or its reverse, and in the winding
+/// of its outer loop, which is counterclockwise in `(u, v)` exactly when that
+/// normal is `S_u × S_v`. `ADVANCED_FACE.same_sense` maps straight onto the
+/// first; the loop the file authors is the second. A producer with
+/// untrustworthy sense flags writes them disagreeing, and that face is then
+/// inconsistent in a way *no* pass above can see: flipping the flag changes no
+/// fin sense, so the two-colouring of [`plan_face_flips`] finds every mated
+/// pair still traversing its edge in opposite directions and plans nothing.
+/// Both measurement paths then break — the tessellator winds that face's
+/// triangles against its neighbours', and
+/// [`brep_mass_properties`](crate::brep_mass_properties) refuses a periodic
+/// face outright, because the branch a seam fin takes is read off the flag
+/// (`OpenParameterLoop`, of-hrgt).
+///
+/// # Why the flag yields to the loop, and not the other way round
+///
+/// The loops carry a constraint the flag does not: mated fins must traverse
+/// their shared edge in opposite directions, which ties every face of a shell
+/// to its neighbours. Reversing a loop to suit its flag would break that tie
+/// and manufacture the very defect [`plan_face_flips`] exists to repair, on a
+/// shell that just came through it clean. The flag constrains one face and
+/// nothing else, so it is the one free to move. This is the argument
+/// [`choose_outer_bounds`](super::read) already makes for `FACE_OUTER_BOUND`:
+/// files get their flags wrong, and the geometry does not.
+///
+/// A face whose winding is unreadable — no surface, no outer loop, fins
+/// without pcurves, or a loop enclosing no measurable area — is left exactly
+/// as authored. Nothing is concluded from a winding that was not measured.
+///
+/// # Where this runs
+///
+/// Not from [`GeometryHealer::heal`]: reading a winding needs the fins'
+/// pcurves, which the reader derives *after* healing has settled which edge
+/// each fin uses (see
+/// [`finish_exact_body`](super::read)). So this is the reader's last repair
+/// rather than the healer's, and it obeys the same
+/// [`HealStrategy`] — planned under [`HealStrategy::ReportOnly`], applied only
+/// when the strategy mutates and orients at all.
+pub fn reconcile_face_senses(
+    body: EntityId<Body>,
+    store: &mut TopologyStore,
+    geo: &GeometryStore,
+    strategy: HealStrategy,
+) -> Vec<HealOperation> {
+    if !strategy.orients() {
+        return Vec::new();
+    }
+    let mut corrections: Vec<(EntityId<Face>, FaceSense)> = Vec::new();
+    for &shell in store.shells_of_body(body) {
+        for &face_id in store.faces_of_shell(shell) {
+            let Some(face) = store.face(face_id) else {
+                continue;
+            };
+            let (Some(surface), Some(outer)) =
+                (face.surface.and_then(|id| geo.surface(id)), face.outer_loop)
+            else {
+                continue;
+            };
+            let Some(twice_signed_area) = store.loop_winding(geo, surface, outer) else {
+                continue;
+            };
+            let wants_positive = twice_signed_area > 0.0;
+            if wants_positive == (face.sense == FaceSense::Positive) {
+                continue;
+            }
+            let sense = if wants_positive {
+                FaceSense::Positive
+            } else {
+                FaceSense::Negative
+            };
+            corrections.push((face_id, sense));
+        }
+    }
+    if strategy.applies() {
+        for &(face_id, sense) in &corrections {
+            if let Some(face) = store.faces.get_mut(face_id) {
+                face.sense = sense;
+            }
+        }
+    }
+    corrections
+        .into_iter()
+        .map(|(face, sense)| HealOperation::FaceSenseCorrected { face, sense })
+        .collect()
 }
 
 /// Whether every edge these faces use is shared by exactly two of them —

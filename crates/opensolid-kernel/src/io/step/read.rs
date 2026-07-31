@@ -156,7 +156,7 @@ use opensolid_core::error::CoreError;
 use opensolid_core::mesh::TriangleMesh;
 use opensolid_core::{EntityId, Point3, Vector3};
 
-use super::heal::{GeometryHealer, HealOptions, HealStrategy};
+use super::heal::{GeometryHealer, HealOptions, HealStrategy, reconcile_face_senses};
 use super::product::{PlacedSolid, resolve_instances};
 use super::{EntityRecord, Instance, SimpleRecord, StepError, StepFile, Value};
 use crate::convert::MeshSdf;
@@ -3712,7 +3712,8 @@ fn map_file(
 
 /// Last step of an exact import: derive the 2D trim geometry the file's
 /// `PCURVE`s could not supply directly (see [`validate_associated_geometry`]),
-/// then settle which bound of each face is the outer one.
+/// settle which bound of each face is the outer one, then make each face's
+/// surface sense agree with that bound's winding.
 ///
 /// This runs on the finished body, after validation and any healing, rather
 /// than face by face during mapping. Healing welds duplicate edges and
@@ -3720,6 +3721,17 @@ fn map_file(
 /// its edge's curve and parameter range — so deriving one before the healer
 /// has settled which edge a fin uses would leave it describing an edge that
 /// is no longer there.
+///
+/// The sense repair belongs here for the same reason and one more: it reads a
+/// loop's winding, which needs both the pcurves *and* the settled outer bound,
+/// so it can only be the last of the three
+/// ([`reconcile_face_senses`] says why the flag yields to the winding).
+///
+/// Returns how many repairs it applied, for
+/// [`StepImport::heal_operations`]. Both of the last two steps read a loop's
+/// winding, which only the pcurves make measurable — with
+/// [`StepReadOptions::pcurves`] off there is nothing to read, so neither runs
+/// and each face keeps the outer bound and the sense flag the file authored.
 fn finish_exact_body(
     store: &mut TopologyStore,
     geo: &mut GeometryStore,
@@ -3728,25 +3740,38 @@ fn finish_exact_body(
     multi_bound_faces: &[EntityId<Face>],
     msb_id: u64,
     diagnostics: &mut Vec<Diagnostic>,
-) {
-    if options.pcurves {
-        attach_body_pcurves(store, geo, body);
-        // Pcurves are what makes a loop measurable, so this can only follow
-        // them. With `pcurves` off there is nothing to measure and the faces
-        // keep whatever outer bound the file's bound order implied.
-        let redesignated = choose_outer_bounds(store, geo, multi_bound_faces);
-        if redesignated > 0 {
-            diagnostics.push(Diagnostic {
-                entity: Some(msb_id),
-                severity: Severity::Info,
-                message: format!(
-                    "outer bound re-chosen by parameter-space area on {redesignated} \
-                     of {} multi-bound face(s)",
-                    multi_bound_faces.len()
-                ),
-            });
-        }
+) -> usize {
+    if !options.pcurves {
+        return 0;
     }
+    attach_body_pcurves(store, geo, body);
+
+    let redesignated = choose_outer_bounds(store, geo, multi_bound_faces);
+    if redesignated > 0 {
+        diagnostics.push(Diagnostic {
+            entity: Some(msb_id),
+            severity: Severity::Info,
+            message: format!(
+                "outer bound re-chosen by parameter-space area on {redesignated} \
+                 of {} multi-bound face(s)",
+                multi_bound_faces.len()
+            ),
+        });
+    }
+
+    // A sense flag contradicting its own loop is invisible to every pass in
+    // `heal` (it changes no fin sense), and invisible again to the
+    // topology-only check that decides whether `heal` is consulted at all —
+    // so this is the only place it is caught. See of-hrgt.
+    let corrections = reconcile_face_senses(body, store, geo, options.heal.strategy);
+    for op in &corrections {
+        diagnostics.push(Diagnostic {
+            entity: Some(msb_id),
+            severity: Severity::Info,
+            message: format!("healed: {op}"),
+        });
+    }
+    corrections.len()
 }
 
 /// Settle the outer bound of each face in `faces` by the area its loops
@@ -3876,7 +3901,7 @@ fn map_solid(
         Ok(body) => {
             let mut failures = store.check(body);
             if failures.is_empty() {
-                finish_exact_body(
+                *heal_operations += finish_exact_body(
                     store,
                     geo,
                     body,
@@ -3910,7 +3935,7 @@ fn map_solid(
                 }
                 failures = result.remaining;
                 if failures.is_empty() {
-                    finish_exact_body(
+                    *heal_operations += finish_exact_body(
                         store,
                         geo,
                         body,

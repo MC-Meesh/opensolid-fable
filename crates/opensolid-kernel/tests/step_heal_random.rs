@@ -52,14 +52,30 @@
 //! stay under the trim tolerance while leaving the *separation between copies
 //! of a corner* — which is what healing merges — inside the gap.
 //!
-//! # A known defect this campaign found
+//! # A defect this campaign found, and what it turned out to be
 //!
-//! Face-sense flips are applied to planar-faced bodies only. On a *periodic*
-//! face (a cylinder wall and its seam) a healed reversal yields a body that
-//! `check()` certifies and `brep_mass_properties` then refuses, with a
-//! parameter-loop gap of exactly `4π` — of-hrgt. The case is parked live and
-//! `#[ignore]`d as [`reversed_periodic_face_is_measurable`] rather than
-//! dropped.
+//! The face-sense campaigns used to run on planar-faced bodies only, because
+//! a *periodic* face (a cylinder wall and its seam) came back from a healed
+//! reversal as a body `check()` certified and `brep_mass_properties` then
+//! refused, with a parameter-loop gap of exactly `4π` — of-hrgt.
+//!
+//! The reversal was never healed at all. Flipping an `ADVANCED_FACE` sense
+//! flag changes no fin sense, so the orientation pass's two-colouring saw a
+//! consistent shell; and the reader only consults the healer once the
+//! *topology-only* `TopologyStore::check` has failed, which that body did not.
+//! It came through as an exact import with one face's flag contradicting its
+//! own loop's winding. The periodic face failed loudly (the seam's branch is
+//! read off the flag); the planar ones failed silently, measuring correctly
+//! while being just as malformed, which is why flipping their senses had
+//! looked safe. `reconcile_face_senses` (`heal.rs`) is the repair, run from
+//! the reader once pcurves make the winding readable.
+//!
+//! Both face-sense campaigns now run the whole corpus — cylinders and cones
+//! included — and [`a_reversed_face_sense_flag_is_corrected_on_import`] pins
+//! the original repro. The cases whose geometry is undamaged also assert
+//! `check_with_geometry`, which is the check that would have caught this on
+//! day one; see [`exact_import_volume_checked`] for why the jittered cases do
+//! not (of-bbh8).
 //!
 //! # Both directions are asserted
 //!
@@ -132,19 +148,9 @@ struct Exported {
 /// declares and what the reader assumes, so `length_scale` is 1 and no unit
 /// conversion sits between the ground truth and the assertion.
 fn export_random_primitive(rng: &mut Rng) -> Exported {
-    export_primitive(rng, false)
-}
-
-/// A random primitive with **planar faces only**. Used by the face-sense
-/// campaigns, which cannot yet run on periodic faces (of-hrgt).
-fn export_random_planar_primitive(rng: &mut Rng) -> Exported {
-    export_primitive(rng, true)
-}
-
-fn export_primitive(rng: &mut Rng, planar_only: bool) -> Exported {
     let mut store = TopologyStore::new();
     let mut geo = GeometryStore::new();
-    let choice = if planar_only { 0 } else { rng.pick(3) };
+    let choice = rng.pick(3);
     let (body, volume, diagonal, label) = match choice {
         0 => {
             let s = [
@@ -393,9 +399,40 @@ fn read_options(strategy: HealStrategy, max_gap: Option<f64>) -> StepReadOptions
     }
 }
 
+/// Import `text` and return the exact body's volume, additionally requiring
+/// that the *geometric* check clears it.
+///
+/// The topology-only `TopologyStore::check` cannot see a face whose sense flag
+/// contradicts its own loop's winding — of-hrgt was exactly that body,
+/// certified by `check()` and then refused by the measurement it was certified
+/// for. `check_with_geometry` is what closes that gap.
+///
+/// Only cases whose *geometry* is undamaged use this. The jittered cases move
+/// vertices off their edges' curves by design, and healing absorbs that into
+/// the surviving entity's tolerance rather than into the vertex — which leaves
+/// `VertexOffEdge` firing at about 1.01× the elevated allowance on a body the
+/// healer reports as repaired (of-bbh8). That disagreement is real but is not
+/// this defect, so it is not asserted against here.
+fn exact_import_volume_checked(
+    text: &str,
+    options: &StepReadOptions,
+    context: &str,
+) -> Option<f64> {
+    exact_import(text, options, context, true)
+}
+
 /// Import `text` and return the exact body's volume, or `None` if the import
 /// did not produce a checker-clean exact B-Rep solid.
 fn exact_import_volume(text: &str, options: &StepReadOptions, context: &str) -> Option<f64> {
+    exact_import(text, options, context, false)
+}
+
+fn exact_import(
+    text: &str,
+    options: &StepReadOptions,
+    context: &str,
+    geometric: bool,
+) -> Option<f64> {
     let mut store = TopologyStore::new();
     let mut geo = GeometryStore::new();
     let import = read_step(text, &mut store, &mut geo, options)
@@ -416,6 +453,16 @@ fn exact_import_volume(text: &str, options: &StepReadOptions, context: &str) -> 
                 failures.len(),
                 failures
             );
+            if geometric {
+                let failures = store.check_with_geometry(&geo, body);
+                assert!(
+                    failures.is_empty(),
+                    "{context}: an EXACT import must be geometrically valid, but \
+                     check_with_geometry() reported {} failures: {:#?}",
+                    failures.len(),
+                    failures
+                );
+            }
             Some(
                 brep_mass_properties(&store, &geo, body)
                     .unwrap_or_else(|e| panic!("{context}: measurement failed: {e:?}"))
@@ -572,7 +619,7 @@ fn gaps_beyond_the_tolerance_are_not_silently_merged() {
 fn random_face_sense_flips_are_repaired() {
     let mut rng = Rng::new(0x_F11E_D001);
     for case in 0..16 {
-        let export = export_random_planar_primitive(&mut rng);
+        let export = export_random_primitive(&mut rng);
         let (damaged, flipped) = flip_face_senses(&export.text, &mut rng);
         if flipped == 0 {
             continue;
@@ -602,7 +649,7 @@ fn random_face_sense_flips_are_repaired() {
 fn wholly_reversed_shells_are_repaired() {
     let mut rng = Rng::new(0x_5E11_0001);
     for case in 0..8 {
-        let export = export_random_planar_primitive(&mut rng);
+        let export = export_random_primitive(&mut rng);
         let damaged = export
             .text
             .lines()
@@ -624,8 +671,9 @@ fn wholly_reversed_shells_are_repaired() {
             export.label
         );
 
-        let volume = exact_import_volume(&damaged, &read_options(HealStrategy::Auto, None), &repro)
-            .unwrap_or_else(|| panic!("{repro}: a wholly reversed shell was not repaired"));
+        let volume =
+            exact_import_volume_checked(&damaged, &read_options(HealStrategy::Auto, None), &repro)
+                .unwrap_or_else(|| panic!("{repro}: a wholly reversed shell was not repaired"));
         assert!(
             volume > 0.0,
             "{repro}: healed body still encloses NEGATIVE volume {volume}"
@@ -634,67 +682,68 @@ fn wholly_reversed_shells_are_repaired() {
     }
 }
 
-/// A healed reversal of a **periodic** face must produce a body the exact
-/// measurement path can weigh. It does not (of-hrgt).
+/// A reversed sense flag on **any single face** of a cylinder must import to
+/// the same body the clean file does — the regression for of-hrgt.
 ///
-/// Deterministic, no randomness: a cylinder exported to STEP with only its
-/// cylindrical wall's `ADVANCED_FACE` sense flipped, imported with
-/// `HealStrategy::Auto`. `check()` reports zero failures — the body is
-/// certified valid — and `brep_mass_properties` then refuses it with
-/// `OpenParameterLoop { gap: 4π }`, exactly two revolutions of the
-/// cylinder's `u` parameter. The two planar caps flip without incident and a
-/// block survives having all six senses flipped, so the defect is specific
-/// to the seam-carrying periodic face; it is independent of
-/// `StepReadOptions::pcurves`, so it is not the pcurve derivation.
+/// Deterministic, no randomness: a cylinder exported to STEP, then re-imported
+/// three times with one `ADVANCED_FACE` sense flag flipped each time.
 ///
-/// Kept live and `#[ignore]`d per the never-soften policy —
-/// `cargo test --test step_heal_random -- --ignored`.
+/// This is the defect the bead was filed on, and it was worse than it looked.
+/// Flipping a sense flag changes no fin sense, so the orientation pass's
+/// two-colouring sees a perfectly consistent shell and plans nothing — and
+/// the reader only consults the healer when the *topology-only*
+/// `TopologyStore::check` fails, which it does not here, so healing was never
+/// even invoked. The body came through as an "exact" import with one face's
+/// flag contradicting its own loop's winding:
+/// `check_with_geometry` reported `FaceSenseContradictsLoop`, tessellation
+/// produced a non-manifold mesh, and `brep_mass_properties` refused the
+/// *periodic* face with `OpenParameterLoop { gap: 4π }` — two revolutions of
+/// `u`, from reading the seam's branch off the flag rather than the loop.
+///
+/// The two planar caps were the quieter half: `brep_mass_properties` takes its
+/// signs from the winding alone, so those bodies measured *correctly* while
+/// being just as malformed. Asserting all three faces is what keeps that half
+/// covered.
 #[test]
-#[ignore = "of-hrgt: healed reversed periodic face passes check() but brep_mass_properties \
-            fails with OpenParameterLoop (gap 4π)"]
-fn reversed_periodic_face_is_measurable() {
+fn a_reversed_face_sense_flag_is_corrected_on_import() {
     let mut store = TopologyStore::new();
     let mut geo = GeometryStore::new();
     let body = primitives::cylinder(&mut store, &mut geo, 3.0, 8.0).expect("valid cylinder");
     let text =
         write_step(&store, &geo, &[body], &StepWriteOptions::default()).expect("cylinder exports");
 
-    // Flip the LAST ADVANCED_FACE — `primitives::cylinder` emits the two
-    // caps first and the wall last.
+    // `primitives::cylinder` emits the two planar caps first and the periodic
+    // wall last, so face 2 is the seam-carrying one.
     let face_lines: Vec<usize> = text
         .lines()
         .enumerate()
         .filter(|(_, l)| l.contains("= ADVANCED_FACE("))
         .map(|(i, _)| i)
         .collect();
-    let wall = *face_lines.last().expect("the cylinder has faces");
-    let damaged = text
-        .lines()
-        .enumerate()
-        .map(|(i, l)| {
-            if i != wall {
-                return l.to_string();
-            }
-            l.strip_suffix(".T.);")
-                .map(|h| format!("{h}.F.);"))
-                .or_else(|| l.strip_suffix(".F.);").map(|h| format!("{h}.T.);")))
-                .unwrap_or_else(|| l.to_string())
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    assert_eq!(face_lines.len(), 3, "the cylinder has three faces");
 
-    let volume = exact_import_volume(
-        &damaged,
-        &read_options(HealStrategy::Auto, None),
-        "cylinder with a reversed periodic wall face",
-    )
-    .expect("healing recovers an exact B-Rep");
-    assert_within(
-        volume,
-        PI * 3.0 * 3.0 * 8.0,
-        1e-9,
-        "cylinder with a reversed periodic wall face",
-    );
+    for (which, &target) in face_lines.iter().enumerate() {
+        let damaged = text
+            .lines()
+            .enumerate()
+            .map(|(i, l)| {
+                if i != target {
+                    return l.to_string();
+                }
+                l.strip_suffix(".T.);")
+                    .map(|h| format!("{h}.F.);"))
+                    .or_else(|| l.strip_suffix(".F.);").map(|h| format!("{h}.T.);")))
+                    .unwrap_or_else(|| l.to_string())
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let repro = format!("cylinder with face #{which}'s ADVANCED_FACE sense flipped");
+
+        let volume =
+            exact_import_volume_checked(&damaged, &read_options(HealStrategy::Auto, None), &repro)
+                .unwrap_or_else(|| panic!("{repro}: healing must recover an exact B-Rep"));
+        assert_within(volume, PI * 3.0 * 3.0 * 8.0, 1e-9, &repro);
+    }
 }
 
 // =====================================================================
@@ -738,6 +787,57 @@ fn non_applying_strategies_do_not_repair_what_auto_repairs() {
                 );
             }
         }
+    }
+}
+
+/// The sense repair obeys the strategy like every other pass: only the
+/// strategies that both orient and apply may correct a flag.
+///
+/// This one needs its own case because it is the one repair that runs from the
+/// *reader* rather than from `GeometryHealer::heal` — it reads a loop's
+/// winding, which only exists once pcurves are attached, which happens after
+/// healing. A pass wired in at a different place is a pass that can miss the
+/// strategy gate, and this is what would catch that.
+///
+/// A non-applying strategy still returns an exact B-Rep here (the flag defect
+/// is invisible to the topology-only check that gates the exact path), so the
+/// contrast is drawn on `check_with_geometry`, which sees the contradiction
+/// the flag makes with its own loop.
+#[test]
+fn only_applying_strategies_correct_a_face_sense_flag() {
+    let mut store = TopologyStore::new();
+    let mut geo = GeometryStore::new();
+    let body = primitives::cylinder(&mut store, &mut geo, 3.0, 8.0).expect("valid cylinder");
+    let text =
+        write_step(&store, &geo, &[body], &StepWriteOptions::default()).expect("cylinder exports");
+    let (damaged, flipped) = flip_face_senses(&text, &mut Rng::new(0x_5E11_5E00));
+    assert!(flipped > 0, "the damage must actually flip something");
+
+    for (strategy, repaired) in [
+        (HealStrategy::Auto, true),
+        (HealStrategy::Minimal, false),
+        (HealStrategy::ReportOnly, false),
+        (HealStrategy::Off, false),
+    ] {
+        let mut store = TopologyStore::new();
+        let mut geo = GeometryStore::new();
+        let import = read_step(
+            &damaged,
+            &mut store,
+            &mut geo,
+            &read_options(strategy, None),
+        )
+        .expect("the damaged file still parses");
+        let SolidOutcome::BRep(body) = import.solids[0].outcome else {
+            panic!("{strategy:?}: expected an exact B-Rep import");
+        };
+        let failures = store.check_with_geometry(&geo, body);
+        assert_eq!(
+            failures.is_empty(),
+            repaired,
+            "{strategy:?}: expected repaired = {repaired}, check_with_geometry() reported \
+             {failures:#?}"
+        );
     }
 }
 
