@@ -6614,6 +6614,293 @@ fn island_boss_unite_subtract_cycles_do_not_drift() {
 }
 
 // ---------------------------------------------------------------------
+// 16.6.1 Coincident-face islands whose boundary is a CONIC (of-x8tn).
+//
+// Everything above imprints straight chords: a square boss on a flat face
+// leaves four line segments that meet at their endpoints, and whether they
+// reach the face's own boundary (16.6's edge-reaching case) or close on
+// themselves in the middle of it (its island case) is the only variable.
+// A round boss closes the same island out of ONE curve, and that single
+// difference reached all the way to the atom bookkeeping: a full circle has
+// two spellings in the arrangement — a flagged ring, and an open polyline
+// from a seam vertex back to itself — and the tool contributed one while the
+// footprint it imprinted contributed the other. Nothing downstream saw them
+// as the same edge, so host and tool never fused: each closed into its own
+// shell with the shared circle missing, and `build_output` rejected both on
+// Euler grounds rather than emitting the boss.
+//
+// A round boss and a round pocket are as ordinary as their square
+// counterparts, so these are held to the same bar: closed-form volume on
+// both measurement paths, one shell, no handles, and — for the cycles — no
+// drift and no unbounded face growth.
+// ---------------------------------------------------------------------
+
+/// The 4 × 4 × 2 block used throughout 16.6, as `(min, max)`.
+const ISLAND_BLOCK: ([f64; 3], [f64; 3]) = ([-2.0, -2.0, -1.0], [2.0, 2.0, 1.0]);
+const ISLAND_BLOCK_VOLUME: f64 = 4.0 * 4.0 * 2.0;
+
+fn cylinder_volume(radius: f64, height: f64) -> f64 {
+    PI * radius * radius * height
+}
+
+/// A round boss standing on the block's top face: the tool's bottom cap is
+/// coincident with the host face and its footprint is a closed circle
+/// strictly inside it. The union has to keep the tool's wall and top cap,
+/// keep the host face minus the disk, and drop the disk itself — so its
+/// volume is the plain sum, with no double count and nothing missing.
+///
+/// This is of-x8tn's first repro. Before the fix `unite` did not return a
+/// wrong solid, it returned no solid at all: `Degenerate` out of
+/// `build_output`, with an Euler count that read as the block plus its
+/// imprinted ring and nothing whatsoever of the cylinder.
+fn circular_boss_unite(center: [f64; 2], radius: f64, height: f64, label: &str) {
+    let (lo, hi) = ISLAND_BLOCK;
+    let mut scene = Scene::new();
+    let base = scene.block(lo, hi);
+    let boss = scene.cylinder(
+        Point3::new(center[0], center[1], hi[2]),
+        Vector3::z(),
+        radius,
+        height,
+    );
+    let out = scene
+        .unite(base, boss)
+        .unwrap_or_else(|e| panic!("{label}: unite failed: {e:?}"));
+
+    assert_eq!(out.shell_count(), 1, "{label}: one shell");
+    assert_eq!(
+        out.store.euler_counts(out.body).genus,
+        0,
+        "{label}: no handles"
+    );
+    let want = ISLAND_BLOCK_VOLUME + cylinder_volume(radius, height);
+    let (meshed, exact) = measured(&out, label);
+    assert_close(exact.volume, want, EXACT_RTOL, &format!("{label} (B-Rep)"));
+    assert_close(
+        meshed.volume,
+        want,
+        CYL_VOLUME_RTOL,
+        &format!("{label} (mesh)"),
+    );
+}
+
+#[test]
+fn circular_island_boss_unite_is_the_sum_of_both_volumes() {
+    circular_boss_unite([0.0, 0.0], 1.0, 1.0, "circular island boss");
+}
+
+/// Off centre and a different size, so nothing about the imprinted circle
+/// is symmetric with the host face's own parameterization and no match can
+/// come off a shared centre or a shared extent.
+#[test]
+fn off_centre_circular_island_boss_unite_is_the_sum_of_both_volumes() {
+    circular_boss_unite([0.75, -0.5], 0.8, 1.5, "off-centre circular island boss");
+}
+
+/// A round POCKET: the tool's TOP cap is coincident with the block's top
+/// face and its body reaches down into the material, so the same island
+/// imprint now has to remove volume across itself rather than add it. It
+/// failed as its own case (chi = 2 - 3 + 2 - 0 = 1, the cylinder with the
+/// block gone) and is fixed by the same merge, so it is fenced separately.
+#[test]
+fn circular_island_pocket_subtract_removes_exactly_the_tool() {
+    let (lo, hi) = ISLAND_BLOCK;
+    let (radius, depth) = (1.0, 0.5);
+    let label = "circular island pocket";
+
+    let mut scene = Scene::new();
+    let base = scene.block(lo, hi);
+    // Bottom cap inside the block, top cap flush with the block's top face.
+    let tool = scene.cylinder(
+        Point3::new(0.0, 0.0, hi[2] - depth),
+        Vector3::z(),
+        radius,
+        depth,
+    );
+    let out = scene
+        .subtract(base, tool)
+        .unwrap_or_else(|e| panic!("{label}: subtract failed: {e:?}"));
+
+    assert_eq!(out.shell_count(), 1, "{label}: one shell");
+    assert_eq!(
+        out.store.euler_counts(out.body).genus,
+        0,
+        "{label}: no handles"
+    );
+    let want = ISLAND_BLOCK_VOLUME - cylinder_volume(radius, depth);
+    let (meshed, exact) = measured(&out, label);
+    assert_close(exact.volume, want, EXACT_RTOL, &format!("{label} (B-Rep)"));
+    assert_close(
+        meshed.volume,
+        want,
+        CYL_VOLUME_RTOL,
+        &format!("{label} (mesh)"),
+    );
+}
+
+/// Two round bosses on the SAME host face, added one boolean at a time.
+/// The second union imprints its circle onto a top face that is already
+/// split by the first one and already carries a ring on its boundary, so
+/// the new ring has to find its own partner among several candidates and
+/// leave the settled one alone.
+#[test]
+fn two_circular_island_bosses_on_one_face_unite() {
+    let (lo, hi) = ISLAND_BLOCK;
+    let (radius, height) = (0.6, 0.9);
+    let label = "two circular island bosses";
+
+    let boss_at = |scene: &mut Scene, center: [f64; 2]| {
+        scene.cylinder(
+            Point3::new(center[0], center[1], hi[2]),
+            Vector3::z(),
+            radius,
+            height,
+        )
+    };
+
+    let mut scene = Scene::new();
+    let body = scene.block(lo, hi);
+    let first = boss_at(&mut scene, [-1.0, -1.0]);
+    let out = scene
+        .unite(body, first)
+        .unwrap_or_else(|e| panic!("{label}: first unite failed: {e:?}"));
+
+    let (mut scene, body) = Scene::adopt(out, tol());
+    let second = boss_at(&mut scene, [1.0, 1.0]);
+    let out = scene
+        .unite(body, second)
+        .unwrap_or_else(|e| panic!("{label}: second unite failed: {e:?}"));
+
+    assert_eq!(out.shell_count(), 1, "{label}: one shell");
+    assert_eq!(
+        out.store.euler_counts(out.body).genus,
+        0,
+        "{label}: no handles"
+    );
+    let want = ISLAND_BLOCK_VOLUME + 2.0 * cylinder_volume(radius, height);
+    let (meshed, exact) = measured(&out, label);
+    assert_close(exact.volume, want, EXACT_RTOL, &format!("{label} (B-Rep)"));
+    assert_close(
+        meshed.volume,
+        want,
+        CYL_VOLUME_RTOL,
+        &format!("{label} (mesh)"),
+    );
+}
+
+/// A through bore whose tool ends EXACTLY flush with both faces it pierces,
+/// so one arrangement carries two conic islands at once — the only case in
+/// this section that does. A drilling tool is normally given overhang, which
+/// is precisely what keeps its caps out of the picture; take the overhang
+/// away and both caps become coincident face pairs, each contributing a ring
+/// in two spellings that must merge with its own partner and not with the
+/// other one 2 units away.
+///
+/// The genus assertion is what makes it more than a second copy of the
+/// pocket case: a hole that fails to open, or opens into a second shell,
+/// cannot report 1.
+#[test]
+fn flush_capped_through_bore_subtract_opens_a_genus_1_hole() {
+    let (lo, hi) = ISLAND_BLOCK;
+    let radius = 1.0;
+    let height = hi[2] - lo[2];
+    let label = "flush-capped through bore";
+
+    let mut scene = Scene::new();
+    let base = scene.block(lo, hi);
+    let tool = scene.cylinder(Point3::new(0.0, 0.0, lo[2]), Vector3::z(), radius, height);
+    let out = scene
+        .subtract(base, tool)
+        .unwrap_or_else(|e| panic!("{label}: subtract failed: {e:?}"));
+
+    assert_eq!(out.shell_count(), 1, "{label}: one shell");
+    assert_eq!(
+        out.store.euler_counts(out.body).genus,
+        1,
+        "{label}: a through hole must give genus 1"
+    );
+    let want = ISLAND_BLOCK_VOLUME - cylinder_volume(radius, height);
+    let (meshed, exact) = measured(&out, label);
+    assert_close(exact.volume, want, EXACT_RTOL, &format!("{label} (B-Rep)"));
+    assert_close(
+        meshed.volume,
+        want,
+        CYL_VOLUME_RTOL,
+        &format!("{label} (mesh)"),
+    );
+}
+
+/// The 16.6 drift question asked of a conic island: unite a round boss, then
+/// subtract it again, six times over. `(A ∪ B) − B` is `A`, so every cycle
+/// must return the block unchanged — but each cycle re-imprints a circle
+/// onto a top face that already carries one, which is where a
+/// tolerance-sized nudge per cycle would show up as a walking volume or a
+/// face count that never settles.
+#[test]
+fn circular_island_boss_unite_subtract_cycles_do_not_drift() {
+    const CYCLES: usize = 6;
+    let (lo, hi) = ISLAND_BLOCK;
+    let (radius, height) = (1.0, 1.0);
+    let label = "circular island boss";
+    let mut counts = Vec::new();
+
+    let mut scene = Scene::new();
+    let mut body = scene.block(lo, hi);
+
+    for cycle in 1..=CYCLES {
+        let context = format!("{label}: unite/subtract cycle {cycle} of {CYCLES}");
+        let base = Point3::new(0.0, 0.0, hi[2]);
+        let tool = scene.cylinder(base, Vector3::z(), radius, height);
+        let united = scene
+            .unite(body, tool)
+            .unwrap_or_else(|e| panic!("{context}: unite failed: {e:?}"));
+        let (mut next, united_body) = Scene::adopt(united, tol());
+        let tool_again = next.cylinder(base, Vector3::z(), radius, height);
+        let out = next
+            .subtract(united_body, tool_again)
+            .unwrap_or_else(|e| panic!("{context}: subtract failed: {e:?}"));
+
+        assert_eq!(out.shell_count(), 1, "{context}: one shell");
+        assert_eq!(
+            out.store.euler_counts(out.body).genus,
+            0,
+            "{context}: no handles"
+        );
+        let (meshed, exact) = measured(&out, &context);
+        assert_close(
+            exact.volume,
+            ISLAND_BLOCK_VOLUME,
+            EXACT_RTOL,
+            &format!("{context} (B-Rep path)"),
+        );
+        assert_close(
+            meshed.volume,
+            ISLAND_BLOCK_VOLUME,
+            CYL_VOLUME_RTOL,
+            &format!("{context} (mesh path)"),
+        );
+        assert!(
+            exact.centroid.coords.norm() <= 1e-9,
+            "{context}: centroid drifted to {:?}",
+            exact.centroid
+        );
+        counts.push(out.face_count());
+
+        let (next, next_body) = Scene::adopt(out, tol());
+        scene = next;
+        body = next_body;
+    }
+
+    // Same bar as `unite_subtract_cycles`: an imprint may legitimately
+    // survive as a split face, but the count must stop growing.
+    assert_eq!(
+        counts.last(),
+        counts.get(1),
+        "{label}: face count did not settle over {CYCLES} identical cycles: {counts:?}"
+    );
+}
+
+// ---------------------------------------------------------------------
 // 16.7 High-degree and near-degenerate-knot NURBS operands.
 //
 // Section (14) proved the NURBS path on degree-1 patches with evenly spaced

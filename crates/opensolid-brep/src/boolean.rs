@@ -5629,6 +5629,45 @@ fn polyline_midpoint(points: &[Point3], closed: bool) -> Point3 {
     ring[ring.len() - 1]
 }
 
+/// Whether an atom traces a whole closed curve, in either of the two
+/// spellings the arrangement produces (of-x8tn).
+///
+/// `closed = true` is the flagged spelling: a ring whose polyline omits the
+/// repeated seam sample. The other is an ordinary open atom that happens to
+/// return to where it started — what [`split_sampled`] emits for a periodic
+/// curve carrying a single split marker, and therefore what *every* uncut
+/// circular boundary edge looks like, since its seam vertex is that marker.
+/// [`build_output`] already treats the two alike (it takes a closed atom's end
+/// point to be its start point); this is the same statement, made where
+/// atoms are compared to each other.
+fn atom_is_ring(a: &Atom, tol: f64) -> bool {
+    a.closed || (a.points.len() >= 3 && (a.points[0] - a.points[a.points.len() - 1]).norm() <= tol)
+}
+
+/// An atom's two endpoints, with a ring's taken to be its seam point twice —
+/// the convention [`build_output`] binds edges by.
+fn atom_ends(a: &Atom) -> (Point3, Point3) {
+    if a.closed {
+        (a.points[0], a.points[0])
+    } else {
+        (a.points[0], a.points[a.points.len() - 1])
+    }
+}
+
+/// Unit direction the atom leaves `points[0]` in, or `None` if its first
+/// non-degenerate chord cannot be found (an all-coincident polyline).
+///
+/// Taken as a chord rather than an exact curve derivative because the caller
+/// compares two independently sampled polylines of the same curve, and a
+/// chord is what both of them actually have.
+fn atom_tangent(a: &Atom) -> Option<Vector3> {
+    a.points[1..]
+        .iter()
+        .map(|p| p - a.points[0])
+        .find(|d| d.norm() > 0.0)
+        .map(|d| d.normalize())
+}
+
 /// Group atoms that trace the same curve into one class, so the output
 /// carries one edge where the arrangement built several (of-bxl.4).
 ///
@@ -5650,6 +5689,22 @@ fn polyline_midpoint(points: &[Point3], closed: bool) -> Point3 {
 /// arc-length midpoint, at the weld length. Endpoints alone would merge the
 /// two halves of a split boundary loop; the midpoint separates them.
 ///
+/// **Rings are compared separately, because the arrangement has two spellings
+/// for one (of-x8tn).** A full closed curve reaches [`build_output`] either as
+/// `closed = true` (an imprint that never met a split point) or as an *open*
+/// polyline running from a seam vertex back to itself ([`split_sampled`]'s
+/// single-marker path, which is how every periodic boundary edge arrives).
+/// A round boss is exactly that pair: the tool's bottom cap circle is the
+/// open spelling, the footprint it imprints on the host face is the closed
+/// one. Comparing them by endpoints cannot see it — the closed spelling's
+/// last sample is one chord short of its first — so the two fuse into
+/// nothing, the union-find never joins host to tool, and each operand closes
+/// into its own shell with the shared circle missing. Both spellings mean
+/// "starts at `points[0]`, ends there too", which is what [`atom_ends`]
+/// reports; the traversal sense that endpoint matching would have supplied is
+/// then read off the tangent at that shared point, since for a ring the ends
+/// alone say nothing about direction.
+///
 /// Returns each atom's class representative and whether it runs *against* that
 /// representative. The direction is not incidental bookkeeping: coincident
 /// atoms generally arrive reversed (the shared edge of two adjacent coplanar
@@ -5658,11 +5713,11 @@ fn polyline_midpoint(points: &[Point3], closed: bool) -> Point3 {
 /// sense to keep saying what it said about its own atom.
 fn canonical_atoms(atoms: &[Atom], snap: f64) -> Vec<(usize, bool)> {
     let tol = snap * 4.0;
-    let ends = |a: &Atom| (a.points[0], a.points[a.points.len() - 1]);
     // `Some(reversed)` when the two atoms trace the same curve.
     let same = |i: usize, j: usize| -> Option<bool> {
         let (a, b) = (&atoms[i], &atoms[j]);
-        if a.closed != b.closed {
+        let (ring_a, ring_b) = (atom_is_ring(a, tol), atom_is_ring(b, tol));
+        if ring_a != ring_b {
             return None;
         }
         if (polyline_midpoint(&a.points, a.closed) - polyline_midpoint(&b.points, b.closed)).norm()
@@ -5670,7 +5725,24 @@ fn canonical_atoms(atoms: &[Atom], snap: f64) -> Vec<(usize, bool)> {
         {
             return None;
         }
-        let ((a0, a1), (b0, b1)) = (ends(a), ends(b));
+        let ((a0, a1), (b0, b1)) = (atom_ends(a), atom_ends(b));
+        if ring_a {
+            // Both ends are the seam point, so only the seam has to agree;
+            // direction comes from the tangent there. `atom_tangent` reports
+            // the outgoing chord, so a reversed twin's is the antipodal one.
+            if (a0 - b0).norm() > tol {
+                return None;
+            }
+            let (ta, tb) = (atom_tangent(a)?, atom_tangent(b)?);
+            let dot = ta.dot(&tb);
+            // A degenerate reading (the two chords near-orthogonal) is not a
+            // match to force either way: leave the atoms distinct.
+            return match dot {
+                d if d > 0.5 => Some(false),
+                d if d < -0.5 => Some(true),
+                _ => None,
+            };
+        }
         if (a0 - b0).norm() <= tol && (a1 - b1).norm() <= tol {
             Some(false)
         } else if (a0 - b1).norm() <= tol && (a1 - b0).norm() <= tol {
@@ -10156,6 +10228,77 @@ mod tests {
                 .is_empty(),
             "cap away from the seam must not report a crossing"
         );
+    }
+
+    /// A unit circle in the xy plane through `n` samples, from angle 0,
+    /// turning `ccw` or not. As a ring atom in one spelling or the other:
+    /// `closed` omits the repeated seam sample, open repeats it.
+    fn ring_atom(n: usize, ccw: bool, closed: bool) -> Atom {
+        let sign = if ccw { 1.0 } else { -1.0 };
+        let mut points: Vec<Point3> = (0..n)
+            .map(|i| {
+                let t = sign * TWO_PI * (i as f64) / (n as f64);
+                Point3::new(t.cos(), t.sin(), 0.0)
+            })
+            .collect();
+        if !closed {
+            points.push(points[0]);
+        }
+        Atom { points, closed }
+    }
+
+    #[test]
+    fn canonical_atoms_fuses_both_spellings_of_one_ring() {
+        // of-x8tn: a round boss's footprint imprints as a flagged ring
+        // while the tool's own cap circle arrives as an open polyline back
+        // to its seam. They are one edge of the result, and the two run
+        // opposite ways — the host's imprint is clipped from the partner's
+        // boundary, which the partner traverses the other way round.
+        let atoms = vec![ring_atom(96, true, false), ring_atom(64, false, true)];
+        let class = canonical_atoms(&atoms, SNAP);
+        assert_eq!(class[0], (0, false), "first atom represents its own class");
+        assert_eq!(
+            class[1],
+            (0, true),
+            "the closed spelling must join the open one, reversed"
+        );
+    }
+
+    #[test]
+    fn canonical_atoms_keeps_a_ring_apart_from_an_arc() {
+        // The ring branch must not swallow an open atom that merely shares
+        // the ring's midpoint: half of the same circle runs from (1,0) to
+        // (-1,0), whose arc-length midpoint is (0,1) — different from the
+        // full ring's (-1,0) — but a start-point-only test would still see
+        // the shared (1,0) and fuse them.
+        let half = Atom {
+            points: (0..49)
+                .map(|i| {
+                    let t = PI * (i as f64) / 48.0;
+                    Point3::new(t.cos(), t.sin(), 0.0)
+                })
+                .collect(),
+            closed: false,
+        };
+        let atoms = vec![ring_atom(96, true, true), half];
+        let class = canonical_atoms(&atoms, SNAP);
+        assert_eq!(class[0], (0, false));
+        assert_eq!(class[1], (1, false), "an arc is not the ring it lies on");
+    }
+
+    #[test]
+    fn canonical_atoms_keeps_rings_with_different_seams_apart() {
+        // Two spellings of the same circle whose seams sit a quarter turn
+        // apart are not one edge — fusing them would bind a loop to a vertex
+        // it does not have. A ring's arc-length midpoint IS its seam's
+        // antipode, so the midpoint filter separates them before the seam
+        // test is even reached; both bars are stated here because either one
+        // alone would be enough and neither may be dropped.
+        let mut rotated = ring_atom(96, true, true);
+        rotated.points.rotate_left(24);
+        let atoms = vec![ring_atom(96, true, true), rotated];
+        let class = canonical_atoms(&atoms, SNAP);
+        assert_eq!(class[1], (1, false), "different seam, different atom");
     }
 
     #[test]
