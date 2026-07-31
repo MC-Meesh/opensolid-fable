@@ -92,21 +92,37 @@ const CLIP_REFINE_ITERATIONS: usize = 50;
 const EDGE_MATCH_SNAP: f64 = 10.0;
 /// Half-width of the "near a region boundary" band that rejects
 /// ray-classification hits whose parity could flip under polyline
-/// discretization, as a fraction of the local face extent
-/// (`Pipeline::face_extents`). Sized to the polyline sagitta —
-/// `r * (1 - cos(π / SAMPLES_PER_CIRCLE)) ≈ 5.4e-4 * r` — so a hit within a
-/// chord's worth of a curved boundary is retried, while genuine interior
-/// hits (nearest ≈ `3e-3 * face_extent`) are not. Keying off the face
-/// extent (not `snap`, whose ULP floor inflates with distance from the
-/// origin) keeps the band a fixed fraction of the feature at any scale and
-/// position; an absolute band instead swallows whole small faces and
-/// misses grazing hits on large ones (of-lxk, of-260).
-const BOUNDARY_BAND_FRAC: f64 = 5e-4;
+/// discretization, in multiples of the *measured* sagitta of the boundary
+/// polyline it is being compared against ([`polyline_sagitta`], cached in
+/// `Pipeline::edge_bands`). Two sagittas is the smallest band that is
+/// certainly wide enough: a hit truly on the boundary can measure as far
+/// as one sagitta away from the chords standing in for it, and the same
+/// slack applies in the other direction.
+///
+/// The band is per *edge*, not per face, because the two differ by orders
+/// of magnitude on the very same face. A cylinder wall is bounded by two
+/// circles, whose chords bow by `r * (1 - cos(π / SAMPLES_PER_CIRCLE))
+/// ≈ 5.4e-4 * r`, and by a seam line, whose chords are exact. A band
+/// sized off the face's own extent — the previous `5e-4 * extent` — is
+/// right only while the face is roughly as long as it is wide: at a
+/// length/radius above ~4e3 it exceeds the wall's whole diameter, so every
+/// hit anywhere on the wall reads as "on the seam", all six rays are
+/// abandoned and the boolean fails outright (of-oygs). Measuring the
+/// polyline instead makes the band a property of the discretization it
+/// exists to tolerate, at any aspect ratio, scale, or position.
+const BOUNDARY_BAND_SAGITTAS: f64 = 2.0;
+/// Floor under the [`BOUNDARY_BAND_SAGITTAS`] band, in multiples of
+/// [`geometric_snap`]: an exactly-sampled boundary (any straight edge) has
+/// zero sagitta, and a hit still must not be trusted inside the weld
+/// length of it. Matches the `ambiguous` band `Pipeline::contains_point`
+/// uses for the same reason one step earlier.
+const BOUNDARY_BAND_SNAPS: f64 = 10.0;
 /// Acceptance band for discretization-noise inputs, as a fraction of the
 /// local face extent: how far off its true locus a chord-sampled point may
 /// legitimately sit before it stops being noise and starts being a
 /// different feature. Marched/boundary polylines carry a chord sagitta of
-/// at most ~`5e-4 * extent` ([`BOUNDARY_BAND_FRAC`]'s sizing), while
+/// at most ~`5e-4 * extent` (a full circle inscribed in the face, sampled
+/// at [`SAMPLES_PER_CIRCLE`] — the coarsest case), while
 /// distinct features (another edge, another face) are a face extent apart,
 /// so 2% clears the noise by ~40x and the wrong feature by 50x. Used by
 /// [`Pipeline::polish_clip_endpoint`] to pick the crossed edge and by
@@ -1884,6 +1900,13 @@ struct Pipeline<'a> {
     snap: f64,
     /// Sampled original edges, per solid.
     edge_samples: [Vec<SampledCurve>; 2],
+    /// Half-width of each sampled edge's "too close to trust" band, per
+    /// solid: [`BOUNDARY_BAND_SAGITTAS`] times what that edge's own
+    /// discretization actually costs, floored at
+    /// [`BOUNDARY_BAND_SNAPS`] × `snap`. Read by
+    /// [`Pipeline::near_face_boundary`]; cached because every ray hit
+    /// against a face walks all of its boundary edges (of-oygs).
+    edge_bands: [Vec<f64>; 2],
     /// Discretized face regions, per solid.
     face_polys: [Vec<FaceRegionPoly>; 2],
     /// Local feature length of each face (boundary bounding-box diagonal),
@@ -2171,6 +2194,15 @@ impl<'a> Pipeline<'a> {
                 .flatten()
                 .flat_map(|s| s.points.iter().copied()),
         );
+        let edge_bands: [Vec<f64>; 2] = [0, 1].map(|s| {
+            edge_samples[s]
+                .iter()
+                .map(|sampled| {
+                    (BOUNDARY_BAND_SAGITTAS * polyline_sagitta(&sampled.points, sampled.closed))
+                        .max(BOUNDARY_BAND_SNAPS * snap)
+                })
+                .collect()
+        });
 
         let mut face_polys: [Vec<FaceRegionPoly>; 2] = [Vec::new(), Vec::new()];
         for s in 0..2 {
@@ -2211,6 +2243,7 @@ impl<'a> Pipeline<'a> {
             tol: *tol,
             snap,
             edge_samples,
+            edge_bands,
             face_polys,
             face_extents,
             imprints: Vec::new(),
@@ -3920,12 +3953,24 @@ impl<'a> Pipeline<'a> {
         })
     }
 
+    /// Whether a ray hit sits close enough to face `(s, f)`'s boundary that
+    /// the polylines standing in for that boundary could have it on the
+    /// wrong side — in which case the caller abandons the ray rather than
+    /// count a parity it cannot trust.
+    ///
+    /// Each edge is judged against its own band ([`Pipeline::edge_bands`]),
+    /// not one band for the whole face. The distinction is not academic: a
+    /// slender cylinder's wall is bounded by two finely-curved circles and
+    /// one exact seam line, and a face-wide band inflated by the wall's
+    /// *length* puts the entire wall inside the seam's band, which is what
+    /// made deep bores unclassifiable (of-oygs).
     fn near_face_boundary(&self, s: SolidTag, f: usize, p: &Point3) -> bool {
-        let band = self.face_extents[s][f] * BOUNDARY_BAND_FRAC;
         for lp in &self.solids[s].faces[f].loops {
             for de in lp {
                 let sampled = &self.edge_samples[s][de.edge];
-                if polyline_distance(&sampled.points, sampled.closed, p) < band {
+                if polyline_distance(&sampled.points, sampled.closed, p)
+                    < self.edge_bands[s][de.edge]
+                {
                     return true;
                 }
             }
@@ -4183,6 +4228,39 @@ fn polyline_distance(points: &[Point3], closed: bool, p: &Point3) -> f64 {
         best = best.min((p - (a + ab * t)).norm());
     }
     best
+}
+
+/// How far the curve behind a sampled polyline can bow away from the
+/// chords standing in for it: the worst sagitta over the polyline.
+///
+/// Measured from the samples rather than assumed from the sampling rate,
+/// because the two disagree by orders of magnitude between edges of one
+/// face — a circle's chords bow, a line's do not, and only the samples
+/// know which this is. For three consecutive samples of a curve of local
+/// curvature `κ` at parameter step `Δ`, the middle one stands off the
+/// chord of its two neighbours by `≈ κΔ²/2`, while a single chord's own
+/// sagitta is `≈ κΔ²/8`: a factor of four, which is the quarter here. On
+/// a circle of radius `r` sampled `n` per turn the estimate is
+/// `r(1 - cos(2π/n))/4`, within 2% of the true `r(1 - cos(π/n))` at
+/// `n = 96`. Straight runs give exactly zero, which is the point.
+///
+/// Zero for fewer than three samples: two points are one chord, whose
+/// deviation is unmeasurable from the samples alone. Callers floor the
+/// result (see [`BOUNDARY_BAND_SNAPS`]) rather than trust a bare zero.
+fn polyline_sagitta(points: &[Point3], closed: bool) -> f64 {
+    let n = points.len();
+    if n < 3 {
+        return 0.0;
+    }
+    // An open polyline has no chord spanning its ends, so its first and
+    // last samples are never middles; a closed one wraps through both.
+    let triples = if closed { n } else { n - 2 };
+    let mut worst = 0.0f64;
+    for i in 0..triples {
+        let (a, b, c) = (points[i], points[(i + 1) % n], points[(i + 2) % n]);
+        worst = worst.max(polyline_distance(&[a, c], false, &b) / 4.0);
+    }
+    worst
 }
 
 /// Split a sampled curve at the given 3D points, producing atoms. Split
@@ -9145,6 +9223,57 @@ mod tests {
             d2.to_bits(),
             "deviation must be bit-identical"
         );
+    }
+
+    /// of-oygs: the boundary band is sized from what a polyline's own
+    /// chords actually cost, so it must read zero off an exactly-sampled
+    /// run and the chord sagitta off a curved one — on the same face, at
+    /// the same sampling rate.
+    #[test]
+    fn polyline_sagitta_separates_a_seam_from_a_circle() {
+        let r = 1e-3;
+        let circle: Vec<Point3> = (0..SAMPLES_PER_CIRCLE)
+            .map(|i| {
+                let a = TWO_PI * i as f64 / SAMPLES_PER_CIRCLE as f64;
+                Point3::new(r * a.cos(), r * a.sin(), 0.0)
+            })
+            .collect();
+        // A circle's samples bow away from their chords by
+        // r(1 - cos(π/n)); the three-sample estimate must land there.
+        let want = r * (1.0 - (PI / SAMPLES_PER_CIRCLE as f64).cos());
+        let got = polyline_sagitta(&circle, true);
+        assert!(
+            (got - want).abs() < 0.05 * want,
+            "circle sagitta {got:e} should be within 5% of {want:e}"
+        );
+
+        // The same cylinder wall's other boundary: a 4-long axial seam,
+        // sampled by the same machinery, with nothing to bow.
+        let seam: Vec<Point3> = (0..=LINE_SAMPLES)
+            .map(|i| Point3::new(r, 0.0, 4.0 * i as f64 / LINE_SAMPLES as f64))
+            .collect();
+        assert_eq!(
+            polyline_sagitta(&seam, false),
+            0.0,
+            "a straight run has no discretization error to tolerate"
+        );
+
+        // Which is the whole point: at aspect 4000 the seam's band must
+        // stay well inside the wall it bounds, where the old face-extent
+        // rule (5e-4 of the wall's 4-unit bounding box) was a full
+        // diameter wide and swallowed it.
+        let wall_diameter = 2.0 * r;
+        assert!(
+            5e-4 * 4.0 >= wall_diameter,
+            "the old face-extent band did cover the whole wall"
+        );
+        assert!(
+            BOUNDARY_BAND_SAGITTAS * polyline_sagitta(&circle, true) < 0.01 * wall_diameter,
+            "the measured band must leave the wall's interior classifiable"
+        );
+
+        // Too few samples to measure: zero, and callers floor it.
+        assert_eq!(polyline_sagitta(&circle[..2], false), 0.0);
     }
 
     #[test]

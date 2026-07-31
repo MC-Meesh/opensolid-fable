@@ -30,14 +30,15 @@
 //!
 //! Sections (1)-(15) are entirely live. Section (16) is not, and that is
 //! the protocol working rather than failing: it is the of-ipt.19 numerical
-//! robustness campaign, and seven of its cases are `#[ignore]`d against four
+//! robustness campaign, and five of its cases are `#[ignore]`d against three
 //! defects it found and filed — of-ukcq (mesh `mass_properties` integrates
-//! tetrahedra from the absolute origin, 191× wrong at offset 1e6), of-oygs
-//! (`ray_classify` gives up on operands past ~1e3 length/radius for
-//! cylinders, ~1e7 for blocks), of-6viu (`unite` rejects a coincident-face
-//! imprint that forms an island, i.e. a boss centred on a face), and
-//! of-y8qc (`brep_mass_properties` on a trimmed sphere degrades with the
-//! angle between the trim and the pole axis, reaching 1.3e-3 at 90°). Each
+//! tetrahedra from the absolute origin, 191× wrong at offset 1e6), of-6viu
+//! (`unite` rejects a coincident-face imprint that forms an island, i.e. a
+//! boss centred on a face), and of-y8qc (`brep_mass_properties` on a trimmed
+//! sphere degrades with the angle between the trim and the pole axis,
+//! reaching 1.3e-3 at 90°). A fourth, of-oygs (`ray_classify` refusing
+//! slender operands past ~1e3 length/radius for cylinders), is fixed and its
+//! two cases are live again. Each
 //! `#[ignore]`d case has a live sibling that fences the working range, so a
 //! fix has a boundary to move rather than a single case to flip.
 //!
@@ -5500,9 +5501,13 @@ fn brep_path_hits_closed_form_on_nurbs_operands() {
 // eight-deep boolean chain to the same budget at step eight as at step one,
 // and swallows degree-5 patches, C0 knots and knots 1e-9 apart without a
 // wobble. What broke was mostly *around* it — the mesh measurement path
-// (of-ukcq), region seeding for slender operands (of-oygs), island imprints
-// (of-6viu), and the trimmed-sphere measurement (of-y8qc) — which is why
-// four of the five beads this section filed are outside `boolean.rs`.
+// (of-ukcq), island imprints (of-6viu), and the trimmed-sphere measurement
+// (of-y8qc). The one defect that was squarely inside it, of-oygs, turned out
+// to be a band sized off the wrong quantity rather than anything about
+// seeding: `near_face_boundary` scaled its "too close to trust" distance by
+// the whole face's bounding box, so a slender face's own length made its
+// interior unreachable. It now measures each boundary polyline's own chord
+// error instead, and both of its cases are live.
 // =====================================================================
 
 /// The tolerance context a model whose features are `scale` model units
@@ -5975,13 +5980,16 @@ fn tiny_tool_dents_a_huge_block() {
 /// million times the budget, so a boolean that lost the needle entirely
 /// still fails.
 ///
-/// The needle is slender in *two* directions at once, which is what puts it
-/// past of-oygs's limit — `ray_classify` reports that every ray from its
-/// region seed hits a degenerate case. Its one-thin-direction sibling
-/// [`crossed_thin_plates_share_a_ribbon`] is the same aspect ratio and is
-/// live, so this test isolates the second thin direction as the trigger.
+/// The needle is slender in *two* directions at once, which is what used to
+/// put it past of-oygs's limit: its long faces are 1e-3 wide and 1000 long,
+/// and the old boundary band — a fixed fraction of the face's *own bounding
+/// box* — was half a unit on those faces, five hundred times their whole
+/// width. Every ray hit anywhere on them read as "too close to an edge to
+/// count", all six directions were abandoned, and classification failed. The
+/// band is now measured from each boundary polyline's actual sagitta, which
+/// on a straight edge is zero, so a face's slenderness no longer inflates the
+/// distance at which its own interior stops being interior.
 #[test]
-#[ignore = "of-oygs: ray_classify gives up on operands slender in two directions"]
 fn crossed_plate_and_needle() {
     let context = "1e6-aspect plate crossed by a 1e6-aspect needle";
     let mut scene = Scene::new();
@@ -6039,14 +6047,26 @@ fn crossed_thin_plates_share_a_ribbon() {
 /// so a fix (or a regression) has a boundary to move rather than a single
 /// broken case to flip.
 ///
-/// The two arms of the family have wildly different limits, which is itself
-/// the finding. Planar operands survive to aspect 1e7 and fail at 1e8;
-/// cylindrical ones survive to aspect 1e3 and fail by 4e3, at every absolute
-/// radius and every linear tolerance tried (1e-5 through 1e-9) — so the
-/// curved seeding path is about four orders of magnitude weaker than the
-/// planar one, and the limit is a pure shape property rather than anything
-/// to do with tolerance. Both arms are exact inside their range, which is
-/// why the failures read as a cliff and not as decay.
+/// The two arms used to have wildly different limits — planar operands
+/// surviving to aspect 1e7 while cylindrical ones failed by 4e3 — and that
+/// four-decade gap was the finding of-oygs was filed on. It is closed: both
+/// arms now hold to aspect 1e7 and fail together at 1e8, because the
+/// classifier's boundary band is measured from each boundary polyline's own
+/// discretization rather than from the bounding box of the face it belongs
+/// to. A wall's length no longer says anything about how close to its seam a
+/// point may be trusted, so a shape being slender is no longer, by itself, a
+/// reason to refuse it.
+///
+/// What is left at 1e8 is a *resolution* limit rather than a shape one, and
+/// it lands in the same place for both arms: `geometric_snap` welds at 1e-9
+/// of the joint extent of both operands, and `contains_point` distrusts a
+/// sample within ten welds of a face. A feature thinner than ~1e-8 of the
+/// model's overall size therefore cannot be classified — a 1e-5 rib in a
+/// 1000-wide model, a 1-radius bore in a 1e8-long drill — and the refusal is
+/// correct at that point, not conservative: forcing the band down to a single
+/// weld makes the 1e8 planar case return an answer that is 33% wrong instead.
+/// See of-x01y. Inside the range every case here is exact, which is why the
+/// failures read as a cliff and not as decay.
 #[test]
 fn high_aspect_operands_inside_the_working_range() {
     // Planar arm: two 1000-wide plates at aspect 1e6 and 1e7.
@@ -6067,10 +6087,13 @@ fn high_aspect_operands_inside_the_working_range() {
         );
     }
 
-    // Cylindrical arm: three bores all at aspect 1000 — the deepest of-oygs
-    // allows — at three different absolute radii, under one fixed 1e-6
-    // tolerance context. Passing all three is the statement that the limit
-    // is the drill's own shape and neither its size nor the tolerance.
+    // Cylindrical arm: three bores from aspect 1e4 to 1e7 — the last decade
+    // before the resolution limit above — at three different absolute radii,
+    // under one fixed 1e-6 tolerance context. Passing all three is the
+    // statement that what survives is set by neither the drill's absolute
+    // size nor the tolerance. The plate is kept in proportion to the drill
+    // (100 radii wide, 10 deep) so that the drill's length is the only thing
+    // varying with aspect; every other ratio in the model is fixed.
     //
     // These three are the one place in the suite that does not tessellate its
     // result, and the reason is cost, not doubt: the triangulator's time
@@ -6081,12 +6104,10 @@ fn high_aspect_operands_inside_the_working_range() {
     // inside `subtract`: of-oygs is a `ray_classify` refusal, so reaching a
     // result at all is most of the assertion. `check()` and the exact volume
     // still confirm the result is a well-formed solid of the right size.
-    for (radius, height) in [(1e-2, 10.0), (1e-3, 1.0), (1e-4, 0.1)] {
-        let (width, thickness) = (100.0 * radius, height / 2.0);
-        let context = format!(
-            "bore r={radius:e}, depth {height} (aspect {:e})",
-            height / radius
-        );
+    for (radius, aspect) in [(1e-2, 1e4), (1e-3, 1e6), (1e-4, 1e7)] {
+        let (width, thickness) = (100.0 * radius, 10.0 * radius);
+        let height = aspect * radius;
+        let context = format!("bore r={radius:e}, drill {height:e} long (aspect {aspect:e})");
         let mut scene = Scene::new();
         let plate = scene.block(
             [-width / 2.0, -width / 2.0, -thickness / 2.0],
@@ -6130,13 +6151,16 @@ fn high_aspect_operands_inside_the_working_range() {
 /// the way through) and the removed material is weighed as the intersection,
 /// which is a body of its own and measurable on its own terms.
 ///
-/// The drill is 4 long and 1e-3 in radius: aspect 4000, just past the ~1e3
-/// of-oygs allows. Shortening it to aspect 1000 with everything else
-/// unchanged makes it pass exactly — that variant is the live fence in
-/// [`high_aspect_operands_inside_the_working_range`]. So this test isolates
-/// the drill's own slenderness, not its size relative to the plate.
+/// The drill is 4 long and 1e-3 in radius: aspect 4000, which is where
+/// of-oygs used to stop. The mechanism was the wall's own *seam*: a cylinder
+/// wall is closed by an axial line, and the old boundary band was a fixed
+/// fraction (5e-4) of the wall's bounding box, so once the wall was longer
+/// than 4e3 radii that band exceeded the wall's whole diameter and every hit
+/// on it counted as sitting on the seam. Aspect is fenced far beyond this
+/// point in [`high_aspect_operands_inside_the_working_range`]; what this test
+/// keeps is the shape a user actually asks for — a real drill, bored clean
+/// through a plate ten thousand times its radius.
 #[test]
-#[ignore = "of-oygs: ray_classify gives up on cylinders past ~1e3 length/radius"]
 fn needle_drill_through_a_wide_plate() {
     let context = "1e-3-radius drill through a 100-unit plate";
     let mut scene = Scene::new();
