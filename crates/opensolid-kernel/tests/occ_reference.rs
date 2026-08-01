@@ -32,7 +32,7 @@
 //!   that: our count equals the file's `EDGE_CURVE`/`VERTEX_POINT` count.
 //! - **Volume, centroid, area** — 0.1% relative, the tolerance spec §7.4
 //!   sets for STEP import, on the [`MEASURED_FILES`] the tessellator can
-//!   close (16 of 34 today; the rest hit the CDT deferral). Our figures come
+//!   close (18 of 34 today; the rest hit the CDT deferral). Our figures come
 //!   from the tessellator, so the residual is chord error; at
 //!   [`ANGULAR_STEP`] it lands around 0.045% on the worst curved part.
 //! - **Booleans** — our `unite`/`subtract`/`intersect` against
@@ -128,10 +128,11 @@ const SEAM_DELTAS: &[(&str, usize, usize)] = &[
 
 /// Measured files whose surface area does not agree with OCC, with the bug.
 ///
-/// Empty today. It was not: `nist_ctc_03_asme1_ap242-e2.stp` used to
-/// tessellate closed with the right volume and 61% too much area (of-kll8),
-/// and as of the welding/pole work on main it no longer closes at all, so it
-/// is simply not measured. The mechanism stays here for the next one.
+/// Empty today, and this time because nothing is wrong. It was not:
+/// `nist_ctc_03_asme1_ap242-e2.stp` tessellated closed with the right volume
+/// and 61% too much area, then stopped closing at all once the welding and
+/// pole work landed — both faces of the same hole-bridging defect, fixed in
+/// of-kll8. The mechanism stays here for the next one.
 const AREA_EXCEPTIONS: &[(&str, &str)] = &[];
 
 /// Boolean cases the kernel cannot produce yet, with the reason it reports.
@@ -168,6 +169,8 @@ const MEASURED_FILES: &[&str] = &[
     // *under* OCC's, which an over-covering mesh could not be. It is a
     // reader-side geometry difference on that file, tracked by of-z6zg.
     "io1-cm-214.stp",
+    "nist/nist_ctc_03_asme1_ap242-e2.stp",
+    "nist/nist_ctc_03_asme1_rc.stp",
     "occ/blend/chamfered_box.stp",
     "occ/blend/filleted_box.stp",
     "occ/coincident/blocks_partial_overlap.stp",

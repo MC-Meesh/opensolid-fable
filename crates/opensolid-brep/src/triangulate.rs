@@ -22,6 +22,8 @@
 //!
 //! [`is_closed_manifold`]: opensolid_core::mesh::TriangleMesh::is_closed_manifold
 
+use std::collections::HashSet;
+
 /// Triangulate a simple polygon given by its vertices in the plane, in
 /// order (either winding, no holes, no self-intersections). Returns
 /// triangles as index triples into `uv`, each wound counterclockwise
@@ -112,6 +114,10 @@ pub fn ear_clip_rings(rings: &[Vec<(f64, f64)>]) -> Option<Vec<[usize; 3]>> {
     // rightmost hole first keeps every later hole's bridge target reachable.
     holes.sort_by(|a, b| max_u(&uv, b).total_cmp(&max_u(&uv, a)));
 
+    // Vertices that already carry a bridge, and so already appear twice in
+    // `polygon`. Bridging to one of them a second time would make it a *triple*
+    // point — see the preference below.
+    let mut bridged: HashSet<usize> = HashSet::new();
     for pos in 0..holes.len() {
         let hole = &holes[pos];
         // The hole's rightmost vertex is where the bridge starts.
@@ -131,13 +137,36 @@ pub fn ear_clip_rings(rings: &[Vec<(f64, f64)>]) -> Option<Vec<[usize; 3]>> {
         candidates.sort_by(|&a, &b| {
             dist_sq(uv[polygon[a]], uv[h_idx]).total_cmp(&dist_sq(uv[polygon[b]], uv[h_idx]))
         });
+        // Prefer a target that does not already carry a bridge (of-kll8).
+        //
+        // A bridge's own vertices each appear twice in the spliced polygon,
+        // which is harmless: the two occurrences are separated by a slit walked
+        // out and back, so the boundary still leaves the vertex the same way it
+        // arrived. Anchoring a *second* bridge at one of them is not — the
+        // vertex becomes a genuine pinch joining three boundary excursions, the
+        // polygon stops being simple, and the two-ears theorem stops applying
+        // to it. Ear clipping then runs out of clippable ears with hundreds of
+        // vertices still in hand and hands the rest to the least-reflex
+        // fallback, which ignores containment and laps the polygon in
+        // overlapping triangles: `nist_ctc_03`'s 8-hole plate face came out
+        // combinatorially closed carrying over twice its own area.
+        //
+        // This is only a preference. A polygon always has more vertices than
+        // bridge endpoints, so a non-bridged candidate exists, but it need not
+        // be *reachable*; refusing the whole face over that would be a
+        // regression against simply taking the pinch.
+        let clear = |c: &usize| bridge_is_clear(&uv, &polygon, unspliced, h_idx, polygon[*c]);
         let cand = candidates
-            .into_iter()
-            .find(|&c| bridge_is_clear(&uv, &polygon, unspliced, h_idx, polygon[c]))?;
+            .iter()
+            .copied()
+            .find(|c| !bridged.contains(&polygon[*c]) && clear(c))
+            .or_else(|| candidates.iter().copied().find(clear))?;
         // Splice: ...p, h, h+1, ..., h, p... — the hole is traversed once and
         // the bridge is walked out and back, so the result stays a single
         // closed polygon whose area is the outer loop's less the holes'.
         let p_idx = polygon[cand];
+        bridged.insert(h_idx);
+        bridged.insert(p_idx);
         let hn = holes[pos].len();
         let mut spliced = Vec::with_capacity(polygon.len() + hn + 2);
         spliced.extend_from_slice(&polygon[..=cand]);
@@ -172,9 +201,9 @@ fn max_u(uv: &[(f64, f64)], ring: &[usize]) -> f64 {
 }
 
 /// Does the bridge `from`→`to` cross any polygon segment, or any segment of
-/// the not-yet-spliced hole rings? Segments sharing an endpoint with the
-/// bridge — including the bridge's own two endpoints' incident edges — do not
-/// count as crossings.
+/// the not-yet-spliced hole rings — or *run through* one of their vertices?
+/// Segments sharing an endpoint with the bridge — including the bridge's own
+/// two endpoints' incident edges — do not count as crossings.
 fn bridge_is_clear(
     uv: &[(f64, f64)],
     polygon: &[usize],
@@ -189,9 +218,52 @@ fn bridge_is_clear(
             if segments_cross(p, q, uv[ring[i]], uv[ring[(i + 1) % n]]) {
                 return false;
             }
+            if vertex_on_segment(p, q, uv[ring[i]]) {
+                return false;
+            }
         }
     }
     true
+}
+
+/// Does `v` lie *on* the open segment `p`→`q`, strictly between its ends?
+///
+/// [`segments_cross`] is a strict *proper* crossing test — it sees a segment
+/// pass from one side of the bridge to the other, and nothing else. A ring
+/// vertex sitting exactly on the bridge does not do that: both of its incident
+/// edges leave from the same point on the line, so neither one properly
+/// crosses, and the bridge is declared clear. Splicing along it then makes the
+/// polygon *touch* that ring instead of merely reaching it, and a self-touching
+/// polygon is no longer covered by the two-ears theorem — ear clipping can and
+/// does run out of clippable ears with hundreds of vertices left, at which
+/// point the least-reflex fallback laps the polygon emitting overlapping
+/// triangles (of-kll8).
+///
+/// Equal holes drilled in a row make this the *normal* case, not a corner
+/// one: their rightmost vertices come out collinear and evenly spaced, so the
+/// bridge from the first hole to the third runs exactly through the second's.
+/// Both of `nist_ctc_03`'s 8-hole plate faces laid a bridge that way, one at
+/// the grazed vertex's exact midpoint.
+///
+/// Rejecting the bridge costs nothing: the caller simply takes the next
+/// candidate vertex, and only a hole with no clear bridge at all fails.
+fn vertex_on_segment(p: (f64, f64), q: (f64, f64), v: (f64, f64)) -> bool {
+    let (dx, dy) = (q.0 - p.0, q.1 - p.1);
+    let length_sq = dx * dx + dy * dy;
+    if length_sq == 0.0 {
+        return false;
+    }
+    // Strictly between the ends: a vertex *at* either end is one of the
+    // bridge's own endpoints (or a duplicate of one, sharing its coordinates
+    // exactly), which is the whole point of the bridge.
+    let t = ((v.0 - p.0) * dx + (v.1 - p.1) * dy) / length_sq;
+    if t <= 0.0 || t >= 1.0 {
+        return false;
+    }
+    // Perpendicular offset of 1e-9 of the bridge's own length, expressed in
+    // twice-area units to stay division-free: `|cross| <= 1e-9 * length²`.
+    let cross = dx * (v.1 - p.1) - dy * (v.0 - p.0);
+    cross * cross <= 1e-18 * length_sq * length_sq
 }
 
 /// Strict proper crossing test: segments that merely share an endpoint (as a
@@ -255,16 +327,34 @@ fn ear_clip_indexed(uv: &[(f64, f64)], mut idx: Vec<usize>) -> Vec<[usize; 3]> {
         }
         let m = idx.len();
         let mut clipped = false;
-        for i in 0..m {
-            let (ia, ib, ic) = (idx[(i + m - 1) % m], idx[i], idx[(i + 1) % m]);
-            let (a, b, c) = (uv[ia], uv[ib], uv[ic]);
-            if !is_clippable_ear(a, b, c, &idx, uv, ia, ib, ic, eps) {
-                continue;
+        // Look for an ear twice: with the containment slack, and — only if
+        // that found none at all — without it (of-kll8).
+        //
+        // The slack only ever *rejects* ears, and it is priced off the whole
+        // polygon's extent while an ear is as small as the feature it belongs
+        // to. A 3.2 m plate drilled with 1 mm holes prices it at 2.6e-3 in
+        // twice-area units, an order of magnitude past a hole ear's own
+        // 2.8e-4: every ear along such a hole reads as containing something
+        // and none of them clip. Reaching the fallback below over that is far
+        // worse than clipping a strictly empty ear, because the fallback
+        // ignores containment altogether and pays for its guaranteed progress
+        // in overlapping triangles.
+        //
+        // This cannot strand a collinear run the way of-6sq describes: the
+        // strict pass runs only where the tolerant one has already given up,
+        // so what it competes against is the fallback, not a later ear.
+        'search: for tolerance in [eps, 0.0] {
+            for i in 0..m {
+                let (ia, ib, ic) = (idx[(i + m - 1) % m], idx[i], idx[(i + 1) % m]);
+                let (a, b, c) = (uv[ia], uv[ib], uv[ic]);
+                if !is_clippable_ear(a, b, c, &idx, uv, ia, ib, ic, tolerance) {
+                    continue;
+                }
+                tris.push([ia, ib, ic]);
+                idx.remove(i);
+                clipped = true;
+                break 'search;
             }
-            tris.push([ia, ib, ic]);
-            idx.remove(i);
-            clipped = true;
-            break;
         }
         if !clipped {
             // Fallback: clip the least-reflex corner to guarantee progress
@@ -505,6 +595,103 @@ mod tests {
             circle(1.5, 1.5, 0.4, 10),
             circle(-1.5, 1.5, 0.4, 10),
         ]);
+    }
+
+    /// A hole pointing right, whose rightmost vertex is unique and whose other
+    /// vertices trail off to the lower left — the shape that makes the bridge
+    /// target predictable.
+    fn barb(cx: f64, cy: f64) -> Vec<(f64, f64)> {
+        vec![(cx, cy), (cx - 1.0, cy - 3.0), (cx - 3.0, cy - 1.0)]
+    }
+
+    #[test]
+    fn a_bridge_grazing_a_ring_vertex_is_not_clear() {
+        // of-kll8. The bridge runs from one hole's tip straight down to
+        // another's, passing exactly through the tip of a third hole between
+        // them without ever entering it. Nothing *crosses*, so the proper-
+        // intersection test alone waves the bridge through and the spliced
+        // polygon comes out touching itself — the state ear clipping cannot
+        // work out of, and the state `nist_ctc_03`'s plate faces were both in.
+        let rings = [
+            square(0.0, 0.0, 30.0),
+            barb(10.0, 20.0),
+            barb(10.0, 0.0),
+            barb(10.0, 10.0),
+        ];
+        let uv: Vec<(f64, f64)> = rings.concat();
+        let index = |ring: usize, k: usize| rings[..ring].iter().map(Vec::len).sum::<usize>() + k;
+        let (from, to) = (index(1, 0), index(2, 0));
+        assert_eq!((uv[from], uv[to]), ((10.0, 20.0), (10.0, 0.0)));
+        let outer: Vec<usize> = (0..rings[0].len()).collect();
+        let grazed: Vec<usize> = (0..rings[3].len()).map(|k| index(3, k)).collect();
+        assert!(
+            bridge_is_clear(&uv, &outer, &[], from, to),
+            "nothing but the outer loop is in the way"
+        );
+        assert!(
+            !bridge_is_clear(&uv, &outer, std::slice::from_ref(&grazed), from, to),
+            "the third hole's tip is on the bridge"
+        );
+    }
+
+    #[test]
+    fn a_hole_vertex_never_anchors_two_bridges() {
+        // of-kll8. Four holes of assorted sizes, positioned so that the third
+        // one spliced finds its nearest reachable target on the *bridge* the
+        // second one just laid down. Anchoring there turns that vertex from a
+        // slit — walked out and back, which the clipper handles — into a pinch
+        // where three excursions of the boundary meet, and the polygon stops
+        // being one ear clipping can finish: it laid down 1.5x the area here,
+        // and over twice it on `nist_ctc_03`'s 8-hole plate faces.
+        //
+        // The layout is a random one from a 400-case sweep; 17 of those cases
+        // folded, and this is the smallest.
+        let rings = vec![
+            square(0.0, 0.0, 100.0),
+            circle(-69.8, 69.2, 8.9, 32),
+            circle(90.3, 86.5, 3.8, 32),
+            circle(89.1, 40.5, 7.9, 32),
+            circle(-17.6, 57.1, 2.2, 32),
+        ];
+        assert_tiles_rings(&rings);
+    }
+
+    #[test]
+    fn small_holes_in_a_large_face_tile_without_overlap() {
+        // of-kll8. The ear containment slack is priced off the whole polygon's
+        // extent, so on a face three orders of magnitude wider than its holes
+        // it exceeds a hole ear's entire area and every ear along that hole
+        // reads as occupied. The clipper then has no ear to take and falls
+        // back on clipping the least-reflex corner, which is only guaranteed
+        // to make progress — not to stay inside the polygon.
+        let mut rings = vec![square(0.0, 0.0, 1600.0)];
+        for k in 0..8 {
+            rings.push(circle(0.0, -52.5 + 15.0 * k as f64, 1.0, 96));
+        }
+        assert_tiles_rings(&rings);
+    }
+
+    #[test]
+    fn vertex_on_segment_only_sees_the_strict_interior() {
+        let (p, q) = ((0.0, 0.0), (10.0, 0.0));
+        assert!(vertex_on_segment(p, q, (5.0, 0.0)), "midpoint is on it");
+        assert!(
+            vertex_on_segment(p, q, (5.0, 1e-12)),
+            "within the perpendicular slack"
+        );
+        assert!(
+            !vertex_on_segment(p, q, (5.0, 1e-3)),
+            "a real feature off to the side is not on it"
+        );
+        // The bridge's own endpoints, and duplicates of them, are the point of
+        // the bridge — never a blocker.
+        assert!(!vertex_on_segment(p, q, p));
+        assert!(!vertex_on_segment(p, q, q));
+        // Collinear but past an end.
+        assert!(!vertex_on_segment(p, q, (-1.0, 0.0)));
+        assert!(!vertex_on_segment(p, q, (11.0, 0.0)));
+        // A degenerate bridge has no interior.
+        assert!(!vertex_on_segment(p, p, (0.0, 0.0)));
     }
 
     #[test]
