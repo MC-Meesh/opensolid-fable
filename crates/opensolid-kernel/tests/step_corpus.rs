@@ -58,8 +58,9 @@
 
 use opensolid_kernel::brep::boolean::{BooleanOutput, intersect, subtract, unite};
 use opensolid_kernel::brep::{
-    Body, CheckFailure, Curve3, CurveEval, GeometryStore, Surface3, SurfaceProject,
-    TessellationOptions, TopologyStore, primitives, tessellate_body, translate_body,
+    Body, CheckFailure, Curve3, CurveEval, GeometryStore, MAX_ALLOWED_TOLERANCE, SYSTEM_RESOLUTION,
+    Surface3, SurfaceProject, TessellationOptions, TopologyStore, primitives, tessellate_body,
+    translate_body,
 };
 use opensolid_kernel::core::EntityId;
 use opensolid_kernel::core::tolerance::ToleranceContext;
@@ -1771,10 +1772,22 @@ mod corpus {
                 );
             }
         }
-        // 2026-08-01 baseline: 33 of 34. One file fails:
+        // 2026-08-01: 31 of 34, measured on this branch rebased onto of-zdx.
+        // That is the 33 of-zdx left minus the two below; the two occ/tangent
+        // parts it brought in are untouched by the measurement here and still
+        // pass. Three files fail:
         // - nist_ctc_05 (of-kwn): edge geometry that misses its vertex points.
-        // The two occ/tangent parts joined the passing set with of-zdx.
-        const FLOOR: usize = 33;
+        // - nist_ctc_02, occ/nurbs/bspline_patch_prism (of-05ac): the two the
+        //   edge half of of-bb6 took off the exact path. Each has an edge
+        //   further from a face's surface than MAX_ALLOWED_TOLERANCE — 0.0386
+        //   mm of authored gap in nist_ctc_02, and in bspline_patch_prism a
+        //   whole 20 mm, because the extrusion patch we build for its faces
+        //   is a twentieth of the length it needs and points the other way
+        //   (of-8ulj). Refusing both is right; what costs the two counts is
+        //   that the mesh fallback does not close for either (of-05ac), so a
+        //   degrade becomes a loss. This floor returns to 33 with of-05ac,
+        //   and does not need of-8ulj first.
+        const FLOOR: usize = 31;
         assert!(
             passed.len() >= FLOOR,
             "corpus pass count regressed below {FLOOR}: only {passed:?} pass"
@@ -1804,10 +1817,22 @@ mod corpus {
     /// vertex's tolerance took every `VertexOffEdge` in the corpus to zero
     /// (116 of them, see [`no_imported_vertex_is_off_its_edges`]) and again
     /// moved this count by nothing. Both times the same six files were held
-    /// down by a *second* defect underneath. What is left is of-bb6's edge
-    /// half — `EdgeOffSurface`, the authored curve straying from its faces'
-    /// surfaces, which the reader still does not measure — and that is now the
-    /// whole of the work list.
+    /// down by a *second* defect underneath — of-bb6's edge half, which is
+    /// what finally moved it: 20 to 31, eleven files at once, once the reader
+    /// measured how far each edge really sits from its faces' surfaces and
+    /// carried that as the edge's tolerance. Every `EdgeOffSurface` and every
+    /// `PcurveDeviation` in the corpus went with it (a pcurve's image lies on
+    /// the surface, so it can never be closer to the curve than the surface
+    /// itself is — the pcurve reports were the same gap seen twice).
+    ///
+    /// The 20 it started from is measured on of-zdx's main, not the 18 that
+    /// main's own constant still claimed: of-zdx brought the two occ/tangent
+    /// parts in as clean B-Reps without raising the floor it passed.
+    ///
+    /// The three files still outside are the three that no longer produce a
+    /// B-Rep at all, listed in [`corpus_pass_rate_does_not_regress`]; this
+    /// gate reads them as vacuous rather than clean. So the two counts move
+    /// together now, and the next lift on either is of-05ac's.
     #[test]
     fn corpus_geometric_pass_rate_does_not_regress() {
         let mut clean = Vec::new();
@@ -1837,12 +1862,13 @@ mod corpus {
                 );
             }
         }
-        // 2026-07-30: 18 files clear this. dm1-id-214 is the newest, landed
-        // by of-fid — its 7 fins on closed NURBS patches had pcurves up to
-        // 13 mm off their own edges. The other 17 are the four analytic
-        // parts of the 2026-07-26 baseline plus the synthetic and OCC
-        // fixtures added since.
-        const FLOOR: usize = 18;
+        // 2026-08-01: 31 files clear this, up from a measured 20 on of-zdx's
+        // main — every corpus file that still imports as a B-Rep at all
+        // (of-bb6's edge half). The eleven of-bb6 brought in are as1-oc-214,
+        // both nist_ctc_01s, nist_ctc_03_rc, nist_ctc_04, nist_ftc_06,
+        // nist_ftc_07, nist_ftc_08, nist_ftc_09, nist_ftc_10 and
+        // nist_stc_06. Nothing that was clean before stopped being clean.
+        const FLOOR: usize = 31;
         assert!(
             clean.len() >= FLOOR,
             "geometrically clean corpus count regressed below {FLOOR}: only {clean:?} pass"
@@ -1865,10 +1891,7 @@ mod corpus {
     /// An absolute gate, not a floor, like
     /// [`no_imported_face_contradicts_its_outer_loop`]: the reader measures
     /// this deviation directly, so there is no file it cannot be right about.
-    /// The *edge* half of of-bb6 — `EdgeOffSurface`, where the authored curve
-    /// strays from its faces' surfaces — is not measured at import and is
-    /// still what [`corpus_geometric_pass_rate_does_not_regress`] is held down
-    /// by.
+    /// [`no_imported_edge_is_off_its_faces`] is the other half.
     #[test]
     fn no_imported_vertex_is_off_its_edges() {
         let mut offenders: Vec<(String, usize)> = Vec::new();
@@ -1904,6 +1927,98 @@ mod corpus {
             offenders.is_empty(),
             "imported vertices off their edges' curves: {offenders:?}"
         );
+    }
+
+    /// No imported edge's curve may stray further from the surface of a face
+    /// it bounds than its own tolerance permits — `spec/08-tolerances.md`
+    /// §7.1 invariant 1, the edge half of of-bb6 and the counterpart of
+    /// [`no_imported_vertex_is_off_its_edges`].
+    ///
+    /// The same shape of defect as the vertex half, and the same fix. STEP
+    /// rounds an `EDGE_CURVE` and the surfaces of the faces it bounds into
+    /// decimal text independently, and plenty of producers author a curve
+    /// that never sat exactly on either surface to begin with — 828 reports
+    /// on nist_ctc_02 alone, and gaps from 3e-9 mm (nist_ftc_09, four orders
+    /// above what the file's own written precision explains) to 5.9e-3 mm
+    /// (nist_ftc_07). The reader used to accept every one of those and stamp
+    /// `SYSTEM_RESOLUTION` on the edge regardless. It measures now, and
+    /// carries the measurement.
+    ///
+    /// Absolute, again because the measurement is available: an edge is
+    /// either given a tolerance that covers where its curve actually is, or —
+    /// past `MAX_ALLOWED_TOLERANCE`, where no honest tolerance exists — the
+    /// solid does not take the exact path at all, so it is not here to be
+    /// asked. Both nist_ctc_02 and bspline_patch_prism leave by that door
+    /// (of-05ac); if either returns, it returns measured.
+    #[test]
+    fn no_imported_edge_is_off_its_faces() {
+        let mut offenders: Vec<(String, usize)> = Vec::new();
+        for file in &corpus_files() {
+            let bytes = std::fs::read(file).unwrap_or_else(|e| panic!("read {file:?}: {e}"));
+            let (store, geo, report) = import_bytes(&bytes);
+            let count: usize = report
+                .solids
+                .iter()
+                .filter_map(|s| match &s.outcome {
+                    SolidOutcome::BRep(body) => Some(*body),
+                    _ => None,
+                })
+                .map(|body| {
+                    store
+                        .check_geometry(&geo, body)
+                        .iter()
+                        .filter(|f| matches!(f, CheckFailure::EdgeOffSurface { .. }))
+                        .count()
+                })
+                .sum();
+            if count > 0 {
+                offenders.push((
+                    file.file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned(),
+                    count,
+                ));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "imported edges off their faces' surfaces: {offenders:?}"
+        );
+    }
+
+    /// Every tolerance the reader writes must be one the kernel would accept:
+    /// at least `SYSTEM_RESOLUTION`, at most `MAX_ALLOWED_TOLERANCE`. The
+    /// point of of-bb6 is that a tolerance is a *bound* on where an entity
+    /// is, and a bound past the kernel's own cap is not one it can honour —
+    /// so an import that would need it refuses the exact path rather than
+    /// writing the number down (which `check` would reject anyway, one step
+    /// later and less clearly).
+    #[test]
+    fn no_imported_tolerance_is_outside_the_kernels_range() {
+        for file in &corpus_files() {
+            let bytes = std::fs::read(file).unwrap_or_else(|e| panic!("read {file:?}: {e}"));
+            let (store, _, report) = import_bytes(&bytes);
+            let name = file.file_name().unwrap_or_default().to_string_lossy();
+            for body in report.solids.iter().filter_map(|s| match &s.outcome {
+                SolidOutcome::BRep(body) => Some(*body),
+                _ => None,
+            }) {
+                for shell in &store.body(body).expect("imported body").shells {
+                    for face in &store.shell(*shell).expect("shell").faces {
+                        for edge_id in store.edges_of_face(*face) {
+                            let edge = store.edge(edge_id).expect("edge of face");
+                            assert!(
+                                (SYSTEM_RESOLUTION..=MAX_ALLOWED_TOLERANCE)
+                                    .contains(&edge.tolerance),
+                                "{name}: edge {edge_id:?} imported with tolerance {}",
+                                edge.tolerance
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// No imported face may disagree with its own outer boundary (of-he8).

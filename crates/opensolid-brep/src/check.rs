@@ -972,8 +972,13 @@ impl TopologyStore {
 
                         if !measured.contains(&(fin.edge, face_id)) {
                             measured.push((fin.edge, face_id));
-                            let deviation =
-                                curve_surface_deviation(surface, curve, edge.t_start, edge.t_end);
+                            let deviation = curve_surface_deviation(
+                                surface,
+                                curve,
+                                edge.t_start,
+                                edge.t_end,
+                                1,
+                            );
                             if let Some((max_deviation, allowed)) =
                                 deviation.exceeding(edge.tolerance)
                             {
@@ -1060,6 +1065,92 @@ impl TopologyStore {
         }
 
         failures
+    }
+
+    /// How far each edge of `body` actually strays from the surfaces of the
+    /// faces it bounds — the measured quantity
+    /// [`CheckFailure::EdgeOffSurface`] weighs an edge's *claimed* tolerance
+    /// against (`spec/08-tolerances.md` §7.1 invariant 1).
+    ///
+    /// One entry per edge that could be measured at all, in first-seen
+    /// traversal order, carrying the largest deviation over every adjacent
+    /// face; an edge with no curve, no measurable adjacent surface or an
+    /// unusable parameter range yields no entry rather than a zero. A
+    /// producer of a body — the STEP reader above all — records these as the
+    /// edges' tolerances, which is what turns a tolerance into a bound on
+    /// where the curve is rather than a decoration (of-bb6).
+    ///
+    /// Measured at [`MEASURE_REFINEMENT`] times the resolution
+    /// [`check_geometry`](Self::check_geometry) audits at, and — because the
+    /// refinement is a whole multiple of the same uniform division of the
+    /// same range — at a strict *superset* of the audit's own parameters. So
+    /// an edge whose tolerance is set from this is one the audit cannot
+    /// report, not because the two agreed to look in the same places but
+    /// because everywhere the audit looks was already measured. Both are
+    /// still samplings: neither sees a spike between adjacent samples, and
+    /// the refinement is what buys the margin.
+    pub fn measure_edges_off_surfaces(
+        &self,
+        geo: &GeometryStore,
+        body: EntityId<Body>,
+    ) -> Vec<(EntityId<Edge>, f64)> {
+        let mut measured: Vec<(EntityId<Edge>, f64)> = Vec::new();
+        let Some(b) = self.bodies.get(body) else {
+            return measured;
+        };
+        // A seam edge is used twice by the one face against the one surface;
+        // measuring that pair twice would cost double and say the same thing.
+        let mut pairs: Vec<(EntityId<Edge>, EntityId<Face>)> = Vec::new();
+
+        for &shell_id in &b.shells {
+            let Some(shell) = self.shells.get(shell_id) else {
+                continue;
+            };
+            for &face_id in &shell.faces {
+                let Some(face) = self.faces.get(face_id) else {
+                    continue;
+                };
+                let Some(surface) = face.surface.and_then(|id| geo.surface(id)) else {
+                    continue;
+                };
+                for loop_id in face
+                    .outer_loop
+                    .into_iter()
+                    .chain(face.inner_loops.iter().copied())
+                {
+                    let Some(lp) = self.loops.get(loop_id) else {
+                        continue;
+                    };
+                    for &fin_id in &lp.fins {
+                        let Some(fin) = self.fins.get(fin_id) else {
+                            continue;
+                        };
+                        let Some(edge) = self.edges.get(fin.edge) else {
+                            continue;
+                        };
+                        let Some(curve) = edge.curve.and_then(|id| geo.curve(id)) else {
+                            continue;
+                        };
+                        if !edge_range_is_sane(edge) || pairs.contains(&(fin.edge, face_id)) {
+                            continue;
+                        }
+                        pairs.push((fin.edge, face_id));
+                        let deviation = curve_surface_deviation(
+                            surface,
+                            curve,
+                            edge.t_start,
+                            edge.t_end,
+                            MEASURE_REFINEMENT,
+                        );
+                        match measured.iter_mut().find(|(id, _)| *id == fin.edge) {
+                            Some((_, worst)) => *worst = worst.max(deviation.max),
+                            None => measured.push((fin.edge, deviation.max)),
+                        }
+                    }
+                }
+            }
+        }
+        measured
     }
 
     /// Validate `body` topologically *and* geometrically: the concatenation
@@ -1344,7 +1435,7 @@ impl TopologyStore {
                 return None;
             }
             let forward = fin.sense == FinSense::Forward;
-            let run: Vec<Point2> = edge_samples(edge.t_start, edge.t_end)
+            let run: Vec<Point2> = edge_samples(edge.t_start, edge.t_end, 1)
                 .map(|t| {
                     // A Reversed fin traverses its edge end → start, so its
                     // pcurve is walked backwards over the same range.
@@ -1430,6 +1521,22 @@ fn check_tolerance(failures: &mut Vec<CheckFailure>, entity: EntityRef, toleranc
 /// power of two, so both endpoints and the midpoint are hit exactly.
 const GEOMETRY_SAMPLES: usize = 17;
 
+/// How much finer than [`GEOMETRY_SAMPLES`] a *measurement* of an edge is
+/// than an *audit* of one (see
+/// [`measure_edges_off_surfaces`](TopologyStore::measure_edges_off_surfaces)).
+///
+/// The two are asked different questions. An audit is run on every check of
+/// every body and only has to catch a claim that is wrong, so it is priced
+/// to be cheap. A measurement is taken once, when a body is built, and
+/// becomes the claim — so it is worth paying more for, and it must not merely
+/// tie the audit: a tolerance that happened to be measured at exactly the
+/// parameters the audit will re-measure would pass by coincidence of
+/// sampling. A whole multiple keeps the audit's parameters inside the
+/// measurement's (each is `t_start + (t_end - t_start) * i / n` for the same
+/// range, and the shared values are hit bit for bit, both being divisions by
+/// a power of two) while adding samples between them.
+const MEASURE_REFINEMENT: usize = 8;
+
 /// Round-off slack, relative to coordinate magnitude, added to a declared
 /// tolerance before a measured deviation counts as a violation.
 ///
@@ -1474,10 +1581,12 @@ fn edge_range_is_sane(edge: &Edge) -> bool {
 }
 
 /// The [`GEOMETRY_SAMPLES`] parameters spanning `[t_start, t_end]`, both
-/// endpoints included.
-fn edge_samples(t_start: f64, t_end: f64) -> impl Iterator<Item = f64> {
-    (0..GEOMETRY_SAMPLES)
-        .map(move |i| t_start + (t_end - t_start) * (i as f64) / ((GEOMETRY_SAMPLES - 1) as f64))
+/// endpoints included, subdivided `refinement` times over (`1` for the
+/// checks' own resolution — see [`MEASURE_REFINEMENT`] for who asks for
+/// more).
+fn edge_samples(t_start: f64, t_end: f64, refinement: usize) -> impl Iterator<Item = f64> {
+    let intervals = (GEOMETRY_SAMPLES - 1) * refinement.max(1);
+    (0..=intervals).map(move |i| t_start + (t_end - t_start) * (i as f64) / (intervals as f64))
 }
 
 /// The largest gap found over a run of samples, together with the coordinate
@@ -1552,9 +1661,10 @@ fn curve_surface_deviation(
     curve: &Curve3,
     t_start: f64,
     t_end: f64,
+    refinement: usize,
 ) -> Deviation {
     let mut deviation = Deviation::new();
-    for t in edge_samples(t_start, t_end) {
+    for t in edge_samples(t_start, t_end, refinement) {
         let p = curve.point(t);
         if !is_finite(&p) {
             continue;
@@ -1620,7 +1730,7 @@ fn pcurve_check_params(pcurve: &Curve2, t_start: f64, t_end: f64) -> Vec<f64> {
             return inside;
         }
     }
-    edge_samples(t_start, t_end).collect()
+    edge_samples(t_start, t_end, 1).collect()
 }
 
 // --------------------------------------------------------------------------
@@ -2999,6 +3109,122 @@ mod tests {
             );
         }
 
+        /// The same displaced plane, measured rather than audited: every edge
+        /// of the moved face is reported at the offset, every other edge at
+        /// nothing, and each entry is the worst of the faces the edge bounds
+        /// (the four moved ones each still lie exactly on their neighbour).
+        #[test]
+        fn measuring_edges_finds_the_gap_the_check_reports() {
+            let (mut store, mut geo, body) = block_with_pcurves();
+            let face_id = first_face(&store, body);
+            let face = store.faces.get(face_id).expect("live face");
+            let Surface3::Plane { origin, normal } = geo
+                .surface(face.surface.expect("surface"))
+                .expect("live surface")
+                .clone()
+            else {
+                panic!("a block's faces are planar");
+            };
+            let gap = 0.1;
+            let moved =
+                geo.add_surface(Surface3::plane(origin + normal * gap, normal).expect("plane"));
+            store.faces.get_mut(face_id).expect("live face").surface = Some(moved);
+
+            let measured = store.measure_edges_off_surfaces(&geo, body);
+            assert_eq!(measured.len(), 12, "a block has twelve edges: {measured:?}");
+            let moved_edges = store.edges_of_face(face_id);
+            for (edge, deviation) in &measured {
+                let expected = if moved_edges.contains(edge) { gap } else { 0.0 };
+                assert!(
+                    (deviation - expected).abs() < 1e-9,
+                    "edge {edge:?} measured {deviation}, expected {expected}"
+                );
+            }
+        }
+
+        /// What the measurement is *for*: an edge given the tolerance it
+        /// measured is one the audit cannot report. Not by agreement — the
+        /// measurement is [`MEASURE_REFINEMENT`] times finer — but because
+        /// every parameter the audit tries was already among those measured.
+        #[test]
+        fn a_measured_tolerance_silences_the_check_that_asked_for_it() {
+            let (mut store, mut geo, body) = block_with_pcurves();
+            let face_id = first_face(&store, body);
+            let face = store.faces.get(face_id).expect("live face");
+            let Surface3::Plane { origin, normal } = geo
+                .surface(face.surface.expect("surface"))
+                .expect("live surface")
+                .clone()
+            else {
+                panic!("a block's faces are planar");
+            };
+            // Tilted, not just displaced, so the gap varies along each edge
+            // and its maximum is not at a sample the audit would be sure to
+            // hit by symmetry.
+            let tilted = geo.add_surface(
+                Surface3::plane(
+                    origin + normal * 1e-4,
+                    normal + Vector3::new(3e-4, 1e-4, 0.0),
+                )
+                .expect("plane"),
+            );
+            store.faces.get_mut(face_id).expect("live face").surface = Some(tilted);
+            assert!(
+                store
+                    .check_geometry(&geo, body)
+                    .iter()
+                    .any(|f| matches!(f, CheckFailure::EdgeOffSurface { .. })),
+                "the tilt must be visible before it is measured"
+            );
+
+            for (edge, deviation) in store.measure_edges_off_surfaces(&geo, body) {
+                store.edges.get_mut(edge).expect("live edge").tolerance =
+                    deviation.max(SYSTEM_RESOLUTION);
+            }
+            let failures = store.check_geometry(&geo, body);
+            assert!(
+                !failures
+                    .iter()
+                    .any(|f| matches!(f, CheckFailure::EdgeOffSurface { .. })),
+                "measured tolerances leave nothing to report: {failures:?}"
+            );
+        }
+
+        /// The refinement has to be a *superset* of the audit's parameters,
+        /// not merely more of them, or the guarantee above is a coincidence.
+        #[test]
+        fn refined_samples_contain_the_checks_own() {
+            let (t_start, t_end) = (-0.75, 3.5);
+            let coarse: Vec<f64> = edge_samples(t_start, t_end, 1).collect();
+            let fine: Vec<f64> = edge_samples(t_start, t_end, MEASURE_REFINEMENT).collect();
+            assert_eq!(coarse.len(), GEOMETRY_SAMPLES);
+            assert_eq!(fine.len(), (GEOMETRY_SAMPLES - 1) * MEASURE_REFINEMENT + 1);
+            // Bit for bit: both are the same range divided by a power of two.
+            for t in coarse {
+                assert!(fine.contains(&t), "refinement misses the audit's {t}");
+            }
+        }
+
+        /// An edge with no curve, or on a face with no surface, is not
+        /// measured — the same "measure what is there" policy the checks
+        /// follow, so a body under construction reports no false gaps.
+        #[test]
+        fn unmeasurable_edges_yield_no_entry() {
+            let (mut store, geo, body) = block_with_pcurves();
+            let face_id = first_face(&store, body);
+            let dropped = store.edges_of_face(face_id);
+            store.faces.get_mut(face_id).expect("live face").surface = None;
+            let measured = store.measure_edges_off_surfaces(&geo, body);
+            assert_eq!(measured.len(), 12, "the other faces still measure them");
+
+            for &edge in &dropped {
+                store.edges.get_mut(edge).expect("live edge").curve = None;
+            }
+            let measured = store.measure_edges_off_surfaces(&geo, body);
+            assert_eq!(measured.len(), 12 - dropped.len(), "{measured:?}");
+            assert!(measured.iter().all(|(e, _)| !dropped.contains(e)));
+        }
+
         #[test]
         fn vertex_off_edge_detected() {
             let (mut store, geo, body) = block_with_pcurves();
@@ -3314,7 +3540,7 @@ mod tests {
             // where the mismatch is the thing worth measuring.
             assert_eq!(
                 pcurve_check_params(&pcurve, 10.0, 11.0),
-                edge_samples(10.0, 11.0).collect::<Vec<_>>()
+                edge_samples(10.0, 11.0, 1).collect::<Vec<_>>()
             );
         }
     }

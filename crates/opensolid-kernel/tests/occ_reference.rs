@@ -90,6 +90,17 @@ const KNOWN_IMPORT_FAILURES: &[(&str, &str)] = &[
     // of-kwn: verify_trim's tolerance is tighter than the vertex slop CATIA
     // authored into this part's CIRCLE edges.
     ("nist/nist_ctc_05_asme1_rd.stp", "of-kwn"),
+    // of-05ac: these two lost the exact path when of-bb6 started measuring
+    // imported edge tolerances — each carries an edge further from its face's
+    // surface than MAX_ALLOWED_TOLERANCE, so there is no tolerance the kernel
+    // could give it honestly — and the mesh fallback does not close for
+    // either, which is what turns a degrade into a loss. The refusal is
+    // right in both cases (nist_ctc_02 has authored gaps to 0.0386 mm;
+    // bspline_patch_prism's surface is mis-sized by of-8ulj and does not
+    // contain its own face at all). The fallback failing is not: of-05ac
+    // takes both files off this list and back into the step_corpus floors.
+    ("nist/nist_ctc_02_asme1_rc.stp", "of-05ac"),
+    ("occ/nurbs/bspline_patch_prism.stp", "of-05ac"),
 ];
 
 /// Per-file (edges, vertices) that OCC reports *in addition* to ours.
@@ -109,7 +120,9 @@ const KNOWN_IMPORT_FAILURES: &[(&str, &str)] = &[
 const SEAM_DELTAS: &[(&str, isize, isize)] = &[
     ("nist/nist_ctc_01_asme1_ap242-e1.stp", 4, 0),
     ("nist/nist_ctc_01_asme1_rd.stp", 20, 6),
-    ("nist/nist_ctc_02_asme1_rc.stp", 148, 0),
+    // nist_ctc_02's delta was (148, 0). It is a `KNOWN_IMPORT_FAILURES`
+    // entry now (of-05ac) and so counts nothing to compare; the entry comes
+    // back with the file.
     ("nist/nist_ctc_03_asme1_rc.stp", 20, 5),
     ("nist/nist_ctc_04_asme1_rd.stp", 66, 0),
     ("nist/nist_ftc_06_asme1_rd.stp", 71, 23),

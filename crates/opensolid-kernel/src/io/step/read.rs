@@ -53,6 +53,21 @@
 //! edge carries more than two fins. Every mapped body is validated with
 //! [`TopologyStore::check`].
 //!
+//! # Tolerances
+//!
+//! What an imported entity's tolerance says is where that entity actually
+//! is, measured — never [`SYSTEM_RESOLUTION`] by default (of-bb6). A STEP
+//! file rounds a curve, the vertices trimming it and the surfaces of the
+//! faces it bounds into decimal text independently, and plenty of producers
+//! author geometry that never met exactly to begin with, so the gaps are
+//! real and the reader's job is to record them rather than to claim they are
+//! not there. A vertex carries the residual [`trim_curve`] accepted when it
+//! trimmed each adjacent edge; an edge carries how far its curve strays from
+//! the surfaces it bounds, measured by [`record_edge_tolerances`] once the
+//! body is whole. Where the measurement exceeds [`MAX_ALLOWED_TOLERANCE`]
+//! there is no tolerance the kernel could honour, and the solid degrades to
+//! the tessellated import below instead of claiming one.
+//!
 //! # Mesh fallback
 //!
 //! B-splines no longer take this path (of-3qy.8) — they map exactly, as
@@ -2707,11 +2722,15 @@ impl SolidBuilder<'_> {
         // `VertexOffEdge`. A vertex is shared, so each edge raises rather
         // than sets, and a closed edge visits its one vertex twice.
         //
-        // The edge's own tolerance is left alone. §7.1 invariant 4 would have
-        // it rise to match, but an edge tolerance answers a different question
-        // — how far the *curve* strays from the adjacent surfaces — and
-        // inflating it to satisfy an ordering would loosen that check by an
-        // amount unrelated to what it measures. Tracked as of-az8x.
+        // The edge is created at `SYSTEM_RESOLUTION` below and gets its own
+        // tolerance from `record_edge_tolerances`, on the finished body,
+        // because an edge tolerance answers a different question — how far
+        // the *curve* strays from the surfaces of every face it bounds, of
+        // which only the first exists here. §7.1 invariant 4 would have the
+        // edge's rise to cover this vertex residual as well; it is not raised
+        // for that, since inflating it to satisfy an ordering would loosen
+        // invariant 1 by an amount unrelated to what that measures. Tracked
+        // as of-az8x.
         for (vertex, residual) in [
             (v_start, trimmed.start_residual),
             (v_end, trimmed.end_residual),
@@ -4015,6 +4034,64 @@ fn choose_outer_bounds(
     redesignated
 }
 
+/// Carry how far each imported edge's curve actually sits from the surfaces
+/// of the faces it bounds as that edge's tolerance — `spec/08-tolerances.md`
+/// §7.1 invariant 1, the edge half of of-bb6 (`map_edge` records the
+/// counterpart for a vertex, the trim residual, as it goes).
+///
+/// The reader has to *accept* such a gap. A STEP file writes an edge's curve
+/// and its faces' surfaces as independently rounded decimals, and plenty of
+/// producers write a curve that was never exactly on either surface to begin
+/// with — the vendored NIST corpus carries authored gaps from 3e-9 mm up to
+/// millimetre thousandths. What it must not do is accept the gap and then
+/// stamp [`SYSTEM_RESOLUTION`] on the edge anyway, which claims a precision
+/// no file supported and which [`TopologyStore::check_geometry`] then reports
+/// as `EdgeOffSurface` — 828 of them on nist_ctc_02 alone.
+///
+/// Tolerances only rise: an edge already tolerant from healing keeps that
+/// tolerance if it is the larger, since the healer's figure covers a gap this
+/// measurement is not looking at.
+///
+/// This runs on the finished, healed body rather than per edge in `map_edge`
+/// for two reasons. An edge's deviation is a maximum over *every* adjacent
+/// face, and at `map_edge` time only the first of them exists — the second
+/// face reaches the same edge through the cache and would never re-measure
+/// it. And healing welds duplicate edges and re-points fins onto the
+/// survivor, so which faces an edge bounds is not settled until it has run.
+///
+/// `Err` names the worst edge whose gap exceeds [`MAX_ALLOWED_TOLERANCE`].
+/// There is no honest tolerance to give such an edge: the kernel's cap is a
+/// cap, and writing the measured value would only move the complaint to
+/// `check`'s per-entity range test. So the solid does not import exactly at
+/// all and falls back to tessellation, which represents the same shape
+/// without claiming anything about where its edges are. That refusal is what
+/// makes the tolerance a bound rather than a decoration.
+fn record_edge_tolerances(
+    store: &mut TopologyStore,
+    geo: &GeometryStore,
+    body: EntityId<Body>,
+) -> Result<usize, (EntityId<Edge>, f64)> {
+    let measured = store.measure_edges_off_surfaces(geo, body);
+    if let Some(&worst) = measured
+        .iter()
+        .filter(|(_, deviation)| *deviation > MAX_ALLOWED_TOLERANCE)
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+    {
+        return Err(worst);
+    }
+    let mut raised = 0;
+    for (edge_id, deviation) in measured {
+        let Some(edge) = store.edges.get_mut(edge_id) else {
+            continue;
+        };
+        if deviation > edge.tolerance {
+            edge.tolerance = deviation;
+            raised += 1;
+        }
+    }
+    Ok(raised)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn map_solid(
     file: &StepFile,
@@ -4078,23 +4155,11 @@ fn map_solid(
     match built {
         Ok(body) => {
             let mut failures = store.check(body);
-            if failures.is_empty() {
-                *heal_operations += finish_exact_body(
-                    store,
-                    geo,
-                    body,
-                    options,
-                    &multi_bound_faces,
-                    msb_id,
-                    diagnostics,
-                );
-                return SolidOutcome::BRep(body);
-            }
             // Import heals, it does not reject (`spec/06-step-io.md` §4): a
             // body whose only defects are an unsewn shell, a vertex gap or a
             // flipped face is repaired and re-validated before the exact path
             // is abandoned for the tessellated one.
-            if options.heal.strategy != HealStrategy::Off {
+            if !failures.is_empty() && options.heal.strategy != HealStrategy::Off {
                 let result = GeometryHealer::heal(body, store, geo, &options.heal);
                 *heal_operations += result.operations.len();
                 for op in &result.operations {
@@ -4112,17 +4177,44 @@ fn map_solid(
                     });
                 }
                 failures = result.remaining;
-                if failures.is_empty() {
-                    *heal_operations += finish_exact_body(
-                        store,
-                        geo,
-                        body,
-                        options,
-                        &multi_bound_faces,
-                        msb_id,
-                        diagnostics,
-                    );
-                    return SolidOutcome::BRep(body);
+            }
+            if failures.is_empty() {
+                // Only once the topology is settled — healing decides which
+                // faces an edge ends up bounding — is there anything to
+                // measure the edges against.
+                match record_edge_tolerances(store, geo, body) {
+                    Ok(raised) => {
+                        if raised > 0 {
+                            diagnostics.push(Diagnostic {
+                                entity: Some(msb_id),
+                                severity: Severity::Info,
+                                message: format!(
+                                    "{raised} edge tolerance(s) raised to the measured \
+                                     distance from their faces' surfaces"
+                                ),
+                            });
+                        }
+                        *heal_operations += finish_exact_body(
+                            store,
+                            geo,
+                            body,
+                            options,
+                            &multi_bound_faces,
+                            msb_id,
+                            diagnostics,
+                        );
+                        return SolidOutcome::BRep(body);
+                    }
+                    Err((edge, deviation)) => diagnostics.push(Diagnostic {
+                        entity: Some(msb_id),
+                        severity: Severity::Warning,
+                        message: format!(
+                            "mapped body failed validation: edge {edge:?} strays \
+                             {deviation} from the surface of a face it bounds, more \
+                             than the kernel's maximum tolerance \
+                             ({MAX_ALLOWED_TOLERANCE})"
+                        ),
+                    }),
                 }
             }
             for failure in &failures {
@@ -5954,6 +6046,142 @@ mod tests {
         )
         .unwrap();
         assert!(ok.start_residual <= MAX_ALLOWED_TOLERANCE);
+    }
+
+    // ---- edge tolerances (of-bb6) ----
+
+    /// A 2 mm block whose bottom face's `PLANE` is tilted by `slope` about
+    /// the corner it is anchored at, leaving everything else — the eight
+    /// `VERTEX_POINT`s, the twelve `LINE` edges, the winding, the senses —
+    /// exactly as the plain fixture writes them. So the four edges bounding
+    /// that face are off *its* surface and still exactly on their other one,
+    /// which is the shape of what real files do (of-bb6) with none of a real
+    /// file's other defects.
+    ///
+    /// The plane passes through corner `(-1, -1, -1)`, so the deviation grows
+    /// with `x` and its largest value over the boundary is at `x = 1`:
+    /// [`tilt_deviation`].
+    fn block_with_a_tilted_face(slope: f64) -> String {
+        let src = block_step(2.0, 2.0, 2.0);
+        let flat = "DIRECTION('', (0.000000, 0.000000, -1.000000));";
+        assert_eq!(
+            src.matches(flat).count(),
+            1,
+            "only the -Z face normal may match; edge directions carry the \
+             corner-to-corner delta, not a unit vector"
+        );
+        src.replace(
+            flat,
+            &format!("DIRECTION('', ({slope:.6}, 0.000000, -1.000000));"),
+        )
+    }
+
+    /// Distance from the tilted plane to the far side of the face it bounds:
+    /// the displacement `(2, *, 0)` from the anchor corner, along the unit
+    /// normal `(slope, 0, -1) / |(slope, 0, -1)|`.
+    fn tilt_deviation(slope: f64) -> f64 {
+        2.0 * slope / (1.0 + slope * slope).sqrt()
+    }
+
+    /// An imported edge carries how far its curve really sits from the
+    /// surfaces of the faces it bounds, not `SYSTEM_RESOLUTION` (of-bb6).
+    /// Only the edges that are off something are raised, and the body the
+    /// reader hands back is geometrically clean because of it.
+    #[test]
+    fn an_edge_off_its_face_imports_with_the_measured_tolerance() {
+        let slope = 1.0e-4;
+        let (store, geo, report) = import(&block_with_a_tilted_face(slope));
+        no_error_diagnostics(&report);
+        let body = brep_body(&report.solids[0].outcome);
+        assert_eq!(
+            store.check_with_geometry(&geo, body),
+            Vec::new(),
+            "the measurement is what makes the import clean"
+        );
+
+        let tilted = store
+            .faces_of_body(body)
+            .into_iter()
+            .find(|&f| {
+                matches!(
+                    store.face(f).expect("live face").surface.and_then(|id| geo.surface(id)),
+                    Some(Surface3::Plane { normal, .. }) if normal.x != 0.0
+                )
+            })
+            .expect("one face's plane is tilted");
+        let on_tilted = store.edges_of_face(tilted);
+        let mut raised: Vec<EntityId<Edge>> = Vec::new();
+        for face in store.faces_of_body(body) {
+            for edge in store.edges_of_face(face) {
+                let tolerance = store.edge(edge).expect("live edge").tolerance;
+                if tolerance > SYSTEM_RESOLUTION && !raised.contains(&edge) {
+                    raised.push(edge);
+                }
+            }
+        }
+        // Three of the tilted face's four edges. The fourth runs through the
+        // corner the plane is anchored at and stays on it however far the
+        // face tilts — a measurement that raised that one would be measuring
+        // noise, and every edge of the other five faces likewise.
+        assert_eq!(raised.len(), 3, "{raised:?}");
+        assert!(
+            raised.iter().all(|e| on_tilted.contains(e)),
+            "only the tilted face's edges are off anything: {raised:?}"
+        );
+
+        let expected = tilt_deviation(slope);
+        let worst = raised
+            .iter()
+            .map(|&e| store.edge(e).expect("live edge").tolerance)
+            .fold(0.0f64, f64::max);
+        assert!(
+            (worst - expected).abs() < 1e-12,
+            "expected the measured {expected}, got {worst}"
+        );
+    }
+
+    /// Past [`MAX_ALLOWED_TOLERANCE`] there is no tolerance the kernel could
+    /// give the edge honestly, so the solid does not take the exact path at
+    /// all and degrades to tessellation — the same refusal
+    /// [`trim_rejects_a_miss_beyond_the_kernel_tolerance_limit`] makes for a
+    /// vertex, and for the same reason: the exact path must not build a body
+    /// `check` would reject for tolerance alone.
+    #[test]
+    fn an_edge_too_far_off_its_face_degrades_to_tessellation() {
+        // 0.04 mm on a 2 mm block, four times the kernel's cap.
+        let slope = 0.02;
+        assert!(tilt_deviation(slope) > MAX_ALLOWED_TOLERANCE);
+        let (_, _, report) = import(&block_with_a_tilted_face(slope));
+        assert!(
+            matches!(report.solids[0].outcome, SolidOutcome::Mesh { .. }),
+            "expected a tessellated fallback, got {:?}",
+            report.solids[0].outcome
+        );
+        assert!(
+            report.diagnostics.iter().any(|d| {
+                d.severity == Severity::Warning
+                    && d.message
+                        .contains("more than the kernel's maximum tolerance")
+            }),
+            "the refusal must say what it refused: {:?}",
+            report.diagnostics
+        );
+    }
+
+    /// A tolerance already covering a wider gap — one healing set, say —
+    /// survives the measurement: an edge's tolerance only ever rises, since
+    /// the healer's figure answers a question this measurement is not asking.
+    #[test]
+    fn recording_only_raises_a_tolerance() {
+        let (mut store, geo, report) = import(&block_step(2.0, 2.0, 2.0));
+        let body = brep_body(&report.solids[0].outcome);
+        let edge = store.edges_of_face(store.faces_of_body(body)[0])[0];
+        let wide = MAX_ALLOWED_TOLERANCE / 2.0;
+        store.edges.get_mut(edge).expect("live edge").tolerance = wide;
+
+        let raised = record_edge_tolerances(&mut store, &geo, body).expect("a block is exact");
+        assert_eq!(raised, 0, "a block's edges lie on their faces exactly");
+        assert_eq!(store.edge(edge).expect("live edge").tolerance, wide);
     }
 
     /// Open cubic B-spline over `[0, 2]`, so a trim recovering `(0, 1)`
