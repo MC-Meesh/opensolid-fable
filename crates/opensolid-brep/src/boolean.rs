@@ -1007,9 +1007,11 @@ impl Chart {
     ) -> Option<(f64, f64, (f64, f64))> {
         match self {
             Chart::Plane { .. } => None,
-            Chart::Cylinder { radius, .. } => {
-                Some((pitch, radius.abs() * pitch, (radius.abs(), 1.0)))
-            }
+            Chart::Cylinder { radius, .. } => Some((
+                pitch,
+                ruled_row_pitch(radius.abs() * pitch, bbox),
+                (radius.abs(), 1.0),
+            )),
             Chart::Sphere { radius, .. } => Some((pitch, pitch, (radius.abs(), radius.abs()))),
             Chart::Torus {
                 major_radius,
@@ -1024,7 +1026,7 @@ impl Chart {
             // never a correctness risk.
             Chart::Cone { radius, .. } => {
                 let r = radius.abs();
-                (r > 0.0).then_some((pitch, r * pitch, (r, 1.0)))
+                (r > 0.0).then(|| (pitch, ruled_row_pitch(r * pitch, bbox), (r, 1.0)))
             }
             Chart::Nurbs { surface, .. } => nurbs_lattice_spec(surface, bbox, pitch),
         }
@@ -7365,6 +7367,37 @@ fn knot_probe_params(knot_vector: &KnotVector, a: f64, b: f64) -> Vec<f64> {
 /// model units — the same relation the cylinder arm states in closed form
 /// with `pitch_v = radius · pitch`. When *neither* direction turns the patch
 /// is planar over this region and the answer is `None`: no lattice at all.
+/// The most interior lattice lines a **ruled** direction is ever charged
+/// (of-mpk0).
+///
+/// A ruled direction is straight in 3D, so a flat chord along it lies exactly
+/// on the surface and a lattice line there buys no chordal accuracy at all —
+/// only the curved direction's lines do. That is the measurement FREEFORM §7.1
+/// already carries forward ("the corpus's exact-form NURBS cylinder already met
+/// the deviation bar with **no interior lattice at all**"). Ruled lines earn
+/// their keep for two lesser reasons: they break up the wide chords a seed
+/// triangulation can span across a region's interior, and they keep the
+/// parameter cells from growing grossly elongated. A handful does both.
+///
+/// Uncapped, the count is set by the region's *aspect ratio* rather than by its
+/// geometry: the cylinder arm spaces rows one `u` arc-pitch apart, so a bore of
+/// radius `r` through a plate of thickness `h` is charged `h / (r · pitch)`
+/// rows — unbounded as the hole shrinks relative to the face it sits in. That
+/// is the canonical bolt-hole-in-a-panel case, and it cost the *lattice*
+/// linearly in the ratio and [`refine_curved_region`]'s insertion (a linear
+/// scan per point) quadratically: a 4×4 plate bored at `r = 0.05` spent 6.9 s
+/// on a 49.5k-triangle mesh whose bore wall carried 24k of the vertices. The
+/// 256-line clamp downstream only moves the wall further out.
+const RULED_MAX_STEPS: usize = 8;
+
+/// The row pitch a ruled analytic chart (cylinder, cone) lays over a region
+/// whose uv box is `bbox`: the arc-matched spacing `arc`, floored so the row
+/// count cannot exceed [`RULED_MAX_STEPS`].
+fn ruled_row_pitch(arc: f64, bbox: (f64, f64, f64, f64)) -> f64 {
+    let v_extent = bbox.3 - bbox.2;
+    arc.max(v_extent / RULED_MAX_STEPS as f64)
+}
+
 fn nurbs_lattice_spec(
     surface: &NurbsSurface,
     bbox: (f64, f64, f64, f64),
@@ -7439,9 +7472,21 @@ fn nurbs_lattice_spec(
         cell = cell.min(arc_v / n_v as f64);
     }
     if cell > 0.0 && cell.is_finite() {
-        let fit = |arc: f64| ((arc / cell).ceil() as usize).clamp(1, MAX_STEPS);
-        n_u = n_u.max(fit(arc_u));
-        n_v = n_v.max(fit(arc_v));
+        // A direction that does not turn is the freeform spelling of the
+        // cylinder's ruled `v`, and takes the same cap for the same reason
+        // (of-mpk0): squaring the cells up off the *other* direction prices
+        // its line count off the region's aspect ratio, which an extruded
+        // profile far smaller than the face it cuts drives without bound.
+        let fit = |arc: f64, turn: f64| {
+            let cap = if turn > FLAT {
+                MAX_STEPS
+            } else {
+                RULED_MAX_STEPS
+            };
+            ((arc / cell).ceil() as usize).clamp(1, cap)
+        };
+        n_u = n_u.max(fit(arc_u, turn_u));
+        n_v = n_v.max(fit(arc_v, turn_v));
     }
 
     Some(((u1 - u0) / n_u as f64, (v1 - v0) / n_v as f64, (su, sv)))
@@ -12048,6 +12093,41 @@ mod tests {
         .expect("valid rational quarter-cylinder patch")
     }
 
+    /// A cylinder wall's rows are priced off its `u` arc-step, so a bore ten
+    /// times deeper than it is wide was charged ten times the rows — and a
+    /// bore a thousand times deeper, a thousand times as many, for a wall a
+    /// flat chord follows *exactly* along `v`. [`RULED_MAX_STEPS`] stops that
+    /// (of-mpk0): a wide shallow band keeps its arc-matched rows, while
+    /// shrinking the radius under a fixed depth stops buying more.
+    #[test]
+    fn a_bores_rows_stop_multiplying_once_it_is_deeper_than_it_is_wide() {
+        let pitch = TWO_PI / SAMPLES_PER_CIRCLE as f64;
+        let depth = 5.0;
+        let rows = |radius: f64| {
+            let surface =
+                Surface3::cylinder(Point3::origin(), Vector3::z(), radius).expect("valid cylinder");
+            let (_, pitch_v, _) = build_chart(&surface)
+                .expect("a cylinder has a chart")
+                .lattice_spec((0.0, TWO_PI, 0.0, depth), pitch)
+                .expect("a cylinder always takes a lattice");
+            (depth / pitch_v).ceil() as usize
+        };
+        // Wider than it is deep: the arc step is the coarser of the two and
+        // the cap does not bind, so the closed-form spacing still stands.
+        assert_eq!(
+            rows(100.0),
+            (depth / (100.0 * pitch)).ceil() as usize,
+            "a shallow band must keep its arc-matched rows"
+        );
+        for radius in [1e-1, 1e-2, 1e-3] {
+            let count = rows(radius);
+            assert!(
+                count <= RULED_MAX_STEPS,
+                "a bore of radius {radius} through a plate {depth} deep took {count} rows"
+            );
+        }
+    }
+
     /// The point of pricing the lattice off *turning* rather than off the
     /// parameter: a NURBS patch of exact analytic form must land on the
     /// same lattice as the analytic surface it duplicates. A quarter
@@ -12056,9 +12136,11 @@ mod tests {
     /// SAMPLES_PER_CIRCLE` pitch gives that quarter arc.
     ///
     /// The ruled direction turns not at all, so it takes its step from the
-    /// curved one instead and comes out square in model units, which is
-    /// the relation `Chart::Cylinder`'s arm states in closed form as
-    /// `pitch_v = radius · pitch`.
+    /// curved one instead — square in model units, the relation
+    /// `Chart::Cylinder`'s arm states in closed form as `pitch_v = radius ·
+    /// pitch`, and then subject to the same [`RULED_MAX_STEPS`] cap on both
+    /// arms (of-mpk0). It is that *agreement* the row half of this test
+    /// asserts, so it holds on either side of the cap.
     #[test]
     fn nurbs_lattice_matches_the_analytic_pitch_on_an_exact_quarter_cylinder() {
         let (r, height) = (2.0, 6.0);
@@ -12074,16 +12156,29 @@ mod tests {
             SAMPLES_PER_CIRCLE / 4,
             "a NURBS quarter cylinder must take the same column count as the analytic one"
         );
-        // The ruled direction: rows one u-arc-step of model length apart.
-        // Compared as a model-space spacing rather than an exact row count,
-        // because the arc the spec measures is a probe *polyline* and so
-        // runs a few tenths of a percent short of the true arc.
-        let arc_step = r * TWO_PI / SAMPLES_PER_CIRCLE as f64;
+        // The ruled direction: the same row spacing in model units the
+        // analytic cylinder of this radius lays over the same region — the
+        // arc step where the ruled cap does not bind, the capped spacing
+        // where it does. Compared as a spacing rather than an exact row
+        // count, because the arc the freeform spec measures is a probe
+        // *polyline* and so runs a few tenths of a percent short of the true
+        // arc.
+        let analytic = build_chart(
+            &Surface3::cylinder(Point3::origin(), Vector3::z(), r).expect("valid cylinder"),
+        )
+        .expect("a cylinder has a chart");
+        let (_, analytic_pitch_v, (_, analytic_sv)) = analytic
+            .lattice_spec(
+                (0.0, std::f64::consts::FRAC_PI_2, 0.0, height),
+                TWO_PI / SAMPLES_PER_CIRCLE as f64,
+            )
+            .expect("a cylinder always takes a lattice");
+        let analytic_step = analytic_pitch_v * analytic_sv;
         let row_spacing = pitch_v * sv;
         assert!(
-            (row_spacing - arc_step).abs() < 0.03 * arc_step,
+            (row_spacing - analytic_step).abs() < 0.03 * analytic_step,
             "ruled-direction rows are {row_spacing} apart in model units, \
-             not the u-arc-step {arc_step}"
+             not the analytic cylinder's {analytic_step}"
         );
         // The scales are the *suprema* of `uv_scale` over the region, so
         // over this unit domain `su` sits just above the arc `r · π/2` (a

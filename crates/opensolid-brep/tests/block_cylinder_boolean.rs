@@ -201,6 +201,55 @@ fn cube_with_small_through_hole() {
     );
 }
 
+/// A bolt hole in a panel: the mesh a bore leaves must be priced off the
+/// geometry, not off how small the bore is relative to the face it sits in
+/// (of-mpk0).
+///
+/// The bore wall's interior lattice used to space its rows one `u` arc-step
+/// apart — `radius · pitch` of model length — so a bore of radius `r` through
+/// a plate of thickness `h` was charged `h / (r · pitch)` rows. Shrinking the
+/// bore therefore *refined* its wall without bound, and since each lattice
+/// point is placed by a linear scan over the triangles already laid, the cost
+/// went as the square of that: a 1×1×5 plate bored at r=1e-2 — the shape this
+/// one is, scaled — did not finish in ten minutes of a debug build, against
+/// 0.85 s once the rows were capped. Rows buy nothing on a cylinder, which is
+/// ruled along `v`: a flat chord there lies exactly on the surface. That is
+/// why capping them costs no accuracy, as the volumes asserted at every radius
+/// here show.
+///
+/// The triangle bound is the fence: a bore two orders of magnitude smaller
+/// than the plate must not out-mesh a bore of the same size as it.
+#[test]
+fn a_bore_much_smaller_than_its_plate_meshes_no_finer_than_a_large_one() {
+    let (plate, thickness) = (4.0, 5.0);
+    let mut counts = Vec::new();
+    for r in [1.0, 0.1, 0.01] {
+        let mut store = TopologyStore::new();
+        let mut geo = GeometryStore::new();
+        let panel = block(&mut store, &mut geo, plate, plate, thickness).expect("valid plate");
+        let bore = cylinder(&mut store, &mut geo, r, thickness * 2.0).expect("valid bore");
+        let out = subtract(&store, &geo, panel, bore, &tol()).expect("subtract");
+        let context = format!("plate {plate} bored at r={r}");
+        let mesh = assert_valid(&out, &context);
+        assert_close(
+            mesh_volume(&mesh),
+            plate * plate * thickness - PI * r * r * thickness,
+            CYL_RTOL,
+            &context,
+        );
+        counts.push((r, mesh.triangle_count()));
+    }
+    // Generous against the ~2k a bore of any radius meshes to today, and well
+    // under the 29.8k a 4×4×1 plate bored at r=0.1 alone produced before the
+    // cap (49.6k at r=0.05, and climbing).
+    for &(r, count) in &counts {
+        assert!(
+            count < 6_000,
+            "r={r} meshed to {count} triangles: {counts:?}"
+        );
+    }
+}
+
 // Keep unused-import lint honest if Point3/Vector3 end up unused.
 #[allow(dead_code)]
 fn _types(_: Point3, _: Vector3) {}

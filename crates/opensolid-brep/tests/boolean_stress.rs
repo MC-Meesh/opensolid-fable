@@ -6124,15 +6124,16 @@ fn high_aspect_operands_inside_the_working_range() {
     // (100 radii wide, 10 deep) so that the drill's length is the only thing
     // varying with aspect; every other ratio in the model is fixed.
     //
-    // These three are the one place in the suite that does not tessellate its
-    // result, and the reason is cost, not doubt: the triangulator's time
-    // climbs steeply as a face's hole shrinks relative to the face (a plain
-    // 4 × 4 slab with a unit bore already takes ~1s in a debug build; a
-    // thousandth-radius bore is far worse — of-mpk0), and it would dominate
-    // the whole suite for no coverage. What is being fenced happens strictly
-    // inside `subtract`: of-oygs is a `ray_classify` refusal, so reaching a
-    // result at all is most of the assertion. `check()` and the exact volume
-    // still confirm the result is a well-formed solid of the right size.
+    // These three used to be the one place in the suite that did not
+    // tessellate its result, for cost: the bore wall's interior lattice was
+    // spaced one `u` arc-step apart in `v` too, so a wall ten radii deep was
+    // charged ~150 rows of 96 columns however small the bore was, and each of
+    // those points was placed by a linear scan over the triangles already
+    // laid. of-mpk0 capped the rows a *ruled* direction can take — a cylinder
+    // is straight along `v`, so those rows bought no accuracy — and the cost
+    // came back down to the rest of the suite's. They tessellate again here,
+    // through `measured`, which also cross-checks the meshed volume against
+    // the exact one.
     for (radius, aspect) in [(1e-2, 1e4), (1e-3, 1e6), (1e-4, 1e7)] {
         let (width, thickness) = (100.0 * radius, 10.0 * radius);
         let height = aspect * radius;
@@ -6151,21 +6152,14 @@ fn high_aspect_operands_inside_the_working_range() {
         let out = scene
             .subtract(plate, drill)
             .unwrap_or_else(|e| panic!("{context}: subtract failed: {e:?}"));
-        let failures = out.check();
-        assert!(
-            failures.is_empty(),
-            "{context}: check() reported {} failures: {failures:#?}",
-            failures.len()
-        );
         assert_eq!(
             out.store.euler_counts(out.body).genus,
             1,
             "{context}: the bore must go through"
         );
-        let measured = brep_mass_properties(&out.store, &out.geo, out.body)
-            .unwrap_or_else(|e| panic!("{context}: brep_mass_properties failed: {e}"));
+        let (_, exact) = measured(&out, &context);
         assert_close(
-            measured.volume,
+            exact.volume,
             (width * width - PI * radius * radius) * thickness,
             EXACT_RTOL,
             &context,
