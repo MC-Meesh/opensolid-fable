@@ -64,13 +64,23 @@
 //! for each; (18) samples the parameters instead and leans on the volume
 //! identities, which hold for every pair of solids and so need no closed
 //! form at all, plus rigid-motion invariance, which compares the pipeline
-//! against itself. It found two bugs. of-7bnv is still open and still
-//! `#[ignore]`d (the sphere-sphere lens volume is 4.4e-4 off its closed
-//! form, and frame-dependent — invisible to the meshed 5e-3 budgets
-//! sections (6)-(9) weigh against). of-ntkk is fixed and its two repros are
-//! live: the exact path failed outright on transversal cone+sphere pairs,
-//! whose marched imprint met the face cover's seam between two samples, and
-//! the `CurvedPair::ConeSphere` sampler is armed again with them.
+//! against itself. It found two bugs, and both are now fixed. of-ntkk: the
+//! exact path failed outright on transversal cone+sphere pairs, whose marched
+//! imprint met the face cover's seam between two samples; its two repros are
+//! live and the `CurvedPair::ConeSphere` sampler is armed again with them.
+//! of-7bnv: the sphere-sphere lens volume was 4.4e-4 off its closed form and
+//! frame-dependent — invisible to the meshed 5e-3 budgets sections (6)-(9)
+//! weigh against. It was the same projected-trim defect section (17) above
+//! describes, and d0258d7 retired it along with the rest;
+//! `sphere_lens_volume_is_exact_and_frame_independent` is live, and measures
+//! that lens to 2e-14 in both frames.
+//!
+//! What the campaign still holds open is narrower and belongs to a different
+//! layer: of-lpsd, where cone+sphere pairs — alone among the sampled classes,
+//! and alone in having a quartic rather than a conic to imprint — stay
+//! frame-dependent at 2.7e-4 because the marched edge curve itself is an
+//! approximation. `RIGID_MOTION_RTOL` is what carries that, at 5e-4 rather
+//! than the `EXACT_RTOL` every other pair class now meets.
 //!
 //! of-ukcq is retired as well: mesh
 //! `mass_properties` integrated tetrahedra from the absolute origin and was
@@ -8167,19 +8177,24 @@ fn random_curved_pairs_satisfy_the_volume_identities() {
 
 /// Budget for a quantity that a rigid motion may not change at all.
 ///
-/// It should be [`EXACT_RTOL`]. It is not, because the exact path is
-/// measurably frame-dependent: over this campaign the worst volume deviation
-/// under a rigid motion is `3.9e-3` and the worst centroid deviation
-/// `3.6e-3`, both on sphere-sphere pairs, where the intersection lens comes
-/// out `4.4e-4` off its closed form in one frame and `4.3e-4` off the other
-/// way in another — of-7bnv. The tight statement is
-/// [`sphere_lens_volume_is_exact_and_frame_independent`], parked `#[ignore]`d
-/// against that bead.
+/// It should be [`EXACT_RTOL`], and for four of the five sampled pair classes
+/// it could be: torus+block, sphere+block, sphere+cylinder and sphere+sphere
+/// all reproduce under a random rotation to `1e-15`, i.e. exactly. The one
+/// class that does not is cone+sphere, which deviates by up to `2.7e-4` in
+/// volume and `1.4e-4` in centroid — of-lpsd. It is the only class here whose
+/// intersection curve is a quartic and so must be *marched* rather than fitted
+/// as a conic, which puts the error in the edge geometry itself rather than in
+/// anything the measurement does with it.
 ///
-/// `5e-3` sits just above the observed spread, so this stays a live test of
-/// everything larger: a misclassified region is orders of magnitude bigger
-/// than the trim error and still fails here.
-const RIGID_MOTION_RTOL: f64 = 5e-3;
+/// `5e-4` sits just above that spread, so this stays a live test of everything
+/// larger: a misclassified region is orders of magnitude bigger than a marching
+/// error and still fails here. The tight statement for the remaining class is
+/// [`cone_sphere_volume_is_frame_independent`], parked `#[ignore]`d against
+/// of-lpsd.
+///
+/// This was `5e-3` while of-7bnv was open, absorbing a `3.9e-3` sphere-sphere
+/// deviation that no longer exists.
+const RIGID_MOTION_RTOL: f64 = 5e-4;
 
 /// A rigid motion applied to BOTH operands must leave the result congruent:
 /// the same volume, and a centroid that has moved exactly as the operands
@@ -8559,20 +8574,28 @@ fn rotated_cone_sphere_intersection_spells_its_seam_crossing_once() {
 }
 
 /// The exact measurement of a sphere-sphere lens must equal its closed form,
-/// in every frame. It does not (of-7bnv).
+/// in every frame (of-7bnv, fixed).
 ///
 /// Minimal repro from `random_curved_pairs_are_invariant_under_rigid_motion`
-/// case 9 (seed `0x0009_161D_C0DE`), reduced to the intersection alone — which
-/// is where the campaign's back-solve localized the error, the three booleans
-/// being mutually consistent to `1e-9` around it. The measured lens is
-/// `4.4e-4` above the closed form in the plain frame and `4.3e-4` below it
-/// after a rigid rotation, which surfaces as a `2e-3` disagreement on
-/// `A − B`.
+/// (seed `0x0009_161D_C0DE`), reduced to the intersection alone — which is
+/// where the campaign's back-solve localized the error, the three booleans
+/// being mutually consistent to `1e-9` around it. The measured lens used to
+/// come out `4.4e-4` above the closed form in the plain frame and `4.3e-4`
+/// below it after a rigid rotation, surfacing as a `2e-3` disagreement on
+/// `A − B` and leaving the truth between the two frames.
 ///
-/// Kept live and `#[ignore]`d per the never-soften policy.
+/// The cause was the one section (17) of the module docs describes: the trim
+/// bounding each cap was *fitted* to the sphere rather than inverted onto it,
+/// so where the intersection circle fell relative to the fit — which a rotation
+/// moves — changed the answer. d0258d7 replaced the fit with
+/// `Curve2::Projected` and adaptive contour panels, and both frames now land
+/// within `2.2e-14` of the closed form. That is why the assertions below are
+/// at [`EXACT_RTOL`]: nothing here is allowed a budget any more.
+///
+/// The campaign's own seed no longer draws a sphere-sphere pair in its first
+/// eight cases, so this is the only live guard on that class's frame
+/// independence. Do not delete it with the bead.
 #[test]
-#[ignore = "of-7bnv: exact sphere-sphere lens volume is ~4e-4 off closed form and \
-            frame-dependent"]
 fn sphere_lens_volume_is_exact_and_frame_independent() {
     let (r1, r2) = (0.8312561812647244, 1.0925146621706086);
     let d = 0.5596874067739965;
@@ -8621,5 +8644,80 @@ fn sphere_lens_volume_is_exact_and_frame_independent() {
         want,
         EXACT_RTOL,
         "rotated sphere lens vs closed form",
+    );
+}
+
+/// A cone+sphere intersection must measure the same in every frame. It does
+/// not (of-lpsd).
+///
+/// Minimal repro from `random_curved_pairs_are_invariant_under_rigid_motion`
+/// case 5 (seed `0x0009_161D_C0DE`), the worst of the three cone+sphere cases
+/// that campaign draws, reduced to the intersection — the operation whose
+/// entire curved boundary is the imprinted edge, and consistently an order of
+/// magnitude worse than the union or the difference on the same pair.
+///
+/// There is no closed form to weigh this against, and none is needed: the two
+/// frames disagree by `2.7e-4` with each other, so at most one of them can be
+/// right. Every other pair class the campaign samples reproduces exactly here
+/// (`1e-15`); this one is alone in having a *quartic* intersection curve, with
+/// no conic to fit and therefore a marched approximation whose samples land
+/// differently once the pair is rotated. That puts the defect in the edge
+/// geometry rather than in the measurement — the opposite of of-7bnv, which
+/// this file's [`sphere_lens_volume_is_exact_and_frame_independent`] now
+/// asserts is fixed.
+///
+/// Kept live and `#[ignore]`d per the never-soften policy. The live campaign
+/// carries the same statement at [`RIGID_MOTION_RTOL`], just above the
+/// observed spread.
+#[test]
+#[ignore = "of-lpsd: exact cone-sphere boolean volume is frame-dependent at ~3e-4"]
+fn cone_sphere_volume_is_frame_independent() {
+    let pair = CurvedPair::ConeSphere {
+        r0: 0.9270325696370899,
+        r1: 0.23376846828406542,
+        h: 1.914976910373373,
+        rs: 0.7879077392858235,
+        dz: 0.9687850333476096,
+    };
+
+    let mut plain = Scene::new();
+    let (a, b) = pair.build(&mut plain);
+    let inter = plain.intersect(a, b).expect("transversal cone and sphere");
+    let got = measured(&inter, "cone-sphere lens").1.volume;
+
+    let axis = Unit::new_normalize(Vector3::new(
+        -0.7996494317234822,
+        -0.5498082118686047,
+        0.24139535311633337,
+    ));
+    let angle = 1.5257527560161017;
+    let center = Point3::new(
+        -0.8107116227771001,
+        0.7446959747969766,
+        -0.07577175550684201,
+    );
+    let mut turned = Scene::new();
+    let (ar, br) = pair.build(&mut turned);
+    for body in [ar, br] {
+        rotate_body(
+            &mut turned.store,
+            &mut turned.geo,
+            body,
+            center,
+            axis.into_inner(),
+            angle,
+        )
+        .expect("valid rotation");
+    }
+    let inter_rot = turned
+        .intersect(ar, br)
+        .expect("transversal cone and sphere after rotation");
+    let got_rot = measured(&inter_rot, "rotated cone-sphere lens").1.volume;
+
+    assert_close(
+        got_rot,
+        got,
+        EXACT_RTOL,
+        "cone-sphere intersection volume under rigid motion",
     );
 }
