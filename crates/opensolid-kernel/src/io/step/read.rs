@@ -4289,11 +4289,11 @@ fn choose_outer_bounds(
         if !all_readable {
             continue;
         }
-        if let Some((_, winner)) = largest {
-            if winner != outer {
-                store.set_outer_loop(face_id, winner);
-                redesignated += 1;
-            }
+        if let Some((_, winner)) = largest
+            && winner != outer
+        {
+            store.set_outer_loop(face_id, winner);
+            redesignated += 1;
         }
     }
     redesignated

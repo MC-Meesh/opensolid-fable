@@ -125,10 +125,11 @@ impl<Id> Bvh<Id> {
             match node.kind {
                 NodeKind::Leaf { start, count } => {
                     for (_, id) in &self.items[start..start + count] {
-                        if let Some(t) = hit(ray, id) {
-                            if t >= 0.0 && best.is_none_or(|(bt, _)| t < bt) {
-                                best = Some((t, id));
-                            }
+                        if let Some(t) = hit(ray, id)
+                            && t >= 0.0
+                            && best.is_none_or(|(bt, _)| t < bt)
+                        {
+                            best = Some((t, id));
                         }
                     }
                 }
