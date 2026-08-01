@@ -1772,22 +1772,20 @@ mod corpus {
                 );
             }
         }
-        // 2026-08-01: 31 of 34, measured on this branch rebased onto of-zdx.
-        // That is the 33 of-zdx left minus the two below; the two occ/tangent
-        // parts it brought in are untouched by the measurement here and still
-        // pass. Three files fail:
+        // 2026-08-01: 32 of 34, measured on this branch rebased onto of-bb6.
+        // That is the 31 of-bb6 left plus bspline_patch_prism, which this bead
+        // returns to the exact path: its extrusion walls were patches one
+        // `VECTOR` long, so they stopped 20 mm short of the faces they carried
+        // and the edges on them needed a tolerance past MAX_ALLOWED_TOLERANCE.
+        // Sizing the patch to its face removes the miss at the source. Two
+        // files still fail:
         // - nist_ctc_05 (of-kwn): edge geometry that misses its vertex points.
-        // - nist_ctc_02, occ/nurbs/bspline_patch_prism (of-05ac): the two the
-        //   edge half of of-bb6 took off the exact path. Each has an edge
-        //   further from a face's surface than MAX_ALLOWED_TOLERANCE — 0.0386
-        //   mm of authored gap in nist_ctc_02, and in bspline_patch_prism a
-        //   whole 20 mm, because the extrusion patch we build for its faces
-        //   is a twentieth of the length it needs and points the other way
-        //   (of-8ulj). Refusing both is right; what costs the two counts is
-        //   that the mesh fallback does not close for either (of-05ac), so a
-        //   degrade becomes a loss. This floor returns to 33 with of-05ac,
-        //   and does not need of-8ulj first.
-        const FLOOR: usize = 999;
+        // - nist_ctc_02 (of-05ac): 0.0386 mm of authored gap puts an edge
+        //   further from its face's surface than MAX_ALLOWED_TOLERANCE.
+        //   Refusing it is right; what costs the count is that the mesh
+        //   fallback does not close for it either, turning a degrade into a
+        //   loss. This floor returns to 33 with of-05ac.
+        const FLOOR: usize = 32;
         assert!(
             passed.len() >= FLOOR,
             "corpus pass count regressed below {FLOOR}: only {passed:?} pass"
@@ -1862,8 +1860,16 @@ mod corpus {
                 );
             }
         }
-        // PLACEHOLDER — re-measured after the rebase completes.
-        const FLOOR: usize = 999;
+        // 2026-08-01: 32 files clear this, up from a measured 31 on of-bb6's
+        // main — every corpus file that imports as a B-Rep at all is also
+        // geometrically clean, so this list and the pass-rate list above are
+        // the same 32 files. The one this bead adds is bspline_patch_prism:
+        // its four extrusion walls were patches one `VECTOR` long and did not
+        // contain their own faces, which showed up here as 12 EdgeOffSurface
+        // (to 20 mm) and 8 PcurveDeviation. Sizing the patch to the face it
+        // carries takes all 20 to zero. Nothing that was clean before stopped
+        // being clean.
+        const FLOOR: usize = 32;
         assert!(
             clean.len() >= FLOOR,
             "geometrically clean corpus count regressed below {FLOOR}: only {clean:?} pass"
