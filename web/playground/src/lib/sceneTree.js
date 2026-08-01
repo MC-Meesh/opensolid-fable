@@ -61,6 +61,13 @@ export const SWEEP_OPS = ['extrude', 'revolve'];
 // node carries a `profile` snapshot plus a `path` snapshot `[[x, y, z], ...]`.
 export const PATH_SWEEP_OPS = ['sweep'];
 
+// Static constructor thickening an open 2D `OpenPath` into a support rib
+// (`Shape.rib(path, thickness, height, side)`). No children; the node carries
+// an `openPath` snapshot (same `{ start, segs }` form as a profile snapshot,
+// minus the close) and args `[thickness, height, side]` where `side` is the
+// string 'both' | 'first' | 'second'.
+export const RIB_OPS = ['rib'];
+
 // Static constructor lofting between two profiles (bottom, top) plus a
 // numeric height. No children; the node carries a `profile` (bottom) snapshot
 // and a `profile2` (top) snapshot.
@@ -92,6 +99,7 @@ const OP_LABELS = {
   revolve: 'Revolve',
   sweep: 'Sweep',
   loft: 'Loft',
+  rib: 'Rib',
   filletEdge: 'Fillet Edge',
   chamferEdge: 'Chamfer Edge',
 };
@@ -119,18 +127,19 @@ export function nodeLabel(node) {
  * Create Shape/Profile-compatible tracing classes that record a construction
  * node for every operation while delegating to `ShapeClass` / `ProfileClass`.
  *
- * Returns `{ TracingShape, TracingProfile, nodes, profiles }`: `nodes`
- * accumulates every node created (including ones a script builds but never
- * uses) so callers can free the underlying shapes; `profiles` accumulates
- * every profile so its real instance can be freed after the script runs.
+ * Returns `{ TracingShape, TracingProfile, TracingPath, TracingOpenPath,
+ * nodes, profiles }`: `nodes` accumulates every node created (including ones
+ * a script builds but never uses) so callers can free the underlying shapes;
+ * `profiles` accumulates every profile/path builder so its real instance can
+ * be freed after the script runs.
  *
  * Node shape: `{ id, op, args, children, shape }` — `args` are the numeric
  * arguments, `children` reference other nodes, and `shape` is the retained
  * `ShapeClass` instance for that intermediate result. Sweep nodes
  * additionally carry `profile`, a plain-data snapshot of the profile at the
- * moment of the sweep call.
+ * moment of the sweep call; rib nodes carry `openPath` likewise.
  */
-export function createTracer(ShapeClass, ProfileClass, PathClass) {
+export function createTracer(ShapeClass, ProfileClass, PathClass, OpenPathClass) {
   let nextId = 1;
   const nodes = [];
   const profiles = [];
@@ -189,6 +198,33 @@ export function createTracer(ShapeClass, ProfileClass, PathClass) {
     }
   }
 
+  // Open 2D polyline for Shape.rib: the Profile segment surface minus
+  // close(), and its snapshot reuses the profile `{ start, segs }` form so
+  // profileSegStatement serializes both.
+  class TracingOpenPath {
+    constructor(x, y) {
+      this.real = OpenPathClass ? new OpenPathClass(x, y) : null;
+      this.start = [x, y];
+      this.segs = [];
+      profiles.push(this);
+    }
+    lineTo(x, y) {
+      this.arcTo(x, y, 0);
+    }
+    arcTo(x, y, bulge) {
+      this.segs.push({ x, y, bulge });
+      this.real?.arcTo(x, y, bulge);
+    }
+    ellipseArcTo(x, y, cx, cy, rx, ry, rotation, ccw) {
+      this.segs.push({ kind: 'ellipse', x, y, cx, cy, rx, ry, rotation, ccw });
+      this.real?.ellipseArcTo(x, y, cx, cy, rx, ry, rotation, ccw);
+    }
+    cubicTo(c1x, c1y, c2x, c2y, x, y) {
+      this.segs.push({ kind: 'spline', x, y, c1x, c1y, c2x, c2y });
+      this.real?.cubicTo(c1x, c1y, c2x, c2y, x, y);
+    }
+  }
+
   const record = (op, args, children, shape) => {
     const node = { id: nextId++, op, args, children, shape };
     nodes.push(node);
@@ -233,6 +269,20 @@ export function createTracer(ShapeClass, ProfileClass, PathClass) {
     const traced = record('sweep', [], [], ShapeClass.sweep(profile.real, path.real));
     traced.node.profile = snapshotProfile(profile);
     traced.node.path = path.points.map((p) => [...p]);
+    return traced;
+  };
+
+  TracingShape.rib = (path, thickness, height, side) => {
+    if (!(path instanceof TracingOpenPath)) {
+      throw new Error('Shape.rib(...) expects an OpenPath as its first argument');
+    }
+    const traced = record(
+      'rib',
+      [thickness, height, side],
+      [],
+      ShapeClass.rib(path.real, thickness, height, side)
+    );
+    traced.node.openPath = snapshotProfile(path);
     return traced;
   };
 
@@ -294,7 +344,7 @@ export function createTracer(ShapeClass, ProfileClass, PathClass) {
     };
   }
 
-  return { TracingShape, TracingProfile, TracingPath, nodes, profiles };
+  return { TracingShape, TracingProfile, TracingPath, TracingOpenPath, nodes, profiles };
 }
 
 /**
@@ -306,12 +356,12 @@ export function createTracer(ShapeClass, ProfileClass, PathClass) {
  * only the plain-data snapshot). On error, any shapes created before the
  * failure are freed, then the error is rethrown.
  */
-export function runTracedScript(source, ShapeClass, ProfileClass, PathClass) {
-  const { TracingShape, TracingProfile, TracingPath, nodes, profiles } =
-    createTracer(ShapeClass, ProfileClass, PathClass);
+export function runTracedScript(source, ShapeClass, ProfileClass, PathClass, OpenPathClass) {
+  const { TracingShape, TracingProfile, TracingPath, TracingOpenPath, nodes, profiles } =
+    createTracer(ShapeClass, ProfileClass, PathClass, OpenPathClass);
   let result;
   try {
-    result = runScript(source, TracingShape, TracingProfile, TracingPath);
+    result = runScript(source, TracingShape, TracingProfile, TracingPath, TracingOpenPath);
   } catch (err) {
     freeNodes(nodes);
     throw err;
@@ -374,8 +424,9 @@ export function scriptHeader(source) {
  * is a readable statement-per-feature program (and the DAG structure
  * survives a round trip); single-use primitives and transform chains stay
  * inline. Sweep nodes emit their profile as `const p<N> = new Profile(...)`
- * builder statements first. `header` (see `scriptHeader`) is prepended with
- * a blank separator line when given.
+ * builder statements first; rib nodes likewise emit their open path as
+ * `const rp<N> = new OpenPath(...)`. `header` (see `scriptHeader`) is
+ * prepended with a blank separator line when given.
  */
 /**
  * One `Profile` builder statement (`p.lineTo(...)` etc.) for a profile
@@ -409,6 +460,7 @@ export function serializeTree(root, { header = '' } = {}) {
   const lines = [];
   let profileCount = 0;
   let pathCount = 0;
+  let openPathCount = 0;
 
   const emitProfile = (profile) => {
     const name = `p${++profileCount}`;
@@ -417,6 +469,15 @@ export function serializeTree(root, { header = '' } = {}) {
       lines.push(profileSegStatement(name, seg));
     }
     lines.push(`${name}.close();`);
+    return name;
+  };
+
+  const emitOpenPath = (openPath) => {
+    const name = `rp${++openPathCount}`;
+    lines.push(`const ${name} = new OpenPath(${openPath.start.map(String).join(', ')});`);
+    for (const seg of openPath.segs) {
+      lines.push(profileSegStatement(name, seg));
+    }
     return name;
   };
 
@@ -457,6 +518,12 @@ export function serializeTree(root, { header = '' } = {}) {
       const pname = emitProfile(node.profile);
       const path = emitPath(node.path);
       text = `Shape.sweep(${pname}, ${path})`;
+    } else if (node.op === 'rib') {
+      // args = [thickness, height, side] — side is a string and must stay
+      // quoted in the emitted script.
+      const pname = emitOpenPath(node.openPath);
+      const [thickness, height, side] = node.args;
+      text = `Shape.rib(${pname}, ${String(thickness)}, ${String(height)}, ${JSON.stringify(side)})`;
     } else if (node.profile) {
       const pname = emitProfile(node.profile);
       const rest = args.length > 0 ? `, ${args.join(', ')}` : '';

@@ -45,6 +45,7 @@ export function createStubApi() {
   }
   StubShape.sweep = () => new StubShape();
   StubShape.loft = () => new StubShape();
+  StubShape.rib = () => new StubShape();
   for (const op of [...UNARY_OPS, ...BINARY_OPS]) {
     StubShape.prototype[op] = () => new StubShape();
   }
@@ -72,7 +73,25 @@ export function createStubApi() {
     }
   }
 
-  return { Shape: StubShape, Profile: StubProfile, Path: StubPath, live };
+  class StubOpenPath {
+    constructor() {
+      live.add(this);
+    }
+    arcTo() {}
+    ellipseArcTo() {}
+    cubicTo() {}
+    free() {
+      live.delete(this);
+    }
+  }
+
+  return {
+    Shape: StubShape,
+    Profile: StubProfile,
+    Path: StubPath,
+    OpenPath: StubOpenPath,
+    live,
+  };
 }
 
 /**
@@ -86,7 +105,7 @@ export function createStubApi() {
  */
 export function reparseTree(source) {
   const api = createStubApi();
-  const traced = runTracedScript(source, api.Shape, api.Profile, api.Path);
+  const traced = runTracedScript(source, api.Shape, api.Profile, api.Path, api.OpenPath);
   freeNodes(traced.nodes);
   return { root: traced.root, nodes: traced.nodes, leaked: api.live.size };
 }

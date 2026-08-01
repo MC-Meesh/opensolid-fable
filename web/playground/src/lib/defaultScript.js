@@ -22,6 +22,11 @@ export const DEFAULT_SCRIPT = `// Build a shape with the OpenSolid API and retur
 //   Shape.sweep(p, path)                profile swept along path (no twist)
 //   Shape.loft(bottom, top, height)     morph bottom (y=0) to top (y=height);
 //                                       parallel planes, linear cross-section
+//   const rp = new OpenPath(x, y);      open 2D polyline (never closed);
+//                                       lineTo/arcTo/ellipseArcTo/cubicTo
+//   Shape.rib(rp, thickness, height, side)  path thickened into a support
+//                                       rib swept along +y; (x,y)->(x,z);
+//                                       side: "both" | "first" | "second"
 // Transforms (each returns a new shape):
 //   .translate(x, y, z)
 //   .rotate(ax, ay, az, angleRad)       about axis (ax,ay,az) through origin

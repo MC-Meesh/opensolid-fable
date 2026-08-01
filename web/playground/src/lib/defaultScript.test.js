@@ -3,6 +3,7 @@ import { DEFAULT_SCRIPT } from './defaultScript.js';
 import {
   BINARY_OPS,
   PRIMITIVE_OPS,
+  RIB_OPS,
   SWEEP_OPS,
   UNARY_OPS,
   runTracedScript,
@@ -34,7 +35,9 @@ describe('DEFAULT_SCRIPT', () => {
       ...UNARY_OPS,
       ...BINARY_OPS,
       ...SWEEP_OPS,
+      ...RIB_OPS,
       'Profile',
+      'OpenPath',
       'lineTo',
       'arcTo',
       'close',

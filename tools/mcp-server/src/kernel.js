@@ -97,10 +97,10 @@ function makeParam(overrides = {}) {
 /**
  * Evaluate a playground script that must `return` a Shape. Runs in strict
  * mode with `Shape`, `Profile`, `Path`, `OpenPath`, and `param` in scope.
- * `Shape`/`Profile`/`Path` are the playground Code tab's bindings (see
- * web/playground/src/lib/runScript.js); `OpenPath` (the `Shape.rib` path
- * builder) and `param()` (design variables for `optimize`) are additions
- * here — a superset, so every playground script still runs unchanged.
+ * `Shape`/`Profile`/`Path`/`OpenPath` are the playground Code tab's bindings
+ * (see web/playground/src/lib/runScript.js); `param()` (design variables for
+ * `optimize`) is the one addition here — a superset, so every playground
+ * script still runs unchanged.
  *
  * Binding the builder classes is what makes their consumers reachable at all:
  * `Shape.sweep` needs a `Path` and `Shape.rib` needs an `OpenPath`, and a

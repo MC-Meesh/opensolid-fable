@@ -66,7 +66,7 @@ for the full table.
 that must `return` a `Shape`. It runs in strict mode with five bindings in
 scope — `Shape`, `Profile` (closed 2D profiles), `Path` (3D polyline for
 `Shape.sweep`), `OpenPath` (open 2D polyline for `Shape.rib`), and `param`
-(design variables for `optimize`). The first three match the playground's
+(design variables for `optimize`). The first four match the playground's
 **Code** tab (see [`runScript.js`](../../web/playground/src/lib/runScript.js)).
 No imports, no `require`, no filesystem or network.
 
@@ -181,9 +181,9 @@ A `Path` is the 3D polyline `Shape.sweep` follows — `new Path(x, y, z)` then
 open 2D polyline `Shape.rib` thickens — `new OpenPath(x, y)` plus the same
 segment methods as `Profile` minus `close()`.
 
-`OpenPath` is bound here but not yet in the playground's Code tab, so a
-`Shape.rib` script is the one thing that will not paste straight into the
-browser.
+`OpenPath` is bound in the playground's Code tab too, so any script here —
+`Shape.rib` included — pastes straight into the browser (`param` calls
+excepted).
 
 ### Exact vs. SDF booleans
 
