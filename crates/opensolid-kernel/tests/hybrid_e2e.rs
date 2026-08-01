@@ -241,6 +241,76 @@ fn coincident_curved_faces_take_the_exact_path() {
     );
 }
 
+/// Scale must not decide the path. A block notching a torus's outer wall
+/// takes the exact path at unit size; twenty times larger it is the same
+/// boolean on the same surfaces, and it must still take it.
+///
+/// It did not. The imprint's endpoint gaps — an exactly solved corner
+/// vertex against the marched polyline it splits — are lengths that grow
+/// with the model, and `build_output` recorded them uncapped, so past about
+/// 13x the result failed `check()` with `ToleranceExceeded`. `validate_exact`
+/// reads *any* non-empty `check()` as grounds to discard, so the whole
+/// B-Rep went to the F-Rep fallback with nothing said but a
+/// `CheckFailed` count (of-abwf). The gaps are capped at the kernel's
+/// ceiling now.
+///
+/// This is the public-API half of the fence; the pipeline half is
+/// `boolean_stress`'s `a_scaled_up_torus_notch_stays_inside_the_tolerance_ceiling`.
+/// Only this one observes the consequence a caller actually feels.
+#[test]
+fn a_scaled_up_torus_notch_still_takes_the_exact_path() {
+    let scale = 20.0;
+    let (major, minor) = (2.0 * scale, 0.5 * scale);
+    let mut store = TopologyStore::new();
+    let mut geo = GeometryStore::new();
+    let ring = primitives::torus(&mut store, &mut geo, major, minor).unwrap();
+    // The `boolean_stress` notch, scaled: x ∈ [2.1, 2.7], y ∈ [±0.35],
+    // z ∈ [±1] times `scale`, biting the outer wall across both seams.
+    let tool =
+        primitives::block(&mut store, &mut geo, 0.6 * scale, 0.7 * scale, 2.0 * scale).unwrap();
+    translate_body(
+        &mut store,
+        &mut geo,
+        tool,
+        Vector3::new(2.4 * scale, 0.0, 0.0),
+    )
+    .unwrap();
+
+    let (hring, htool) = (
+        HybridBody::brep(&store, &geo, ring),
+        HybridBody::brep(&store, &geo, tool),
+    );
+    let mut volumes = 0.0;
+    for (op, context) in [
+        (
+            hybrid::subtract(&hring, &htool, &opts()),
+            "20x torus minus notch",
+        ),
+        (
+            hybrid::intersect(&hring, &htool, &opts()),
+            "20x torus meet notch",
+        ),
+    ] {
+        let out = op.unwrap_or_else(|e| panic!("{context}: {e}"));
+        assert!(
+            matches!(out.path, HybridPath::Brep(_)),
+            "of-abwf: {context} must take the exact path, not the F-Rep \
+             fallback — got {:?}",
+            out.diagnostic
+        );
+        assert!(out.mesh.is_closed_manifold(), "{context}: not watertight");
+        volumes += volume(&out.mesh);
+    }
+    // The two halves partition the ring, so they add back up to it. The
+    // budget is the tessellation's: a torus discretizes in both parameter
+    // directions, losing ~1.5e-3 of its volume at 96 samples per circle.
+    let torus_volume = 2.0 * PI * PI * major * minor * minor;
+    assert!(
+        (volumes - torus_volume).abs() / torus_volume < 5e-3,
+        "notch + remainder is {volumes}, not the torus's {torus_volume}"
+    );
+}
+
 /// The F-Rep fallback acceptance the two tests above used to carry.
 ///
 /// Their coincident-block inputs no longer reach the fallback, but the

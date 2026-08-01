@@ -44,8 +44,9 @@
 //! an original input edge's curve or the exact SSI intersection curve —
 //! with the parameter range recovered by closest-point projection
 //! ([`CurveProject`]). Vertices sit on sampled polylines, so edge and
-//! vertex tolerances record the actual curve-endpoint-to-vertex residual
-//! (tolerant modeling, `spec/08-tolerances.md`).
+//! vertex tolerances record the actual curve-endpoint-to-vertex residual,
+//! up to the kernel's ceiling ([`recorded_endpoint_gap`]) — tolerant
+//! modeling, `spec/08-tolerances.md`.
 
 use crate::check::{CheckFailure, MAX_ALLOWED_TOLERANCE};
 use crate::curve::{Curve3, CurveEval, TWO_PI, plane_basis};
@@ -6295,6 +6296,51 @@ fn canonical_atoms(atoms: &[Atom], snap: f64) -> Vec<(usize, bool)> {
     class
 }
 
+/// The endpoint gap [`build_output`] records, given the one it measured:
+/// the same number, capped at [`MAX_ALLOWED_TOLERANCE`].
+///
+/// An output vertex is placed exactly — a triple point solved against all
+/// three surfaces meeting there, a seam crossing bisected against the exact
+/// curve. What it is welded to may not be: a marched SSI imprint is carried
+/// as a [`Curve3::Polyline`], and `point(t)` interpolates its chords, so
+/// the exact point the arrangement split at sits up to a chord sagitta off
+/// the polyline it splits. That distance is the edge's departure from exact
+/// geometry, which is what a tolerance declares — but it is a *length*, and
+/// it scales with the model while the kernel's ceiling does not. On the
+/// `boolean_stress` torus notch it measures 7.5e-4 at unit scale and
+/// crosses the absolute 1e-2 limit at about 13x (of-abwf).
+///
+/// Past there, declaring it honestly does not fix the body: it fails
+/// [`crate::check::CheckFailure::ToleranceExceeded`] in the structural
+/// pass, and `opensolid_kernel`'s hybrid gate reads *any* non-empty
+/// `check()` as "this exact result is untrustworthy" and throws the whole
+/// B-Rep away for the F-Rep fallback. So a torus notch on a part one order
+/// of magnitude larger than the suite's would silently stop taking the
+/// exact path — and would gain nothing for it, since the fallback's
+/// re-meshed result is no closer to the true geometry than the tolerant
+/// exact one. Capping keeps the exact path and under-declares exactly as
+/// far as the ceiling forces, leaving the residue to be reported where it
+/// belongs: as `VertexOffEdge` from the geometric pass, which measures the
+/// gap itself rather than trusting the number.
+///
+/// This is the same trade [`crate::io::step::heal`] makes for its own gaps
+/// (clamp to the limit rather than emit a body the kernel refuses), and the
+/// same one the marched-imprint sagitta term makes (of-2hbp). All three
+/// are budgeting for chord error; what retires them is fitting marched
+/// curves as NURBS, which removes it.
+///
+/// A non-finite measurement is not a gap and cannot be capped into one, so
+/// it degrades to the resolution floor — which is what the surrounding
+/// `SYSTEM_RESOLUTION.max(..)` already made of a `NaN`, and is neutral for
+/// the vertex bump that has no such floor.
+fn recorded_endpoint_gap(gap: f64) -> f64 {
+    if gap.is_finite() {
+        gap.min(MAX_ALLOWED_TOLERANCE)
+    } else {
+        SYSTEM_RESOLUTION
+    }
+}
+
 fn build_output(
     pipe: &Pipeline<'_>,
     _op: BooleanOp,
@@ -6453,11 +6499,15 @@ fn build_output(
 
                         // Tolerant modeling: vertices come from sampled
                         // polylines (imprint refinement, seam interpolation),
-                        // so record the true curve-endpoint-to-vertex gap.
-                        let d_start =
-                            (curve.point(t_start) - store.vertex(sv).expect("live").point).norm();
-                        let d_end =
-                            (curve.point(t_end) - store.vertex(ev).expect("live").point).norm();
+                        // so record the true curve-endpoint-to-vertex gap —
+                        // capped at the kernel's own ceiling, see
+                        // `recorded_endpoint_gap` for why (of-abwf).
+                        let d_start = recorded_endpoint_gap(
+                            (curve.point(t_start) - store.vertex(sv).expect("live").point).norm(),
+                        );
+                        let d_end = recorded_endpoint_gap(
+                            (curve.point(t_end) - store.vertex(ev).expect("live").point).norm(),
+                        );
                         // The endpoint gaps say where the edge is pinned;
                         // they say nothing about the curve BETWEEN them,
                         // and a marched imprint is a chord approximation
@@ -11228,6 +11278,28 @@ mod tests {
         assert_geometry_bound(&out, "large block minus r=25 cylinder");
         let counts = out.store.euler_counts(out.body);
         assert_eq!(counts.genus, 1, "through hole must give genus 1");
+    }
+
+    /// A gap is recorded at what it measures, right up to the kernel's
+    /// ceiling, and never past it — the cap binds only where the honest
+    /// number is one the kernel refuses to model (of-abwf).
+    #[test]
+    fn an_endpoint_gap_is_recorded_up_to_the_kernel_ceiling_and_no_further() {
+        for gap in [0.0, SYSTEM_RESOLUTION, 1e-4, MAX_ALLOWED_TOLERANCE] {
+            assert_eq!(recorded_endpoint_gap(gap), gap, "{gap:e} is under the cap");
+        }
+        for gap in [MAX_ALLOWED_TOLERANCE * 1.5, 1.0, f64::MAX] {
+            assert_eq!(
+                recorded_endpoint_gap(gap),
+                MAX_ALLOWED_TOLERANCE,
+                "{gap:e} is past the cap"
+            );
+        }
+        // Not a gap at all: capping cannot make one, so it degrades to the
+        // floor rather than to the ceiling.
+        for gap in [f64::NAN, f64::INFINITY] {
+            assert_eq!(recorded_endpoint_gap(gap), SYSTEM_RESOLUTION);
+        }
     }
 
     #[test]

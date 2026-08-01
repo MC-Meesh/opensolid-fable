@@ -125,7 +125,7 @@ use nalgebra::{Matrix3, Rotation3, Unit};
 use opensolid_brep::boolean::{InsideTest, boolean_with_inside_tests, intersect, subtract, unite};
 use opensolid_brep::curve::plane_basis;
 use opensolid_brep::{
-    Body, BodyType, BooleanOp, BooleanOutput, CheckFailure, Curve3, FaceSense, FinSense,
+    Body, BodyType, BooleanOp, BooleanOutput, CheckFailure, Curve3, CurveEval, FaceSense, FinSense,
     GeometryStore, KnotVector, LoopType, MAX_ALLOWED_TOLERANCE, NurbsSurface, SYSTEM_RESOLUTION,
     ShellOrientation, Surface3, TessellationOptions, TopologyStore, primitives, rotate_body,
     tessellate_body, translate_body,
@@ -2932,10 +2932,11 @@ fn torus_notch_imprints_stay_within_their_declared_tolerance() {
 /// B-Rep path at all. The bow is capped instead, and the structural pass
 /// must stay clean.
 ///
-/// Held at 8× deliberately: the endpoint gaps `build_output` has always
-/// recorded scale with the model too and are NOT capped, and they cross
-/// the same ceiling at around 13× (of-abwf). That is a separate hole and
-/// this fence must not accidentally be measuring it.
+/// Held at 8× deliberately: when this fence was written, the endpoint
+/// gaps `build_output` records scaled with the model uncapped and crossed
+/// the same ceiling at around 13× — that was of-abwf, fixed in this same
+/// train — and staying below 13× keeps the two fences from measuring each
+/// other's defect.
 #[test]
 fn a_scaled_up_imprint_does_not_declare_itself_past_the_kernel_limit() {
     let s = 8.0;
@@ -3024,6 +3025,121 @@ fn torus_notch_edges_carry_ranges_check_geometry_can_read() {
         }
     }
 }
+
+/// The same outer-wall notch, on parts twenty and a hundred times the size.
+///
+/// An output vertex here is exact — the corner where two block planes and
+/// the torus meet, solved against all three. The marched imprint it splits
+/// is not: a [`Curve3::Polyline`] interpolates its chords, so the exact
+/// corner sits a chord sagitta off the polyline, and `build_output` records
+/// that gap as the edge's and the vertex's tolerance. It is a *length*: it
+/// measures 7.5e-4 at unit scale and grows with the model, while the
+/// kernel's absolute 1e-2 ceiling does not. Recorded uncapped it crossed
+/// that ceiling at about 13x, and `check()` came back with
+/// `ToleranceExceeded` on two edges and two vertices — which
+/// `opensolid_kernel`'s hybrid gate reads as "this exact result is
+/// untrustworthy", discarding the whole B-Rep for the F-Rep fallback. A
+/// torus notch on a part one order of magnitude larger than this suite's
+/// silently stopped taking the exact path, and nothing here caught it: the
+/// scale sweeps assert volumes, not `check()` (of-abwf).
+///
+/// So the recorded gap is capped, and every tolerance in the result stays
+/// inside the ceiling at any scale. What the cap under-declares is not
+/// lost — the geometric pass measures the gap itself and reports it as
+/// `VertexOffEdge` — and it is not widened either: below the ceiling the
+/// gap is still recorded in full.
+#[test]
+fn a_scaled_up_torus_notch_stays_inside_the_tolerance_ceiling() {
+    for scale in [1.0, 20.0, 100.0] {
+        let context = format!("torus outer-wall notch at {scale}x");
+        let (major, minor) = (2.0 * scale, 0.5 * scale);
+        let mut scene = Scene::new();
+        let ring = scene.torus(Point3::origin(), major, minor);
+        let tool = scene.block(
+            [2.1 * scale, -0.35 * scale, -scale],
+            [2.7 * scale, 0.35 * scale, 1.0 * scale],
+        );
+
+        let diff = scene
+            .subtract(ring, tool)
+            .unwrap_or_else(|e| panic!("{context}: subtract failed: {e:?}"));
+        let counts = diff.store.euler_counts(diff.body);
+        assert_eq!(counts.genus, 1, "{context}: notched ring must stay genus 1");
+        let inter = scene
+            .intersect(ring, tool)
+            .unwrap_or_else(|e| panic!("{context}: intersect failed: {e:?}"));
+        // `assert_valid`, inside `volume`, is where the regression bites:
+        // it is `check()` that the hybrid gate consults.
+        let vol_diff = volume(&diff, &format!("{context}: difference"));
+        let vol_inter = volume(&inter, &format!("{context}: intersection"));
+        assert_close(
+            vol_diff + vol_inter,
+            torus_volume(major, minor),
+            CURVED_VOLUME_RTOL,
+            &format!("{context}: difference + intersection vs torus volume"),
+        );
+
+        let capped = assert_endpoint_gaps_are_capped_not_widened(&diff, &context);
+        // Non-vacuity: at unit scale nothing reaches the ceiling and this
+        // case proves only that the cap is inert; the scaled ones are what
+        // exercise it. If they stop reaching it — marched imprints fitted
+        // as NURBS would remove the bow rather than budget for it — this
+        // fence has outlived the defect and should be retired, not relaxed.
+        assert_eq!(
+            capped > 0,
+            scale > 1.0,
+            "{context}: {capped} gap(s) past the ceiling"
+        );
+    }
+}
+
+/// Every endpoint gap in `out` is recorded at its measured value, or at
+/// [`MAX_ALLOWED_TOLERANCE`] when the measurement is past it — the cap is
+/// the *only* reason a tolerance ever under-declares. Returns how many gaps
+/// the cap actually bound, so a caller can tell whether it exercised one.
+fn assert_endpoint_gaps_are_capped_not_widened(out: &BooleanOutput, context: &str) -> usize {
+    let mut capped = 0;
+    for face in out.store.faces_of_body(out.body) {
+        for edge_id in out.store.edges_of_face(face) {
+            let edge = out.store.edge(edge_id).expect("live edge");
+            assert!(
+                edge.tolerance <= MAX_ALLOWED_TOLERANCE,
+                "{context}: {edge_id:?} declares {:.3e}, past the kernel limit",
+                edge.tolerance
+            );
+            let Some(curve) = edge.curve.and_then(|id| out.geo.curve(id)) else {
+                continue;
+            };
+            for (t, vertex_id) in [
+                (edge.t_start, edge.start_vertex),
+                (edge.t_end, edge.end_vertex),
+            ] {
+                let vertex = out.store.vertex(vertex_id).expect("live vertex");
+                assert!(
+                    vertex.tolerance <= MAX_ALLOWED_TOLERANCE,
+                    "{context}: {vertex_id:?} declares {:.3e}, past the kernel limit",
+                    vertex.tolerance
+                );
+                let gap = (curve.point(t) - vertex.point).norm();
+                if gap > MAX_ALLOWED_TOLERANCE {
+                    capped += 1;
+                    continue;
+                }
+                // Under the ceiling there is nothing to cap, so the gap
+                // must still be declared in full by both entities it is a
+                // gap between.
+                let declared = edge.tolerance.min(vertex.tolerance);
+                assert!(
+                    gap <= declared + 1e-12,
+                    "{context}: {edge_id:?} sits {gap:.3e} off {vertex_id:?} \
+                     but declares only {declared:.3e}"
+                );
+            }
+        }
+    }
+    capped
+}
+
 /// Two congruent coaxial tori shifted along their common axis: the tube
 /// cross-sections are equal circles offset by the shift, so the
 /// intersection is the revolved circle-circle lens (Pappus about the
