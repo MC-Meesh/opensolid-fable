@@ -113,6 +113,7 @@ export function createWasmLoader({
       WasmShape: mod.WasmShape,
       WasmProfile2D: mod.WasmProfile2D,
       WasmPath3D: mod.WasmPath3D,
+      WasmOpenPath2D: mod.WasmOpenPath2D,
     };
   }
 

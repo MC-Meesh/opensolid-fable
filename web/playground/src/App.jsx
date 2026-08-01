@@ -400,7 +400,7 @@ export default function App() {
     api.WasmShape.setExactBooleans?.(exactBooleansRef.current);
     let traced;
     try {
-      traced = runTracedScript(scriptRef.current, api.WasmShape, api.WasmProfile2D, api.WasmPath3D);
+      traced = runTracedScript(scriptRef.current, api.WasmShape, api.WasmProfile2D, api.WasmPath3D, api.WasmOpenPath2D);
     } catch (err) {
       setError(String(err?.stack || err));
       return;
@@ -1015,7 +1015,7 @@ export default function App() {
     }
     let traced;
     try {
-      traced = runTracedScript(serializeTree(pruned), api.WasmShape, api.WasmProfile2D, api.WasmPath3D);
+      traced = runTracedScript(serializeTree(pruned), api.WasmShape, api.WasmProfile2D, api.WasmPath3D, api.WasmOpenPath2D);
     } catch (err) {
       setError(`Recomputing without hidden features failed: ${String(err)}`);
       displayRef.current = { mode: 'full' };

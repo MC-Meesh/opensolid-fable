@@ -174,6 +174,15 @@ export const OP_SPECS = {
       },
     ],
   },
+  rib: {
+    kind: 'sweep',
+    title: 'Rib',
+    // args: [thickness, height, side] — side is a string and stays put.
+    groups: [
+      { label: 'Thickness', fields: [size(0, 't')] },
+      { label: 'Height', fields: [size(1, 'h')] },
+    ],
+  },
   shell: {
     kind: 'modifier',
     title: 'Shell',

@@ -42,6 +42,9 @@ class FakeShape {
   static revolve(profile, angle) {
     return new FakeShape(['revolve', profile.trace.slice(), angle]);
   }
+  static rib(path, thickness, height, side) {
+    return new FakeShape(['rib', path.trace.slice(), thickness, height, side]);
+  }
   translate(x, y, z) {
     return new FakeShape(['translate', this.desc, x, y, z]);
   }
@@ -91,6 +94,23 @@ class FakeProfile {
   }
   close() {
     this.trace.push(['close']);
+  }
+  free() {
+    this.freed = true;
+  }
+}
+
+// Stand-in for WasmOpenPath2D: records calls so tests can assert delegation.
+class FakeOpenPath {
+  constructor(x, y) {
+    this.trace = [['new', x, y]];
+    this.freed = false;
+  }
+  lineTo(x, y) {
+    this.trace.push(['lineTo', x, y]);
+  }
+  arcTo(x, y, bulge) {
+    this.trace.push(['arcTo', x, y, bulge]);
   }
   free() {
     this.freed = true;
@@ -492,6 +512,99 @@ describe('sweep ops (extrude / revolve)', () => {
     expect(script.match(/new Profile/g)).toHaveLength(1);
     expect(script).toContain('const s1 = Shape.extrude(p1, 2);');
     const again = runTracedScript(script, FakeShape, FakeProfile);
+    expect(serializeTree(again.root)).toBe(script);
+  });
+});
+
+describe('rib op (OpenPath)', () => {
+  const RIB = `
+    const rp = new OpenPath(-1, 0);
+    rp.lineTo(0, 0.5);
+    rp.arcTo(1, 0, 0.2);
+    return Shape.rib(rp, 0.2, 0.8, "both");
+  `;
+  const run = (source) =>
+    runTracedScript(source, FakeShape, FakeProfile, undefined, FakeOpenPath);
+
+  it('traces rib with an open-path snapshot and delegates to the real classes', () => {
+    const { root } = run(RIB);
+    expect(root.op).toBe('rib');
+    expect(root.args).toEqual([0.2, 0.8, 'both']);
+    expect(root.children).toEqual([]);
+    expect(root.openPath).toEqual({
+      start: [-1, 0],
+      segs: [
+        { x: 0, y: 0.5, bulge: 0 },
+        { x: 1, y: 0, bulge: 0.2 },
+      ],
+    });
+    // Real open-path calls flowed through (lineTo delegates as arcTo bulge 0).
+    expect(root.shape.desc).toEqual([
+      'rib',
+      [
+        ['new', -1, 0],
+        ['arcTo', 0, 0.5, 0],
+        ['arcTo', 1, 0, 0.2],
+      ],
+      0.2,
+      0.8,
+      'both',
+    ]);
+  });
+
+  it('rejects a non-OpenPath first argument with a helpful message', () => {
+    expect(() => run('return Shape.rib(42, 0.2, 0.8, "both");')).toThrow(
+      /Shape\.rib\(\.\.\.\) expects an OpenPath/
+    );
+    // A closed Profile is not an OpenPath either.
+    expect(() =>
+      run('const p = new Profile(0, 0); return Shape.rib(p, 0.2, 0.8, "both");')
+    ).toThrow(/Shape\.rib\(\.\.\.\) expects an OpenPath/);
+  });
+
+  it('frees real open paths once the script finishes', () => {
+    const created = [];
+    class TrackingOpenPath extends FakeOpenPath {
+      constructor(x, y) {
+        super(x, y);
+        created.push(this);
+      }
+    }
+    runTracedScript(RIB, FakeShape, FakeProfile, undefined, TrackingOpenPath);
+    expect(created).toHaveLength(1);
+    expect(created[0].freed).toBe(true);
+  });
+
+  it('labels rib nodes', () => {
+    const { root } = run(RIB);
+    expect(nodeLabel(root)).toBe('Rib [0.2, 0.8, both]');
+  });
+
+  it('serializes a rib as open-path statements plus the rib call, side quoted', () => {
+    const { root } = run(RIB);
+    const script = serializeTree(root);
+    expect(script).toBe(
+      'const rp1 = new OpenPath(-1, 0);\n' +
+        'rp1.lineTo(0, 0.5);\n' +
+        'rp1.arcTo(1, 0, 0.2);\n' +
+        'return Shape.rib(rp1, 0.2, 0.8, "both");\n'
+    );
+    // Round trip: the emitted script re-evaluates to the same canonical form.
+    const again = run(script);
+    expect(serializeTree(again.root)).toBe(script);
+  });
+
+  it('round-trips a rib unioned onto a base body', () => {
+    const source = `
+      const base = Shape.box3(1, 0.1, 0.5);
+      const rp = new OpenPath(-0.6, 0);
+      rp.lineTo(0.6, 0);
+      return base.union(Shape.rib(rp, 0.2, 0.8, "first"));
+    `;
+    const { root } = run(source);
+    const script = serializeTree(root);
+    expect(script).toContain('Shape.rib(rp1, 0.2, 0.8, "first")');
+    const again = run(script);
     expect(serializeTree(again.root)).toBe(script);
   });
 });

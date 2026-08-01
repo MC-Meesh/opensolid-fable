@@ -150,6 +150,24 @@ describe('reparseTree', () => {
     expect(rp.leaked).toBe(0);
   });
 
+  it('supports ribs built from open paths', () => {
+    const rp = reparseTree(
+      [
+        'const rp1 = new OpenPath(-0.6, 0);',
+        'rp1.lineTo(0, 0.4);',
+        'rp1.arcTo(0.6, 0, 0.2);',
+        'return Shape.box3(1, 0.1, 0.5).union(Shape.rib(rp1, 0.2, 0.8, "both"));',
+        '',
+      ].join('\n')
+    );
+    expect(rp.root.op).toBe('union');
+    const rib = rp.root.children[1];
+    expect(rib.op).toBe('rib');
+    expect(rib.args).toEqual([0.2, 0.8, 'both']);
+    expect(rib.openPath.segs).toHaveLength(2);
+    expect(rp.leaked).toBe(0);
+  });
+
   it('throws on broken scripts', () => {
     expect(() => reparseTree('return Shape.nope(1);')).toThrow();
     expect(() => reparseTree('const x = 1;')).toThrow(/return a Shape/);

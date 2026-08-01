@@ -37,6 +37,23 @@ describe('runScript', () => {
     expect(shape.r).toBe(3);
   });
 
+  it('binds OpenPath when an open-path class is given', () => {
+    class FakeOpenPath {
+      constructor(x, y) {
+        this.x = x;
+        this.y = y;
+      }
+    }
+    const shape = runScript(
+      'const rp = new OpenPath(4, 1); return Shape.sphere(rp.x - rp.y);',
+      FakeShape,
+      undefined,
+      undefined,
+      FakeOpenPath
+    );
+    expect(shape.r).toBe(3);
+  });
+
   it('propagates syntax errors', () => {
     expect(() => runScript('return return;', FakeShape)).toThrow(SyntaxError);
   });

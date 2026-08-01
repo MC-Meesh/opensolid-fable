@@ -29,6 +29,7 @@ export const FEATURE_META = {
   revolve: { kind: 'sweep', type: 'Revolve' },
   sweep: { kind: 'sweep', type: 'Sweep' },
   loft: { kind: 'sweep', type: 'Loft' },
+  rib: { kind: 'sweep', type: 'Rib' },
   union: { kind: 'boolean', type: 'Union' },
   intersect: { kind: 'boolean', type: 'Intersect' },
   subtract: { kind: 'boolean', type: 'Subtract' },

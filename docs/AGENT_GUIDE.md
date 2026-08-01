@@ -662,7 +662,7 @@ which solid of it (`solidIndex`, `stepId`, `outcome`).
 | `OpenPath` | open 2D polyline builder, for `rib` |
 | `param` | declare a design variable `optimize` may move |
 
-The first three match the playground's **Code** tab exactly. No imports, no
+The first four match the playground's **Code** tab exactly. No imports, no
 `require`, no filesystem or network. Because it's real JavaScript, patterns
 (loops, arrays, math) are just code:
 
@@ -874,9 +874,9 @@ spine.lineTo(15, 0);
 return base.union(Shape.rib(spine, 2, 10, 'both')); // 2 thick, 10 tall
 ```
 
-> `OpenPath` is bound here but not yet in the playground's **Code** tab, so a
-> script using `Shape.rib` is the one thing that will not paste straight into the
-> browser. Everything else in this section is common to both.
+> `OpenPath` is bound in the playground's **Code** tab too, so everything in
+> this section is common to both surfaces. Only `param()` (above) is
+> MCP-specific.
 
 Full reference (with the exact-vs-SDF discussion) lives in the
 [server README](../tools/mcp-server/README.md#the-script-format), and
