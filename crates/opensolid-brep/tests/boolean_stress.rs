@@ -2797,6 +2797,70 @@ fn rotated_frame_torus_sunk_congruence() {
     }
 }
 
+/// The parameter ranges bound to the edges of a marched imprint that is
+/// geometrically a *ring*; returns how many such edges the result carried
+/// and how many of them span their whole curve.
+///
+/// Such an imprint reaches the arrangement as an **open** polyline whose
+/// two ends are the same point — a ring stopped at (or cut at) the chart
+/// seam it ran off — and [`ring_polyline`] in `build_output` re-spells the
+/// *bound* copy closed so its ranges can unwrap by a period. The two torus
+/// notches below are where the suite first produced one, in both spellings
+/// of the defect: the whole-ring edge bound `t_start == t_end`, and the
+/// edge straddling the ring's cut point bound a backwards range (of-i7ka,
+/// of-sf12). The detection here is geometric — a polyline whose domain
+/// ends land on the same point — so it keeps matching if a regression
+/// binds the open spelling again.
+///
+/// It has to be asserted here rather than left to [`assert_valid`], because
+/// `BooleanOutput::check()` runs the *structural* pass only: the range
+/// check that would report these — `InvalidEdgeRange` — lives in
+/// `check_geometry`, which needs the `GeometryStore` and which nothing on
+/// the boolean's own validity path calls. (The of-sf12 fence asserts that
+/// class through `check_geometry` on fresh results; this one reads the
+/// ranges directly on the results the tests already have, and additionally
+/// pins the non-vacuity — that a looping imprint still occurs at all.)
+fn looping_imprint_edge_ranges(out: &BooleanOutput, context: &str) -> (usize, usize) {
+    let (mut looping, mut whole_curve) = (0, 0);
+    for face in out.store.faces_of_body(out.body) {
+        for edge_id in out.store.edges_of_face(face) {
+            let edge = out.store.edge(edge_id).expect("live edge");
+            let curve_id = edge.curve.expect("every output edge binds a curve");
+            let curve = out.geo.curve(curve_id).expect("live curve");
+            let (lo, hi) = curve.domain();
+            // Marched imprints are the only curves here spelled as
+            // polylines whose domain ends meet; a torus seam circle
+            // declares its period as a `Circle` and wraps honestly.
+            if !matches!(curve, Curve3::Polyline { .. })
+                || (curve.point(hi) - curve.point(lo)).norm() > 1e-9
+            {
+                continue;
+            }
+            looping += 1;
+            let span = hi - lo;
+            assert!(
+                edge.t_end > edge.t_start,
+                "{context}: {edge_id:?} spans nothing on a looping curve: [{}, {}]",
+                edge.t_start,
+                edge.t_end
+            );
+            // A range may unwrap forward past the domain end — that is the
+            // repair — but never by more than one lap of the ring.
+            assert!(
+                edge.t_start >= lo && edge.t_end - edge.t_start <= span * (1.0 + 1e-9),
+                "{context}: {edge_id:?} range [{}, {}] traces more than one \
+                 lap of its ring's domain [{lo}, {hi}]",
+                edge.t_start,
+                edge.t_end
+            );
+            if edge.t_end - edge.t_start > span * (1.0 - 1e-9) {
+                whole_curve += 1;
+            }
+        }
+    }
+    (looping, whole_curve)
+}
+
 /// Block notch through the FULL tube cross-section over a small angular
 /// span: the subtraction severs the ring into a C — genus drops 1 → 0.
 /// The block's side faces are off-axis planes parallel to the torus
@@ -2814,6 +2878,19 @@ fn block_severs_torus_tube() {
         .unwrap_or_else(|e| panic!("{context}: subtract failed: {e:?}"));
     let counts = diff.store.euler_counts(diff.body);
     assert_eq!(counts.genus, 0, "{context}: severed ring must be genus 0");
+    // The block's ±Y planes cut the tube in a closed quartic apiece, so each
+    // is one edge spanning its whole curve: the case that used to bind an
+    // empty range (of-i7ka).
+    let (looping, whole_curve) = looping_imprint_edge_ranges(&diff, context);
+    assert!(
+        looping > 0,
+        "{context}: no edge bound to a looping imprint — the case this \
+         fences is gone, and the fence with it"
+    );
+    assert!(
+        whole_curve > 0,
+        "{context}: no edge spanning a whole looping curve"
+    );
     let inter = scene
         .intersect(ring, tool)
         .unwrap_or_else(|e| panic!("{context}: intersect failed: {e:?}"));
@@ -2843,6 +2920,15 @@ fn block_notches_torus_outer_wall() {
         .unwrap_or_else(|e| panic!("{context}: subtract failed: {e:?}"));
     let counts = diff.store.euler_counts(diff.body);
     assert_eq!(counts.genus, 1, "{context}: notched ring must stay genus 1");
+    // Here the loops are cut by the torus's own seams, so their edges are
+    // arcs terminating *on* the joint rather than whole curves — the
+    // wrapped spelling of of-i7ka.
+    let (looping, _) = looping_imprint_edge_ranges(&diff, context);
+    assert!(
+        looping > 0,
+        "{context}: no edge bound to a looping imprint — the case this \
+         fences is gone, and the fence with it"
+    );
     let inter = scene
         .intersect(ring, tool)
         .unwrap_or_else(|e| panic!("{context}: intersect failed: {e:?}"));
