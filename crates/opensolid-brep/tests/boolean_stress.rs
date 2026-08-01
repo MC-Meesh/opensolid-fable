@@ -106,7 +106,7 @@ use nalgebra::{Matrix3, Rotation3, Unit};
 use opensolid_brep::boolean::{InsideTest, boolean_with_inside_tests, intersect, subtract, unite};
 use opensolid_brep::curve::plane_basis;
 use opensolid_brep::{
-    Body, BodyType, BooleanOp, BooleanOutput, CheckFailure, Curve3, FaceSense, FinSense,
+    Body, BodyType, BooleanOp, BooleanOutput, CheckFailure, Curve3, CurveEval, FaceSense, FinSense,
     GeometryStore, KnotVector, LoopType, NurbsSurface, SYSTEM_RESOLUTION, ShellOrientation,
     Surface3, TessellationOptions, TopologyStore, primitives, rotate_body, tessellate_body,
     translate_body,
@@ -2718,6 +2718,71 @@ fn rotated_frame_torus_sunk_congruence() {
     }
 }
 
+/// The parameter ranges bound to the edges of a marched imprint that
+/// *loops*; returns how many such edges the result carried and how many of
+/// them span their whole curve.
+///
+/// Such an imprint arrives parameterized as an **open** polyline whose two
+/// ends are the same point: a ring stopped at (or cut at) the chart seam it
+/// ran off. The two torus notches below are where the suite first produced
+/// one — both spellings of the defect, in fact.
+/// It has to stay that way — the arrangement clips an imprint against the
+/// face cover as an open run precisely so that no atom spans the seam — so
+/// the joint has two parameters, `0` and `n − 1`, and closest-point
+/// projection picks either. An edge terminating there used to bind
+/// `t_start == t_end` or a backwards range (of-i7ka), which every consumer
+/// walking an edge by parameter reads as nothing at all.
+///
+/// It has to be asserted here rather than left to [`assert_valid`], because
+/// `BooleanOutput::check()` runs the *structural* pass only: the range check
+/// that would report these — `InvalidEdgeRange` — lives in `check_geometry`,
+/// which needs the `GeometryStore` and which nothing on the boolean's own
+/// validity path calls. (Nor can this simply call it instead: on these two
+/// results it also reports the marched imprints' own chordal deviation from
+/// the torus, ~1.3e-3 against an edge tolerance recording only the endpoint
+/// gap — a separate defect, filed as of-2hbp.) And it would not cover the
+/// second half of the invariant either, that the range stay *inside* the
+/// domain: evaluation clamps past the end of an open polyline, so a range
+/// unwrapped past it — the repair a genuinely periodic curve gets — would
+/// silently measure the joint instead of the arc.
+fn looping_imprint_edge_ranges(out: &BooleanOutput, context: &str) -> (usize, usize) {
+    let (mut looping, mut whole_curve) = (0, 0);
+    for face in out.store.faces_of_body(out.body) {
+        for edge_id in out.store.edges_of_face(face) {
+            let edge = out.store.edge(edge_id).expect("live edge");
+            let curve_id = edge.curve.expect("every output edge binds a curve");
+            let curve = out.geo.curve(curve_id).expect("live curve");
+            let (lo, hi) = curve.domain();
+            // Marched imprints are the only curves here with a finite domain
+            // that closes on itself; a torus seam circle is a `Circle`, which
+            // declares its period and wraps honestly.
+            if !matches!(curve, Curve3::Polyline { .. })
+                || (curve.point(hi) - curve.point(lo)).norm() > 1e-9
+            {
+                continue;
+            }
+            looping += 1;
+            assert!(
+                edge.t_end > edge.t_start,
+                "{context}: {edge_id:?} spans nothing on a looping curve: [{}, {}]",
+                edge.t_start,
+                edge.t_end
+            );
+            assert!(
+                edge.t_start >= lo && edge.t_end <= hi,
+                "{context}: {edge_id:?} range [{}, {}] leaves the domain \
+                 [{lo}, {hi}], where an open polyline clamps",
+                edge.t_start,
+                edge.t_end
+            );
+            if edge.t_end - edge.t_start > (hi - lo) * (1.0 - 1e-9) {
+                whole_curve += 1;
+            }
+        }
+    }
+    (looping, whole_curve)
+}
+
 /// Block notch through the FULL tube cross-section over a small angular
 /// span: the subtraction severs the ring into a C — genus drops 1 → 0.
 /// The block's side faces are off-axis planes parallel to the torus
@@ -2733,8 +2798,22 @@ fn block_severs_torus_tube() {
     let diff = scene
         .subtract(ring, tool)
         .unwrap_or_else(|e| panic!("{context}: subtract failed: {e:?}"));
+    assert_valid(&diff, context);
     let counts = diff.store.euler_counts(diff.body);
     assert_eq!(counts.genus, 0, "{context}: severed ring must be genus 0");
+    // The block's ±Y planes cut the tube in a closed quartic apiece, so each
+    // is one edge spanning its whole curve: the case that used to bind an
+    // empty range (of-i7ka).
+    let (looping, whole_curve) = looping_imprint_edge_ranges(&diff, context);
+    assert!(
+        looping > 0,
+        "{context}: no edge bound to a looping imprint — the case this \
+         fences is gone, and the fence with it"
+    );
+    assert!(
+        whole_curve > 0,
+        "{context}: no edge spanning a whole looping curve"
+    );
     let inter = scene
         .intersect(ring, tool)
         .unwrap_or_else(|e| panic!("{context}: intersect failed: {e:?}"));
@@ -2762,8 +2841,18 @@ fn block_notches_torus_outer_wall() {
     let diff = scene
         .subtract(ring, tool)
         .unwrap_or_else(|e| panic!("{context}: subtract failed: {e:?}"));
+    assert_valid(&diff, context);
     let counts = diff.store.euler_counts(diff.body);
     assert_eq!(counts.genus, 1, "{context}: notched ring must stay genus 1");
+    // Here the loops are cut by the torus's own seams, so their edges are
+    // arcs terminating *on* the joint rather than whole curves — the wrapped
+    // spelling of of-i7ka.
+    let (looping, _) = looping_imprint_edge_ranges(&diff, context);
+    assert!(
+        looping > 0,
+        "{context}: no edge bound to a looping imprint — the case this \
+         fences is gone, and the fence with it"
+    );
     let inter = scene
         .intersect(ring, tool)
         .unwrap_or_else(|e| panic!("{context}: intersect failed: {e:?}"));

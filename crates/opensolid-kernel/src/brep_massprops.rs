@@ -117,7 +117,6 @@
 use std::collections::HashMap;
 
 use nalgebra::Matrix3;
-use opensolid_brep::curve::{Curve3, CurveEval};
 use opensolid_brep::geometry::GeometryStore;
 use opensolid_brep::pcurve::{Curve2, Curve2Eval, SeamSide, fit_pcurve};
 use opensolid_brep::surface::{Surface3, SurfaceEval};
@@ -144,9 +143,9 @@ pub enum BrepMassPropertiesError {
     /// projected into the face's parameter space.
     #[error("{fin:?} has no usable trim geometry")]
     MissingTrim { fin: EntityId<Fin> },
-    /// A fin's edge spans an empty parameter range on a curve whose ends do
-    /// not meet, so the fin traverses nothing and its loop cannot close.
-    #[error("{fin:?} spans the empty parameter range [{t_start}, {t_end}] on an open curve")]
+    /// A fin's edge carries a parameter range that does not increase, so the
+    /// fin traverses nothing and its loop cannot close.
+    #[error("{fin:?} spans the empty parameter range [{t_start}, {t_end}]")]
     EmptyEdgeRange {
         fin: EntityId<Fin>,
         t_start: f64,
@@ -615,64 +614,19 @@ fn seam_branch(
     }
 }
 
-/// A parameter range this short a fraction of its curve's own domain spans
-/// nothing a fit could see, however the two endpoints compare.
-const DEGENERATE_RANGE_REL: f64 = 1e-9;
-
-/// The parameter ranges a fin's edge really spans, in forward traversal
-/// order — one normally, two when the edge wraps past the end of its curve's
-/// domain.
+/// The parameter range a fin's edge spans, or `None` when it bounds nothing.
 ///
-/// A range that does not increase is a *wrap*: the edge runs off the end of
-/// the domain and resumes at the start. That is how an arc across a circle's
-/// `t = 0`, and how every imprint loop the boolean pipeline closes on itself,
-/// arrive here. The wrapped part cannot simply be evaluated past the domain
-/// end — a sampled [`Curve3::Polyline`](opensolid_brep::Curve3::Polyline)
-/// clamps there rather than repeating — so it is split into the two in-domain
-/// pieces instead, which trace exactly the same arc.
-///
-/// Wrapping is only meaningful when the curve's ends actually meet, which is
-/// checked *geometrically*: the closed imprint polylines carry `closed:
-/// false` and no period despite looping, which is what leaves their ranges
-/// unwrapped (and empty, or a rounding step wide) in the first place — the
-/// emitter-side defect is of-i7ka, and this recovery goes away with it. A
-/// range that neither increases nor wraps onto a closed curve bounds nothing
-/// and gets [`BrepMassPropertiesError::EmptyEdgeRange`] rather than a
-/// plausible number.
-fn edge_ranges(edge: &opensolid_brep::Edge, curve: Option<&Curve3>) -> Option<Vec<(f64, f64)>> {
-    let curve = curve?;
-    let (lo, hi) = curve.domain();
-    let span = hi - lo;
-    if !span.is_finite() {
-        // An unbounded curve (a line) has nothing to wrap around.
-        return (edge.t_end > edge.t_start).then(|| vec![(edge.t_start, edge.t_end)]);
-    }
-    if !exceeds(span, 0.0) {
-        return None;
-    }
-    let empty = DEGENERATE_RANGE_REL * span;
-    if edge.t_end - edge.t_start > empty {
-        return Some(vec![(edge.t_start, edge.t_end)]);
-    }
-    let closes = (curve.point(lo) - curve.point(hi)).norm()
-        <= edge.tolerance.max(opensolid_brep::SYSTEM_RESOLUTION);
-    if !closes {
-        return None;
-    }
-    let pieces: Vec<(f64, f64)> = [
-        (edge.t_start.clamp(lo, hi), hi),
-        (lo, edge.t_end.clamp(lo, hi)),
-    ]
-    .into_iter()
-    .filter(|&(a, b)| b - a > empty)
-    .collect();
-    // Both ends sitting on the domain boundary means the edge is the whole
-    // closed curve, not nothing.
-    Some(if pieces.is_empty() {
-        vec![(lo, hi)]
-    } else {
-        pieces
-    })
+/// This used to recover an edge whose range did not increase, by reading it as
+/// a *wrap* past the end of its curve's domain and splitting it into the two
+/// in-domain pieces tracing the same arc. Nothing produces one any more: the
+/// boolean pipeline unwraps a periodic curve's range forward by a period, and
+/// re-spells a merely-looping one's onto the right parameter of its joint
+/// (of-i7ka, which is what left them empty or backwards). What survives is the
+/// same definition of usable [`TopologyStore::check`] enforces — finite and
+/// increasing — so a range that fails it means a malformed body, and it gets
+/// [`BrepMassPropertiesError::EmptyEdgeRange`] rather than a plausible number.
+fn edge_range(edge: &opensolid_brep::Edge) -> Option<(f64, f64)> {
+    (edge.t_start.is_finite() && edge.t_end > edge.t_start).then_some((edge.t_start, edge.t_end))
 }
 
 /// Every fin's trim curve for one face, grouped by loop and unwrapped onto
@@ -727,95 +681,78 @@ fn face_trims(
                 .edge(edge_id)
                 .ok_or(BrepMassPropertiesError::MissingTrim { fin: fin_id })?;
             let edge_curve = edge.curve.and_then(|id| geo.curve(id));
-            let mut ranges =
-                edge_ranges(edge, edge_curve).ok_or(BrepMassPropertiesError::EmptyEdgeRange {
-                    fin: fin_id,
-                    t_start: edge.t_start,
-                    t_end: edge.t_end,
-                })?;
-            // A wrapped edge's two pieces are listed in the curve's own
-            // direction; a reversed fin walks them the other way round.
-            if fin.sense == FinSense::Reversed {
-                ranges.reverse();
-            }
-            // Only a whole fin counts as a use of its edge — the pieces of a
-            // wrapped one are not two visits to a seam.
-            let first_visit = !first_use.contains_key(&edge_id);
+            let range = edge_range(edge).ok_or(BrepMassPropertiesError::EmptyEdgeRange {
+                fin: fin_id,
+                t_start: edge.t_start,
+                t_end: edge.t_end,
+            })?;
 
-            for (piece, range) in ranges.into_iter().enumerate() {
-                let base = if stored_everywhere {
-                    geo.pcurve(fin.pcurve.expect("checked above"))
-                        .expect("checked above")
-                        .clone()
-                } else {
-                    let curve =
-                        edge_curve.ok_or(BrepMassPropertiesError::MissingTrim { fin: fin_id })?;
-                    fit_pcurve(surface, curve, range.0, range.1, SeamSide::Low)
-                        .map_err(|_| BrepMassPropertiesError::MissingTrim { fin: fin_id })?
-                };
+            let base = if stored_everywhere {
+                geo.pcurve(fin.pcurve.expect("checked above"))
+                    .expect("checked above")
+                    .clone()
+            } else {
+                let curve =
+                    edge_curve.ok_or(BrepMassPropertiesError::MissingTrim { fin: fin_id })?;
+                fit_pcurve(surface, curve, range.0, range.1, SeamSide::Low)
+                    .map_err(|_| BrepMassPropertiesError::MissingTrim { fin: fin_id })?
+            };
 
-                let probe = Trim {
-                    curve: base,
-                    range,
-                    sense: fin.sense,
-                };
-                let net = probe.end() - probe.start();
-                let previous_end = trims.last().map(|t: &Trim| t.end());
-                let seam_anchor = if piece == 0 && !first_visit {
-                    first_use.get(&edge_id).copied()
-                } else {
-                    None
-                };
+            let probe = Trim {
+                curve: base,
+                range,
+                sense: fin.sense,
+            };
+            let net = probe.end() - probe.start();
+            let previous_end = trims.last().map(|t: &Trim| t.end());
+            let seam_anchor = first_use.get(&edge_id).copied();
 
-                let shift = match (seam_anchor, previous_end) {
-                    // Second use of an edge this face already walked: a seam.
-                    // Its branch is fixed by which side of the seam the face
-                    // is on, which continuity cannot see when the two uses
-                    // coincide. The target is *absolute* — one period from
-                    // where the first use ended up — so it holds whether the
-                    // base curves came in on one branch (a fresh fit) or on
-                    // two (stored pcurves, which record the split already).
-                    (Some(anchor), previous) => match seam_branch(net, per, winding) {
-                        Some((constant_in_u, offset)) => {
-                            let base = probe.start();
-                            let mut shift = if constant_in_u {
-                                Vector2::new(anchor.x + offset - base.x, 0.0)
+            let shift = match (seam_anchor, previous_end) {
+                // Second use of an edge this face already walked: a seam.
+                // Its branch is fixed by which side of the seam the face
+                // is on, which continuity cannot see when the two uses
+                // coincide. The target is *absolute* — one period from
+                // where the first use ended up — so it holds whether the
+                // base curves came in on one branch (a fresh fit) or on
+                // two (stored pcurves, which record the split already).
+                (Some(anchor), previous) => match seam_branch(net, per, winding) {
+                    Some((constant_in_u, offset)) => {
+                        let base = probe.start();
+                        let mut shift = if constant_in_u {
+                            Vector2::new(anchor.x + offset - base.x, 0.0)
+                        } else {
+                            Vector2::new(0.0, anchor.y + offset - base.y)
+                        };
+                        // The seam only pins its own constant direction;
+                        // the other one still follows the walk.
+                        if let Some(prev) = previous {
+                            let free = continuity_shift(prev, base + shift, per);
+                            if constant_in_u {
+                                shift.y += free.y;
                             } else {
-                                Vector2::new(0.0, anchor.y + offset - base.y)
-                            };
-                            // The seam only pins its own constant direction;
-                            // the other one still follows the walk.
-                            if let Some(prev) = previous {
-                                let free = continuity_shift(prev, base + shift, per);
-                                if constant_in_u {
-                                    shift.y += free.y;
-                                } else {
-                                    shift.x += free.x;
-                                }
+                                shift.x += free.x;
                             }
-                            shift
                         }
-                        None => previous
-                            .map(|prev| continuity_shift(prev, probe.start(), per))
-                            .unwrap_or_else(Vector2::zeros),
-                    },
-                    (None, Some(prev)) => continuity_shift(prev, probe.start(), per),
-                    (None, None) => Vector2::zeros(),
-                };
+                        shift
+                    }
+                    None => previous
+                        .map(|prev| continuity_shift(prev, probe.start(), per))
+                        .unwrap_or_else(Vector2::zeros),
+                },
+                (None, Some(prev)) => continuity_shift(prev, probe.start(), per),
+                (None, None) => Vector2::zeros(),
+            };
 
-                let placed = Trim {
-                    curve: shifted(&probe.curve, shift),
-                    range,
-                    sense: probe.sense,
-                };
-                if piece == 0 {
-                    // Record where this edge's first use *landed*, not the
-                    // shift that put it there: the second use is placed a
-                    // period from the branch, not from the correction.
-                    first_use.entry(edge_id).or_insert_with(|| placed.start());
-                }
-                trims.push(placed);
-            }
+            let placed = Trim {
+                curve: shifted(&probe.curve, shift),
+                range,
+                sense: probe.sense,
+            };
+            // Record where this edge's first use *landed*, not the shift
+            // that put it there: the second use is placed a period from the
+            // branch, not from the correction.
+            first_use.entry(edge_id).or_insert_with(|| placed.start());
+            trims.push(placed);
         }
         out.push(trims);
     }
@@ -1416,87 +1353,12 @@ mod tests {
         }
     }
 
-    /// The four shapes an edge's parameter range arrives in, read against a
-    /// closed curve: an ordinary interval, a wrap through the domain end, and
-    /// the two ways the boolean pipeline spells "the whole loop" when it
-    /// cannot unwrap one — the range collapsed onto either end of the domain.
+    /// An edge whose range does not increase traces nothing, whatever its
+    /// curve does at the two ends, and is reported rather than quietly
+    /// measured as zero. Recovering one as a wrap past the domain end was the
+    /// of-i7ka workaround, and it went with the emitter-side fix.
     #[test]
-    fn a_range_that_wraps_a_closed_curve_is_read_as_the_arc_it_traces() {
-        const TAU: f64 = std::f64::consts::TAU;
-        let mut store = TopologyStore::new();
-        let mut geo = GeometryStore::new();
-        let circle = geo
-            .add_curve(Curve3::circle(Point3::origin(), Vector3::z(), 1.0).expect("valid circle"));
-        let vertex = store.create_vertex(Point3::new(1.0, 0.0, 0.0), 1e-10);
-        let edge_id = store.create_edge_with_curve(vertex, vertex, 1e-10, circle, 0.0, TAU);
-
-        /// A stored range and the pieces it should be read as.
-        type Case = ((f64, f64), &'static [(f64, f64)]);
-        let cases: [Case; 4] = [
-            ((0.5, 2.0), &[(0.5, 2.0)]),
-            ((5.0, 1.0), &[(5.0, TAU), (0.0, 1.0)]),
-            ((0.0, 0.0), &[(0.0, TAU)]),
-            ((TAU, TAU), &[(0.0, TAU)]),
-        ];
-        for ((t_start, t_end), want) in cases {
-            let edge = store.edges.get_mut(edge_id).expect("live edge");
-            edge.t_start = t_start;
-            edge.t_end = t_end;
-            let edge = store.edge(edge_id).expect("live edge");
-            let got = edge_ranges(edge, geo.curve(circle)).expect("a closed curve can wrap");
-            assert_eq!(got.len(), want.len(), "[{t_start}, {t_end}] -> {got:?}");
-            for (got, want) in got.iter().zip(want) {
-                assert!(
-                    (got.0 - want.0).abs() < 1e-12 && (got.1 - want.1).abs() < 1e-12,
-                    "[{t_start}, {t_end}] -> {got:?}, want {want:?}"
-                );
-            }
-        }
-    }
-
-    /// And the whole measurement still runs when an edge arrives spelled that
-    /// way: the primitive's own cap circles, re-stamped as the empty range
-    /// the boolean pipeline hands over for a closed imprint loop, must
-    /// measure exactly as before.
-    #[test]
-    fn a_degenerate_range_on_a_closed_curve_measures_as_before() {
-        let mut scene = Scene::new();
-        let body = primitives::cylinder(&mut scene.store, &mut scene.geo, 1.5, 4.0).unwrap();
-        let before = scene.measure(body);
-
-        // Each circle bounds both a cap and the wall, so dedupe the walk.
-        let circles: std::collections::HashSet<_> = scene
-            .store
-            .faces_of_body(body)
-            .into_iter()
-            .flat_map(|f| scene.store.edges_of_face(f))
-            .filter(|&e| {
-                scene
-                    .store
-                    .edge(e)
-                    .is_some_and(|edge| edge.t_end - edge.t_start > 6.0)
-            })
-            .collect();
-        assert_eq!(circles.len(), 2, "expected the two cap circles");
-        for edge_id in circles {
-            let edge = scene.store.edges.get_mut(edge_id).expect("live edge");
-            edge.t_end = edge.t_start;
-        }
-
-        let after = scene.measure(body);
-        assert_rel(after.volume, before.volume, 1e-12, "wrapped-range volume");
-        assert_rel(
-            after.surface_area,
-            before.surface_area,
-            1e-12,
-            "wrapped-range area",
-        );
-    }
-
-    /// The same empty range on a curve whose ends do *not* meet traces
-    /// nothing, and is reported rather than quietly measured as zero.
-    #[test]
-    fn an_empty_range_on_an_open_curve_is_rejected() {
+    fn an_empty_edge_range_is_rejected() {
         let mut scene = Scene::new();
         let body = primitives::block(&mut scene.store, &mut scene.geo, 2.0, 3.0, 5.0).unwrap();
         let edge_id = scene

@@ -6145,6 +6145,55 @@ fn canonical_atoms(atoms: &[Atom], snap: f64) -> Vec<(usize, bool)> {
     class
 }
 
+/// The domain of a curve that traces a loop without saying so — its two
+/// domain ends land on the same point (within the weld length `snap`) while
+/// `period()` reports `None` — or `None` for anything else.
+///
+/// Marched imprints are the whole population today, and they arrive this way
+/// by design rather than by omission. [`crate::ssi::intersect_marched`] reports a
+/// trace as closed only when it returns to its seed inside both surface
+/// domains; a loop running off a chart seam is stopped there instead, and
+/// comes back as an open trace whose two ends are polished onto the *same*
+/// seam crossing. [`Pipeline::marched_polylines`] then cuts a closed trace
+/// that wraps a seam at each crossing, which at a single crossing yields one
+/// fragment running from that crossing back around to it. Both are rings
+/// spelled as open curves, and must stay that way: `clip_imprint` stations a
+/// closed curve without repeating its start and lets runs wrap, so declaring
+/// these closed makes the imprint read as an interior ring and the region
+/// trace fails outright ("an interior imprint ring lies in no region of its
+/// host face").
+///
+/// What that costs the reader is that the joint has two parameters, `lo` and
+/// `hi`, and closest-point projection picks either — so an edge terminating
+/// there can come back empty or backwards unless the caller re-spells it.
+/// The test is geometric rather than by variant because the ambiguity is: a
+/// closed *clamped* NURBS curve reports no period either (evaluation clamps
+/// outside its knot interval instead of wrapping), and would need the same
+/// repair the day one bounds an output edge.
+fn looping_domain(curve: &Curve3, snap: f64) -> Option<(f64, f64)> {
+    if curve.period().is_some() {
+        return None;
+    }
+    let (lo, hi) = curve.domain();
+    if !(lo.is_finite() && hi.is_finite() && hi > lo) {
+        return None;
+    }
+    ((curve.point(hi) - curve.point(lo)).norm() <= snap).then_some((lo, hi))
+}
+
+/// A point strictly inside an open atom's run, for disambiguating a terminus
+/// that landed on a looping curve's joint. The middle vertex where there is
+/// one; a two-point atom has only its chord to offer, and its midpoint
+/// projects near the middle of the run, which is all the comparison needs.
+fn atom_probe(atom: &Atom) -> Point3 {
+    let pts = &atom.points;
+    if pts.len() >= 3 {
+        pts[pts.len() / 2]
+    } else {
+        pts[0] + (pts[pts.len() - 1] - pts[0]) * 0.5
+    }
+}
+
 fn build_output(
     pipe: &Pipeline<'_>,
     _op: BooleanOp,
@@ -6275,23 +6324,48 @@ fn build_output(
                         // range recovered by exact closest-point projection.
                         // Atom polylines run in increasing curve parameter,
                         // so a wrapped range on a periodic curve unwraps
-                        // forward by one period.
+                        // forward by one period, and one on a curve that
+                        // merely *loops* is re-spelled onto the joint's other
+                        // parameter (see `looping_domain`).
                         let source = atom_source[ai];
                         let curve = source_curve(pipe, source);
                         let curve_id = *curve_of_source
                             .entry(source)
                             .or_insert_with(|| geo.add_curve(curve.clone()));
-                        let t_first = curve.project_point(&start_p).t;
+                        let loop_domain = looping_domain(curve, snap);
+                        let mut t_first = curve.project_point(&start_p).t;
                         let (t_start, t_end) = if atom.closed {
-                            let period = curve
-                                .period()
-                                .expect("closed atoms come from periodic curves");
-                            (t_first, t_first + period)
+                            match (curve.period(), loop_domain) {
+                                (Some(period), _) => (t_first, t_first + period),
+                                // Nothing wraps past a merely-looping curve's
+                                // domain — evaluation clamps there — so a ring
+                                // atom on one is spelled as the whole domain
+                                // rather than a period from wherever the ring
+                                // happens to have been seamed.
+                                (None, Some(domain)) => domain,
+                                (None, None) => {
+                                    panic!("closed atoms come from curves that close")
+                                }
+                            }
                         } else {
                             let mut t_last = curve.project_point(&end_p).t;
                             if let Some(period) = curve.period() {
                                 if t_last <= t_first {
                                     t_last += period;
+                                }
+                            } else if let Some((lo, hi)) = loop_domain {
+                                // The joint reads as both `lo` and `hi`, and
+                                // projection picks either. The atom's own
+                                // interior is unambiguous — no run spans the
+                                // joint, because a looping curve is clipped as
+                                // an open one — so it decides which end of the
+                                // domain each terminus meant.
+                                let t_mid = curve.project_point(&atom_probe(atom)).t;
+                                if t_first > t_mid {
+                                    t_first = lo;
+                                }
+                                if t_last < t_mid {
+                                    t_last = hi;
                                 }
                             }
                             (t_first, t_last)
@@ -9858,6 +9932,54 @@ mod tests {
             }
         }
         assert!(rim_circles >= 2, "band must be rimmed by circular edges");
+    }
+
+    /// [`looping_domain`] asks whether a curve's two domain ends meet, and
+    /// answers only for curves that do not already say so themselves — a
+    /// declared period means the range unwraps forward instead, which is a
+    /// different repair (of-i7ka).
+    #[test]
+    fn looping_domain_names_only_the_curves_that_close_without_saying_so() {
+        let snap = 1e-9;
+        let ring = vec![
+            Point3::new(1.0, 0.0, 0.0),
+            Point3::new(0.0, 1.0, 0.0),
+            Point3::new(-1.0, 0.0, 0.0),
+            Point3::new(1.0, 0.0, 0.0),
+        ];
+        let looping = Curve3::polyline(ring.clone(), false).expect("valid polyline");
+        assert_eq!(
+            looping_domain(&looping, snap),
+            Some((0.0, 3.0)),
+            "an open polyline whose ends meet is the case this exists for"
+        );
+
+        let mut open = ring;
+        open[3] = Point3::new(1.0, 0.5, 0.0);
+        let open = Curve3::polyline(open, false).expect("valid polyline");
+        assert_eq!(
+            looping_domain(&open, snap),
+            None,
+            "ends a half unit apart are not a joint"
+        );
+
+        // Same points, honestly declared: `period()` covers it.
+        let declared = Curve3::polyline(
+            match &looping {
+                Curve3::Polyline { points, .. } => points.clone(),
+                _ => unreachable!(),
+            },
+            true,
+        )
+        .expect("valid polyline");
+        assert_eq!(looping_domain(&declared, snap), None);
+
+        let circle = Curve3::circle(Point3::origin(), Vector3::z(), 1.0).expect("valid circle");
+        assert_eq!(looping_domain(&circle, snap), None);
+
+        // A line's domain is unbounded, so its "ends" are not points at all.
+        let line = Curve3::line(Point3::origin(), Vector3::x()).expect("valid line");
+        assert_eq!(looping_domain(&line, snap), None);
     }
 
     #[test]
