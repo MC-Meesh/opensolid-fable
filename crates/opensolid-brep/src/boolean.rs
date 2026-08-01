@@ -1776,6 +1776,14 @@ struct Imprint {
     /// The exact SSI curve the samples came from (bound to result edges).
     curve: Curve3,
     sampled: SampledCurve,
+    /// For an [`ImprintKind::CoincidentEdge`], the partner trim edge this
+    /// imprint *is* a clipped copy of, as `(solid, edge)`. Two things need it
+    /// and nothing else can supply either: the surface across that edge, which
+    /// is the only one that cuts the host's boundary at this imprint's ends
+    /// ([`Pipeline::polish_clip_endpoint`]), and the edge's own vertices,
+    /// which subdivide it and must subdivide this copy identically
+    /// ([`Pipeline::collect_splits`]).
+    partner_edge: Option<(SolidTag, usize)>,
 }
 
 /// A maximal un-split piece of a source curve: the atomic arrangement edge
@@ -2357,6 +2365,7 @@ impl<'a> Pipeline<'a> {
                             ImprintKind::Transversal,
                             None,
                             None,
+                            None,
                         )?;
                     }
                 }
@@ -2379,6 +2388,7 @@ impl<'a> Pipeline<'a> {
                                 },
                                 ImprintKind::Transversal,
                                 Some(&uv),
+                                None,
                                 None,
                             )?;
                         }
@@ -2406,6 +2416,7 @@ impl<'a> Pipeline<'a> {
                                 },
                                 ImprintKind::Transversal,
                                 Some(&uv),
+                                None,
                                 None,
                             )?;
                         }
@@ -2661,7 +2672,7 @@ impl<'a> Pipeline<'a> {
         for (host, other_s, other_f) in [(0, 1, fb), (1, 0, fa)] {
             let face = &self.solids[other_s].faces[other_f];
             let uses = |e: usize| face.loops.iter().flatten().filter(|d| d.edge == e).count();
-            let edges: Vec<(Curve3, CurveSpan)> = face
+            let edges: Vec<(Curve3, CurveSpan, usize)> = face
                 .loops
                 .iter()
                 .flatten()
@@ -2687,10 +2698,11 @@ impl<'a> Pipeline<'a> {
                             // coarsen it.
                             intervals: edge_intervals(edge).max(IMPRINT_LINE_SAMPLES),
                         },
+                        de.edge,
                     )
                 })
                 .collect();
-            for (curve, span) in edges {
+            for (curve, span, edge) in edges {
                 // An existing trim edge, carried from the partner's
                 // topology rather than traced: no preimages travel with it.
                 // Its own parameter window travels with it instead — the
@@ -2707,6 +2719,7 @@ impl<'a> Pipeline<'a> {
                     ImprintKind::CoincidentEdge { host },
                     None,
                     Some(span),
+                    Some((other_s, edge)),
                 )?;
             }
         }
@@ -2923,6 +2936,7 @@ impl<'a> Pipeline<'a> {
         kind: ImprintKind,
         station_uv: Option<&[Option<HostUv>]>,
         span: Option<CurveSpan>,
+        partner: Option<(SolidTag, usize)>,
     ) -> CoreResult<()> {
         let ImprintHosts {
             fa,
@@ -3066,6 +3080,7 @@ impl<'a> Pipeline<'a> {
                     face_b: fb,
                     kind,
                     curve: curve.clone(),
+                    partner_edge: partner,
                     sampled: SampledCurve {
                         points,
                         closed: true,
@@ -3140,10 +3155,10 @@ impl<'a> Pipeline<'a> {
                 // Seed from the run's first station: it is inside, so its
                 // parameters are on the sheet the crossing belongs to.
                 let t = refine_clip_crossing(&inside, t_out, t_in, Some(uvs[first_idx]))?;
-                let p = self.polish_clip_endpoint(curve.point(t), fa, fb);
+                let p = self.polish_clip_endpoint(curve.point(t), fa, fb, kind, partner);
                 pts.insert(0, p);
             } else {
-                pts[0] = self.polish_clip_endpoint(pts[0], fa, fb);
+                pts[0] = self.polish_clip_endpoint(pts[0], fa, fb, kind, partner);
             }
             // Exit point (after the run's last sample).
             let last_idx = *run.last().expect("non-empty run");
@@ -3156,11 +3171,11 @@ impl<'a> Pipeline<'a> {
                     t_out += period;
                 }
                 let t = refine_clip_crossing(&inside, t_out, t_in, Some(uvs[last_idx]))?;
-                let p = self.polish_clip_endpoint(curve.point(t), fa, fb);
+                let p = self.polish_clip_endpoint(curve.point(t), fa, fb, kind, partner);
                 pts.push(p);
             } else {
                 let last = pts.len() - 1;
-                pts[last] = self.polish_clip_endpoint(pts[last], fa, fb);
+                pts[last] = self.polish_clip_endpoint(pts[last], fa, fb, kind, partner);
             }
             // A polished endpoint *supersedes* raw stations the marcher
             // left within its landing tolerance of the junction (observed
@@ -3214,6 +3229,7 @@ impl<'a> Pipeline<'a> {
                     face_b: fb,
                     kind,
                     curve: curve.clone(),
+                    partner_edge: partner,
                     sampled: SampledCurve {
                         points: pts,
                         closed: false,
@@ -3232,6 +3248,7 @@ impl<'a> Pipeline<'a> {
                         face_b: fb,
                         kind,
                         curve: curve.clone(),
+                        partner_edge: partner,
                         sampled: SampledCurve {
                             points,
                             closed: true,
@@ -3269,11 +3286,47 @@ impl<'a> Pipeline<'a> {
     /// chord's sagitta off the true curve, but that is the same error, not
     /// a different one.
     ///
+    /// A **coincident** imprint ([`ImprintKind::CoincidentEdge`]) names the
+    /// same junction but cannot be pointed at it the same way, and getting
+    /// this wrong is what of-m350 was: two equal-radius cylinders `d` apart
+    /// on parallel axes have coplanar caps, so the caps are a coincident pair
+    /// whose *curved* boundaries cross at a shallow angle, and every quantity
+    /// above degenerates.
+    ///
+    /// - The curve being clipped IS a trim edge of the partner, so it lies at
+    ///   distance zero from the partner's own boundary along its whole
+    ///   length. The nearest-edge search would pick that edge — not the one
+    ///   actually crossed — on a float coin flip against the two polylines'
+    ///   chord sag. Only the trims that *bind* the imprint are searched, and
+    ///   for a coincident imprint that is the host's alone, which is exactly
+    ///   the trim [`Pipeline::clip_imprint`] clipped against.
+    /// - The partner's face surface no longer *cuts* the crossed edge — it
+    ///   contains it, that being what coincidence means — so its residual is
+    ///   identically zero along the edge and Newton "converges" at the seed,
+    ///   pinning the endpoint wherever the discretized polygon happened to
+    ///   put it. The surface that does cut the edge there is the partner's
+    ///   face *across* the imprinted edge, reached through the `partner` edge
+    ///   the imprint records: the junction is where the two solids' boundary
+    ///   edges cross, and the partner's edge is the intersection of its
+    ///   coincident face with that one.
+    ///
+    /// Left unpolished, a cap imprint at `d = 1e-3` ended 6e-2 away from the
+    /// wall imprint it meets — four orders past the sagitta this polish
+    /// exists to absorb, because the error scales as `sagitta/d` when two
+    /// boundaries cross at angle `d` rather than as the sagitta itself.
+    ///
     /// Returns `p` unchanged when no boundary edge is plausibly involved
     /// (a fragment endpoint pinned on a chart seam and already exact), when
     /// the endpoint sits on a chart pole, or when the root refinement
     /// fails.
-    fn polish_clip_endpoint(&self, p: Point3, fa: usize, fb: usize) -> Point3 {
+    fn polish_clip_endpoint(
+        &self,
+        p: Point3,
+        fa: usize,
+        fb: usize,
+        kind: ImprintKind,
+        partner: Option<(SolidTag, usize)>,
+    ) -> Point3 {
         // A pole endpoint is not this root. Every boundary edge meeting a
         // pole runs *through* it, so the residual of the other surface
         // along that edge has no isolated zero there to Newton onto — the
@@ -3291,12 +3344,15 @@ impl<'a> Pipeline<'a> {
                 }
             }
         }
-        // The crossed edge: nearest over both faces' boundaries, accepted
-        // within a discretization-scale band (the endpoint can sit a chord
-        // sagitta off a curved boundary, but distinct edges are a face
-        // extent apart).
+        // The crossed edge: nearest over the boundaries that bind this
+        // imprint, accepted within a discretization-scale band (the endpoint
+        // can sit a chord sagitta off a curved boundary, but distinct edges
+        // are a face extent apart).
         let mut best: Option<(f64, SolidTag, usize)> = None;
         for (s, f) in [(0usize, fa), (1usize, fb)] {
+            if !kind.binds(s) {
+                continue;
+            }
             let band = DISCRETIZATION_BAND_FRAC * self.face_extents[s][f];
             for lp in &self.solids[s].faces[f].loops {
                 for de in lp {
@@ -3314,9 +3370,23 @@ impl<'a> Pipeline<'a> {
         let edge = &self.solids[s].edges[e];
         let other = &self.solids[1 - s];
         // The imprint's face on the other solid carries the surface the
-        // junction must also lie on.
+        // junction must also lie on — unless that face is *coincident* with
+        // the crossed edge's own, which contains it instead of cutting it. A
+        // coincident imprint names its partner edge, and the face across that
+        // edge is the surface that does cut here (see above).
         let sf = if s == 0 { fb } else { fa };
-        let surface = &other.faces[sf].surface;
+        let across = partner.and_then(|(ps, pe)| {
+            let coincident_face = if ps == 0 { fa } else { fb };
+            self.solids[ps]
+                .faces
+                .iter()
+                .enumerate()
+                .find(|(g, f)| {
+                    *g != coincident_face && f.loops.iter().flatten().any(|d| d.edge == pe)
+                })
+                .map(|(_, f)| &f.surface)
+        });
+        let surface = across.unwrap_or(&other.faces[sf].surface);
         let proj = edge.curve.project_point(&p);
         let mut t = if edge.closed {
             proj.t
@@ -3326,28 +3396,43 @@ impl<'a> Pipeline<'a> {
         // Newton on residual(edge(t)) = 0; the seed is within a chord
         // sagitta of the root, far inside its basin for transversal
         // crossings.
+        //
+        // Convergence is judged by how far the *point* moves, not by how
+        // small the residual is: the two are the same question only when the
+        // surface cuts the edge squarely. Where they cross at a shallow
+        // angle `a`, the residual falls off `a` times slower than the
+        // distance to the root does, so a residual below the weld length
+        // still leaves the endpoint `snap/a` away from it — 1e-4 for the
+        // `d = 1e-5` near-coaxial pair, five orders past the weld and enough
+        // to tear the junction all over again (of-m350). A step test is the
+        // scale-free form of the same criterion and costs at most an extra
+        // iteration on the well-conditioned crossings.
         let sanity = 0.05 * self.face_extents[0][fa].min(self.face_extents[1][fb]);
         for _ in 0..CLIP_REFINE_ITERATIONS {
             let q = edge.curve.point(t);
             let Some(r) = surface_residual(surface, &q) else {
                 return p;
             };
-            if r.abs() <= self.snap * 0.5 {
-                return if (q - p).norm() <= sanity { q } else { p };
-            }
             let Some(g) = surface_residual_gradient(surface, &q) else {
                 return p;
             };
-            let slope = g.dot(&edge.curve.derivative(t));
+            let tangent = edge.curve.derivative(t);
+            let slope = g.dot(&tangent);
             if slope.abs() <= f64::MIN_POSITIVE {
                 return p;
             }
-            t -= r / slope;
-            if !t.is_finite() {
+            let dt = -r / slope;
+            if !dt.is_finite() {
                 return p;
             }
+            let moved = dt.abs() * tangent.norm();
+            t += dt;
             if !edge.closed {
                 t = t.clamp(edge.t0, edge.t1);
+            }
+            if moved <= self.snap * 0.5 {
+                let q = edge.curve.point(t);
+                return if (q - p).norm() <= sanity { q } else { p };
             }
         }
         p
@@ -3482,6 +3567,44 @@ impl<'a> Pipeline<'a> {
                 }
             }
         }
+        // A coincident imprint is a *copy* of the partner's trim edge, and the
+        // two must come apart at the same places or the arrangement ends up
+        // with one edge spelled two ways: the partner's own atoms cut at its
+        // vertices, and one uncut imprint atom spanning them. Both spellings
+        // are then used once each, and the shell has open edges where it has
+        // a perfectly good face on either side (of-m350).
+        //
+        // Cut points are the partner edge's own endpoints — a closed circular
+        // trim edge still carries the one vertex it starts at — plus every
+        // split already registered against it above.
+        let mut mirrored: Vec<(CurveSource, Point3)> = Vec::new();
+        for (ii, imp) in self.imprints.iter().enumerate() {
+            let Some((ps, pe)) = imp.partner_edge else {
+                continue;
+            };
+            let partner = &self.solids[ps].edges[pe];
+            let cuts = [
+                partner.curve.point(partner.t0),
+                partner.curve.point(partner.t1),
+            ]
+            .into_iter()
+            .chain(events.iter().filter_map(|&(source, p)| {
+                matches!(source, CurveSource::Edge { solid, edge }
+                        if solid == ps && edge == pe)
+                .then_some(p)
+            }));
+            for cut in cuts {
+                let t = imp.curve.project_point(&cut).t;
+                if (imp.curve.point(t) - cut).norm() > self.snap * EDGE_MATCH_SNAP {
+                    continue;
+                }
+                if !imp.sampled.closed && !Self::interior_curve_param(imp, t, self.snap) {
+                    continue;
+                }
+                mirrored.push((CurveSource::Imprint { index: ii }, cut));
+            }
+        }
+        events.extend(mirrored);
         for (source, p) in events {
             self.splits.entry(source).or_default().push(p);
         }
@@ -5379,6 +5502,22 @@ fn point_in_cycle(cycle: &Cycle, p: (f64, f64)) -> bool {
 }
 
 /// A robust interior point of a region, in 3D.
+///
+/// Probes are anchored at the outline's **vertices** before its chord
+/// midpoints, and the order is load-bearing rather than cosmetic (of-m350).
+/// A vertex is a sample of the boundary's exact curve and lies on it; a chord
+/// midpoint lies a sagitta *inside* it — `5.4e-4` of the radius at this
+/// pipeline's circle sampling. The sample is then handed to `classify`, which
+/// asks the other solid's **exact** surfaces about it, so a midpoint-anchored
+/// probe answers for a point the region may not contain.
+///
+/// That is invisible until a region is thinner than the sag, and then it is
+/// fatal: the crescent left on one cylinder's cap by a near-coaxial partner is
+/// `d` wide, so at `d = 1e-3` every midpoint probe inside the *polygon* band
+/// sits outside the true crescent, in the coincident lens next door, and the
+/// crescent is classified as the lens's opposite. Anchoring at a vertex keeps
+/// the common-mode sag out of the probe, and only the region's own width — the
+/// thing the offset ladder below is already searching for — has to be resolved.
 fn region_interior_point(chart: &Chart, region: &Region) -> Option<Point3> {
     let outer = &region.cycles[0];
     let n = outer.poly.len();
@@ -5411,26 +5550,107 @@ fn region_interior_point(chart: &Chart, region: &Region) -> Option<Point3> {
     // regions that are thin along only one axis.
     let du = (hi.0 - lo.0).max(1e-12);
     let dv = (hi.1 - lo.1).max(1e-12);
-    // Coarse offsets first (bolder samples classify more robustly); the
-    // sub-1e-3 tail reaches regions that are thin even diagonally.
-    for scale in [5e-2, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6, 1e-7] {
-        for i in 0..n {
-            let (a, _) = outer.poly[i];
-            let (b, _) = outer.poly[(i + 1) % n];
-            let (dx, dy) = ((b.0 - a.0) / du, (b.1 - a.1) / dv);
-            let len = (dx * dx + dy * dy).sqrt();
-            if len < 1e-9 {
-                continue;
+    // Left normal of segment `i`, in the normalized coordinates: for a CCW
+    // boundary it points into the region (orientation survives the positive
+    // per-axis scaling). `None` for a segment too short to give a direction.
+    let normal = |i: usize| -> Option<(f64, f64)> {
+        let (a, _) = outer.poly[i];
+        let (b, _) = outer.poly[(i + 1) % n];
+        let (dx, dy) = ((b.0 - a.0) / du, (b.1 - a.1) / dv);
+        let len = (dx * dx + dy * dy).sqrt();
+        (len >= 1e-9).then(|| (-dy / len, dx / len))
+    };
+    // Clearance from the whole outline. Asked in two coordinate systems,
+    // because two different questions are being asked of it:
+    //
+    // - normalized, to check a probe against its own offset (below), which is
+    //   a per-axis fraction of the region's extents and means nothing in
+    //   model units;
+    // - raw, to rank probes against each other, because what makes a sample
+    //   classify robustly is absolute distance from the surfaces around it.
+    //   Ranking normalized would pick a probe 3e-6 from the face bounding a
+    //   1e-4-thick plate over one 5e-5 away, on the grounds that the first is
+    //   a larger fraction of a thickness — and `contains_point` distrusts
+    //   samples in absolute terms, so that trade is exactly backwards.
+    let clearance = |p: (f64, f64), normalized: bool| -> f64 {
+        let (su, sv) = if normalized { (du, dv) } else { (1.0, 1.0) };
+        let scaled = |q: (f64, f64)| (q.0 / su, q.1 / sv);
+        let p = scaled(p);
+        let mut best = f64::INFINITY;
+        for cy in &region.cycles {
+            let m = cy.poly.len();
+            for i in 0..m {
+                let a = scaled(cy.poly[i].0);
+                let b = scaled(cy.poly[(i + 1) % m].0);
+                best = best.min(point_seg_dist2(p, a, b));
             }
-            // Left normal of a CCW boundary points into the region
-            // (orientation survives the positive per-axis scaling).
-            let (nx, ny) = (-dy / len, dx / len);
-            let mid = (
-                (a.0 + b.0) * 0.5 + nx * scale * du,
-                (a.1 + b.1) * 0.5 + ny * scale * dv,
-            );
-            if inside_region(mid) {
-                return Some(chart_point(chart, mid));
+        }
+        best.sqrt()
+    };
+    // Every probe, coarsest offset first (bolder samples classify more
+    // robustly), vertex anchors before chord midpoints, and the sub-1e-3 tail
+    // reaching regions that are thin even diagonally.
+    let probes = |scale: f64, vertex_anchor: bool| {
+        (0..n).filter_map(move |i| {
+            let (nx, ny) = normal(i)?;
+            let (anchor, dir) = if vertex_anchor {
+                // Offset along the corner's interior bisector, not one
+                // segment's normal: a vertex is where two boundary curves may
+                // meet, and a probe that clears only one of them hugs the
+                // other. The bisector is interior at a convex and a reflex
+                // corner alike, and degenerates to the normal itself along a
+                // smooth stretch.
+                let (px, py) = normal((i + n - 1) % n).unwrap_or((nx, ny));
+                let (bx, by) = (nx + px, ny + py);
+                let len = (bx * bx + by * by).sqrt();
+                if len < 1e-9 {
+                    return None;
+                }
+                (outer.poly[i].0, (bx / len, by / len))
+            } else {
+                let (a, _) = outer.poly[i];
+                let (b, _) = outer.poly[(i + 1) % n];
+                (((a.0 + b.0) * 0.5, (a.1 + b.1) * 0.5), (nx, ny))
+            };
+            Some((anchor.0 + dir.0 * scale * du, anchor.1 + dir.1 * scale * dv))
+        })
+    };
+    const LADDER: [f64; 7] = [5e-2, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6, 1e-7];
+    // A probe offset by `scale` should end up about `scale` clear of the
+    // outline. Where it does not, the region is thinner *there* than the
+    // offset asked for, and the probe has crossed something — which on a
+    // region whose two boundaries run within a chord sagitta of each other
+    // (the cusp tips of a near-coaxial lune, of-m350) the even-odd test above
+    // cannot see, because the two polylines interleave. Demanding the
+    // clearance the offset implies is the self-consistency check that skips
+    // exactly those probes and lets the ladder walk down to an offset the
+    // region can actually hold.
+    //
+    // The whole pass is ranked rather than taken first-come: several probes
+    // usually qualify, they differ by orders of magnitude in how far from the
+    // outline they land, and only the distance decides whether `classify` can
+    // read the sample at all.
+    let best_of = |scale: f64, vertex_anchor: bool, self_consistent: bool| {
+        probes(scale, vertex_anchor)
+            .filter(|&p| {
+                inside_region(p) && (!self_consistent || clearance(p, true) >= 0.5 * scale)
+            })
+            .max_by(|&p, &q| clearance(p, false).total_cmp(&clearance(q, false)))
+    };
+    for scale in LADDER {
+        for vertex_anchor in [true, false] {
+            if let Some(probe) = best_of(scale, vertex_anchor, true) {
+                return Some(chart_point(chart, probe));
+            }
+        }
+    }
+    // Nothing cleared its own offset anywhere on the ladder: the outline is
+    // degenerate at this discretization. Any interior probe beats reporting
+    // no sample at all, which fails the boolean outright.
+    for scale in LADDER {
+        for vertex_anchor in [true, false] {
+            if let Some(probe) = best_of(scale, vertex_anchor, false) {
+                return Some(chart_point(chart, probe));
             }
         }
     }
@@ -10080,6 +10300,7 @@ mod tests {
             face_b: 0,
             kind: ImprintKind::Transversal,
             curve,
+            partner_edge: None,
             sampled: SampledCurve {
                 points,
                 closed: false,

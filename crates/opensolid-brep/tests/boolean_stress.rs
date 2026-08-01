@@ -7862,31 +7862,38 @@ fn sub_snap_offset_cylinders_stay_coincident() {
 /// equal-radius cylinders whose walls meet in two full lines
 /// (`ssi/analytic.rs:512`), bounding a thin lune.
 ///
-/// KNOWN BROKEN — of-m350, and NOT a coincident-face bug: the failures are
-/// byte-identical with of-bxl.5's changes reverted, so this is the
-/// transversal path. Kept as written rather than softened, per this file's
-/// protocol, because §9's decision to model the lune rather than snap it away
-/// assumes exactly this path works. `d = 1e-3` and `d = 1e-5` produce
-/// `OpenEdgeInClosedShell` and an impossible Euler characteristic
-/// respectively.
+/// Every part of this is thin at `d` and nothing may be snapped away
+/// (of-m350). The walls split near half-and-half, but the lune between the
+/// two circles is `d` wide, tapering to a cusp at each end, and it survives as
+/// a real face of the union — one whose interior sample the arrangement has to
+/// find inside a region narrower than its own outline's chord sag.
+///
+/// `dz` staggers the caps as well, which changes which pairs are coincident
+/// without changing the answer: at `dz = 0` the caps are coplanar and the
+/// crescents are cut by the coincident-face path, while at `dz = 0.25` no two
+/// faces are coincident at all and the same crescents arrive from ordinary
+/// plane-cylinder SSI. Both spellings of the configuration are pinned, because
+/// of-m350 broke on both and for the same reason.
 #[test]
-#[ignore = "of-m350: near-coaxial equal-radius cylinders produce invalid booleans"]
 fn near_coaxial_cylinders_stay_transversal() {
     for d in [1e-3, 1e-5] {
-        let context = &format!("cylinders with a {d:e} axis offset, inclusion-exclusion");
-        let mut scene = Scene::new();
-        let a = scene.cylinder(Point3::origin(), Vector3::z(), 1.0, 1.0);
-        let b = scene.cylinder(Point3::new(d, 0.0, 0.0), Vector3::z(), 1.0, 1.0);
-        let united = scene
-            .unite(a, b)
-            .unwrap_or_else(|e| panic!("{context}, unite: rejected: {e:?}"));
-        let intersected = scene
-            .intersect(a, b)
-            .unwrap_or_else(|e| panic!("{context}, intersect: rejected: {e:?}"));
-        // No closed form is needed: inclusion-exclusion pins the pair against
-        // each other, and both operands are unit cylinders.
-        let sum = volume(&united, context) + volume(&intersected, context);
-        assert_close(sum, 2.0 * PI, CYL_VOLUME_RTOL, context);
+        for dz in [0.0, 0.25] {
+            let context =
+                &format!("cylinders with a {d:e} axis offset and {dz} rise, inclusion-exclusion");
+            let mut scene = Scene::new();
+            let a = scene.cylinder(Point3::origin(), Vector3::z(), 1.0, 1.0);
+            let b = scene.cylinder(Point3::new(d, 0.0, dz), Vector3::z(), 1.0, 1.0);
+            let united = scene
+                .unite(a, b)
+                .unwrap_or_else(|e| panic!("{context}, unite: rejected: {e:?}"));
+            let intersected = scene
+                .intersect(a, b)
+                .unwrap_or_else(|e| panic!("{context}, intersect: rejected: {e:?}"));
+            // No closed form is needed: inclusion-exclusion pins the pair
+            // against each other, and both operands are unit cylinders.
+            let sum = volume(&united, context) + volume(&intersected, context);
+            assert_close(sum, 2.0 * PI, CYL_VOLUME_RTOL, context);
+        }
     }
 }
 

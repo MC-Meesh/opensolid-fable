@@ -494,16 +494,20 @@ results.
   unreachable, and the gate for this decision is a stress case on each side
   of the threshold rather than a smoothing pass between them.
 
-  One honest caveat, and it belongs with the decision rather than buried in a
-  bug list: the *sub-snap* side is gated live
-  (`sub_snap_offset_cylinders_stay_coincident`), but the transversal side is
-  **currently broken** — of-m350, where a near-coaxial pair at `d` between
-  1e-8 and 1e-3 returns an open shell, an impossible Euler characteristic, or
-  a `classify` failure. That is the ordinary transversal path and it fails
-  identically with of-bxl.5's changes reverted, so it does not weigh on the
-  decision above; but reason 1 rests on the lune being representable, and
-  until of-m350 lands that claim is argued rather than demonstrated. Its
-  stress case is written and `#[ignore]`d against the bead.
+  Both sides of the threshold are now gated live: the sub-snap side by
+  `sub_snap_offset_cylinders_stay_coincident`, the transversal side by
+  `near_coaxial_cylinders_stay_transversal`, which pins `d = 1e-3` and
+  `d = 1e-5` against inclusion–exclusion with the caps coplanar and staggered
+  alike. Reason 1 rests on the lune being representable and it now is: the
+  lune survives as a real face of the union, `d` wide and cusped at both ends.
+
+  Getting there (of-m350) turned on three things, and all three are about a
+  region being *thinner than the arrangement's own discretization* rather than
+  about coincidence as such — see `Pipeline::polish_clip_endpoint` and
+  `region_interior_point`. What remains broken is the band below `d ≈ 1e-7`,
+  and that is this section's *first* bullet rather than this one: SSI calls
+  such a pair `Coincident` at `tol.linear` while `coincident_at_snap` does
+  not, so the pair contributes no imprint at all.
 - **Non-manifold results** — §6 tier 2 is a rep limitation. If the
   roadmap ever admits non-manifold bodies, tier 2 reopens. Worth a
   pointer from the topology docs so the constraint is discoverable from
