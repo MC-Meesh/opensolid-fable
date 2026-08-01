@@ -2277,6 +2277,45 @@ mod corpus {
             assert_edges_lie_on_faces(&store, &geo, body);
         }
 
+        // These three solids are exactly the trimmed-NURBS bodies the
+        // standalone tessellator used to refuse (`nurbs_lattice` rejects any
+        // boundary that leaves the knot-domain border), which left the
+        // edge-on-surface sampling above as this file's only geometric gate
+        // (of-znb). Routing freeform faces through the constrained-Delaunay
+        // pass (of-37i.6) gave them a standalone path, so require what that
+        // bead's repro asked for: every solid meshes closed and measures a
+        // positive volume.
+        //
+        // Where the B-Rep-native contour integral can also measure, the two
+        // must agree to tessellation fidelity (the same 3% calibration
+        // `assert_round_trip_gate` uses). It cannot on the two solids whose
+        // walls close in `u`: their seam fins' pcurves sit on the same branch
+        // instead of period-separated ones, so `brep_mass_properties` refuses
+        // the loop as open (of-z6zg, which also tracks the sub-percent
+        // disagreement of all three volumes with OCC's — a reader-side
+        // geometry difference this self-consistency check cannot see).
+        let mut cross_checked = 0usize;
+        for &body in &breps {
+            let meshed = closed_volume(&store, &geo, body).unwrap_or_else(|| {
+                panic!("dm1 solid must tessellate closed and measure a volume (of-znb)")
+            });
+            assert!(meshed > 0.0, "dm1 meshed volume must be positive: {meshed}");
+            if let Some(exact) = exact_volume(&store, &geo, body) {
+                let gap = (meshed - exact).abs() / exact.abs().max(1e-300);
+                assert!(
+                    gap <= 3e-2,
+                    "dm1 meshed volume {meshed} and B-Rep-native volume {exact} \
+                     disagree by {gap:e}, far past tessellation error"
+                );
+                cross_checked += 1;
+            }
+        }
+        assert!(
+            cross_checked >= 1,
+            "no dm1 solid measured through its B-Rep faces — the contour \
+             integral regressed past even the u-open solid (see of-z6zg)"
+        );
+
         // The freeform loop closes here on *authored* CAD geometry rather
         // than a synthetic patch: export (of-3qy.7) re-emits what this
         // import read, and reading that back must reproduce the same
@@ -2296,6 +2335,19 @@ mod corpus {
             assert_eq!(breps2.len(), 1, "re-import must be one exact B-Rep");
             assert_counts_equal(&store, body, &store2, breps2[0], "dm1 NURBS round trip");
             assert_edges_lie_on_faces(&store2, &geo2, breps2[0]);
+            // A re-imported solid must stay measurable, and at the same
+            // volume: the writer re-emitting a knot vector or weight list
+            // imprecisely would move the walls without disturbing the counts
+            // or the edge-on-surface samples above (of-znb).
+            let v1 = closed_volume(&store, &geo, body)
+                .expect("original dm1 solid measures (asserted above)");
+            let v2 = closed_volume(&store2, &geo2, breps2[0])
+                .unwrap_or_else(|| panic!("dm1 solid must stay tessellable across the round trip"));
+            let drift = (v1 - v2).abs() / v1.max(1.0);
+            assert!(
+                drift <= 1e-9,
+                "dm1 volume drift {drift:e} across the round trip ({v1} vs {v2})"
+            );
         }
     }
 
