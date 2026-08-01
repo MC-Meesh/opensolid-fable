@@ -1772,27 +1772,26 @@ mod corpus {
                 );
             }
         }
-        // 2026-08-01: 32 of 34, measured with of-8ulj and of-kwn both on main.
-        // of-8ulj returned bspline_patch_prism to the exact path (its
-        // extrusion walls were patches one `VECTOR` long, so they stopped
-        // 20 mm short of the faces they carried); of-kwn cleared the five
-        // nist_ctc_05 edges whose ~1e-5 in misses were slop the file's own
-        // declared 3.67e-3 in closure covers. Two files still fail:
+        // 2026-08-02: 33 of 34, measured with of-8ulj, of-kwn, of-aoml and
+        // of-05ac all on main. of-8ulj returned bspline_patch_prism to the
+        // exact path; of-kwn cleared the five nist_ctc_05 edges whose
+        // ~1e-5 in misses were slop the file's own declared 3.67e-3 in
+        // closure covers; and nist_ctc_02 — off the exact path for good on
+        // 0.0386 mm of authored gap, rightly refused — now arrives as a
+        // fallback mesh instead of a loss: of-05ac closes the fallback over
+        // its trimmed faces (spec/06-step-io.md §4) and of-aoml gives its
+        // tilted-bore rim lenses corners of their own, so `MeshSdf::new` has
+        // pseudonormals to take at the rims. One file still fails:
         // - nist_ctc_05 (of-5cn5): one CIRCLE edge (#4444) whose end
         //   VERTEX_POINT sits 7.2e-4 in off the circle's *plane* — 0.0182 mm,
         //   nearly twice MAX_ALLOWED_TOLERANCE, so no tolerance the reader
-        //   could derive would let the kernel carry it. Snapping the vertex is
-        //   no answer either: its CARTESIAN_POINT #374 is the last control
-        //   point of B_SPLINE_CURVE #375 and the other three edges meeting
-        //   there interpolate it exactly, so a snap only moves the 18 um onto
-        //   edges that currently have none.
-        // - nist_ctc_02 (of-05ac): 0.0386 mm of authored gap puts an edge
-        //   further from its face's surface than MAX_ALLOWED_TOLERANCE.
-        //   Refusing it is right; what costs the count is that the mesh
-        //   fallback does not close for it either, turning a degrade into a
-        //   loss. This floor returns to 33 with of-05ac — 34 needs
-        //   nist_ctc_05's 18 um vertex as well.
-        const FLOOR: usize = 32;
+        //   could derive would let the kernel carry it, and no consistent
+        //   shell survives it for the fallback either. Snapping the vertex is
+        //   no answer: its CARTESIAN_POINT #374 is the last control point of
+        //   B_SPLINE_CURVE #375 and the other three edges meeting there
+        //   interpolate it exactly, so a snap only moves the 18 um onto edges
+        //   that currently have none. 34 needs that 18 um vertex.
+        const FLOOR: usize = 33;
         assert!(
             passed.len() >= FLOOR,
             "corpus pass count regressed below {FLOOR}: only {passed:?} pass"
