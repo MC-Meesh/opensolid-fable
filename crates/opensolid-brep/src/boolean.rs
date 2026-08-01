@@ -1036,7 +1036,7 @@ impl Chart {
     /// planes (unbounded) and NURBS (a clamped knot domain — a closed
     /// spline body wraps at a topology seam edge, not in the chart). Every
     /// analytic *curved* chart wraps `u` every 2π.
-    fn period_u(&self) -> Option<f64> {
+    pub(crate) fn period_u(&self) -> Option<f64> {
         match self {
             Chart::Plane { .. } | Chart::Nurbs { .. } => None,
             Chart::Cylinder { .. }
@@ -1050,7 +1050,7 @@ impl Chart {
     /// minor angle wraps). Cylinder `v` is an unbounded length, sphere `v`
     /// is clamped latitude, and NURBS `v` is a clamped knot domain, so all
     /// are `None`.
-    fn period_v(&self) -> Option<f64> {
+    pub(crate) fn period_v(&self) -> Option<f64> {
         match self {
             Chart::Torus { .. } => Some(TWO_PI),
             Chart::Plane { .. }
@@ -1074,7 +1074,7 @@ impl Chart {
     ///   (the surface widens toward `+v`), so it reads like a sphere's
     ///   *south* pole in the CCW pole-row sweep — correct, since the cone
     ///   interior always lies on the `+v` side of the apex.
-    fn pole_v(&self, p: &Point3) -> Option<f64> {
+    pub(crate) fn pole_v(&self, p: &Point3) -> Option<f64> {
         match self {
             Chart::Sphere {
                 center,
@@ -1146,7 +1146,7 @@ impl Chart {
     /// collapsed `v`-boundary rows (`[v_min, v_max]`, either or both
     /// present) — where the `u`-line collapses to a point. Empty for charts
     /// with no such degeneracy (plane, cylinder, torus).
-    fn pole_points(&self) -> Vec<Point3> {
+    pub(crate) fn pole_points(&self) -> Vec<Point3> {
         match self {
             Chart::Sphere {
                 center,
@@ -1511,6 +1511,19 @@ impl<'c> CoverEmbedder<'c> {
         }
     }
 
+    /// Prime the continuity hint before the first point, as if a sample had
+    /// already been embedded at `uv`.
+    ///
+    /// A *cycle*'s first point has a predecessor — its last — which no
+    /// forward walk can consult. Seeding lets a caller that has already
+    /// walked the cycle once re-walk it knowing where the closure arrives,
+    /// which is the only way a ring beginning **on a pole** gets its true
+    /// arrival meridian rather than the placeholder [`Chart::pole_u_default`]
+    /// hands out (see `crate::tessellate::embed_ring`).
+    pub(crate) fn seed(&mut self, uv: (f64, f64)) {
+        self.last_uv = Some(uv);
+    }
+
     /// Embed the walk's next point, appending one cover point — or two
     /// when this point leaves a pole (the departure end of the pole row,
     /// carrying the pole's 3D point, precedes it).
@@ -1594,7 +1607,7 @@ impl<'c> CoverEmbedder<'c> {
     /// it the closure chord cuts a diagonal across the pole and the cover
     /// collapses to a triangle (of-dtj.5). No-op when the walk never ended
     /// on a pole.
-    fn close_at_pole(&mut self, u_arr: f64, out: &mut Vec<CoverPoint>) {
+    pub(crate) fn close_at_pole(&mut self, u_arr: f64, out: &mut Vec<CoverPoint>) {
         let Some((vp, pole_pt)) = self.at_pole.take() else {
             return;
         };
@@ -7245,22 +7258,20 @@ pub(crate) type TriangulatedRegion = (Vec<[usize; 3]>, Vec<(f64, f64)>, Vec<Poin
 /// in parameter space — which is the `du × dv` side, so a caller whose face
 /// is outward-opposed reverses them.
 ///
+/// The caller supplies the [`Chart`] rather than the surface because it
+/// needed one of its own to embed the rings in the first place — the uv a
+/// ring carries is only meaningful in a named chart, and building a second
+/// one here would be both wasted work and a second source of truth.
+///
 /// # Errors
-/// [`CoreError::NotImplemented`] if the surface has no chart (see
-/// [`Chart::build`] — a NURBS patch with a collapsed control row);
 /// [`CoreError::Degenerate`] if the rings do not bound a triangulable
 /// region.
 pub(crate) fn triangulate_trimmed_region(
-    surface: &Surface3,
-    tol: &ToleranceContext,
+    chart: &Chart,
     pitch: f64,
     rings_uv: &[Vec<(f64, f64)>],
     rings_p: &[Vec<Point3>],
 ) -> CoreResult<TriangulatedRegion> {
-    // The chart's captured tolerance only feeds `Chart::param`'s iterative
-    // inverse, which nothing on this path calls — the caller already holds
-    // every boundary uv.
-    let chart = Chart::build(surface, tol)?;
     let (mut all_uv, mut all_p) = (Vec::new(), Vec::new());
     let mut ring_ranges = Vec::with_capacity(rings_uv.len());
     for (uv, p) in rings_uv.iter().zip(rings_p) {
@@ -7286,7 +7297,7 @@ pub(crate) fn triangulate_trimmed_region(
         &mut tris,
         &mut all_uv,
         &mut all_p,
-        &chart,
+        chart,
         pitch,
         &ring_ranges,
     );

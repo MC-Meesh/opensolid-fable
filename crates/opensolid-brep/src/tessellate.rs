@@ -20,7 +20,8 @@
 //!   Ruled directions (cylinder/cone `v`) use one segment; angular
 //!   directions honor the angular step. The `v` range of an unbounded
 //!   surface is recovered by projecting boundary-edge samples onto the
-//!   surface.
+//!   surface. A sphere or torus face that does **not** cover its whole
+//!   surface takes the constrained-Delaunay pass instead (see below).
 //!
 //! Per-vertex normals come from [`SurfaceEval::normal`], negated for
 //! [`FaceSense::Negative`] faces so they point outward from the material;
@@ -54,11 +55,17 @@
 //!   ([`crate::boolean`]'s `Chart::build` rejects it, of-37i.7): untrimmed,
 //!   it still grids off the same turning measure ([`nurbs_lattice`]);
 //!   trimmed, it is rejected.
-//! - Sphere/torus faces must cover the **full `v` domain/period**: their
-//!   boundary must consist purely of seams (every edge traversed with net-zero
-//!   sense), as the primitive constructors and STEP reader produce. Trimmed
-//!   sphere/torus faces (caps, zones, wedges) are likewise rejected for the CDT
-//!   pass.
+//! - A sphere/torus face whose boundary is purely seams (every edge traversed
+//!   with net-zero sense, as the primitive constructors and STEP reader
+//!   produce for a whole sphere or torus) grids over the full period. Any
+//!   other one is *trimmed* and takes the same constrained-Delaunay pass a
+//!   freeform patch does — a fillet quarter-round, a blended corner's
+//!   spherical octant (of-6fcu). What is still rejected there is a boundary
+//!   that **wraps a full period**: a spherical cap bounded only by its
+//!   latitude circle, or a torus band bounded by two tube circles, whose uv
+//!   region is closed by the chart's own seam and poles rather than by any
+//!   edge the topology carries. Completing such a cover is the boolean
+//!   pipeline's seam-barrier job, not a ring's.
 //! - The only fidelity control is [`TessellationOptions::angular_step`];
 //!   chord tolerance, edge-length bounds, and adaptive refinement are
 //!   deferred.
@@ -189,8 +196,9 @@ fn nurbs_curve_segments(
 /// or edge lacks attached geometry; [`CoreError::NotImplemented`] for the
 /// trimmed quadric faces the module docs list, and for a trimmed
 /// collapsed-row NURBS patch; [`CoreError::Degenerate`] if a planar face's
-/// inner loops do not bound a valid region, or a NURBS face's loops do not
-/// bound a triangulable one.
+/// inner loops do not bound a valid region, if a face's loops do not bound
+/// a triangulable region, or if a boundary point cannot be inverted onto
+/// the face it bounds (see [`boundary_band`]).
 pub fn tessellate_body(
     store: &TopologyStore,
     geo: &GeometryStore,
@@ -382,8 +390,7 @@ fn tessellate_face_into(
             );
             Ok(())
         }
-        Surface3::Sphere { .. } => {
-            require_seam_closed_boundary(store, face_id, face)?;
+        Surface3::Sphere { .. } if is_seam_closed_boundary(store, face_id, face)? => {
             let period = surface.period_u().expect("sphere is u-periodic");
             let (v_lo, v_hi) = surface.domain_v();
             let n_v = angular_segments(v_hi - v_lo, options);
@@ -392,8 +399,7 @@ fn tessellate_face_into(
             );
             Ok(())
         }
-        Surface3::Torus { .. } => {
-            require_seam_closed_boundary(store, face_id, face)?;
+        Surface3::Torus { .. } if is_seam_closed_boundary(store, face_id, face)? => {
             let period_u = surface.period_u().expect("torus is u-periodic");
             let period_v = surface.period_v().expect("torus is v-periodic");
             let n_v = angular_segments(period_v, options);
@@ -401,6 +407,16 @@ fn tessellate_face_into(
                 surface, 0.0, period_u, true, 0.0, period_v, true, n_v, flip, options, mesh,
             );
             Ok(())
+        }
+        // A *trimmed* sphere or torus — a cap, a zone, a fillet quarter-round
+        // — has real boundary edges, so the full-surface grid above would be
+        // grossly wrong and is not merely inaccurate (of-q6u). It takes the
+        // same constrained-Delaunay pass a freeform patch does: its boundary
+        // is whatever the loops say it is, and its chart is periodic in `u`
+        // (both families, on a torus), which [`face_cdt`]'s ring embedding
+        // unwraps (of-6fcu).
+        Surface3::Sphere { .. } | Surface3::Torus { .. } => {
+            face_cdt(store, geo, face_id, face, surface, flip, options, mesh)
         }
         // A freeform patch takes the constrained-Delaunay pass (of-37i.6):
         // its boundary comes from the *edge curves*, so it welds to whatever
@@ -428,16 +444,14 @@ fn tessellate_face_into(
             emit_grid(surface, &us, &vs, v_range, false, false, flip, mesh);
             Ok(())
         }
-        Surface3::Nurbs(_) => {
-            nurbs_face_cdt(store, geo, face_id, face, surface, flip, options, mesh)
-        }
+        Surface3::Nurbs(_) => face_cdt(store, geo, face_id, face, surface, flip, options, mesh),
     }
 }
 
-/// Tessellate a NURBS face through the of-lcx constrained-Delaunay pass —
-/// the same one a boolean result's faces take
+/// Tessellate a face through the of-lcx constrained-Delaunay pass — the
+/// same one a boolean result's faces take
 /// ([`crate::boolean::BooleanOutput::tessellate`]) — instead of gridding it
-/// (of-37i.6).
+/// (of-37i.6 for freeform patches, of-6fcu for trimmed spheres and tori).
 ///
 /// Two things fall out of that, and they are the two limits the grid arm
 /// could not lift:
@@ -452,15 +466,15 @@ fn tessellate_face_into(
 /// - **Trimming and inner loops work.** The boundary is whatever the loops
 ///   say it is, and holes are removed by ring parity rather than needing an
 ///   iso-rectangle. Nothing here requires the boundary to run along the
-///   knot-domain border.
+///   knot-domain border, or a sphere/torus face to cover its whole period.
 ///
-/// Each sample's `uv` comes from projecting its 3D curve point onto the
-/// patch, so the ring is the curve's polyline first and a parameter-space
-/// ring second. A projection is only ever used to place a point the
-/// triangulation already owns, never to *produce* one, so its error costs
-/// combinatorics and shading, not position.
+/// Each ring's `uv` comes from [`embed_ring`], which walks the 3D polyline
+/// through the face's [`Chart`] rather than inverting each sample on its
+/// own. A uv is only ever used to place a point the triangulation already
+/// owns, never to *produce* one, so its error costs combinatorics and
+/// shading, not position.
 #[allow(clippy::too_many_arguments)]
-fn nurbs_face_cdt(
+fn face_cdt(
     store: &TopologyStore,
     geo: &GeometryStore,
     face_id: EntityId<Face>,
@@ -483,60 +497,61 @@ fn nurbs_face_cdt(
     for &inner_id in &face.inner_loops {
         rings_p.push(sample_loop(store, geo, face_id, inner_id, options)?);
     }
-    // A collapsed `v`-boundary row is one 3D point for the whole `u` span,
-    // so a boundary sample landing on it has no `u` to project for. Both
-    // rings get the pole-row treatment before triangulation; for a patch
-    // with no collapsed row (the common case) this is a no-op.
-    let poles = match surface {
-        Surface3::Nurbs(nurbs) => nurbs.collapsed_v_rows(),
-        _ => [None, None],
+    // The chart's captured tolerance feeds `Chart::param`'s iterative
+    // inverse, which only the NURBS arm uses and only to judge that a
+    // boundary point really does lie on the patch it bounds — see
+    // `boundary_band` for why that judgement is made at the face's
+    // discretization scale here rather than at the kernel's linear one.
+    let tol = ToleranceContext {
+        linear: boundary_band(&rings_p),
+        ..ToleranceContext::default()
     };
-    let mut rings_uv: Vec<Vec<(f64, f64)>> = rings_p
-        .iter()
-        .map(|ring| {
-            ring.iter()
-                .map(|p| {
-                    let projected = surface.project_point(p);
-                    (projected.u, projected.v)
-                })
-                .collect()
-        })
-        .collect();
-    if poles.iter().any(Option::is_some) {
-        let Surface3::Nurbs(nurbs) = surface else {
-            unreachable!("only a NURBS patch reports collapsed rows")
-        };
-        for (ring_uv, ring_p) in rings_uv.iter_mut().zip(rings_p.iter_mut()) {
-            open_pole_rows(nurbs, &poles, ring_uv, ring_p);
+    let chart = crate::boolean::Chart::build(surface, &tol)?;
+    // A stored loop winds counter-clockwise seen from the face's *outward*
+    // side, which is counter-clockwise in the chart only when that side
+    // follows the surface normal — i.e. exactly when the face is not
+    // flipped. The embedder needs the true winding to orient pole rows.
+    let mut rings_uv: Vec<Vec<(f64, f64)>> = Vec::with_capacity(rings_p.len());
+    for ring_p in rings_p.iter_mut() {
+        let ring_uv = embed_ring(&chart, !flip, ring_p)?;
+        if !ring_closes(&chart, &ring_uv) {
+            return Err(CoreError::NotImplemented {
+                feature: "tessellating a face whose boundary wraps a full period \
+                          (a sphere cap or torus band closed by the surface itself, \
+                          not by a seam edge; needs the cover-completion pass)",
+            });
         }
-        if rings_uv[0].len() < 3 {
-            return Err(invalid_face(
-                face_id,
-                "outer loop degenerates to fewer than 3 parameter points at a pole",
-            ));
-        }
+        rings_uv.push(ring_uv);
+    }
+    if rings_uv[0].len() < 3 {
+        return Err(invalid_face(
+            face_id,
+            "outer loop degenerates to fewer than 3 parameter points at a pole",
+        ));
     }
 
-    // The tolerance only feeds `Chart::param`'s iterative inverse, which
-    // this path never reaches — every boundary uv is already in hand.
     let (tris, uv, points) = crate::boolean::triangulate_trimmed_region(
-        surface,
-        &ToleranceContext::default(),
+        &chart,
         options.angular_step,
         &rings_uv,
         &rings_p,
     )?;
 
-    // Every parameter point on a pole row lifts to the *same* 3D point, so
-    // they must share one mesh vertex — otherwise the tip carries a fan of
+    // Every parameter point on a pole lifts to the *same* 3D point, so they
+    // must share one mesh vertex — otherwise the tip carries a fan of
     // coincident vertices and the triangles between them are zero-area
     // slivers that no index test can spot. `emit_grid` does the same thing
     // structurally by giving a singular row a single column; here the row
-    // is discovered rather than gridded, so the sharing is by lookup.
-    let mut pole_vertex: [Option<usize>; 2] = [None, None];
+    // is discovered rather than gridded, so the sharing is by lookup, and
+    // it is keyed on the 3D point because that — not `v` — is what the
+    // charts with more than one pole shape distinguish them by.
+    let poles = chart.pole_points();
+    let mut pole_vertex: Vec<Option<usize>> = vec![None; poles.len()];
     let mut index_of: Vec<usize> = Vec::with_capacity(uv.len());
     for (&(u, v), &p) in uv.iter().zip(&points) {
-        let slot = pole_slot(surface, &poles, v);
+        let slot = chart
+            .pole_v(&p)
+            .and_then(|_| poles.iter().position(|q| (q - p).norm_squared() == 0.0));
         if let Some(existing) = slot.and_then(|s| pole_vertex[s]) {
             index_of.push(existing);
             continue;
@@ -546,7 +561,7 @@ fn nurbs_face_cdt(
             pole_vertex[s] = Some(mesh.positions.len());
         }
         mesh.positions.push(p);
-        // On a pole row `du × dv` vanishes, so the normal is the meridian
+        // On a pole `du × dv` vanishes, so the normal is the meridian
         // limit. The shared pole vertex keeps whichever meridian reached it
         // first — a shading choice, and the only one available once the row
         // is one vertex.
@@ -565,94 +580,270 @@ fn nurbs_face_cdt(
     Ok(())
 }
 
+/// Embed one loop's 3D polyline as a parameter-space ring on `chart`,
+/// growing `ring_p` where the walk stands on a pole so the two stay index
+/// aligned.
+///
+/// This is [`crate::boolean`]'s [`CoverEmbedder`] applied to a tessellation
+/// ring rather than to an imprint walk, and it replaces the blind
+/// per-sample projection this path used to do (of-6fcu). Blind projection
+/// is wrong wherever the chart has a **branch cut** — every representative
+/// a period apart inverts the same point, and picking each one
+/// independently tears the ring:
+///
+/// - A sphere or torus face trimmed to an arc has a boundary that may
+///   straddle the seam; independently wrapped into `[0, 2π)`, the ring
+///   jumps a full period mid-edge and bounds a region that is not the face.
+/// - A NURBS patch **closed in `u`** (`S(u_min, v) == S(u_max, v)`, which
+///   is what a ruled patch over a full-circle control row is) carries its
+///   wrap as a seam *edge*, traversed once in each direction. Both
+///   traversals are the same 3D polyline, so projecting them blind gave
+///   them the same `u` and the ring collapsed to zero area —
+///   `boundary_cdt` then reported the whole face untriangulable, which is
+///   how dm1-id-214's seven spline faces blocked an otherwise exact
+///   import.
+///
+/// Walking instead takes every sample to the representative nearest its
+/// predecessor and seeds the iterative inverse with it, so the ring is
+/// continuous by construction and a seam edge's two fins land a period
+/// apart on opposite sides.
+///
+/// Poles are the embedder's other job: a sample standing on one has no
+/// longitude of its own, so it inherits the arrival meridian and the
+/// departure meridian is opened into a **pole row** — zero length in 3D,
+/// up to a period wide in `uv` — which is what keeps the ring's shoelace
+/// area from collapsing at a sphere pole or a lofted-to-a-point patch tip.
+fn embed_ring(
+    chart: &crate::boolean::Chart,
+    ccw: bool,
+    ring_p: &mut Vec<Point3>,
+) -> CoreResult<Vec<(f64, f64)>> {
+    let mut emb = crate::boolean::CoverEmbedder::new(chart, ccw);
+    let mut cover: Vec<crate::boolean::CoverPoint> = Vec::with_capacity(ring_p.len());
+    // A ring that *starts* on a pole has no arrival meridian yet, so the
+    // embedder places it at a placeholder `u`; the true arrival is the last
+    // sample's meridian, which only exists once the walk is done.
+    let starts_at_pole = ring_p.first().is_some_and(|p| chart.pole_v(p).is_some());
+    for p in ring_p.iter() {
+        emb.push(*p, &mut cover)?;
+    }
+    if starts_at_pole {
+        // Re-walk seeded with the closing meridian, which is simpler than
+        // re-deriving the placeholder row's far end in place and costs one
+        // extra pass over the rings that touch a pole at their seam.
+        if let Some(&(uv, _)) = cover.last() {
+            let mut emb = crate::boolean::CoverEmbedder::new(chart, ccw);
+            emb.seed(uv);
+            cover.clear();
+            for p in ring_p.iter() {
+                emb.push(*p, &mut cover)?;
+            }
+        }
+    } else {
+        // A ring that *ends* on a pole has no post-pole sample to fire the
+        // leave-a-pole branch, so its row is swept toward the first
+        // sample's meridian here — the closure is where the ring returns.
+        if let Some(&((u_arr, _), _)) = cover.first() {
+            emb.close_at_pole(u_arr, &mut cover);
+        }
+    }
+    *ring_p = cover.iter().map(|&(_, p)| p).collect();
+    let mut ring_uv: Vec<(f64, f64)> = cover.iter().map(|&(uv, _)| uv).collect();
+    unwrap_across_closure(chart, &mut ring_uv);
+    recenter_on_domain(chart, &mut ring_uv);
+    Ok(ring_uv)
+}
+
+/// Fraction of a face's boundary extent within which a boundary point
+/// still counts as lying on that face's surface, for the sole purpose of
+/// giving it a `uv` (see [`boundary_band`]).
+const BOUNDARY_BAND_FRACTION: f64 = 1e-4;
+
+/// How far off its own face's surface a boundary sample may sit and still
+/// be inverted for a `uv`: [`BOUNDARY_BAND_FRACTION`] of the boundary's own
+/// extent, never below the kernel's linear tolerance.
+///
+/// [`crate::boolean::Chart::param`]'s NURBS arm refuses a point that misses
+/// the patch, and is right to: the boolean pipeline embeds the uv it
+/// returns in a region polygon, where a wrong one silently corrupts parity
+/// and yields a plausible solid of the wrong volume. **Tessellation cannot
+/// fail that way.** Every 3D point it emits comes from an edge curve it
+/// already holds; a uv only ever places a point the mesh already owns, so a
+/// bad one costs triangulation combinatorics and shading, never position.
+///
+/// The bound therefore keeps the projection and sizes it to the
+/// discretization rather than to model exactness — the same trade
+/// [`crate::boolean::Chart::param_within`] makes for clip predicates. It
+/// has to: an imported body's edges are only as true to their faces as the
+/// authoring system left them (as1-oc-214's spline faces carry boundary
+/// curves 7e-6 to 2e-5 off the patch, well past the default 1e-6 linear
+/// tolerance and nowhere near a modelling error), and refusing those would
+/// fail the whole part over a defect the mesh absorbs without trace.
+/// Keying off the boundary's extent rather than its coordinates keeps the
+/// band the same for a part modelled at the origin and a copy of it a
+/// kilometre away (the of-260 lesson).
+fn boundary_band(rings_p: &[Vec<Point3>]) -> f64 {
+    let extent = rings_p.iter().flatten().fold(
+        (Point3::origin(), Point3::origin(), false),
+        |(lo, hi, seen), p| {
+            if !seen {
+                return (*p, *p, true);
+            }
+            (
+                Point3::new(lo.x.min(p.x), lo.y.min(p.y), lo.z.min(p.z)),
+                Point3::new(hi.x.max(p.x), hi.y.max(p.y), hi.z.max(p.z)),
+                true,
+            )
+        },
+    );
+    let (lo, hi, _) = extent;
+    (BOUNDARY_BAND_FRACTION * (hi - lo).norm()).max(ToleranceContext::default().linear)
+}
+
+/// Whether an embedded ring closes in parameter space — i.e. its implicit
+/// closing segment, from the last sample back to the first, is a short hop
+/// and not a jump of a whole period.
+///
+/// A ring is a closed polyline in 3D by construction, but on a wrapping
+/// chart that does **not** make it a closed polygon in `uv`. A boundary
+/// that winds a full period — a spherical cap bounded only by its latitude
+/// circle, a torus band bounded by two tube circles — comes out of
+/// [`embed_ring`] as an open arc whose ends sit a period apart, and an open
+/// arc bounds no region. Such a face's uv region is closed by the chart's
+/// own seam and its poles rather than by any edge the topology carries, so
+/// reconstructing it needs the cover-completion the boolean pipeline does
+/// with seam barriers, not a ring. Detecting that here keeps of-q6u's
+/// promise — a trimmed quadric is never silently gridded as the whole
+/// surface — while letting the trims that *do* close through (of-6fcu).
+///
+/// Tested by unwrapping the first sample from the last: on a ring that
+/// closes, the nearest representative of the start is the start itself.
+fn ring_closes(chart: &crate::boolean::Chart, ring_uv: &[(f64, f64)]) -> bool {
+    let (Some(&first), Some(&last)) = (ring_uv.first(), ring_uv.last()) else {
+        return true;
+    };
+    let (period_u, period_v) = wrap_periods(chart);
+    let closed = |a: f64, b: f64, period: Option<f64>| {
+        crate::pcurve::nearest_representative(a, b, period) == a
+    };
+    closed(first.0, last.0, period_u) && closed(first.1, last.1, period_v)
+}
+
+/// Both branch cuts a ring on `chart` may cross: a periodic
+/// parameterization's, and the join of a clamped patch that closes on
+/// itself. The second is why this is not [`crate::boolean::Chart::period_u`]
+/// — closure is not periodicity, and `is_periodic_u` must keep saying so
+/// (of-fid).
+fn wrap_periods(chart: &crate::boolean::Chart) -> (Option<f64>, Option<f64>) {
+    match chart {
+        crate::boolean::Chart::Nurbs { surface, .. } => (surface.closure_u(), surface.closure_v()),
+        _ => (chart.period_u(), chart.period_v()),
+    }
+}
+
+/// Continue a closed NURBS patch's ring past its **join**, the one branch
+/// cut [`crate::boolean::Chart::param`] does not unwrap for itself.
+///
+/// The analytic charts unwrap inside `param`: their `u` (and a torus's `v`)
+/// is an angle, and `param` hands back the representative nearest the hint,
+/// so a ring crossing a seam already runs continuously past it. A clamped
+/// patch has no period to unwrap by — `is_periodic_u` is false and must
+/// stay false, because the seam machinery in `crate::boolean` reads it —
+/// yet a patch whose first and last control rows coincide closes on itself
+/// all the same, and `NurbsSurface::closure_u` is the extent it closes over
+/// (of-fid).
+///
+/// The inverse is genuinely two-valued there, and projection returns
+/// whichever end its iteration reached: on dm1-id-214's ruled patches, the
+/// corner vertex sitting *on* the join came back as `u_min` while the run
+/// leading into it had climbed to just under `u_max`. Both are the same 3D
+/// point, so no error is detectable locally — the ring simply folded back
+/// on itself and bounded nothing. Taking each sample to the representative
+/// nearest its predecessor picks the branch the walk was already on.
+///
+/// Runs after the walk rather than inside it because the seed only has to
+/// find *a* valid inverse, and every representative of a join point is one.
+fn unwrap_across_closure(chart: &crate::boolean::Chart, ring_uv: &mut [(f64, f64)]) {
+    // NURBS only: the analytic charts unwrap inside `param`, and re-doing it
+    // here would pull a pole row's far end — deliberately up to a full
+    // period from its near end — back to within half a period of it.
+    if !matches!(chart, crate::boolean::Chart::Nurbs { .. }) {
+        return;
+    }
+    let (closure_u, closure_v) = wrap_periods(chart);
+    if closure_u.is_none() && closure_v.is_none() {
+        return;
+    }
+    for i in 1..ring_uv.len() {
+        let previous = ring_uv[i - 1];
+        ring_uv[i].0 = crate::pcurve::nearest_representative(ring_uv[i].0, previous.0, closure_u);
+        ring_uv[i].1 = crate::pcurve::nearest_representative(ring_uv[i].1, previous.1, closure_v);
+    }
+}
+
+/// Shift an unwrapped ring by whole closure periods until it sits on a
+/// clamped NURBS patch's knot rectangle.
+///
+/// This is [`crate::pcurve`]'s `recenter_on_knot_rectangle`, restated for a
+/// ring rather than a pcurve walk and for the same reason. Unwrapping keeps
+/// the walk continuous across the join of a closed patch, at the price of
+/// letting it leave the domain: a boundary that starts *on* the join is
+/// inverted to whichever of the two equal ends the search returned, and if
+/// that is the low one the rest of the ring trails off below it. For a
+/// periodic chart that costs nothing — evaluation is periodic too, so
+/// `u = 7` and `u = 7 − 2π` are the same point, and the analytic arms are
+/// left alone here. A clamped patch does not extrapolate outside its knot
+/// rectangle but *saturates*, so a `u` a period low would lift the interior
+/// lattice onto the domain edge.
+///
+/// A ring already on the rectangle is left exactly where it is, which is
+/// what keeps a seam edge's two traversals on their separate branches.
+fn recenter_on_domain(chart: &crate::boolean::Chart, ring_uv: &mut [(f64, f64)]) {
+    let crate::boolean::Chart::Nurbs { surface, .. } = chart else {
+        return;
+    };
+    let axes = [
+        (surface.closure_u(), surface.domain_u(), true),
+        (surface.closure_v(), surface.domain_v(), false),
+    ];
+    for (period, (lo, hi), is_u) in axes {
+        let Some(period) = period else { continue };
+        let component = |p: &(f64, f64)| if is_u { p.0 } else { p.1 };
+        let (min, max) = ring_uv
+            .iter()
+            .map(component)
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(min, max), c| {
+                (min.min(c), max.max(c))
+            });
+        // NaN-safe: a non-finite sample leaves the fold's sentinels in place
+        // and there is nothing meaningful to shift by.
+        if !(min >= lo && max <= hi) && min.is_finite() && max.is_finite() {
+            let shift = period * ((0.5 * (lo + hi) - 0.5 * (min + max)) / period).round();
+            for p in ring_uv.iter_mut() {
+                if is_u {
+                    p.0 += shift;
+                } else {
+                    p.1 += shift;
+                }
+            }
+        }
+    }
+}
+
 /// The surface normal at `(u, v)`, falling back to the meridian limit on a
-/// NURBS patch's collapsed row where `du × dv` vanishes. Only the NURBS arm
-/// is reachable — this serves [`nurbs_face_cdt`] alone — but taking a
-/// `Surface3` keeps the caller from having to carry both forms of the same
-/// surface just for the normal.
+/// NURBS patch's collapsed row where `du × dv` vanishes.
+///
+/// The NURBS arm is the only one that needs the fallback: an analytic
+/// chart's pole has a closed-form normal that [`SurfaceEval::normal`]
+/// already gives (a sphere's pole is its axis, a cone's apex its slant),
+/// while a patch's collapsed row has neither `S_u` nor a formula. Both
+/// arms are reachable — [`face_cdt`] serves trimmed quadrics as well as
+/// freeform patches — which is why this takes a `Surface3`.
 fn normal_or_limit(surface: &Surface3, u: f64, v: f64) -> Option<Vector3> {
     match surface {
         Surface3::Nurbs(nurbs) => nurbs.normal_limit(u, v),
         _ => surface.normal(u, v),
     }
-}
-
-/// Which pole row (`0` for `v_min`, `1` for `v_max`) the parameter `v` sits
-/// on, or `None` when it sits on neither. Keyed on `v` alone: a pole row
-/// *is* a domain boundary, so no distance test is needed once the row is
-/// known to be collapsed.
-fn pole_slot(surface: &Surface3, poles: &[Option<Point3>; 2], v: f64) -> Option<usize> {
-    let (v0, v1) = surface.domain_v();
-    let eps = 1e-9 * (v1 - v0);
-    [(0usize, v0), (1, v1)]
-        .into_iter()
-        .find(|&(s, vp)| poles[s].is_some() && (v - vp).abs() <= eps)
-        .map(|(s, _)| s)
-}
-
-/// Rewrite a boundary ring so each run of samples standing on a pole
-/// becomes the pole row's two ends — `(u_in, v_pole)` and `(u_out, v_pole)`
-/// — instead of one point with an arbitrary `u`.
-///
-/// This is [`crate::boolean`]'s `CoverEmbedder` pole row, applied to a
-/// tessellation ring rather than an imprint walk, and for the same reason:
-/// the collapsed row is *one 3D point* spanning the whole `u` domain, so a
-/// ring that visits it carries no `u` of its own there. Projecting anyway
-/// yields whatever `u` the solver's last iterate held, which pinches the uv
-/// polygon to a point at the tip — and the polygon then covers a wedge of
-/// the domain rather than the domain, so the triangulation silently misses
-/// most of the patch.
-///
-/// The `u` ends come from the ring's neighbours on either side of the run,
-/// cyclically, which are the meridians the boundary actually arrives and
-/// departs on. The 3D ring gains the pole's point for each new entry, so
-/// the two rings stay index-aligned.
-fn open_pole_rows(
-    nurbs: &NurbsSurface,
-    poles: &[Option<Point3>; 2],
-    ring_uv: &mut Vec<(f64, f64)>,
-    ring_p: &mut Vec<Point3>,
-) {
-    let mut on_pole: Vec<Option<f64>> = ring_p.iter().map(|p| nurbs.pole_v_at(poles, p)).collect();
-    if on_pole.iter().all(Option::is_none) {
-        return;
-    }
-    // A ring *entirely* on a pole has no meridian to read from either side;
-    // leave it for the caller's minimum-length check to reject.
-    let Some(start) = on_pole.iter().position(Option::is_none) else {
-        return;
-    };
-    // Rotate a non-pole sample to the front so no run straddles the ring's
-    // wrap point, which would make a run's own members its neighbours.
-    on_pole.rotate_left(start);
-    ring_uv.rotate_left(start);
-    ring_p.rotate_left(start);
-
-    let n = on_pole.len();
-    let (mut uv_out, mut p_out) = (Vec::with_capacity(n + 2), Vec::with_capacity(n + 2));
-    let mut i = 0;
-    while i < n {
-        let Some(vp) = on_pole[i] else {
-            uv_out.push(ring_uv[i]);
-            p_out.push(ring_p[i]);
-            i += 1;
-            continue;
-        };
-        // The whole run collapses to the same point; find its extent.
-        let mut end = i;
-        while on_pole[(end + 1) % n].is_some() && end + 1 - i < n {
-            end += 1;
-        }
-        let before = (i + n - 1) % n;
-        let after = (end + 1) % n;
-        for u in [ring_uv[before].0, ring_uv[after].0] {
-            uv_out.push((u, vp));
-            p_out.push(ring_p[i]);
-        }
-        i = end + 1;
-    }
-    *ring_uv = uv_out;
-    *ring_p = p_out;
 }
 
 /// Ear-clip triangulate a planar face, bridging any inner loops (holes) into
@@ -840,22 +1031,26 @@ const BOUNDARY_SAMPLES: usize = 32;
 /// silently rendered as the whole surface of revolution (of-q6u).
 const MIN_PERIOD_COVERAGE: f64 = 0.9;
 
-/// Guard that a face on a *closed* surface (sphere, torus) covers the whole
-/// surface: its boundary must cancel, i.e. every edge appears in the face's
+/// Whether a face on a *closed* surface (sphere, torus) covers the whole
+/// surface: its boundary cancels, i.e. every edge appears in the face's
 /// loops with as many `Forward` as `Reversed` fins — pure seams, as the
-/// primitive constructors and STEP reader produce. A trimmed face (cap,
-/// zone, wedge, imported partial revolve) has at least one real boundary
-/// edge traversed once; gridding the full closed surface for it would be
-/// grossly wrong (of-q6u). Faces closed only by singular vertex loops (no
-/// fins) pass vacuously.
+/// primitive constructors and STEP reader produce. Faces closed only by
+/// singular vertex loops (no fins) qualify vacuously.
+///
+/// This is the grid arm's precondition, not a validity test. A face that
+/// fails it is trimmed (a cap, zone, wedge, fillet quarter-round, or an
+/// imported partial revolve) and has at least one real boundary edge
+/// traversed once; gridding the whole closed surface for it would be
+/// grossly wrong (of-q6u), so it takes [`face_cdt`] instead, which reads
+/// its boundary rather than assuming one.
 ///
 /// # Errors
-/// [`CoreError::NotImplemented`] if any boundary edge is not a seam.
-fn require_seam_closed_boundary(
+/// [`CoreError::InvalidArgument`] if a loop references a stale fin.
+fn is_seam_closed_boundary(
     store: &TopologyStore,
     face_id: EntityId<Face>,
     face: &Face,
-) -> CoreResult<()> {
+) -> CoreResult<bool> {
     let mut net: std::collections::HashMap<EntityId<Edge>, i32> = std::collections::HashMap::new();
     for loop_id in face
         .outer_loop
@@ -872,13 +1067,7 @@ fn require_seam_closed_boundary(
             };
         }
     }
-    if net.values().any(|&n| n != 0) {
-        return Err(CoreError::NotImplemented {
-            feature: "tessellating trimmed sphere/torus faces \
-                      (boundary edges are not all seams; needs the CDT pass)",
-        });
-    }
-    Ok(())
+    Ok(net.values().all(|&n| n == 0))
 }
 
 /// How a cylinder/cone face maps onto its surface's `u` period, recovered
@@ -2095,8 +2284,16 @@ mod tests {
             expect_not_implemented(&store, &geo, face);
         }
 
-        /// A spherical cap (one latitude-circle boundary, traversed once —
-        /// not a seam) must be rejected, not rendered as the full sphere.
+        /// A spherical cap bounded *only* by its latitude circle must be
+        /// rejected, not rendered as the full sphere.
+        ///
+        /// This one survives the of-6fcu promotion of trimmed sphere/torus
+        /// faces to the CDT pass, because its boundary wraps a full period:
+        /// embedded in the chart, the rim is a horizontal arc from `u = 0`
+        /// to `u = 2π` whose ends are the same 3D point but a period apart
+        /// in `uv`, so it bounds no region. The cap's actual uv region is
+        /// closed by the chart's seam and its north pole — neither of which
+        /// the topology carries an edge for.
         #[test]
         fn rejects_sphere_cap() {
             let mut store = TopologyStore::new();
@@ -2123,6 +2320,12 @@ mod tests {
 
         /// A half-torus band (two tube-circle boundaries, each traversed
         /// once) must be rejected, not rendered as the full torus.
+        ///
+        /// Rejected for the same reason as [`rejects_sphere_cap`]: each
+        /// tube circle wraps the whole `v` period, so neither ring closes
+        /// in `uv`. The band between them *is* a uv rectangle, but its
+        /// vertical sides are the chart's own `v`-seam rather than edges,
+        /// and a ring cannot name what the topology does not carry.
         #[test]
         fn rejects_half_torus_band() {
             let mut store = TopologyStore::new();
@@ -2159,6 +2362,145 @@ mod tests {
             store.create_loop(face, LoopType::Inner, &[(e_start, FinSense::Reversed)]);
 
             expect_not_implemented(&store, &geo, face);
+        }
+
+        /// A torus quarter-round — the fillet face every rounded edge on a
+        /// revolved part is made of, and the shape that blocked io1-cm-214
+        /// — tessellates through the CDT pass at its true area instead of
+        /// being rejected (of-6fcu).
+        ///
+        /// The patch is `u ∈ [0, π/2] × v ∈ [0, π/2]`, whose area is
+        /// `∫∫ r(R + r cos v) du dv = (π/2)·r·(R·π/2 + r)`. Nothing about
+        /// it is an iso-rectangle the grid arm could have gridded: it does
+        /// not reach the surface's `v` period, so the full-torus grid would
+        /// have covered eight times the area.
+        #[test]
+        fn accepts_torus_quarter_round() {
+            let mut store = TopologyStore::new();
+            let mut geo = GeometryStore::new();
+            let (major, minor) = (3.0, 1.0);
+            let face = face_on(
+                &mut store,
+                &mut geo,
+                Surface3::torus(Point3::origin(), Vector3::z(), major, minor).unwrap(),
+            );
+
+            // Each arc's own parameterization is the torus's: a circle about
+            // `z` sweeps `u`, and the two tube circles sweep `v` (their
+            // `plane_basis` axes are chosen so `t` *is* the minor angle).
+            let outer_rim = geo
+                .add_curve(Curve3::circle(Point3::origin(), Vector3::z(), major + minor).unwrap());
+            let top_rim = geo.add_curve(
+                Curve3::circle(Point3::new(0.0, 0.0, minor), Vector3::z(), major).unwrap(),
+            );
+            let tube_at_u0 = geo.add_curve(
+                Curve3::circle(Point3::new(major, 0.0, 0.0), -Vector3::y(), minor).unwrap(),
+            );
+            let tube_at_u90 = geo.add_curve(
+                Curve3::circle(Point3::new(0.0, major, 0.0), Vector3::x(), minor).unwrap(),
+            );
+
+            let a = store.create_vertex(Point3::new(major + minor, 0.0, 0.0), SYSTEM_RESOLUTION);
+            let b = store.create_vertex(Point3::new(0.0, major + minor, 0.0), SYSTEM_RESOLUTION);
+            let c = store.create_vertex(Point3::new(0.0, major, minor), SYSTEM_RESOLUTION);
+            let d = store.create_vertex(Point3::new(major, 0.0, minor), SYSTEM_RESOLUTION);
+
+            let quarter = PI / 2.0;
+            let e_v0 =
+                store.create_edge_with_curve(a, b, SYSTEM_RESOLUTION, outer_rim, 0.0, quarter);
+            let e_u90 =
+                store.create_edge_with_curve(b, c, SYSTEM_RESOLUTION, tube_at_u90, 0.0, quarter);
+            let e_v90 =
+                store.create_edge_with_curve(d, c, SYSTEM_RESOLUTION, top_rim, 0.0, quarter);
+            let e_u0 =
+                store.create_edge_with_curve(a, d, SYSTEM_RESOLUTION, tube_at_u0, 0.0, quarter);
+            store.create_loop(
+                face,
+                LoopType::Outer,
+                &[
+                    (e_v0, FinSense::Forward),
+                    (e_u90, FinSense::Forward),
+                    (e_v90, FinSense::Reversed),
+                    (e_u0, FinSense::Reversed),
+                ],
+            );
+
+            let mesh = tessellate_face(&store, &geo, face, &TessellationOptions::default())
+                .expect("a trimmed torus fillet must tessellate (of-6fcu)");
+            assert_within(
+                mesh.total_area(),
+                quarter * minor * (major * quarter + minor),
+                0.05,
+                "torus quarter-round area",
+            );
+        }
+
+        /// A spherical octant reaching the north pole — a blended corner's
+        /// face, and what `filleted_box.stp` is made of — tessellates at
+        /// its true area, one eighth of the sphere (of-6fcu).
+        ///
+        /// The pole is the point of this fixture. Its ring visits the pole
+        /// exactly once, where longitude is undefined; the embedder opens
+        /// that single sample into a **pole row** running from the arrival
+        /// meridian to the departure one, without which the uv polygon
+        /// pinches to a triangle and covers a wedge rather than the square.
+        #[test]
+        fn accepts_sphere_octant_reaching_the_pole() {
+            let mut store = TopologyStore::new();
+            let mut geo = GeometryStore::new();
+            let r = 2.0;
+            let face = face_on(
+                &mut store,
+                &mut geo,
+                Surface3::sphere(Point3::origin(), Vector3::z(), r).unwrap(),
+            );
+
+            let equator = geo.add_curve(Curve3::circle(Point3::origin(), Vector3::z(), r).unwrap());
+            let meridian_at_u0 =
+                geo.add_curve(Curve3::circle(Point3::origin(), -Vector3::y(), r).unwrap());
+            let meridian_at_u90 =
+                geo.add_curve(Curve3::circle(Point3::origin(), Vector3::x(), r).unwrap());
+
+            let a = store.create_vertex(Point3::new(r, 0.0, 0.0), SYSTEM_RESOLUTION);
+            let b = store.create_vertex(Point3::new(0.0, r, 0.0), SYSTEM_RESOLUTION);
+            let pole = store.create_vertex(Point3::new(0.0, 0.0, r), SYSTEM_RESOLUTION);
+
+            let quarter = PI / 2.0;
+            let e_eq = store.create_edge_with_curve(a, b, SYSTEM_RESOLUTION, equator, 0.0, quarter);
+            let e_m90 = store.create_edge_with_curve(
+                b,
+                pole,
+                SYSTEM_RESOLUTION,
+                meridian_at_u90,
+                0.0,
+                quarter,
+            );
+            let e_m0 = store.create_edge_with_curve(
+                a,
+                pole,
+                SYSTEM_RESOLUTION,
+                meridian_at_u0,
+                0.0,
+                quarter,
+            );
+            store.create_loop(
+                face,
+                LoopType::Outer,
+                &[
+                    (e_eq, FinSense::Forward),
+                    (e_m90, FinSense::Forward),
+                    (e_m0, FinSense::Reversed),
+                ],
+            );
+
+            let mesh = tessellate_face(&store, &geo, face, &TessellationOptions::default())
+                .expect("a spherical octant must tessellate (of-6fcu)");
+            assert_within(
+                mesh.total_area(),
+                0.5 * PI * r * r,
+                0.05,
+                "spherical octant area",
+            );
         }
 
         /// A wall whose rims are split into two half-circle edges each (as

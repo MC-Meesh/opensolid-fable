@@ -268,19 +268,53 @@ describe('import_step', () => {
     assert.ok(elapsed < 20_000, `import_step took ${elapsed} ms`);
   });
 
-  // A body the reader maps exactly can still hit a gap in the *tessellator*
-  // (of-6fcu). That is not a crash and not a silent empty model: the solid
-  // comes back named, with the outcome it achieved and the reason it has no
-  // shape.
+  // A body the reader maps exactly can still hit a gap in the *tessellator*.
+  // That is not a crash and not a silent empty model: the solid comes back
+  // named, with the outcome it achieved and the reason it has no shape.
+  //
+  // This used to be fenced on io1-cm-214, whose torus fillets the
+  // tessellator refused; of-6fcu closed that gap, so the contract is held
+  // open here on a part that still hits one — a NIST file whose only solid
+  // is bounded by a cylindrical face carrying no seam edge, so its boundary
+  // wraps a full period and no parameter ring can bound it.
   test('a solid the tessellator cannot handle says so per solid', () => {
     const t = freshTools();
-    const path = resolve(repoRoot, 'crates/opensolid-kernel/tests/data/step/io1-cm-214.stp');
+    const path = resolve(repoRoot, 'crates/opensolid-kernel/tests/data/step/nist/nist_ftc_11_asme1_rb.stp');
     const out = t.call('import_step', { path });
     assert.equal(out.isError, true);
     const payload = JSON.parse(out.content[0].text);
     assert.match(payload.error, /usable shape/);
     assert.equal(payload.counts.brep, 1, 'the reader did import it as an exact B-Rep');
     assert.match(payload.solids[0].shapeError, /tessellat/i);
+  });
+
+  // The other half of of-6fcu: the two corpus files that read as exact
+  // B-Reps with no diagnostics at all and still could not be ingested,
+  // because every solid in them failed to mesh. An agent handed either one
+  // got `isError` and no model; both must now come back measurable.
+  //
+  // io1-cm is one solid of planes, cylinders and two torus fillets;
+  // dm1-id is three solids of ruled spline patches closed in `u`. The
+  // volume figures are gated against OpenCASCADE in `occ_reference.rs`; what
+  // matters here is that the path an agent walks produces a valid model.
+  test('parts that only the tessellator was blocking now import', () => {
+    for (const [file, solids] of [
+      ['io1-cm-214.stp', 1],
+      ['dm1-id-214.stp', 3],
+    ]) {
+      const t = freshTools();
+      const path = resolve(repoRoot, `crates/opensolid-kernel/tests/data/step/${file}`);
+      const out = jsonOf(t.call('import_step', { path }));
+      assert.equal(out.counts.brep, solids, `${file}: every solid must map exactly`);
+      assert.equal(out.counts.failed, 0, `${file}: no solid may fail`);
+      assert.ok(out.model_id, `${file}: the whole file must register as a model`);
+      assert.equal(out.valid, true, `${file}: mesh is not a closed manifold: ${out.issues}`);
+      assert.ok(out.volume > 0, `${file}: volume ${out.volume}`);
+      for (const solid of out.solids) {
+        assert.equal(solid.shapeError, undefined, `${file}: solid ${solid.index} has no shape`);
+        assert.ok(solid.model_id, `${file}: solid ${solid.index} did not register`);
+      }
+    }
   });
 });
 

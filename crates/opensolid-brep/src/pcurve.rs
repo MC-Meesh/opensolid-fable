@@ -885,7 +885,7 @@ fn repair_singular_samples(surface: &Surface3, points: &mut [Point2]) {
 
 /// The representative of `value` (modulo `period`) nearest `reference`.
 /// Aperiodic directions pass through untouched.
-fn nearest_representative(value: f64, reference: f64, period: Option<f64>) -> f64 {
+pub(crate) fn nearest_representative(value: f64, reference: f64, period: Option<f64>) -> f64 {
     let Some(period) = period else { return value };
     value + period * ((reference - value) / period).round()
 }

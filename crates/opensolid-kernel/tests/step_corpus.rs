@@ -2143,6 +2143,44 @@ mod corpus {
         }
     }
 
+    /// An exact import is only *usable* once it has a mesh: the wasm layer
+    /// builds its `MeshSdf` from one, and every measurement the MCP server
+    /// reports goes through it. Both of these files read as exact B-Reps
+    /// with zero diagnostics and still had no shape at all, because two
+    /// separate tessellator gaps refused every solid in them (of-6fcu).
+    ///
+    /// - `io1-cm-214` carries two torus fillet quarter-rounds. A trimmed
+    ///   sphere/torus face used to be refused outright; it now takes the
+    ///   constrained-Delaunay pass.
+    /// - `dm1-id-214`'s three solids are built from ruled patches closed in
+    ///   `u`, whose seam edge is traversed once each way. Projecting each
+    ///   boundary sample independently gave both traversals the same `u`,
+    ///   so the parameter ring bounded nothing; the ring is now walked with
+    ///   continuity across the patch's join.
+    ///
+    /// Closed *and* manifold is the assertion that matters: it says the
+    /// faces welded to their neighbours, which is what separates a real
+    /// tessellation from a pile of triangles that merely stopped erroring.
+    /// The volumes these meshes measure are gated against OpenCASCADE in
+    /// `occ_reference.rs`.
+    #[test]
+    fn every_exactly_imported_solid_tessellates_closed() {
+        for name in ["io1-cm-214.stp", "dm1-id-214.stp"] {
+            let (store, geo, report) = import_bytes(&load(name));
+            let breps = assert_all_outcomes_structured(&store, &report);
+            assert!(!breps.is_empty(), "{name}: expected exact B-Rep imports");
+            for body in breps {
+                let mesh = tessellate_body(&store, &geo, body, &TessellationOptions::default())
+                    .unwrap_or_else(|e| panic!("{name}: exactly-imported body must mesh: {e}"));
+                assert!(
+                    mesh.is_closed_manifold(),
+                    "{name}: mesh is not a closed manifold: {:?}",
+                    mesh.manifold_defects().describe()
+                );
+            }
+        }
+    }
+
     /// Sample every face's bounding edges and require each sample to lie on
     /// that face's surface. The tolerance is relative: this part's
     /// coordinates are inches-scaled-to-mm, and STEP carries only finite
