@@ -724,10 +724,12 @@ impl GradedBuilder<'_> {
         // samples exactly the points refinement would need anyway, so a
         // cell rejected by the probe re-reads them for free.
         let mut lattice = SubLattice::seeded(&corners);
-        if depth >= MIN_GRADED_DEPTH && has_sign_change(&corners)
-            && let Some(node) = self.try_leaf(depth, coords, corners, &mut lattice) {
-                return node;
-            }
+        if depth >= MIN_GRADED_DEPTH
+            && has_sign_change(&corners)
+            && let Some(node) = self.try_leaf(depth, coords, corners, &mut lattice)
+        {
+            return node;
+        }
         self.subdivide(depth, coords, lattice)
     }
 

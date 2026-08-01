@@ -603,9 +603,10 @@ impl TopologyStore {
     /// here is a kernel bug (the operator broke the topology), so it panics.
     fn debug_check_invariants(&self, body: EntityId<Body>) {
         if cfg!(debug_assertions)
-            && let Err(e) = self.check_body_invariants(body) {
-                panic!("Euler operator broke a topology invariant: {e}");
-            }
+            && let Err(e) = self.check_body_invariants(body)
+        {
+            panic!("Euler operator broke a topology invariant: {e}");
+        }
     }
 
     // ------------------------------------------------------------------

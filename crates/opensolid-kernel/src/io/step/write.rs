@@ -1077,7 +1077,11 @@ impl<'a> Emitter<'a> {
         let corners: Vec<Point2> = (0..9)
             .map(|i| {
                 let angle = i as f64 * std::f64::consts::FRAC_PI_4;
-                let reach = if i % 2 == 0 { 1.0 } else { std::f64::consts::SQRT_2 };
+                let reach = if i % 2 == 0 {
+                    1.0
+                } else {
+                    std::f64::consts::SQRT_2
+                };
                 at(angle, reach)
             })
             .collect();
@@ -1086,7 +1090,13 @@ impl<'a> Emitter<'a> {
             .map(|p| self.emit(format!("CARTESIAN_POINT('',{})", fmt_pair(p.x, p.y))))
             .collect();
         let weights: Vec<f64> = (0..9)
-            .map(|i| if i % 2 == 0 { 1.0 } else { std::f64::consts::FRAC_1_SQRT_2 })
+            .map(|i| {
+                if i % 2 == 0 {
+                    1.0
+                } else {
+                    std::f64::consts::FRAC_1_SQRT_2
+                }
+            })
             .collect();
         let q = std::f64::consts::FRAC_PI_2;
         let knots = [
@@ -1697,8 +1707,7 @@ mod tests {
         let text = emitter.finish("cw-circle");
 
         let file = super::super::parse::parse(&text).expect("emitted text parses");
-        let parsed =
-            super::super::read::resolve_bspline_curve_2d(&file, id, id).expect("resolves");
+        let parsed = super::super::read::resolve_bspline_curve_2d(&file, id, id).expect("resolves");
         for i in 0..=4 {
             let t = i as f64 * FRAC_PI_2;
             assert!(

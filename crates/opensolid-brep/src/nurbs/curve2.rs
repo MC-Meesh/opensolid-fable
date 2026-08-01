@@ -334,7 +334,11 @@ mod tests {
             Err(NurbsError::NonPositiveWeight { index: 1 })
         );
         assert_eq!(
-            NurbsCurve2::new(vec![Point2::origin(); 3], vec![1.0, f64::NAN, 1.0], kv.clone()),
+            NurbsCurve2::new(
+                vec![Point2::origin(); 3],
+                vec![1.0, f64::NAN, 1.0],
+                kv.clone()
+            ),
             Err(NurbsError::NonPositiveWeight { index: 1 })
         );
         let mut pts = vec![Point2::origin(); 3];

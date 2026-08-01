@@ -682,9 +682,10 @@ fn march_boxed<A: MarchSurface, B: MarchSurface>(
         // more of `a` than `b` reaches once clipped, and an out-of-region
         // seed only re-traces a fragment of an in-region crossing (of-l69).
         if let Some((center, reach)) = roi_reach
-            && (seed.1.pa - center).norm() > reach {
-                continue;
-            }
+            && (seed.1.pa - center).norm() > reach
+        {
+            continue;
+        }
         // Skip seeds landing on an already-traced curve.
         let on_existing = curves.iter().any(|curve| {
             curve

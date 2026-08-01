@@ -2194,7 +2194,10 @@ pub(super) fn resolve_bspline_curve_2d(
 ) -> MapResult<NurbsCurve2> {
     let inst = instance(file, id, referrer)?;
     let Some(parts) = BSplineParts::curve(&inst.entity) else {
-        return Err(unsupported(id, "authored pcurve geometry is not a B-spline"));
+        return Err(unsupported(
+            id,
+            "authored pcurve geometry is not a B-spline",
+        ));
     };
     let base = parts.base;
     let offset = parts.base_offset;
@@ -3136,13 +3139,16 @@ impl SolidBuilder<'_> {
             else {
                 continue;
             };
-            let Some(&curve_2d_ref) =
-                typed_record(self.file, definitional, "DEFINITIONAL_REPRESENTATION", item_ref)
-                    .and_then(|rep| ref_list(rep, 1, definitional))
-                    .ok()
-                    .as_ref()
-                    .and_then(|refs| refs.first())
-            else {
+            let Some(&curve_2d_ref) = typed_record(
+                self.file,
+                definitional,
+                "DEFINITIONAL_REPRESENTATION",
+                item_ref,
+            )
+            .and_then(|rep| ref_list(rep, 1, definitional))
+            .ok()
+            .as_ref()
+            .and_then(|refs| refs.first()) else {
                 continue;
             };
             let Ok(curve_2d) = resolve_bspline_curve_2d(self.file, curve_2d_ref, definitional)
@@ -4631,10 +4637,11 @@ fn choose_outer_bounds(
             continue;
         }
         if let Some((_, winner)) = largest
-            && winner != outer {
-                store.set_outer_loop(face_id, winner);
-                redesignated += 1;
-            }
+            && winner != outer
+        {
+            store.set_outer_loop(face_id, winner);
+            redesignated += 1;
+        }
     }
     redesignated
 }
@@ -5745,6 +5752,16 @@ mod tests {
             "volume {}",
             signed_volume(&mesh)
         );
+
+        // Exact trim integrates exactly: the parameter-space integrator
+        // consumes the transplanted `Curve2::Nurbs` directly.
+        let props = crate::brep_massprops::brep_mass_properties(&store, &geo, body)
+            .expect("closed body with full trim geometry");
+        assert!(
+            (props.volume - 8.0).abs() < 1e-9,
+            "B-Rep volume {}",
+            props.volume
+        );
     }
 
     /// `same_sense = .F.` reverses the 3D basis into the kernel's edge
@@ -5775,11 +5792,8 @@ mod tests {
         for face in store.faces_of_body(body) {
             for loop_id in store.loops_of_face(face) {
                 for &fin in store.fins_of_loop(loop_id) {
-                    if let Some(Curve2::Nurbs { curve, fit_params }) = store
-                        .fin(fin)
-                        .unwrap()
-                        .pcurve
-                        .and_then(|id| geo.pcurve(id))
+                    if let Some(Curve2::Nurbs { curve, fit_params }) =
+                        store.fin(fin).unwrap().pcurve.and_then(|id| geo.pcurve(id))
                     {
                         assert!(fit_params.is_empty());
                         assert_eq!(
@@ -5814,11 +5828,8 @@ mod tests {
         for face in store.faces_of_body(body) {
             for loop_id in store.loops_of_face(face) {
                 for &fin in store.fins_of_loop(loop_id) {
-                    if let Some(Curve2::Nurbs { fit_params, .. }) = store
-                        .fin(fin)
-                        .unwrap()
-                        .pcurve
-                        .and_then(|id| geo.pcurve(id))
+                    if let Some(Curve2::Nurbs { fit_params, .. }) =
+                        store.fin(fin).unwrap().pcurve.and_then(|id| geo.pcurve(id))
                     {
                         assert!(
                             !fit_params.is_empty(),

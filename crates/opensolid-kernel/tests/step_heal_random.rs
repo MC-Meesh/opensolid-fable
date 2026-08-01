@@ -243,9 +243,10 @@ fn referenced_ids(line: &str) -> Vec<u64> {
                 end += 1;
             }
             if end > start
-                && let Ok(id) = body[start..end].parse() {
-                    out.push(id);
-                }
+                && let Ok(id) = body[start..end].parse()
+            {
+                out.push(id);
+            }
             i = end;
         } else {
             i += 1;

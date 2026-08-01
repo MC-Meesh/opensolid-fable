@@ -5057,15 +5057,16 @@ fn embed_walk(
             atom.points.iter().rev().copied().collect()
         };
         if atom.closed
-            && let Some(prev) = walk_pos {
-                let rot = pts
-                    .iter()
-                    .enumerate()
-                    .min_by(|a, b| (a.1 - prev).norm().total_cmp(&(b.1 - prev).norm()))
-                    .map(|(i, _)| i)
-                    .unwrap_or(0);
-                pts.rotate_left(rot);
-            }
+            && let Some(prev) = walk_pos
+        {
+            let rot = pts
+                .iter()
+                .enumerate()
+                .min_by(|a, b| (a.1 - prev).norm().total_cmp(&(b.1 - prev).norm()))
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            pts.rotate_left(rot);
+        }
         let last_dart = k + 1 == darts.len();
         let take = if atom.closed || (last_dart && keep_final) {
             pts.len()
@@ -5132,42 +5133,44 @@ fn embed_walk(
     // meridian is not the placeholder, and the cover polygon overlaps its
     // neighbors (of-rb4). Chains (`keep_final`) have no closure: their
     // start-pole longitude is only ever used for 3D-anchored matching.
-    if !keep_final && poly.len() >= 3
-        && let Some(vp) = initial_pole {
-            let row_end_is_pole = face_poly.chart.pole_v(&poly[1].1) == Some(vp);
-            let last_at_pole = face_poly.chart.pole_v(&poly[poly.len() - 1].1).is_some();
-            if row_end_is_pole && !last_at_pole {
-                let u_arr = poly[poly.len() - 1].0.0;
-                let u_out_old = poly[1].0.0;
-                // Same sweep rule as the embedder: CCW keeps the interior
-                // meridians left of the walk (north row toward -u, south
-                // row toward +u); a departure within POLE_TURN_EPS of the
-                // arrival is a doubling-back and sweeps the full period.
-                let toward_neg_u = vp > 0.0;
-                let turn = if toward_neg_u {
-                    (u_arr - u_out_old).rem_euclid(TWO_PI)
-                } else {
-                    (u_out_old - u_arr).rem_euclid(TWO_PI)
-                };
-                let turn = if turn < POLE_TURN_EPS || TWO_PI - turn < POLE_TURN_EPS {
-                    TWO_PI
-                } else {
-                    turn
-                };
-                let u_out_new = if toward_neg_u {
-                    u_arr - turn
-                } else {
-                    u_arr + turn
-                };
-                let delta = u_out_new - u_out_old;
-                poly[0].0.0 = u_arr;
-                if delta != 0.0 {
-                    for ((u, _), _) in poly[1..].iter_mut() {
-                        *u += delta;
-                    }
+    if !keep_final
+        && poly.len() >= 3
+        && let Some(vp) = initial_pole
+    {
+        let row_end_is_pole = face_poly.chart.pole_v(&poly[1].1) == Some(vp);
+        let last_at_pole = face_poly.chart.pole_v(&poly[poly.len() - 1].1).is_some();
+        if row_end_is_pole && !last_at_pole {
+            let u_arr = poly[poly.len() - 1].0.0;
+            let u_out_old = poly[1].0.0;
+            // Same sweep rule as the embedder: CCW keeps the interior
+            // meridians left of the walk (north row toward -u, south
+            // row toward +u); a departure within POLE_TURN_EPS of the
+            // arrival is a doubling-back and sweeps the full period.
+            let toward_neg_u = vp > 0.0;
+            let turn = if toward_neg_u {
+                (u_arr - u_out_old).rem_euclid(TWO_PI)
+            } else {
+                (u_out_old - u_arr).rem_euclid(TWO_PI)
+            };
+            let turn = if turn < POLE_TURN_EPS || TWO_PI - turn < POLE_TURN_EPS {
+                TWO_PI
+            } else {
+                turn
+            };
+            let u_out_new = if toward_neg_u {
+                u_arr - turn
+            } else {
+                u_arr + turn
+            };
+            let delta = u_out_new - u_out_old;
+            poly[0].0.0 = u_arr;
+            if delta != 0.0 {
+                for ((u, _), _) in poly[1..].iter_mut() {
+                    *u += delta;
                 }
             }
         }
+    }
     // Align the whole polyline into the face's cover window so cycles,
     // holes, and probes of one face are mutually comparable. Each periodic
     // axis is aligned independently (only the torus wraps `v`).
@@ -5554,10 +5557,11 @@ fn apply_chain(
         }
     }
     if chosen.is_none()
-        && let Some((ri, pair)) = fallback {
-            let (one, two) = split_at(ri, pair)?;
-            chosen = Some((ri, one, two));
-        }
+        && let Some((ri, pair)) = fallback
+    {
+        let (one, two) = split_at(ri, pair)?;
+        chosen = Some((ri, one, two));
+    }
     if let Some((ri, cycle_one, cycle_two)) = chosen {
         let holes: Vec<Cycle> = regions[ri].cycles[1..].to_vec();
         let mut region_one = Region {
@@ -6487,9 +6491,10 @@ fn build_output(
                         } else {
                             let mut t_last = curve.project_point(&end_p).t;
                             if let Some(period) = curve.period()
-                                && t_last <= t_first {
-                                    t_last += period;
-                                }
+                                && t_last <= t_first
+                            {
+                                t_last += period;
+                            }
                             (t_first, t_last)
                         };
 
@@ -6973,9 +6978,10 @@ fn triangulate_mesh_face(mf: &MeshFace, weld_eps: f64) -> CoreResult<(Vec<Triang
     // lays no lattice: both of-6ry's folding hazard and the wide-chord hazard
     // are properties of the chart being curved, not of having a lattice pitch.
     if mf.chart.takes_cdt_seed()
-        && let Some(cdt) = boundary_cdt(&all_uv, &ring_ranges) {
-            tris = cdt;
-        }
+        && let Some(cdt) = boundary_cdt(&all_uv, &ring_ranges)
+    {
+        tris = cdt;
+    }
 
     refine_curved_region(
         &mut tris,
