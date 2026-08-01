@@ -90,17 +90,21 @@ const KNOWN_IMPORT_FAILURES: &[(&str, &str)] = &[
     // of-kwn: verify_trim's tolerance is tighter than the vertex slop CATIA
     // authored into this part's CIRCLE edges.
     ("nist/nist_ctc_05_asme1_rd.stp", "of-kwn"),
-    // of-05ac: these two lost the exact path when of-bb6 started measuring
-    // imported edge tolerances — each carries an edge further from its face's
-    // surface than MAX_ALLOWED_TOLERANCE, so there is no tolerance the kernel
-    // could give it honestly — and the mesh fallback does not close for
-    // either, which is what turns a degrade into a loss. The refusal is
-    // right in both cases (nist_ctc_02 has authored gaps to 0.0386 mm;
-    // bspline_patch_prism's surface is mis-sized by of-8ulj and does not
-    // contain its own face at all). The fallback failing is not: of-05ac
-    // takes both files off this list and back into the step_corpus floors.
+    // of-05ac: this lost the exact path when of-bb6 started measuring imported
+    // edge tolerances — it carries an edge further from its face's surface
+    // than MAX_ALLOWED_TOLERANCE, so there is no tolerance the kernel could
+    // give it honestly — and the mesh fallback does not close for it either,
+    // which is what turns a degrade into a loss. The refusal is right (the
+    // part has authored gaps to 0.0386 mm); the fallback failing is not, and
+    // of-05ac takes the file off this list and back into the step_corpus
+    // floors.
+    //
+    // bspline_patch_prism was listed here alongside it for a different reason
+    // — its extrusion walls were patches one `VECTOR` long and did not contain
+    // their own faces. That was this bead's bug, not a fallback gap, and
+    // sizing the patch to its face restores the *exact* path, so the file
+    // leaves this list here rather than with of-05ac. It is measured below.
     ("nist/nist_ctc_02_asme1_rc.stp", "of-05ac"),
-    ("occ/nurbs/bspline_patch_prism.stp", "of-05ac"),
 ];
 
 /// Per-file (edges, vertices) that OCC reports *in addition* to ours.
@@ -194,6 +198,11 @@ const MEASURED_FILES: &[&str] = &[
     "occ/coincident/blocks_partial_overlap.stp",
     "occ/coincident/blocks_shared_face.stp",
     "occ/nurbs/lofted_vase.stp",
+    // of-8ulj sized this one's four `SURFACE_OF_LINEAR_EXTRUSION` walls to
+    // the faces they carry instead of to their `VECTOR`, which is what
+    // makes it measurable: the patches used to stop 20 mm short of their
+    // own faces, and the tessellator called that degenerate.
+    "occ/nurbs/bspline_patch_prism.stp",
     "occ/periodic/cone_apex.stp",
     "occ/periodic/cone_truncated.stp",
     "occ/periodic/cylinder_full.stp",
