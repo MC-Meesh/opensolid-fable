@@ -8089,34 +8089,168 @@ fn refine_curved_region(
         // legalization did not reach.
         mesh.make_delaunay(all_uv, &constraints);
 
-        // Corruption check: a 2-manifold triangulation never shares an edge
-        // among more than two triangles. If refinement violated that (a fold
-        // the guards did not catch), discard it and fall back to the snapshot.
-        let mut mult: std::collections::HashMap<(usize, usize), u32> =
-            std::collections::HashMap::new();
-        let mut corrupt = false;
-        'scan: for tri in &mesh.tris {
-            for k in 0..3 {
-                let (a, b) = (tri[k], tri[(k + 1) % 3]);
-                if a == b {
-                    continue;
-                }
-                let m = mult.entry((a.min(b), a.max(b))).or_insert(0);
-                *m += 1;
-                if *m > 2 {
-                    corrupt = true;
-                    break 'scan;
-                }
-            }
-        }
         // Revert on corruption OR on a runaway (budget-exhausted) refinement:
         // both signal a face this parameter-space scheme cannot refine safely,
         // so keep the valid pre-refinement mesh instead.
-        if corrupt || budget == 0 {
+        if !edges_are_manifold(&mesh.tris) || budget == 0 {
             mesh.tris = snapshot_tris;
             all_uv.truncate(snapshot_verts);
             all_p.truncate(snapshot_verts);
         }
+    }
+
+    // Give every boundary LENS a corner of its own (of-aoml).
+    //
+    // A ring is convex from the region's side only where the trim is simple.
+    // A bore whose axis is tilted a few degrees off the plate it opens onto
+    // has a near rim that traces `r·tan(theta)·cos u` in the bore's own
+    // chart, and over the half of that cosine which bulges away from the
+    // wall a chord between two rim samples runs THROUGH the region. The seed
+    // CDT fills the lens between chord and rim with triangles all three of
+    // whose corners are rim samples, and no lattice point can ever break one
+    // up: the lattice keeps a quarter-cell clear of the boundary, and a lens
+    // that hugs its own chord is thinner than that everywhere.
+    //
+    // Realized in 3D from three rim samples alone, such a triangle is flat in
+    // the rim's own plane — which is the *plate's* plane, since that is what
+    // cut the rim. Its facet normal is then exactly antiparallel to the
+    // plate's own facets, and at the rim vertices between them the
+    // angle-weighted pseudonormals cancel to zero, which `MeshSdf::new`
+    // refuses. That is nist_ctc_02: a shell that closes as a manifold and is
+    // still rejected, on 294 vertices, every one of them on a bore rim.
+    //
+    // The lens is a real part of the uv region — what was wrong is only its
+    // 3D realization, flat because its three corners were the only samples it
+    // had. So give it a corner: split the chord at its own parameter midpoint
+    // and put the new vertex ON the surface there. The surface point at that
+    // parameter leaves the plane the rim was cut by (the chart curves between
+    // the two rim samples while the chord's `v` runs affinely), so the
+    // triangles either side of it lean off the plate's facets instead of
+    // opposing them. Splitting a chord leaves shallower sub-lenses bounded by
+    // chords of exactly the same kind, which the same sweep picks up, so this
+    // terminates on the lens rather than peeling one flap at a time (the
+    // absorb-the-flap attempt in of-05ac converged, but took 32 passes and
+    // 310 s on this one file).
+    //
+    // The band is what tells a lens chord from an honest one, and it is the
+    // lattice's own clearance. A chord that cuts ACROSS the region — a bore
+    // wall's near-rim-to-far-rim diagonal, a fan across a cap — has its
+    // midpoint a quarter-cell or more from the boundary, which is exactly
+    // where lattice points are allowed to be, so its triangles already carry
+    // interior corners; only a chord whose midpoint falls inside that
+    // clearance bounds a lens the lattice could not reach. The lower bound is
+    // the sphere pass's, and for the same reason: a vertex that welds into a
+    // boundary edge would split it on one face only and T-junction the
+    // assembled mesh.
+    //
+    // Runs last so nothing undoes it — `insert_on_edge` legalizes locally,
+    // and a later global sweep could flip a fresh interior edge back into a
+    // chord between two ring samples.
+    let n_boundary = ring_ranges.last().map_or(0, |&(start, len)| start + len);
+    let lens_min2 = {
+        let m = 1e-4 * (step_u * su).min(step_v * sv);
+        m * m
+    };
+    let eps_area = 1e-12 * (u1 - u0) * (v1 - v0);
+    let snapshot_tris = mesh.tris.clone();
+    let snapshot_verts = all_uv.len();
+    // One split per lens chord resolves it, and a split mints no new chord
+    // (its midpoint is not a ring sample); the allowance is for the chords a
+    // local legalization re-forms, and bounds a face that will not settle.
+    let mut budget = 4 * n_boundary + 64;
+    let ring_of = |i: usize| {
+        ring_ranges
+            .iter()
+            .position(|&(start, len)| i >= start && i < start + len)
+    };
+    loop {
+        let mut split_any = false;
+        let ntri = mesh.tris.len();
+        for t in 0..ntri {
+            let mut k = 0;
+            while k < 3 {
+                let n = mesh.adj[t][k];
+                let (a, b) = (mesh.tris[t][k], mesh.tris[t][(k + 1) % 3]);
+                // A ring segment is a constraint edge, so skipping constraints
+                // is also what restricts this to chords between samples that
+                // are NOT neighbours along their ring.
+                if n == NO_TRI
+                    || a >= n_boundary
+                    || b >= n_boundary
+                    || constraints.contains(&(a.min(b), a.max(b)))
+                    || ring_of(a) != ring_of(b)
+                {
+                    k += 1;
+                    continue;
+                }
+                let mid_uv = (
+                    0.5 * (all_uv[a].0 + all_uv[b].0),
+                    0.5 * (all_uv[a].1 + all_uv[b].1),
+                );
+                let ps = (mid_uv.0 * su, mid_uv.1 * sv);
+                let mut near2 = f64::INFINITY;
+                for &(start, len) in ring_ranges {
+                    for jj in 0..len {
+                        let ba = (all_uv[start + jj].0 * su, all_uv[start + jj].1 * sv);
+                        let bb = (
+                            all_uv[start + (jj + 1) % len].0 * su,
+                            all_uv[start + (jj + 1) % len].1 * sv,
+                        );
+                        near2 = near2.min(point_seg_dist2(ps, ba, bb));
+                    }
+                }
+                if !(lens_min2..=margin2).contains(&near2) {
+                    k += 1;
+                    continue;
+                }
+                // `insert_on_edge` needs both incident triangles proper and
+                // the quad across the edge unfolded — the same two guards the
+                // sphere pass keeps, and for the same reasons (a degenerate
+                // host mints slivers; a fold corrupts the relink).
+                let [ha, hb, hc] = mesh.tris[t];
+                let [na, nb, nc] = mesh.tris[n];
+                let c = mesh.tris[t][(k + 2) % 3];
+                let folded = match mesh.edge_index(n, a, b) {
+                    None => true,
+                    Some(j) => {
+                        let q = mesh.tris[n][(j + 2) % 3];
+                        q == c || q == a || q == b || c == a || c == b
+                    }
+                };
+                if folded
+                    || orient2d(all_uv[ha], all_uv[hb], all_uv[hc]) <= eps_area
+                    || orient2d(all_uv[na], all_uv[nb], all_uv[nc]) <= eps_area
+                {
+                    k += 1;
+                    continue;
+                }
+                let np = all_uv.len();
+                all_uv.push(mid_uv);
+                all_p.push(chart_point(chart, mid_uv));
+                mesh.insert_on_edge(t, k, np, all_uv, &constraints);
+                split_any = true;
+                budget -= 1;
+                if budget == 0 {
+                    break;
+                }
+                // `t` is a different, smaller triangle now; re-examine it.
+                k = 0;
+            }
+            if budget == 0 {
+                break;
+            }
+        }
+        if !split_any || budget == 0 {
+            break;
+        }
+    }
+    // Same bargain the sphere pass strikes: a face this cannot resolve safely
+    // keeps the mesh it had, which is coarse but valid, rather than a broken
+    // one.
+    if !edges_are_manifold(&mesh.tris) || budget == 0 {
+        mesh.tris = snapshot_tris;
+        all_uv.truncate(snapshot_verts);
+        all_p.truncate(snapshot_verts);
     }
 
     // Last, because it deliberately trades Delaunay-ness for 3D validity and
@@ -8238,6 +8372,29 @@ fn is_sliver_3d([a, b, c]: [Point3; 3]) -> bool {
         .max((c - a).norm_squared())
         .max((c - b).norm_squared());
     (b - a).cross(&(c - a)).norm() <= POLE_SLIVER_REL * longest_sq
+}
+
+/// Whether no edge of `tris` is shared by more than two triangles — the one
+/// invariant a 2-manifold triangulation cannot be repaired without, and the
+/// corruption test both of [`refine_curved_region`]'s vertex-inserting passes
+/// revert on. Their guards are meant to make a fold impossible; this catches
+/// the fold they did not foresee, and costs one pass over the mesh.
+fn edges_are_manifold(tris: &[[usize; 3]]) -> bool {
+    let mut mult: std::collections::HashMap<(usize, usize), u32> = std::collections::HashMap::new();
+    for tri in tris {
+        for k in 0..3 {
+            let (a, b) = (tri[k], tri[(k + 1) % 3]);
+            if a == b {
+                continue;
+            }
+            let m = mult.entry((a.min(b), a.max(b))).or_insert(0);
+            *m += 1;
+            if *m > 2 {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// Do the open segments `a-b` and `c-d` cross at a point interior to both?
@@ -11657,6 +11814,145 @@ mod tests {
             (area - m as f64 * e).abs() < 1e-18,
             "strip area changed: {area} vs {}",
             m as f64 * e
+        );
+    }
+
+    /// A chart and the rings that trim it, in uv and in 3D — the three
+    /// arguments [`triangulate_trimmed_region`] takes, in its order.
+    type ChartRings = (Chart, Vec<Vec<(f64, f64)>>, Vec<Vec<Point3>>);
+
+    /// The uv rings of a bore wall whose axis is tilted `theta` off the
+    /// plate it opens onto, in the bore cylinder's own chart: `u` is the
+    /// angle about the tilted axis, `v` the height along it.
+    ///
+    /// The plate's plane cuts the cylinder in an ellipse, so the near rim
+    /// traces `v = r·tan(theta)·cos u` rather than a constant — and every
+    /// one of its samples lies exactly in the plate's plane by
+    /// construction, which is the whole point (of-aoml). The far rim is a
+    /// plain `v = depth` circle. The ring runs bottom rim forward, up the
+    /// seam, top rim back, and closes down the seam.
+    fn tilted_bore_rings(
+        theta: f64,
+        radius: f64,
+        depth: f64,
+        near: usize,
+        far: usize,
+    ) -> ChartRings {
+        let axis = Vector3::new(theta.sin(), 0.0, theta.cos());
+        let chart = Chart::Cylinder {
+            origin: Point3::origin(),
+            axis,
+            e_u: Vector3::new(theta.cos(), 0.0, -theta.sin()),
+            e_v: Vector3::new(0.0, 1.0, 0.0),
+            radius,
+        };
+        let rim_v = radius * theta.tan();
+        let mut uv: Vec<(f64, f64)> = Vec::with_capacity(near + far);
+        for i in 0..near {
+            let u = TWO_PI * i as f64 / near as f64;
+            uv.push((u, rim_v * u.cos()));
+        }
+        for i in (0..far).rev() {
+            uv.push((TWO_PI * i as f64 / far as f64, depth));
+        }
+        let p = uv.iter().map(|&q| chart_point(&chart, q)).collect();
+        (chart, vec![uv], vec![p])
+    }
+
+    /// of-aoml regression: a bore whose axis is tilted off the plate it
+    /// opens onto has a near rim that traces a cosine in its own chart, and
+    /// where that cosine bulges away from the wall region a chord of the rim
+    /// runs *through* the region. The seed CDT fills the lens between chord
+    /// and rim with triangles all three of whose corners are rim samples —
+    /// and every rim sample sits exactly in the plate's plane, so those
+    /// triangles come out exactly flat there, with facet normals exactly
+    /// antiparallel to the plate's own. The rim vertices between them then
+    /// have angle-weighted pseudonormals that cancel to zero, and
+    /// `MeshSdf::new` refuses the shell (nist_ctc_02's 294 such vertices,
+    /// every one on a bore rim).
+    ///
+    /// The lens is a real part of the uv region; what was wrong is its 3D
+    /// realization, flat because its three corners were the only samples it
+    /// had. Assert it now has corners of its own: no emitted triangle has
+    /// all three corners in the plate's plane.
+    #[test]
+    fn tilted_bore_rim_lens_is_not_realized_flat() {
+        let (chart, rings_uv, rings_p) = tilted_bore_rings(2.0_f64.to_radians(), 25.0, 40.0, 25, 9);
+        let rim = rings_p[0].clone();
+        let (tris, uv, points) =
+            triangulate_trimmed_region(&chart, TWO_PI / 32.0, &rings_uv, &rings_p)
+                .expect("the bore wall's rings bound a triangulable region");
+
+        // Every near-rim sample is in the plate's plane to rounding.
+        let plate_band = 1e-9;
+        for (i, p) in rim.iter().take(25).enumerate() {
+            assert!(p.z.abs() <= plate_band, "rim sample {i} is off the plate");
+        }
+        let flat: Vec<[usize; 3]> = tris
+            .iter()
+            .copied()
+            .filter(|t| t.iter().all(|&i| points[i].z.abs() <= plate_band))
+            .collect();
+        assert!(
+            flat.is_empty(),
+            "{} triangles lie flat in the plate's plane: {:?}",
+            flat.len(),
+            &flat[..flat.len().min(8)]
+        );
+
+        // The corners it gained are ON the bore wall — a split vertex placed
+        // anywhere else would move the mesh off the surface to buy a normal.
+        let theta = 2.0_f64.to_radians();
+        let axis = Vector3::new(theta.sin(), 0.0, theta.cos());
+        for (i, p) in points.iter().enumerate() {
+            let off = (p.coords - axis * p.coords.dot(&axis)).norm();
+            assert!(
+                (off - 25.0).abs() < 1e-9,
+                "vertex {i} sits {off} from the axis, not on the r = 25 wall"
+            );
+        }
+
+        // And it still tiles exactly the region the rings bound: insertion and
+        // legalization only ever retriangulate a point set inside the seed.
+        let area: f64 = tris
+            .iter()
+            .map(|t| 0.5 * orient2d(uv[t[0]], uv[t[1]], uv[t[2]]))
+            .sum();
+        let ring: Vec<CoverPoint> = rings_uv[0].iter().map(|&q| (q, Point3::origin())).collect();
+        let expected = shoelace(&ring);
+        assert!(
+            (area - expected).abs() <= 1e-9 * expected.abs(),
+            "triangulated uv area {area} vs the rings' {expected}"
+        );
+    }
+
+    /// The lens split is for lenses. A plain bore — same wall, same sampling,
+    /// axis square to the plate — has a near rim that is a straight `v = 0`
+    /// line in its chart, bounds no lens at all, and must come out at the
+    /// lattice's own size. Its near-to-far-rim diagonals are chords between
+    /// two samples of the same ring exactly as a lens chord is, and only
+    /// their distance from the boundary tells them apart; if that band ever
+    /// stops discriminating, this is where it shows up (of-aoml).
+    #[test]
+    fn a_square_bore_is_not_refined_by_the_lens_split() {
+        let pitch = TWO_PI / 32.0;
+        let (chart, rings_uv, rings_p) = tilted_bore_rings(0.0, 25.0, 40.0, 25, 9);
+        let (_, square_uv, _) =
+            triangulate_trimmed_region(&chart, pitch, &rings_uv, &rings_p).unwrap();
+        let (chart, rings_uv, rings_p) = tilted_bore_rings(2.0_f64.to_radians(), 25.0, 40.0, 25, 9);
+        let (_, tilted_uv, _) =
+            triangulate_trimmed_region(&chart, pitch, &rings_uv, &rings_p).unwrap();
+        // A lens is bounded by the ring path between its chord's ends, so the
+        // corners a rim can acquire scale with the rim's own sampling — not
+        // with the region's area. A band that reached the cross-region
+        // diagonals instead would add a lattice's worth of vertices and blow
+        // straight through this.
+        assert!(
+            tilted_uv.len() <= square_uv.len() + 25,
+            "the tilted bore grew to {} vertices against the square bore's {} — \
+             the split is reaching chords that cut across the region",
+            tilted_uv.len(),
+            square_uv.len()
         );
     }
 
