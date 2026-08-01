@@ -242,10 +242,10 @@ fn referenced_ids(line: &str) -> Vec<u64> {
             while end < bytes.len() && bytes[end].is_ascii_digit() {
                 end += 1;
             }
-            if end > start {
-                if let Ok(id) = body[start..end].parse() {
-                    out.push(id);
-                }
+            if end > start
+                && let Ok(id) = body[start..end].parse()
+            {
+                out.push(id);
             }
             i = end;
         } else {
