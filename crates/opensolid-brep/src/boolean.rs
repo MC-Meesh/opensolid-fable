@@ -6057,6 +6057,60 @@ fn source_curve<'p>(pipe: &'p Pipeline<'_>, source: CurveSource) -> &'p Curve3 {
     }
 }
 
+/// The closed spelling of a source polyline that is geometrically a *ring*
+/// — `Some` only for an open one whose two ends land on the same point.
+///
+/// A marched ring reaches the arrangement open, and has to: its ends sit on
+/// a host chart's seam, where its uv image runs cover edge to cover edge
+/// rather than closing, so it applies as a chord there and only re-merges
+/// into a ring on the *other* host, whose interior the same points fall in
+/// ([`merge_imprint_chains`], of-43n). Two paths spell it that way. The
+/// tracer stops a wrapping march at the hard domain bounds, handing back
+/// `closed = false` with both ends polished onto the seam point; and
+/// [`Pipeline::marched_polylines`] cuts a *closed* march at every seam
+/// crossing, which for a curve wrapping a periodic direction exactly once
+/// is one cut, leaving a single "fragment" that runs from the cut back to
+/// it. Either way `points[0]` and `points[last]` are the same point — to a
+/// rounding step, not bit for bit, which is why this reads the geometry
+/// rather than a flag.
+///
+/// The *output edge* cannot use that spelling. An atom's parameter range is
+/// recovered by projecting its ends onto this curve, and a range that wraps
+/// the ring's own start — the whole-ring atom, whose ends project to the
+/// same parameter, and any atom straddling it — is only expressible if the
+/// curve reports a period. An open polyline reports none and clamps outside
+/// its domain, so those edges came out with `t_start == t_end` or
+/// `t_start > t_end`, ranges [`TopologyStore::check_geometry`] rejects as
+/// insane and then measures nothing on (of-sf12). Closed, the polyline
+/// wraps by its vertex count and both ranges unwrap forward.
+///
+/// Only the output geometry changes: the arrangement keeps the open
+/// spelling it needs, and the two differ by moving one endpoint onto the
+/// other, below the welding snap.
+fn ring_polyline(curve: &Curve3, snap: f64) -> Option<Curve3> {
+    let Curve3::Polyline {
+        points,
+        closed: false,
+    } = curve
+    else {
+        return None;
+    };
+    let last = points.len() - 1;
+    // Three distinct vertices is the least that bounds any area; below the
+    // same length floor `Pipeline::clip_imprint` holds a seam-cut ring to,
+    // a polyline returning to its start is a degenerate spike, not a ring.
+    if last < 3 || (points[last] - points[0]).norm() > snap || polyline_length(points) <= snap * 4.0
+    {
+        return None;
+    }
+    let mut points = points.clone();
+    points[last] = points[0];
+    Some(Curve3::Polyline {
+        points,
+        closed: true,
+    })
+}
+
 /// Whether an open polyline is geometrically a straight segment: every
 /// interior point within `tol` of the endpoint chord (distance to the
 /// clamped segment, so points marginally past an end still count as
@@ -6371,12 +6425,16 @@ fn build_output(
                         // range recovered by exact closest-point projection.
                         // Atom polylines run in increasing curve parameter,
                         // so a wrapped range on a periodic curve unwraps
-                        // forward by one period.
+                        // forward by one period — which is why a source
+                        // polyline that closes on itself is bound in its
+                        // closed spelling ([`ring_polyline`]), the only one
+                        // that HAS a period to unwrap by.
                         let source = atom_source[ai];
-                        let curve = source_curve(pipe, source);
-                        let curve_id = *curve_of_source
-                            .entry(source)
-                            .or_insert_with(|| geo.add_curve(curve.clone()));
+                        let curve_id = *curve_of_source.entry(source).or_insert_with(|| {
+                            let raw = source_curve(pipe, source);
+                            geo.add_curve(ring_polyline(raw, snap).unwrap_or_else(|| raw.clone()))
+                        });
+                        let curve = geo.curve(curve_id).expect("just bound");
                         let t_first = curve.project_point(&start_p).t;
                         let (t_start, t_end) = if atom.closed {
                             let period = curve
@@ -11748,6 +11806,99 @@ mod tests {
     fn resolve_station_uv_rejects_preimages_that_miss_a_station() {
         let carried = vec![Some(((1.0, 2.0), (3.0, 4.0)))];
         let _ = resolve_station_uv(2, Some(&carried), |_, _| Ok(((0.0, 0.0), (0.0, 0.0))));
+    }
+
+    /// A square traced as an OPEN polyline whose last vertex misses the
+    /// first by `gap` — how a marched ring arrives, its two ends polished
+    /// onto the same seam point by separate solves that agree to a
+    /// rounding step rather than bit for bit.
+    fn open_ring_polyline(gap: f64) -> Curve3 {
+        Curve3::Polyline {
+            points: vec![
+                Point3::new(0.0, 0.0, 0.0),
+                Point3::new(1.0, 0.0, 0.0),
+                Point3::new(1.0, 1.0, 0.0),
+                Point3::new(0.0, 1.0, 0.0),
+                Point3::new(0.0, gap, 0.0),
+            ],
+            closed: false,
+        }
+    }
+
+    /// of-sf12: the closed spelling `build_output` binds a ring imprint in.
+    /// The arrangement needs the open one (its ends are a chart seam, where
+    /// the uv image is a cover-edge-to-cover-edge chord, not a loop), but an
+    /// open polyline has no period, and without one an edge covering the
+    /// whole ring or straddling its start gets a range that says nothing.
+    #[test]
+    fn ring_polyline_closes_a_polyline_that_returns_to_its_start() {
+        let snap = 1e-9;
+        let closed = ring_polyline(&open_ring_polyline(1e-16), snap)
+            .expect("ends within snap of each other: a ring");
+        let Curve3::Polyline {
+            points,
+            closed: is_closed,
+        } = &closed
+        else {
+            panic!("the closed spelling of a polyline is a polyline");
+        };
+        assert!(is_closed, "only the closed flag makes `period` report");
+        assert_eq!(points.len(), 5, "no vertex is added or dropped");
+        assert_eq!(
+            points[4], points[0],
+            "closing is exact — `Curve3::polyline`'s own invariant, and what \
+             makes the seam project to one parameter instead of two"
+        );
+        assert_eq!(
+            closed.period(),
+            Some(4.0),
+            "the period an edge range unwraps by is the vertex count"
+        );
+        // The point of the period: a range running past the last vertex
+        // evaluates back onto the ring instead of clamping to its end.
+        assert!(
+            (closed.point(4.5) - closed.point(0.5)).norm() < 1e-15,
+            "a closed polyline wraps; the open spelling would clamp both to \
+             the last vertex and measure the edge as a point"
+        );
+
+        // Ends genuinely apart: an open imprint, left alone.
+        assert!(
+            ring_polyline(&open_ring_polyline(snap * 10.0), snap).is_none(),
+            "a polyline that does not return to its start is not a ring"
+        );
+        assert!(
+            ring_polyline(&closed, snap).is_none(),
+            "an already-closed polyline has its period already"
+        );
+        assert!(
+            ring_polyline(
+                &Curve3::circle(Point3::origin(), Vector3::z(), 1.0).expect("valid circle"),
+                snap,
+            )
+            .is_none(),
+            "analytic curves carry their own period and are never respelled"
+        );
+        // Degenerate spikes, which have a repeated endpoint and nothing else.
+        assert!(
+            ring_polyline(
+                &Curve3::Polyline {
+                    points: vec![
+                        Point3::origin(),
+                        Point3::new(1.0, 0.0, 0.0),
+                        Point3::origin()
+                    ],
+                    closed: false,
+                },
+                snap,
+            )
+            .is_none(),
+            "a there-and-back spike bounds no area, whatever its ends do"
+        );
+        assert!(
+            ring_polyline(&open_ring_polyline(1e-16), 10.0).is_none(),
+            "a ring shorter than the welding snap is noise, not a loop"
+        );
     }
 
     /// A patch that folds back on itself, its two ends `gap` apart in z at

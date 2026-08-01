@@ -2870,16 +2870,17 @@ fn block_notches_torus_outer_wall() {
 /// alone, so the edge declared ~1e-10 and missed by seven orders.
 ///
 /// Asserted per failure *class* rather than as a bare
-/// `check_with_geometry().is_empty()`: `InvalidEdgeRange` still fires on
-/// the two full-ring imprints here (of-sf12, a ring cut at exactly one
-/// seam), and a blanket assertion would fence that instead of this. The
-/// classes below are the ones of-2hbp is about, and they must be empty.
+/// `check_with_geometry().is_empty()`: while of-sf12 was open,
+/// `InvalidEdgeRange` fired on the two full-ring imprints here (a ring cut
+/// at exactly one seam), and a blanket assertion would have fenced that
+/// instead of this. The classes below are the ones of-2hbp is about, and
+/// they must be empty.
 ///
 /// The same defect is why the severing case carries this fence without
 /// currently exercising it: both its imprint edges ARE the full rings, and
 /// `check_geometry` measures nothing on an edge whose range it cannot
-/// trust. It goes live the moment of-sf12 does, which is the point of
-/// leaving it here.
+/// trust. of-sf12 lands in the same train as this fence, so that case is
+/// live from the start.
 #[test]
 fn torus_notch_imprints_stay_within_their_declared_tolerance() {
     let (major, minor) = (2.0, 0.5);
@@ -2967,6 +2968,62 @@ fn a_scaled_up_imprint_does_not_declare_itself_past_the_kernel_limit() {
     );
 }
 
+/// of-sf12 fence: no edge of either torus notch may carry a parameter
+/// range `check_geometry` refuses to read.
+///
+/// Both notches cut the tube with off-axis planes, and a plane's section of
+/// a torus tube wraps the minor direction exactly once — so it is a ring,
+/// and a ring reaches the arrangement as an OPEN polyline running from a
+/// chart seam back to it, because on the torus its uv image is a chord
+/// across the cover rather than a loop (of-43n). Bound to the output edge
+/// in that spelling it reports no period, and `build_output` needs one to
+/// unwrap a range that wraps the ring's own start: the edge covering the
+/// whole ring came out `t_start == t_end`, and the edge straddling the
+/// start came out `t_start > t_end`.
+///
+/// A range that fails `edge_range_is_sane` costs more than itself:
+/// `check_geometry` reports it and then skips EVERY geometric measurement
+/// on that edge, so the two marched imprints — the least exact curves in
+/// the result and the ones most worth measuring — were the only two edges
+/// going unmeasured.
+///
+/// The `InvalidEdgeRange` class alone is asserted, not the whole check. The
+/// edges this unblocks measure ~1.3e-3 off their host surface against a
+/// 1.2e-10 allowance — one chord sagitta of a ~46-segment polyline
+/// approximating a quartic — which is of-2hbp, a defect this fix reveals
+/// rather than introduces (and which is fixed in this same train).
+#[test]
+fn torus_notch_edges_carry_ranges_check_geometry_can_read() {
+    let (major, minor) = (2.0, 0.5);
+    for (shape, min) in [
+        ("severed tube", [1.3, -0.35, -1.0]),
+        ("outer-wall notch", [2.1, -0.35, -1.0]),
+    ] {
+        let mut scene = Scene::new();
+        let ring = scene.torus(Point3::origin(), major, minor);
+        let tool = scene.block(min, [2.7, 0.35, 1.0]);
+        for op in [BooleanOp::Subtract, BooleanOp::Intersect] {
+            let context = format!("{shape}, {op:?}");
+            let out = match op {
+                BooleanOp::Subtract => scene.subtract(ring, tool),
+                _ => scene.intersect(ring, tool),
+            }
+            .unwrap_or_else(|e| panic!("{context}: failed: {e:?}"));
+            let insane: Vec<CheckFailure> = out
+                .store
+                .check_geometry(&out.geo, out.body)
+                .into_iter()
+                .filter(|f| matches!(f, CheckFailure::InvalidEdgeRange { .. }))
+                .collect();
+            assert!(
+                insane.is_empty(),
+                "{context}: {} edge(s) carry a range check_geometry cannot read, \
+                 so nothing about their geometry is measured: {insane:#?}",
+                insane.len(),
+            );
+        }
+    }
+}
 /// Two congruent coaxial tori shifted along their common axis: the tube
 /// cross-sections are equal circles offset by the shift, so the
 /// intersection is the revolved circle-circle lens (Pappus about the
