@@ -33,8 +33,8 @@
 //! `#[ignore]`d referencing the bead rather than softened.
 
 use opensolid_brep::{
-    Body, GeometryStore, TessellationOptions, TopologyStore, primitives, tessellate_body,
-    translate_body,
+    Body, GeometryStore, SYSTEM_RESOLUTION, Surface3, TessellationOptions, TopologyStore,
+    primitives, tessellate_body, translate_body,
 };
 use opensolid_core::EntityId;
 use opensolid_core::types::{BoundingBox3, Point3, Vector3};
@@ -461,6 +461,121 @@ fn sdf_to_brep_recovers_volume_and_genus() {
             RTOL,
             &format!("{repro}: recovered volume vs closed form"),
         );
+    }
+}
+
+/// A recovered face's boundary must lie *on* the plane that face carries,
+/// whatever the clustering tolerance is set to.
+///
+/// This is what makes the `1e-9` in
+/// [`sdf_to_brep_recovers_volume_and_genus`] a statement about the
+/// conversion rather than about a magic constant. The two measurements it
+/// compares read the same body two different ways: `tessellate_body`
+/// triangulates the loop's *mesh vertices*, while `brep_mass_properties`
+/// integrates the *fitted plane* the face carries. They agree exactly when —
+/// and only when — those vertices are on that plane, so their difference is a
+/// direct read of how far a recovered face floats off its own boundary.
+///
+/// Nothing used to hold that down. A triangle joined a region on its distance
+/// to the **seed** triangle's plane, up to `planar_offset_tol` (`1e-7` of the
+/// meshing diagonal by default), and the face was then fitted area-weighted
+/// over the region, which the seed plane does not pin. So the admissible
+/// disagreement was `~1e-7` relative — a hundred times the assertion's
+/// allowance, and exactly the magnitude of the of-sfp6 report
+/// (`1.103e-7`) — bought purely by which side of a strict inequality a QEF
+/// vertex landed on.
+///
+/// Loosening `planar_offset_tol` is how that budget gets spent on purpose.
+/// One decade of it used to put 120 of a depth-6 sphere's faces `1.55e-7` of
+/// the diagonal off their own planes and the two volumes `3.6e-10` apart, and
+/// a torus `3.4e-9` apart — a real failure of the assertion above. The
+/// conversion now refuses a region whose fitted plane does not carry its
+/// vertices and dissolves it into per-triangle faces, so the decades below
+/// buy nothing.
+#[test]
+fn a_recovered_face_carries_its_own_boundary() {
+    const MAX_DEPTH: u32 = 6;
+    let mut rng = Rng::new(0x_5DF2_B2E7);
+    for case in 0..3 {
+        let mut store = TopologyStore::new();
+        let mut geo = GeometryStore::new();
+        let spec = random_case(&mut rng, &mut store, &mut geo);
+        let Some(field) = spec.shape.field(Point3::origin()) else {
+            continue;
+        };
+        let bounds = bounds_for(&spec, Vector3::zeros(), 1.4);
+        let diagonal = (bounds.max - bounds.min).norm();
+
+        for decade in [-7i32, -5, -3] {
+            let repro = format!(
+                "case {case}: sdf_to_brep({}) at planar_offset_tol = 1e{decade} * diagonal",
+                spec.label
+            );
+            let mut opts = SdfToBrepOptions::new(bounds, MAX_DEPTH);
+            opts.planar_offset_tol = 10f64.powi(decade) * diagonal;
+
+            let mut out_store = TopologyStore::new();
+            let mut out_geo = GeometryStore::new();
+            let recovered = sdf_to_brep(field.as_ref(), &mut out_store, &mut out_geo, &opts)
+                .unwrap_or_else(|e| panic!("{repro}: sdf_to_brep failed: {e:?}"));
+            assert!(
+                out_store.check(recovered).is_empty(),
+                "{repro}: recovered body failed check()"
+            );
+
+            // Every vertex of every loop, against the plane of the face that
+            // loop bounds. The allowance is the tolerance `sdf_to_brep`
+            // stamps on the vertices it creates: a face claiming a plane it
+            // misses by more than that is claiming something untrue.
+            let mut worst = 0.0_f64;
+            for face_id in out_store.faces_of_body(recovered) {
+                let surface = out_store
+                    .face(face_id)
+                    .and_then(|f| f.surface)
+                    .and_then(|id| out_geo.surface(id));
+                let Some(Surface3::Plane { origin, normal }) = surface else {
+                    panic!("{repro}: recovered face is not a plane: {surface:?}");
+                };
+                for loop_id in out_store.loops_of_face(face_id) {
+                    for &fin_id in out_store.fins_of_loop(loop_id) {
+                        let fin = out_store.fin(fin_id).expect("loop fin exists");
+                        let edge = out_store.edge(fin.edge).expect("fin edge exists");
+                        for vertex_id in [edge.start_vertex, edge.end_vertex] {
+                            let point = out_store.vertex(vertex_id).expect("edge vertex").point;
+                            worst = worst.max(normal.dot(&(point - *origin)).abs());
+                        }
+                    }
+                }
+            }
+            let allowed = SYSTEM_RESOLUTION.max(1e-12 * diagonal);
+            assert!(
+                worst <= allowed,
+                "{repro}: a face's boundary sits {worst:.3e} off its own plane \
+                 ({:.3e} of the diagonal), past the {allowed:.3e} its vertices claim",
+                worst / diagonal,
+            );
+
+            // And therefore the two ways of measuring the body agree — the
+            // of-sfp6 assertion, held here across three decades of the knob
+            // that used to break it.
+            let exact = brep_mass_properties(&out_store, &out_geo, recovered)
+                .unwrap_or_else(|e| panic!("{repro}: brep_mass_properties failed: {e:?}"));
+            let mesh = tessellate_body(
+                &out_store,
+                &out_geo,
+                recovered,
+                &TessellationOptions::default(),
+            )
+            .unwrap_or_else(|e| panic!("{repro}: tessellate_body failed: {e:?}"));
+            let meshed = mass_properties(&mesh)
+                .unwrap_or_else(|e| panic!("{repro}: mass_properties failed: {e}"));
+            assert_within(
+                meshed.volume,
+                exact.volume,
+                1e-9,
+                &format!("{repro}: meshed vs B-Rep-native volume"),
+            );
+        }
     }
 }
 

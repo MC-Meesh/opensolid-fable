@@ -18,15 +18,19 @@
 //!    seed's plane. Comparing against the fixed seed plane (not a running
 //!    average) prevents tolerance drift from chaining gently curved facets
 //!    into one bogus "plane".
-//! 3. **Recover faces**: each region becomes one planar face. Its loops are
-//!    traced from the region's boundary (directed triangle edges whose
-//!    neighbor lies in another region); the loop winding positively about
-//!    the region normal is the outer loop, the rest are holes. Curved
-//!    regions never merge past a single triangle, so they remain as
-//!    triangulated face sets — one planar face per facet. Regions whose
+//! 3. **Recover faces**: each region becomes one planar face. Its plane is
+//!    the area-weighted fit of its members, and every member vertex must lie
+//!    on *that* plane to [`PLANE_FIT_TOL_REL`] of the region's own extent —
+//!    the clustering above only measured against the *seed* triangle's
+//!    plane, which the fit is free to move away from. Its loops are traced
+//!    from the region's boundary (directed triangle edges whose neighbor
+//!    lies in another region); the loop winding positively about the region
+//!    normal is the outer loop, the rest are holes. Curved regions never
+//!    merge past a single triangle, so they remain as triangulated face sets
+//!    — one planar face per facet. Regions that fail the fit, or whose
 //!    boundary is not a set of simple loops (pinched vertices, or a region
-//!    swallowing a whole closed component) dissolve back into per-triangle
-//!    faces rather than producing invalid topology.
+//!    swallowing a whole closed component), dissolve back into per-triangle
+//!    faces rather than producing invalid geometry or topology.
 //! 4. **Assemble** a [`TopologyStore`] body: one closed outward shell per
 //!    connected mesh component with its genus derived from the component's
 //!    Euler characteristic, shared vertices and edges keyed by mesh
@@ -68,6 +72,37 @@ use opensolid_core::mesh::TriangleMesh;
 use opensolid_core::types::{BoundingBox3, Point3, Vector3};
 use opensolid_frep::mesh_adaptive::{AdaptiveMeshOptions, mesh_sdf_adaptive_indexed};
 use opensolid_frep::primitives::Sdf;
+
+/// How far a recovered face's vertices may sit off the face's own fitted
+/// plane, as a fraction of the region's extent, before the region is refused
+/// and dissolved into per-triangle faces.
+///
+/// This is the invariant that makes a recovered body mean what it says. A
+/// [`Surface3::Plane`] face claims its boundary lies *on* that plane, and
+/// `build_body` stamps [`SYSTEM_RESOLUTION`] on every vertex it creates as
+/// the promise. Nothing in the clustering enforces that: a triangle joins on
+/// its distance to the *seed* triangle's plane, up to
+/// [`planar_offset_tol`](SdfToBrepOptions::planar_offset_tol) (`1e-7` of the
+/// meshing diagonal by default), and the face is then integrated against the
+/// area-weighted fit, which the seed plane does not pin. A region that used
+/// that slack would be a face whose own vertices are off it by ~`1e-7` of the
+/// body — and the two ways of measuring such a body disagree by exactly that
+/// much, since [`tessellate_body`](opensolid_brep::tessellate_body)
+/// triangulates the raw loop vertices while
+/// [`brep_mass_properties`](crate::brep_mass_properties) integrates the
+/// plane.
+///
+/// Truly coplanar regions are nowhere near this bound. Measured over the
+/// of-ipt.18 campaign's recovered bodies, the worst vertex sits `~1e-16` of
+/// the diagonal off its face's plane for the curved shapes and `~6e-15` for a
+/// block, so `1e-12` leaves two to four orders of headroom while cutting the
+/// admissible disagreement from `1e-7` to below `1e-14`. The
+/// [`SYSTEM_RESOLUTION`] floor keeps the test meaningful for a region so
+/// small its extent is itself at the resolution.
+///
+/// Only regions of more than one triangle are held to it — see
+/// [`trace_region`].
+const PLANE_FIT_TOL_REL: f64 = 1e-12;
 
 /// Options controlling F-Rep → B-Rep conversion.
 #[derive(Debug, Clone, Copy)]
@@ -369,10 +404,11 @@ fn trace_faces(
     specs
 }
 
-/// Fit the region's plane and trace its boundary loops. `None` if the
-/// boundary is empty (region covers a whole closed component), pinched
-/// (some vertex starts two boundary edges), broken, or does not classify
-/// into exactly one outer loop plus holes.
+/// Fit the region's plane and trace its boundary loops. `None` if the fitted
+/// plane does not carry the region's own vertices (see [`PLANE_FIT_TOL_REL`]),
+/// or if the boundary is empty (region covers a whole closed component),
+/// pinched (some vertex starts two boundary edges), broken, or does not
+/// classify into exactly one outer loop plus holes.
 fn trace_region(
     mesh: &TriangleMesh,
     normals: &[Vector3],
@@ -407,6 +443,38 @@ fn trace_region(
     } else {
         mesh.positions[mesh.indices[members[0]][0]]
     };
+
+    // The face is only a plane if its own vertices are on it. Measured
+    // against the *fitted* plane, which is not the seed plane the clustering
+    // tested — refuse the region rather than emit a face whose boundary
+    // floats off its surface (of-sfp6).
+    //
+    // Only a *merged* region is asked: dissolving is what refusal costs, and
+    // a lone triangle dissolves into itself. Its own three vertices are all
+    // the plane there is to fit — even for a sliver, whose fitted normal
+    // comes from the field gradient rather than from its degenerate winding
+    // and so need not carry them. Asking it would put `trace_faces` in a loop
+    // rebuilding the same one-triangle region forever.
+    if members.len() > 1 {
+        let mut lo = Point3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY);
+        let mut hi = Point3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+        for &t in members {
+            for v in mesh.indices[t] {
+                let p = mesh.positions[v];
+                lo = Point3::new(lo.x.min(p.x), lo.y.min(p.y), lo.z.min(p.z));
+                hi = Point3::new(hi.x.max(p.x), hi.y.max(p.y), hi.z.max(p.z));
+            }
+        }
+        let fit_tol = (PLANE_FIT_TOL_REL * (hi - lo).norm()).max(SYSTEM_RESOLUTION);
+        let carries_its_vertices = members.iter().all(|&t| {
+            mesh.indices[t]
+                .iter()
+                .all(|&v| normal.dot(&(mesh.positions[v] - origin)).abs() <= fit_tol)
+        });
+        if !carries_its_vertices {
+            return None;
+        }
+    }
 
     // Directed boundary edges, sorted for deterministic loop order. The
     // triangles' outward winding makes outer boundaries counterclockwise
