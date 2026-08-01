@@ -525,14 +525,13 @@ impl TopologyStore {
             }
             if shell.is_closed || b.body_type == BodyType::Solid {
                 for &edge_id in &shell_edges {
-                    if let Some(edge) = self.edges.get(edge_id) {
-                        if edge.fins.len() == 1 {
+                    if let Some(edge) = self.edges.get(edge_id)
+                        && edge.fins.len() == 1 {
                             failures.push(CheckFailure::OpenEdgeInClosedShell {
                                 shell: shell_id,
                                 edge: edge_id,
                             });
                         }
-                    }
                 }
             }
             if !shell.is_closed
@@ -750,14 +749,13 @@ impl TopologyStore {
                 if let (Some(end), Some(start)) = (
                     self.fin_vertex_defensive(fin_id, false),
                     self.fin_vertex_defensive(lp.fins[(i + 1) % n], true),
-                ) {
-                    if end != start {
+                )
+                    && end != start {
                         failures.push(CheckFailure::LoopNotVertexContinuous {
                             loop_id,
                             fin: fin_id,
                         });
                     }
-                }
                 if let Some(mate_id) = fin.mate {
                     match self.fins.get(mate_id) {
                         None => failures.push(CheckFailure::StaleReference {
@@ -824,8 +822,8 @@ impl TopologyStore {
                     }
                     // Opposite traversal directions = consistent orientation
                     // of the two adjacent faces.
-                    if a.sense == b.sense {
-                        if let (Some(face_a), Some(face_b)) =
+                    if a.sense == b.sense
+                        && let (Some(face_a), Some(face_b)) =
                             (self.fin_face_defensive(a_id), self.fin_face_defensive(b_id))
                         {
                             failures.push(CheckFailure::InconsistentOrientation {
@@ -834,7 +832,6 @@ impl TopologyStore {
                                 face_b,
                             });
                         }
-                    }
                 }
             }
             n => failures.push(CheckFailure::NonManifoldEdge {
@@ -1010,8 +1007,8 @@ impl TopologyStore {
 
                 // The winding is only meaningful in a surface's parameter
                 // space, so a face without one has nothing to read it from.
-                if let (Some(surface), Some(outer)) = (surface, face.outer_loop) {
-                    if let Some(twice_signed_area) = self.loop_winding(geo, surface, outer) {
+                if let (Some(surface), Some(outer)) = (surface, face.outer_loop)
+                    && let Some(twice_signed_area) = self.loop_winding(geo, surface, outer) {
                         let wound_ccw = twice_signed_area > 0.0;
                         if wound_ccw != (face.sense == FaceSense::Positive) {
                             failures.push(CheckFailure::FaceSenseContradictsLoop {
@@ -1021,7 +1018,6 @@ impl TopologyStore {
                             });
                         }
                     }
-                }
             }
         }
 
@@ -1805,11 +1801,10 @@ impl FacePatch {
     /// *stabbed* by another face's edge, where the contact locus lies on
     /// one face's boundary and the strict even-odd test is a coin flip.
     fn covers(&self, p: &Point3, slack: f64) -> bool {
-        if let Ok(uv) = self.poly.chart.param(p, None) {
-            if self.poly.contains_for_clip(uv, self.snap) {
+        if let Ok(uv) = self.poly.chart.param(p, None)
+            && self.poly.contains_for_clip(uv, self.snap) {
                 return true;
             }
-        }
         self.boundary_distance(p) <= slack
     }
 
@@ -1864,11 +1859,10 @@ impl BoundaryEdge {
     /// side) still measures to the nearest point of the edge that exists.
     fn distance_to(&self, p: &Point3) -> f64 {
         let mut t = self.curve.project_point(p).t;
-        if let Some(period) = self.curve.period() {
-            if period > 0.0 && period.is_finite() {
+        if let Some(period) = self.curve.period()
+            && period > 0.0 && period.is_finite() {
                 t = self.t_start + (t - self.t_start).rem_euclid(period);
             }
-        }
         [t.clamp(self.t_start, self.t_end), self.t_start, self.t_end]
             .into_iter()
             .map(|t| self.curve.point(t))

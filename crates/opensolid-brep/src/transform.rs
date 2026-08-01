@@ -245,29 +245,26 @@ fn body_geometry_ids(
     let mut surface_ids: Vec<EntityId<Surface3>> = Vec::new();
 
     for face in store.faces_of_body(body) {
-        if let Some(surface) = store.face(face).expect("stale Face id").surface {
-            if !surface_ids.contains(&surface) {
+        if let Some(surface) = store.face(face).expect("stale Face id").surface
+            && !surface_ids.contains(&surface) {
                 surface_ids.push(surface);
             }
-        }
         for loop_id in store.loops_of_face(face) {
             // Degenerate vertex loops carry a vertex but no fins.
-            if let Some(v) = store.loop_(loop_id).expect("stale Loop id").vertex {
-                if !vertex_ids.contains(&v) {
+            if let Some(v) = store.loop_(loop_id).expect("stale Loop id").vertex
+                && !vertex_ids.contains(&v) {
                     vertex_ids.push(v);
                 }
-            }
         }
         for edge_id in store.edges_of_face(face) {
             let edge = store.edge(edge_id).expect("stale Edge id");
             if !edge_ids.contains(&edge_id) {
                 edge_ids.push(edge_id);
             }
-            if let Some(curve) = edge.curve {
-                if !curve_ids.contains(&curve) {
+            if let Some(curve) = edge.curve
+                && !curve_ids.contains(&curve) {
                     curve_ids.push(curve);
                 }
-            }
             for v in [edge.start_vertex, edge.end_vertex] {
                 if !vertex_ids.contains(&v) {
                     vertex_ids.push(v);

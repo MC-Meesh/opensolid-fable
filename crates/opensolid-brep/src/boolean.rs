@@ -5056,8 +5056,8 @@ fn embed_walk(
         } else {
             atom.points.iter().rev().copied().collect()
         };
-        if atom.closed {
-            if let Some(prev) = walk_pos {
+        if atom.closed
+            && let Some(prev) = walk_pos {
                 let rot = pts
                     .iter()
                     .enumerate()
@@ -5066,7 +5066,6 @@ fn embed_walk(
                     .unwrap_or(0);
                 pts.rotate_left(rot);
             }
-        }
         let last_dart = k + 1 == darts.len();
         let take = if atom.closed || (last_dart && keep_final) {
             pts.len()
@@ -5133,8 +5132,8 @@ fn embed_walk(
     // meridian is not the placeholder, and the cover polygon overlaps its
     // neighbors (of-rb4). Chains (`keep_final`) have no closure: their
     // start-pole longitude is only ever used for 3D-anchored matching.
-    if !keep_final && poly.len() >= 3 {
-        if let Some(vp) = initial_pole {
+    if !keep_final && poly.len() >= 3
+        && let Some(vp) = initial_pole {
             let row_end_is_pole = face_poly.chart.pole_v(&poly[1].1) == Some(vp);
             let last_at_pole = face_poly.chart.pole_v(&poly[poly.len() - 1].1).is_some();
             if row_end_is_pole && !last_at_pole {
@@ -5169,7 +5168,6 @@ fn embed_walk(
                 }
             }
         }
-    }
     // Align the whole polyline into the face's cover window so cycles,
     // holes, and probes of one face are mutually comparable. Each periodic
     // axis is aligned independently (only the torus wraps `v`).
@@ -5555,12 +5553,11 @@ fn apply_chain(
             }
         }
     }
-    if chosen.is_none() {
-        if let Some((ri, pair)) = fallback {
+    if chosen.is_none()
+        && let Some((ri, pair)) = fallback {
             let (one, two) = split_at(ri, pair)?;
             chosen = Some((ri, one, two));
         }
-    }
     if let Some((ri, cycle_one, cycle_two)) = chosen {
         let holes: Vec<Cycle> = regions[ri].cycles[1..].to_vec();
         let mut region_one = Region {
@@ -6489,11 +6486,10 @@ fn build_output(
                             (t_first, t_first + period)
                         } else {
                             let mut t_last = curve.project_point(&end_p).t;
-                            if let Some(period) = curve.period() {
-                                if t_last <= t_first {
+                            if let Some(period) = curve.period()
+                                && t_last <= t_first {
                                     t_last += period;
                                 }
-                            }
                             (t_first, t_last)
                         };
 
@@ -6976,11 +6972,10 @@ fn triangulate_mesh_face(mf: &MeshFace, weld_eps: f64) -> CoreResult<(Vec<Triang
     // NURBS charts take the CDT seed too, including the flat-patch case that
     // lays no lattice: both of-6ry's folding hazard and the wide-chord hazard
     // are properties of the chart being curved, not of having a lattice pitch.
-    if mf.chart.takes_cdt_seed() {
-        if let Some(cdt) = boundary_cdt(&all_uv, &ring_ranges) {
+    if mf.chart.takes_cdt_seed()
+        && let Some(cdt) = boundary_cdt(&all_uv, &ring_ranges) {
             tris = cdt;
         }
-    }
 
     refine_curved_region(
         &mut tris,

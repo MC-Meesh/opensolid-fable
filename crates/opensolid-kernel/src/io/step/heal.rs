@@ -1032,11 +1032,10 @@ fn apply_edge_welds(
             (kept.start_vertex, kept.end_vertex)
         };
         for vertex_id in [start, end] {
-            if let Some(vertex) = store.vertices.get_mut(vertex_id) {
-                if !vertex.edges.contains(&weld.kept) {
+            if let Some(vertex) = store.vertices.get_mut(vertex_id)
+                && !vertex.edges.contains(&weld.kept) {
                     vertex.edges.push(weld.kept);
                 }
-            }
         }
 
         operations.push(HealOperation::EdgesWelded {
@@ -1398,11 +1397,10 @@ fn body_vertices(store: &TopologyStore, body: EntityId<Body>) -> Vec<EntityId<Ve
     let mut out = Vec::new();
     for face in store.faces_of_body(body) {
         for loop_id in store.loops_of_face(face) {
-            if let Some(v) = store.loop_(loop_id).and_then(|l| l.vertex) {
-                if !out.contains(&v) {
+            if let Some(v) = store.loop_(loop_id).and_then(|l| l.vertex)
+                && !out.contains(&v) {
                     out.push(v);
                 }
-            }
             for &fin_id in store.fins_of_loop(loop_id) {
                 let edge_id = store.fin_edge(fin_id);
                 let Some(edge) = store.edge(edge_id) else {

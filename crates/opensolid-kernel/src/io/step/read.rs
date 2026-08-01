@@ -4350,16 +4350,16 @@ fn finish_exact_body(
     geo: &mut GeometryStore,
     body: EntityId<Body>,
     options: &StepReadOptions,
-    multi_bound_faces: &[EntityId<Face>],
-    authored: &AuthoredPcurves,
+    carryover: &MappingCarryover,
     msb_id: u64,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> usize {
     if !options.pcurves {
         return 0;
     }
+    let multi_bound_faces = &carryover.multi_bound_faces;
     attach_body_pcurves(store, geo, body);
-    let transplanted = transplant_authored_pcurves(store, geo, body, authored);
+    let transplanted = transplant_authored_pcurves(store, geo, body, carryover);
     if transplanted > 0 {
         diagnostics.push(Diagnostic {
             entity: Some(msb_id),
@@ -4399,11 +4399,15 @@ fn finish_exact_body(
     corrections.len()
 }
 
-/// The authored 2D trim geometry one solid's mapping collected, waiting for
-/// [`transplant_authored_pcurves`] once the body's own pcurves exist.
-struct AuthoredPcurves {
-    /// Per freeform edge: `(basis surface STEP id, 2D curve)` candidates.
-    by_edge: HashMap<EntityId<Edge>, Vec<(u64, NurbsCurve2)>>,
+/// What one solid's mapping collected for [`finish_exact_body`]: questions
+/// only the finished body (with pcurves attached) can settle.
+struct MappingCarryover {
+    /// Faces with more than one real bound, whose outer bound is re-decided
+    /// by parameter-space area.
+    multi_bound_faces: Vec<EntityId<Face>>,
+    /// Authored 2D trim per freeform edge — `(basis surface STEP id, 2D
+    /// curve)` candidates for [`transplant_authored_pcurves`].
+    authored_pcurves: HashMap<EntityId<Edge>, Vec<(u64, NurbsCurve2)>>,
     /// Each face's surface as the file named it.
     face_surface_refs: HashMap<EntityId<Face>, u64>,
 }
@@ -4433,14 +4437,15 @@ struct AuthoredPcurves {
 /// Seam fins are left alone: a `SEAM_CURVE` carries two pcurves on the
 /// same surface with nothing but authoring order to say which fin owns
 /// which, and the derived branches are already exact there. So is any fin
-/// whose surface has more than one candidate on this edge.
+/// whose surface has more than one candidate on this edge, and any fin
+/// whose derived pcurve is already an exact form rather than a fit.
 fn transplant_authored_pcurves(
     store: &mut TopologyStore,
     geo: &mut GeometryStore,
     body: EntityId<Body>,
-    authored: &AuthoredPcurves,
+    authored: &MappingCarryover,
 ) -> usize {
-    if authored.by_edge.is_empty() {
+    if authored.authored_pcurves.is_empty() {
         return 0;
     }
     let mut transplanted = 0;
@@ -4474,8 +4479,27 @@ fn transplant_authored_pcurves(
             if uses[&edge_id] != 1 {
                 continue;
             }
+            // Only an *approximate* derivation is worth displacing: a fin
+            // that carries an exact fit (a line or circle in `(u, v)`)
+            // already holds the invariant everywhere, in a form every
+            // consumer handles more cheaply than a spline. A fin with no
+            // pcurve at all has nothing to lose.
+            let replaceable = match store
+                .fins
+                .get(fin_id)
+                .and_then(|f| f.pcurve)
+                .and_then(|id| geo.pcurve(id))
+            {
+                None => true,
+                Some(Curve2::Polyline { .. }) => true,
+                Some(Curve2::Nurbs { fit_params, .. }) => !fit_params.is_empty(),
+                Some(_) => false,
+            };
+            if !replaceable {
+                continue;
+            }
             let candidates: Vec<&NurbsCurve2> = authored
-                .by_edge
+                .authored_pcurves
                 .get(&edge_id)
                 .map(|list| {
                     list.iter()
@@ -4504,7 +4528,7 @@ fn transplant_authored_pcurves(
                 .fins
                 .get_mut(fin_id)
                 .expect("fin came from this face's loops");
-            if let Some(stale) = std::mem::replace(&mut fin.pcurve, Some(pcurve_id)) {
+            if let Some(stale) = fin.pcurve.replace(pcurve_id) {
                 geo.pcurves.remove(stale);
             }
             transplanted += 1;
@@ -4600,12 +4624,11 @@ fn choose_outer_bounds(
         if !all_readable {
             continue;
         }
-        if let Some((_, winner)) = largest {
-            if winner != outer {
+        if let Some((_, winner)) = largest
+            && winner != outer {
                 store.set_outer_loop(face_id, winner);
                 redesignated += 1;
             }
-        }
     }
     redesignated
 }
@@ -4729,9 +4752,9 @@ fn map_solid(
     };
     let built = builder.build(msb_id, shell_ref, &voids);
     let created = builder.created;
-    let multi_bound_faces = builder.multi_bound_faces;
-    let authored = AuthoredPcurves {
-        by_edge: builder.authored_pcurves,
+    let carryover = MappingCarryover {
+        multi_bound_faces: builder.multi_bound_faces,
+        authored_pcurves: builder.authored_pcurves,
         face_surface_refs: builder.face_surface_refs,
     };
     match built {
@@ -4781,8 +4804,7 @@ fn map_solid(
                             geo,
                             body,
                             options,
-                            &multi_bound_faces,
-                            &authored,
+                            &carryover,
                             msb_id,
                             diagnostics,
                         );
@@ -5473,6 +5495,289 @@ mod tests {
         assert!(
             (signed_volume(&mesh) - 24.0).abs() < 1e-9,
             "bilinear patches mesh exactly"
+        );
+    }
+
+    // ---- authored freeform trim transplant (of-50u) ----
+
+    /// A 2×2×2 block whose top face is split along a curved quadratic
+    /// Bezier edge from the top A corner to the top C corner, each half on
+    /// its own copy of the bilinear top patch. The `SURFACE_CURVE` carries
+    /// one `PCURVE` per half with the *exact* 2D trim: the patch is affine
+    /// in `(u, v)`, and the 3D Bezier's control points are the images of
+    /// the 2D Bezier's, so `S(q(t)) == c(t)` identically.
+    ///
+    /// Corner letters run A(-1,-1) B(1,-1) C(1,1) D(-1,1); the patch rows
+    /// `((A, D), (B, C))` put `u` along A→B and `v` along A→D, so
+    /// `uv = ((x+1)/2, (y+1)/2)`.
+    fn split_top_block_step() -> String {
+        let mut b = String::new();
+        let corners = [
+            (-1.0, -1.0, -1.0),
+            (1.0, -1.0, -1.0),
+            (1.0, 1.0, -1.0),
+            (-1.0, 1.0, -1.0),
+            (-1.0, -1.0, 1.0),
+            (1.0, -1.0, 1.0),
+            (1.0, 1.0, 1.0),
+            (-1.0, 1.0, 1.0),
+        ];
+        // #1-#8 corner points, #11-#18 their vertices.
+        for (i, &(x, y, z)) in corners.iter().enumerate() {
+            writeln!(
+                b,
+                "#{} = CARTESIAN_POINT('', ({x:.6}, {y:.6}, {z:.6}));",
+                i + 1
+            )
+            .unwrap();
+            writeln!(b, "#{} = VERTEX_POINT('', #{});", i + 11, i + 1).unwrap();
+        }
+        // Straight edges: bottom ring, top ring, verticals. Edge `e`'s
+        // EDGE_CURVE is #(23 + 4e).
+        const EDGES: [(usize, usize); 12] = [
+            (0, 1),
+            (1, 2),
+            (2, 3),
+            (3, 0),
+            (4, 5),
+            (5, 6),
+            (6, 7),
+            (7, 4),
+            (0, 4),
+            (1, 5),
+            (2, 6),
+            (3, 7),
+        ];
+        for (e, &(i, j)) in EDGES.iter().enumerate() {
+            let eb = 20 + 4 * e;
+            let (dx, dy, dz) = (
+                corners[j].0 - corners[i].0,
+                corners[j].1 - corners[i].1,
+                corners[j].2 - corners[i].2,
+            );
+            writeln!(b, "#{eb} = DIRECTION('', ({dx:.6}, {dy:.6}, {dz:.6}));").unwrap();
+            writeln!(b, "#{} = VECTOR('', #{eb}, 1.);", eb + 1).unwrap();
+            writeln!(b, "#{} = LINE('', #{}, #{});", eb + 2, i + 1, eb + 1).unwrap();
+            writeln!(
+                b,
+                "#{} = EDGE_CURVE('', #{}, #{}, #{}, .T.);",
+                eb + 3,
+                i + 11,
+                j + 11,
+                eb + 2
+            )
+            .unwrap();
+        }
+        // Bottom and the four walls, as planes (same cycle tables as the
+        // block fixtures).
+        let face_specs: [([usize; 4], (f64, f64, f64)); 5] = [
+            ([0, 3, 2, 1], (0.0, 0.0, -1.0)),
+            ([0, 1, 5, 4], (0.0, -1.0, 0.0)),
+            ([1, 2, 6, 5], (1.0, 0.0, 0.0)),
+            ([2, 3, 7, 6], (0.0, 1.0, 0.0)),
+            ([3, 0, 4, 7], (-1.0, 0.0, 0.0)),
+        ];
+        let mut shell_faces = Vec::new();
+        for (f, &(cycle, (nx, ny, nz))) in face_specs.iter().enumerate() {
+            let fb = 100 + 10 * f;
+            writeln!(b, "#{fb} = DIRECTION('', ({nx:.6}, {ny:.6}, {nz:.6}));").unwrap();
+            writeln!(
+                b,
+                "#{} = AXIS2_PLACEMENT_3D('', #{}, #{fb}, $);",
+                fb + 1,
+                cycle[0] + 1
+            )
+            .unwrap();
+            writeln!(b, "#{} = PLANE('', #{});", fb + 2, fb + 1).unwrap();
+            for k in 0..4 {
+                let (from, to) = (cycle[k], cycle[(k + 1) % 4]);
+                let (idx, &(a, _)) = EDGES
+                    .iter()
+                    .enumerate()
+                    .find(|&(_, &(a, c))| (a, c) == (from, to) || (a, c) == (to, from))
+                    .expect("face cycles only use listed edges");
+                let orientation = if a == from { ".T." } else { ".F." };
+                writeln!(
+                    b,
+                    "#{} = ORIENTED_EDGE('', *, *, #{}, {orientation});",
+                    fb + 3 + k,
+                    23 + 4 * idx
+                )
+                .unwrap();
+            }
+            writeln!(
+                b,
+                "#{} = EDGE_LOOP('', (#{}, #{}, #{}, #{}));",
+                fb + 7,
+                fb + 3,
+                fb + 4,
+                fb + 5,
+                fb + 6
+            )
+            .unwrap();
+            writeln!(b, "#{} = FACE_OUTER_BOUND('', #{}, .T.);", fb + 8, fb + 7).unwrap();
+            writeln!(
+                b,
+                "#{} = ADVANCED_FACE('', (#{}), #{}, .T.);",
+                fb + 9,
+                fb + 8,
+                fb + 2
+            )
+            .unwrap();
+            shell_faces.push(format!("#{}", fb + 9));
+        }
+        // The curved splitting edge: 3D control A(-1,-1,1) M(0.5,-0.5,1)
+        // C(1,1,1) is the affine image of 2D control (0,0) (0.75,0.25)
+        // (1,1) under S.
+        b.push_str(
+            "#200 = CARTESIAN_POINT('', (0.5, -0.5, 1.0));\n\
+             #201 = B_SPLINE_CURVE_WITH_KNOTS('', 2, (#5, #200, #7), .UNSPECIFIED., .F., .F., \
+             (3, 3), (0., 1.), .UNSPECIFIED.);\n\
+             #210 = B_SPLINE_SURFACE_WITH_KNOTS('', 1, 1, ((#5, #8), (#6, #7)), .UNSPECIFIED., \
+             .F., .F., .F., (2, 2), (2, 2), (0., 1.), (0., 1.), .UNSPECIFIED.);\n\
+             #211 = B_SPLINE_SURFACE_WITH_KNOTS('', 1, 1, ((#5, #8), (#6, #7)), .UNSPECIFIED., \
+             .F., .F., .F., (2, 2), (2, 2), (0., 1.), (0., 1.), .UNSPECIFIED.);\n\
+             #220 = CARTESIAN_POINT('', (0., 0.));\n\
+             #221 = CARTESIAN_POINT('', (0.75, 0.25));\n\
+             #222 = CARTESIAN_POINT('', (1., 1.));\n\
+             #223 = B_SPLINE_CURVE_WITH_KNOTS('', 2, (#220, #221, #222), .UNSPECIFIED., .F., .F., \
+             (3, 3), (0., 1.), .UNSPECIFIED.);\n\
+             #224 = ( GEOMETRIC_REPRESENTATION_CONTEXT(2) PARAMETRIC_REPRESENTATION_CONTEXT() \
+             REPRESENTATION_CONTEXT('2D SPACE','') );\n\
+             #225 = DEFINITIONAL_REPRESENTATION('', (#223), #224);\n\
+             #226 = PCURVE('', #210, #225);\n\
+             #227 = PCURVE('', #211, #225);\n\
+             #228 = SURFACE_CURVE('', #201, (#226, #227), .CURVE_3D.);\n\
+             #229 = EDGE_CURVE('', #15, #17, #228, .T.);\n",
+        );
+        // Half 1: A → C (curved) → D → A, on #210. Top-ring edges: A→B is
+        // edge 4 (#39), B→C edge 5 (#43), C→D edge 6 (#47), D→A edge 7
+        // (#51).
+        b.push_str(
+            "#230 = ORIENTED_EDGE('', *, *, #229, .T.);\n\
+             #231 = ORIENTED_EDGE('', *, *, #47, .T.);\n\
+             #232 = ORIENTED_EDGE('', *, *, #51, .T.);\n\
+             #233 = EDGE_LOOP('', (#230, #231, #232));\n\
+             #234 = FACE_OUTER_BOUND('', #233, .T.);\n\
+             #235 = ADVANCED_FACE('', (#234), #210, .T.);\n",
+        );
+        // Half 2: A → B → C → A (curved, reversed), on #211.
+        b.push_str(
+            "#240 = ORIENTED_EDGE('', *, *, #39, .T.);\n\
+             #241 = ORIENTED_EDGE('', *, *, #43, .T.);\n\
+             #242 = ORIENTED_EDGE('', *, *, #229, .F.);\n\
+             #243 = EDGE_LOOP('', (#240, #241, #242));\n\
+             #244 = FACE_OUTER_BOUND('', #243, .T.);\n\
+             #245 = ADVANCED_FACE('', (#244), #211, .T.);\n",
+        );
+        shell_faces.push("#235".to_string());
+        shell_faces.push("#245".to_string());
+        writeln!(b, "#250 = CLOSED_SHELL('', ({}));", shell_faces.join(", ")).unwrap();
+        writeln!(b, "#251 = MANIFOLD_SOLID_BREP('split top', #250);").unwrap();
+        wrap(&b)
+    }
+
+    /// The transplant case (of-50u): a freeform edge on freeform faces,
+    /// whose authored pcurves line up with the kernel's parameterization
+    /// exactly — so both top fins adopt them verbatim, claiming exactness
+    /// (`fit_params` empty) where a refit could only claim its samples.
+    #[test]
+    fn exact_authored_freeform_trim_is_transplanted() {
+        let (store, geo, report) = import(&split_top_block_step());
+        no_error_diagnostics(&report);
+        let body = brep_body(&report.solids[0].outcome);
+        assert!(store.check(body).is_empty(), "{:?}", store.check(body));
+        let counts = store.euler_counts(body);
+        assert_eq!((counts.vertices, counts.edges, counts.faces), (8, 13, 7));
+
+        let mut transplanted = 0;
+        for face in store.faces_of_body(body) {
+            for loop_id in store.loops_of_face(face) {
+                for &fin in store.fins_of_loop(loop_id) {
+                    let pcurve = store
+                        .fin(fin)
+                        .unwrap()
+                        .pcurve
+                        .and_then(|id| geo.pcurve(id))
+                        .expect("every fin carries a pcurve");
+                    if let Curve2::Nurbs { curve, fit_params } = pcurve {
+                        assert!(
+                            fit_params.is_empty(),
+                            "authored trim must be adopted verbatim, not refit"
+                        );
+                        // The authored 2D Bezier, verbatim.
+                        assert_eq!(curve.degree(), 2);
+                        assert_eq!(
+                            curve.control_points(),
+                            &[
+                                opensolid_core::Point2::new(0.0, 0.0),
+                                opensolid_core::Point2::new(0.75, 0.25),
+                                opensolid_core::Point2::new(1.0, 1.0),
+                            ]
+                        );
+                        transplanted += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            transplanted, 2,
+            "both top fins of the curved edge adopt the authored trim"
+        );
+        assert!(
+            report.diagnostics.iter().any(|d| d
+                .message
+                .contains("authored freeform trim curve(s) adopted")),
+            "{:?}",
+            report.diagnostics
+        );
+
+        let mesh = tessellate_body(&store, &geo, body, &TessellationOptions::default()).unwrap();
+        assert!(mesh.is_closed_manifold());
+        assert!(
+            (signed_volume(&mesh) - 8.0).abs() < 1e-9,
+            "volume {}",
+            signed_volume(&mesh)
+        );
+    }
+
+    /// An authored pcurve that does not trace its edge — here shifted a
+    /// tenth in `u` — must fail the sampled invariant and leave the derived
+    /// fit in place. Wrong trim is worse than refit trim.
+    #[test]
+    fn a_lying_authored_pcurve_is_refused_and_the_fit_kept() {
+        let text = split_top_block_step().replace(
+            "#221 = CARTESIAN_POINT('', (0.75, 0.25));",
+            "#221 = CARTESIAN_POINT('', (0.85, 0.25));",
+        );
+        let (store, geo, report) = import(&text);
+        no_error_diagnostics(&report);
+        let body = brep_body(&report.solids[0].outcome);
+
+        for face in store.faces_of_body(body) {
+            for loop_id in store.loops_of_face(face) {
+                for &fin in store.fins_of_loop(loop_id) {
+                    if let Some(Curve2::Nurbs { fit_params, .. }) = store
+                        .fin(fin)
+                        .unwrap()
+                        .pcurve
+                        .and_then(|id| geo.pcurve(id))
+                    {
+                        assert!(
+                            !fit_params.is_empty(),
+                            "a candidate off its edge must be refused, keeping the fit"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            !report
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("authored freeform trim")),
+            "{:?}",
+            report.diagnostics
         );
     }
 
