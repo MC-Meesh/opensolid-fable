@@ -181,6 +181,11 @@ const MEASURED_FILES: &[&str] = &[
     "occ/coincident/blocks_partial_overlap.stp",
     "occ/coincident/blocks_shared_face.stp",
     "occ/nurbs/lofted_vase.stp",
+    // of-8ulj sized this one's four `SURFACE_OF_LINEAR_EXTRUSION` walls to
+    // the faces they carry instead of to their `VECTOR`, which is what
+    // makes it measurable: the patches used to stop 20 mm short of their
+    // own faces, and the tessellator called that degenerate.
+    "occ/nurbs/bspline_patch_prism.stp",
     "occ/periodic/cone_apex.stp",
     "occ/periodic/cone_truncated.stp",
     "occ/periodic/cylinder_full.stp",

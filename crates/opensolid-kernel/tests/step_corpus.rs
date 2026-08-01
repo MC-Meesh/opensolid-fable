@@ -1837,12 +1837,14 @@ mod corpus {
                 );
             }
         }
-        // 2026-07-30: 18 files clear this. dm1-id-214 is the newest, landed
-        // by of-fid — its 7 fins on closed NURBS patches had pcurves up to
-        // 13 mm off their own edges. The other 17 are the four analytic
-        // parts of the 2026-07-26 baseline plus the synthetic and OCC
-        // fixtures added since.
-        const FLOOR: usize = 18;
+        // 2026-08-01: 19 files clear this. bspline_patch_prism is the newest,
+        // landed by of-8ulj — its four extrusion walls were patches one
+        // direction-vector long, 20 mm short of the faces they carried.
+        // dm1-id-214 came in before it with of-fid (7 fins on closed NURBS
+        // patches whose pcurves ran up to 13 mm off their own edges); the
+        // other 17 are the four analytic parts of the 2026-07-26 baseline
+        // plus the synthetic and OCC fixtures added since.
+        const FLOOR: usize = 19;
         assert!(
             clean.len() >= FLOOR,
             "geometrically clean corpus count regressed below {FLOOR}: only {clean:?} pass"
@@ -2181,6 +2183,56 @@ mod corpus {
             assert_counts_equal(&store, body, &store2, breps2[0], "dm1 NURBS round trip");
             assert_edges_lie_on_faces(&store2, &geo2, breps2[0]);
         }
+    }
+
+    /// A prism whose four walls are `SURFACE_OF_LINEAR_EXTRUSION`s of
+    /// degree-5 B-splines (of-8ulj).
+    ///
+    /// The entity states no extent: it is unbounded along the sweep, and
+    /// this file — like most — spells a `VECTOR` of magnitude 1 pointing
+    /// `+z` for faces that reach 20 mm along `−z`. Sweeping the profile by
+    /// that vector, as the reader used to, built four patches that contained
+    /// none of their own faces but the `z = 0` rim: 12 `EdgeOffSurface`
+    /// reports up to 20 mm, and a tessellation that called the geometry
+    /// degenerate. The patches are sized from the faces' own bounds now, so
+    /// the exact import has to be geometrically clean, not merely
+    /// structurally valid.
+    #[test]
+    fn bspline_extrusion_prism_imports_on_patches_that_reach_its_faces() {
+        let name = "occ/nurbs/bspline_patch_prism.stp";
+        let (store, geo, report) = import_bytes(&load(name));
+        assert!(
+            report.diagnostics.is_empty(),
+            "{name}: expected a clean exact import, got: {:?}",
+            report.diagnostics
+        );
+        let breps = assert_all_outcomes_structured(&store, &report);
+        assert_eq!(breps.len(), 1, "{name}: expected an exact B-Rep import");
+        let body = breps[0];
+
+        let failures = store.check_geometry(&geo, body);
+        assert!(
+            failures.is_empty(),
+            "{name}: extrusion patches do not reach their faces: {failures:?}"
+        );
+
+        // OCC reads this part as 50000 mm³ (`reference/occ/nurbs/`), and
+        // both of our measurements have to find the same solid. The
+        // tessellated one carries the chord error of a degree-5 profile at
+        // the default 32-segments-per-turn pitch (0.36% here; `occ_reference`
+        // measures it at its own finer pitch and lands inside 0.01%). The
+        // exact one integrates the B-Rep faces through their stored pcurves
+        // and has no such excuse.
+        let volume = closed_volume(&store, &geo, body).expect("the prism must tessellate closed");
+        assert!(
+            (volume - 50_000.0).abs() / 50_000.0 < 1e-2,
+            "{name}: tessellated volume {volume} is not OCC's 50000"
+        );
+        let exact = exact_volume(&store, &geo, body).expect("the prism must integrate");
+        assert!(
+            (exact - 50_000.0).abs() / 50_000.0 < 1e-9,
+            "{name}: exact volume {exact} is not OCC's 50000"
+        );
     }
 
     /// An exact import is only *usable* once it has a mesh: the wasm layer
