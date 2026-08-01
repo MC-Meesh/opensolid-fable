@@ -117,9 +117,9 @@ use opensolid_brep::boolean::{InsideTest, boolean_with_inside_tests, intersect, 
 use opensolid_brep::curve::plane_basis;
 use opensolid_brep::{
     Body, BodyType, BooleanOp, BooleanOutput, CheckFailure, Curve3, FaceSense, FinSense,
-    GeometryStore, KnotVector, LoopType, NurbsSurface, SYSTEM_RESOLUTION, ShellOrientation,
-    Surface3, TessellationOptions, TopologyStore, primitives, rotate_body, tessellate_body,
-    translate_body,
+    GeometryStore, KnotVector, LoopType, MAX_ALLOWED_TOLERANCE, NurbsSurface, SYSTEM_RESOLUTION,
+    ShellOrientation, Surface3, TessellationOptions, TopologyStore, primitives, rotate_body,
+    tessellate_body, translate_body,
 };
 use opensolid_core::EntityId;
 use opensolid_core::error::{CoreError, CoreResult};
@@ -2784,6 +2784,117 @@ fn block_notches_torus_outer_wall() {
         torus_volume(major, minor),
         CURVED_VOLUME_RTOL,
         &format!("{context}: difference + intersection vs torus volume"),
+    );
+}
+
+/// Fence for of-2hbp, on the two configurations that filed it: the
+/// marched imprints those notches leave must not sit off the torus they
+/// were cut from by more than they say they do.
+///
+/// `BooleanOutput::check` runs the STRUCTURAL pass only, so nothing on the
+/// boolean's validity path measures geometry and this whole class was
+/// invisible. What it hid: an imprint of a plane in a torus is a general
+/// quartic, carried as a `Curve3::Polyline` of ~46 samples, and
+/// `check_geometry` samples the edge curve *between* those samples — where
+/// it sits a chord sagitta (~1.3e-3 at minor radius 0.5) inside the
+/// surface. `build_output` recorded a tolerance covering the ENDPOINT gaps
+/// alone, so the edge declared ~1e-10 and missed by seven orders.
+///
+/// Asserted per failure *class* rather than as a bare
+/// `check_with_geometry().is_empty()`: `InvalidEdgeRange` still fires on
+/// the two full-ring imprints here (of-sf12, a ring cut at exactly one
+/// seam), and a blanket assertion would fence that instead of this. The
+/// classes below are the ones of-2hbp is about, and they must be empty.
+///
+/// The same defect is why the severing case carries this fence without
+/// currently exercising it: both its imprint edges ARE the full rings, and
+/// `check_geometry` measures nothing on an edge whose range it cannot
+/// trust. It goes live the moment of-sf12 does, which is the point of
+/// leaving it here.
+#[test]
+fn torus_notch_imprints_stay_within_their_declared_tolerance() {
+    let (major, minor) = (2.0, 0.5);
+    for (label, min, max) in [
+        ("severing the tube", [1.3, -0.35, -1.0], [2.7, 0.35, 1.0]),
+        (
+            "notching the outer wall",
+            [2.1, -0.35, -1.0],
+            [2.7, 0.35, 1.0],
+        ),
+    ] {
+        for op in [BooleanOp::Subtract, BooleanOp::Intersect] {
+            let context = format!("torus block notch {label}, {op:?}");
+            let mut scene = Scene::new();
+            let ring = scene.torus(Point3::origin(), major, minor);
+            let tool = scene.block(min, max);
+            let out = match op {
+                BooleanOp::Subtract => scene.subtract(ring, tool),
+                _ => scene.intersect(ring, tool),
+            }
+            .unwrap_or_else(|e| panic!("{context}: failed: {e:?}"));
+
+            let off_surface: Vec<_> = out
+                .store
+                .check_geometry(&out.geo, out.body)
+                .into_iter()
+                .filter(|f| {
+                    matches!(
+                        f,
+                        CheckFailure::EdgeOffSurface { .. } | CheckFailure::PcurveDeviation { .. }
+                    )
+                })
+                .collect();
+            assert!(
+                off_surface.is_empty(),
+                "{context}: an edge must declare the tolerance it needs: {off_surface:#?}"
+            );
+        }
+    }
+}
+
+/// The other half of of-2hbp: a chord sagitta is a *length*, so the
+/// tolerance it justifies grows with the model, and past a minor radius of
+/// about 2 the honest number crosses the kernel's absolute
+/// `MAX_ALLOWED_TOLERANCE`. Recording it there would be a self-inflicted
+/// wound — `check` reports `ToleranceExceeded`, and `opensolid_kernel`'s
+/// hybrid gate discards any exact result whose `check` is non-empty, so
+/// declaring the bow honestly would silently stop this notch taking the
+/// B-Rep path at all. The bow is capped instead, and the structural pass
+/// must stay clean.
+///
+/// Held at 8× deliberately: the endpoint gaps `build_output` has always
+/// recorded scale with the model too and are NOT capped, and they cross
+/// the same ceiling at around 13× (of-abwf). That is a separate hole and
+/// this fence must not accidentally be measuring it.
+#[test]
+fn a_scaled_up_imprint_does_not_declare_itself_past_the_kernel_limit() {
+    let s = 8.0;
+    let context = format!("torus block notch at {s}× scale");
+    let mut scene = Scene::new();
+    let ring = scene.torus(Point3::origin(), 2.0 * s, 0.5 * s);
+    let tool = scene.block([2.1 * s, -0.35 * s, -s], [2.7 * s, 0.35 * s, s]);
+    let out = scene
+        .subtract(ring, tool)
+        .unwrap_or_else(|e| panic!("{context}: subtract failed: {e:?}"));
+
+    let failures = out.check();
+    assert!(
+        failures.is_empty(),
+        "{context}: the structural pass must stay clean: {failures:#?}"
+    );
+    // Not vacuous: the same notch's widest bow is 2.64e-3 at 1× scale, so
+    // uncapped it would declare ~2.1e-2 here, twice the limit.
+    let widest = out
+        .store
+        .faces_of_body(out.body)
+        .into_iter()
+        .flat_map(|f| out.store.edges_of_face(f))
+        .filter_map(|e| out.store.edge(e))
+        .map(|e| e.tolerance)
+        .fold(0.0_f64, f64::max);
+    assert_eq!(
+        widest, MAX_ALLOWED_TOLERANCE,
+        "{context}: the imprint edges must be sitting exactly at the cap"
     );
 }
 

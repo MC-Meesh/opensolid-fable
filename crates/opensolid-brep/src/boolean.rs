@@ -47,7 +47,7 @@
 //! vertex tolerances record the actual curve-endpoint-to-vertex residual
 //! (tolerant modeling, `spec/08-tolerances.md`).
 
-use crate::check::CheckFailure;
+use crate::check::{CheckFailure, MAX_ALLOWED_TOLERANCE};
 use crate::curve::{Curve3, CurveEval, TWO_PI, plane_basis};
 use crate::geometry::GeometryStore;
 use crate::nurbs::curve::{KnotVector, NurbsCurve};
@@ -117,6 +117,34 @@ const BOUNDARY_BAND_SAGITTAS: f64 = 2.0;
 /// length of it. Matches the `ambiguous` band `Pipeline::contains_point`
 /// uses for the same reason one step earlier.
 const BOUNDARY_BAND_SNAPS: f64 = 10.0;
+/// Safety factor applied to a marched imprint's measured chord sagitta
+/// ([`marched_span_sagitta`]) before [`build_output`] records it as the
+/// edge's tolerance.
+///
+/// The measurement is an estimate, not a bound: it reads three consecutive
+/// samples as an arc of constant curvature evenly stepped, and where the
+/// marcher's step or the curve's curvature changes across a triple it can
+/// land a few percent under the worst single chord it is standing in for —
+/// 6% under, on the torus notch that filed of-2hbp. A tolerance that is
+/// *nearly* wide enough is a tolerance that fails, so it is doubled. Two is
+/// the same margin [`BOUNDARY_BAND_SAGITTAS`] takes on the same estimate.
+///
+/// The product is capped at [`MAX_ALLOWED_TOLERANCE`], and the cap is not a
+/// formality: a marched section is sampled coarsely enough that its bow
+/// runs ~2.6e-3 of the feature radius, so it crosses the kernel's absolute
+/// 1e-2 ceiling somewhere around radius 2. Past there the honest number is
+/// one the kernel refuses to model, and *declaring* it would not fix the
+/// body — it would only fail [`crate::check::CheckFailure::ToleranceExceeded`]
+/// in the structural pass, which `opensolid_kernel`'s hybrid gate reads as
+/// "this exact result is untrustworthy" and answers by throwing the whole
+/// B-Rep away for the F-Rep fallback. Trading the exact path for a number
+/// is the wrong trade. Capped, the edge under-declares exactly as far as
+/// the kernel's own ceiling forces it to, and says so where it belongs: as
+/// `EdgeOffSurface` from the geometric pass. What actually retires that
+/// residue is fitting marched curves as NURBS instead of polylines
+/// ([`Curve3::Polyline`]'s "later hardening pass"), which removes the bow
+/// rather than budgeting for it.
+const IMPRINT_SAGITTA_MARGIN: f64 = 2.0;
 /// Acceptance band for discretization-noise inputs, as a fraction of the
 /// local face extent: how far off its true locus a chord-sampled point may
 /// legitimately sit before it stops being noise and starts being a
@@ -4550,6 +4578,61 @@ fn polyline_sagitta(points: &[Point3], closed: bool) -> f64 {
     worst
 }
 
+/// How far `curve` can bow away from itself over `[t_start, t_end]` — the
+/// worst chord sagitta of a marched imprint, and exactly zero for every
+/// analytic curve, which has none.
+///
+/// [`Curve3::Polyline`] is the exact-geometry carrier for marched SSI
+/// curves, and `point(t)` interpolates its chords. Between two samples the
+/// intersection it stands for bows away from the chord by up to one
+/// sagitta, so an edge bound to it sits that far off *both* surfaces it is
+/// the intersection of — not because the weld was loose, but because the
+/// curve itself is only chord-accurate (of-2hbp). Which is what a
+/// tolerance is for; [`build_output`] records this alongside the endpoint
+/// gaps.
+///
+/// Measured over the samples the edge actually spans, not the whole
+/// polyline: an imprint is split into as many edges as the arrangement
+/// needs, and the worst bow of a full torus section is twenty times that
+/// of the sliver of it one edge covers. A tolerance is a claim about the
+/// entity carrying it.
+fn marched_span_sagitta(curve: &Curve3, t_start: f64, t_end: f64) -> f64 {
+    let Curve3::Polyline { points, closed } = curve else {
+        return 0.0;
+    };
+    if points.len() < 3 {
+        return 0.0;
+    }
+    let segs = (points.len() - 1) as i64;
+    let (lo, hi) = (t_start.min(t_end), t_start.max(t_end));
+    // A range past one full traversal has nothing left to localize, and a
+    // range that is not a pair of numbers cannot be localized at all: both
+    // fall back to the whole polyline, which is the wider claim of the two
+    // and so the safe one.
+    if !(lo.is_finite() && hi.is_finite()) || hi - lo >= segs as f64 {
+        return polyline_sagitta(points, *closed);
+    }
+    // The window of samples the range touches, widened outward to whole
+    // samples.
+    let (first, last) = (lo.floor() as i64, hi.ceil() as i64);
+    let mut span: Vec<Point3> = Vec::with_capacity((last - first + 1) as usize);
+    for i in first..=last {
+        // A closed polyline wraps through its repeated end sample; an open
+        // one has nothing past its domain, and the clamped repeats a
+        // wrapped range would produce are dropped rather than measured as
+        // zero-length chords.
+        let i = if *closed {
+            i.rem_euclid(segs)
+        } else {
+            i.clamp(0, segs)
+        };
+        if span.last() != Some(&points[i as usize]) {
+            span.push(points[i as usize]);
+        }
+    }
+    polyline_sagitta(&span, false)
+}
+
 /// Split a sampled curve at the given 3D points, producing atoms. Split
 /// points are inserted into the polyline at their nearest segment.
 fn split_sampled(sampled: &SampledCurve, splits: &[Point3], snap: f64) -> Vec<Atom> {
@@ -6317,7 +6400,19 @@ fn build_output(
                             (curve.point(t_start) - store.vertex(sv).expect("live").point).norm();
                         let d_end =
                             (curve.point(t_end) - store.vertex(ev).expect("live").point).norm();
-                        let tolerance = SYSTEM_RESOLUTION.max(d_start).max(d_end);
+                        // The endpoint gaps say where the edge is pinned;
+                        // they say nothing about the curve BETWEEN them,
+                        // and a marched imprint is a chord approximation
+                        // whose interior sits a sagitta off the surfaces it
+                        // bounds. Both are the edge's departure from exact
+                        // geometry, so both belong in the one number that
+                        // declares it (of-2hbp). Capped at the kernel's own
+                        // ceiling — see `IMPRINT_SAGITTA_MARGIN` for why a
+                        // number past it costs more than it buys.
+                        let bow = (IMPRINT_SAGITTA_MARGIN
+                            * marched_span_sagitta(curve, t_start, t_end))
+                        .min(MAX_ALLOWED_TOLERANCE);
+                        let tolerance = SYSTEM_RESOLUTION.max(d_start).max(d_end).max(bow);
                         let edge_id = store
                             .create_edge_with_curve(sv, ev, tolerance, curve_id, t_start, t_end);
                         for (v, d) in [(sv, d_start), (ev, d_end)] {
@@ -8212,7 +8307,6 @@ fn segments_cross(p1: (f64, f64), p2: (f64, f64), q1: (f64, f64), q2: (f64, f64)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::check::MAX_ALLOWED_TOLERANCE;
     use crate::primitives;
     use crate::surface::SurfaceEval;
     use crate::topology::Face;
@@ -9778,6 +9872,95 @@ mod tests {
 
         // Too few samples to measure: zero, and callers floor it.
         assert_eq!(polyline_sagitta(&circle[..2], false), 0.0);
+    }
+
+    /// The tolerance a marched edge declares is a claim about *that edge*,
+    /// so the bow it is charged for is the bow of the samples it spans —
+    /// not of the whole imprint, most of which belongs to other edges
+    /// (of-2hbp).
+    #[test]
+    fn marched_span_sagitta_charges_the_span_not_the_whole_imprint() {
+        let r = 1.5;
+        // An imprint that runs straight for a while and then turns: the
+        // arrangement splits it into edges, and the ones on the straight
+        // run carry no discretization error at all while the ones on the
+        // turn carry the arc's full bow.
+        const RUN: usize = 16;
+        const ARC: usize = 32;
+        let mut points: Vec<Point3> = (0..=RUN)
+            .map(|i| Point3::new(-r, r * i as f64 / RUN as f64, 0.0))
+            .collect();
+        points.extend((1..=ARC).map(|i| {
+            let t = PI * i as f64 / ARC as f64;
+            Point3::new(-r * t.cos(), r + r * t.sin(), 0.0)
+        }));
+        let imprint = Curve3::Polyline {
+            points: points.clone(),
+            closed: false,
+        };
+        assert_eq!(
+            marched_span_sagitta(&imprint, 0.0, RUN as f64),
+            0.0,
+            "an edge on the straight run has nothing to declare"
+        );
+        let turn = marched_span_sagitta(&imprint, RUN as f64, (RUN + 4) as f64);
+        assert!(turn > 0.0, "an edge on the turn does");
+        // The whole-curve figure is the turn's, so charging the straight
+        // edge with it is the over-declaration the span exists to avoid.
+        assert_eq!(
+            marched_span_sagitta(&imprint, 0.0, (RUN + ARC) as f64),
+            polyline_sagitta(&points, false)
+        );
+
+        // Against the closed form: a circle of radius r sampled n per turn
+        // stands off its chords by r(1 − cos(π/n)), and the three-sample
+        // estimate lands within 2% of it.
+        let circle: Vec<Point3> = (0..=SAMPLES_PER_CIRCLE)
+            .map(|i| {
+                let t = TWO_PI * i as f64 / SAMPLES_PER_CIRCLE as f64;
+                Point3::new(r * t.cos(), r * t.sin(), 0.0)
+            })
+            .collect();
+        let ring = Curve3::Polyline {
+            points: circle,
+            closed: true,
+        };
+        let want = r * (1.0 - (PI / SAMPLES_PER_CIRCLE as f64).cos());
+        let interior = marched_span_sagitta(&ring, 10.0, 14.0);
+        assert!(
+            (interior - want).abs() < 0.05 * want,
+            "span sagitta {interior:e} should be within 5% of {want:e}"
+        );
+        // A range that runs off the end of a closed polyline wraps through
+        // its repeated sample, so a span straddling the wrap measures the
+        // same as any other four segments of the same circle.
+        let n = SAMPLES_PER_CIRCLE as f64;
+        let wrapped = marched_span_sagitta(&ring, n - 2.0, n + 2.0);
+        assert!(
+            (wrapped - interior).abs() < 1e-12 * interior,
+            "wrapped span {wrapped:e} vs interior {interior:e}"
+        );
+
+        // Nothing to charge: analytic curves are exact, and a straight run
+        // has no discretization to tolerate.
+        let seam = Curve3::Polyline {
+            points: (0..=8).map(|i| Point3::new(0.0, 0.0, i as f64)).collect(),
+            closed: false,
+        };
+        assert_eq!(marched_span_sagitta(&seam, 0.0, 8.0), 0.0);
+        for exact in [
+            Curve3::Line {
+                origin: Point3::origin(),
+                dir: Vector3::z(),
+            },
+            Curve3::Circle {
+                center: Point3::origin(),
+                axis: Vector3::z(),
+                radius: r,
+            },
+        ] {
+            assert_eq!(marched_span_sagitta(&exact, 0.0, TWO_PI), 0.0);
+        }
     }
 
     #[test]
