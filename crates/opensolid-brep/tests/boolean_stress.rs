@@ -7976,14 +7976,19 @@ impl CurvedPair {
     /// ([`cone_sphere_union_takes_the_exact_path`] and
     /// [`rotated_cone_sphere_union_takes_the_exact_path`]).
     ///
-    /// The variant is **not** clean everywhere yet, and re-arming it here
-    /// says only that these seeds are: a 240-configuration sweep of rotated
-    /// cone-sphere unions run while closing of-ntkk went from 30 passing to
-    /// 208, with the remaining 32 splitting into an impossible reconstructed
-    /// Euler characteristic, the same missing-interior-sample `classify`
-    /// error, and a non-manifold tessellation — of-kzhd. Widening the case
-    /// count or the seed here will find those; that is the campaign working,
-    /// not a regression of this one.
+    /// Widening the sweep behind that decision is what found of-kzhd: 240
+    /// randomly sampled rotated cone-sphere unions went from 30 passing to
+    /// 208 over of-ntkk, and the remaining 32 split into an impossible
+    /// reconstructed Euler characteristic, the same missing-interior-sample
+    /// `classify` error, and a non-manifold tessellation. All three are
+    /// fixed — a seam stub the marcher emitted beside its own ring, an
+    /// imprint doubling back past a polished endpoint, and one junction
+    /// spelled twice — and the sweep now runs 700 configurations clean
+    /// across all three booleans. One case per mode is pinned as a live
+    /// test ([`rotated_cone_sphere_union_has_no_duplicate_seam_edge`] and
+    /// the two after it), because the sweep itself is far too slow to
+    /// commit: this campaign's eight cases already take ~15 minutes in a
+    /// debug build.
     fn random(rng: &mut Rng) -> Self {
         match rng.pick(5) {
             0 => {
@@ -8392,6 +8397,170 @@ fn rotated_cone_sphere_union_takes_the_exact_path() {
          (expected {want:?}, off by {gap:.3e})",
         rot_props.centroid,
         plain_props.centroid
+    );
+}
+
+/// Run one boolean on `pair` twice — plain, and after a rigid motion of
+/// both operands — and assert the campaign's two invariants: congruent
+/// volume, equivariant centroid.
+///
+/// Both measurements route through [`measured`], so `check()` cleanliness
+/// and a closed-manifold tessellation are asserted in each frame on the
+/// way. That is what the of-kzhd repros below need: their results are
+/// *topologically* valid in the rotated frame and wrong anyway, so the
+/// closed-manifold assertion is doing the work, not the volume.
+fn assert_congruent_under_rigid_motion(
+    pair: CurvedPair,
+    op: &str,
+    axis: Vector3,
+    angle: f64,
+    center: Point3,
+) {
+    let unit = Unit::new_normalize(axis);
+    let rot = Rotation3::from_axis_angle(&unit, angle);
+    type BoolOp = fn(&Scene, EntityId<Body>, EntityId<Body>) -> CoreResult<BooleanOutput>;
+    let run: BoolOp = match op {
+        "union" => |s, a, b| s.unite(a, b),
+        "intersection" => |s, a, b| s.intersect(a, b),
+        "difference" => |s, a, b| s.subtract(a, b),
+        other => panic!("unknown op {other}"),
+    };
+
+    let mut plain = Scene::new();
+    let (a, b) = pair.build(&mut plain);
+    let mut turned = Scene::new();
+    let (ar, br) = pair.build(&mut turned);
+    for body in [ar, br] {
+        rotate_body(
+            &mut turned.store,
+            &mut turned.geo,
+            body,
+            center,
+            unit.into_inner(),
+            angle,
+        )
+        .expect("rotate_body");
+    }
+
+    let out = run(&plain, a, b).unwrap_or_else(|e| panic!("plain {op} failed: {e:?}"));
+    let out_rot = run(&turned, ar, br).unwrap_or_else(|e| panic!("rotated {op} failed: {e:?}"));
+    let plain_props = measured(&out, &format!("plain {op}")).1;
+    let rot_props = measured(&out_rot, &format!("rotated {op}")).1;
+
+    assert_close(
+        rot_props.volume,
+        plain_props.volume,
+        RIGID_MOTION_RTOL,
+        &format!("rotated {op} volume"),
+    );
+    let want = center + rot * (plain_props.centroid - center);
+    let gap = (rot_props.centroid - want).norm();
+    let scale = 1.0 + want.coords.norm();
+    assert!(
+        gap <= RIGID_MOTION_RTOL * scale,
+        "rotated {op} centroid {:?} is not the rigid image of {:?} \
+         (expected {want:?}, off by {gap:.3e})",
+        rot_props.centroid,
+        plain_props.centroid
+    );
+}
+
+/// A rotated cone-sphere union must reconstruct one closed shell, not one
+/// with a spare edge in it (of-kzhd, the Euler mode).
+///
+/// The cone and the sphere are coaxial, so their charts' seams sit on one
+/// meridian; the frustum is wider at the bottom, so its frame axis is
+/// antiparallel to the sphere's and the ring runs through that meridian
+/// with opposite senses on the two surfaces. A marching seed there is
+/// pinned in *both* directions at once and comes back as a curve of its
+/// own: a three-station stub about `6e-7` long beside a ring of `5.5`. In
+/// the plain frame that is under the seam-cut-ring bar of `snap * 4` and
+/// `find_imprints` drops it as a degenerate sliver; rotated, rounding
+/// stretches it past that bar, it reads as a seam-cut ring, and it
+/// survives all the way into the shell as a duplicate edge —
+/// `chi = 4-6+3-0 = 1`, which `build_output` rejects outright.
+///
+/// From the of-kzhd sweep of rotated cone-sphere unions (`0x0009_161D_C0DE`,
+/// case 13). Verified failing on the parent.
+#[test]
+fn rotated_cone_sphere_union_has_no_duplicate_seam_edge() {
+    assert_congruent_under_rigid_motion(
+        CurvedPair::ConeSphere {
+            r0: 1.401703312715901,
+            r1: 0.6135710500472259,
+            h: 1.38624811719119,
+            rs: 0.9471306544194826,
+            dz: 0.618589629610925,
+        },
+        "union",
+        Vector3::new(0.6733074213620325, -0.34712450075053086, 0.6528106136679345),
+        1.220_478_839_096_182,
+        Point3::new(-1.408262276545437, 1.051812357705336, -0.6538267726880505),
+    );
+}
+
+/// A rotated cone-sphere union's imprint must not double back past its own
+/// endpoint (of-kzhd, the first non-manifold mode).
+///
+/// The marched ring is cut at the chart's `u` bound, but the junction its
+/// endpoint has to weld to is where the ring meets the cover's *seam
+/// edge* — and rotating the body moves that edge off the branch cut.
+/// `polish_clip_endpoint` steps the endpoint the whole way there, more
+/// than a station pitch, past stations that then hang beyond it. The
+/// ring's parameter-space image comes out longer than the cover's period
+/// and self-overlapping, and the lateral face tessellates open. Topology
+/// and `check()` are clean throughout — the mesh is the only thing that
+/// sees it.
+///
+/// From the same sweep, case 8. Verified failing on the parent.
+#[test]
+fn rotated_cone_sphere_union_imprint_does_not_backtrack() {
+    assert_congruent_under_rigid_motion(
+        CurvedPair::ConeSphere {
+            r0: 0.9196485465825933,
+            r1: 0.5225522212700651,
+            h: 1.9569706695179607,
+            rs: 0.6975041124879476,
+            dz: 0.7474154559632228,
+        },
+        "union",
+        Vector3::new(0.9014878237951721, 0.3835260361049211, 0.2005679016659728),
+        0.556_465_239_741_768_6,
+        Point3::new(-1.0203890042039023, -1.3350181649836148, 1.0332230255267913),
+    );
+}
+
+/// A seam crossing both hosts report must reach both face covers as the
+/// same point (of-kzhd, the second non-manifold mode).
+///
+/// A coaxial pair puts the cone's seam and the sphere's on one meridian,
+/// so the crossing there is found once per host and `polish_seam_crossing`
+/// re-solves it once per host, pinned to a different surface each time.
+/// Both solves stop at half a snap on the gap, so the two answers differ
+/// by about a snap — under the arrangement's welding bar, which fuses them
+/// into one vertex and reports the shell valid, but over the mesh's, which
+/// is derived from the *result's* extent and is tighter for a small
+/// intersection lens. The two covers then embed that one junction at two
+/// positions and the mesh tears between them: four boundary edges.
+///
+/// From the same sweep, case 71, on the intersection. On the parent it
+/// dies further upstream — the seam stub above reaches `classify` as a
+/// zero-area region with no interior sample — so the tear is what is left
+/// once the other two are fixed, and that is the state this fences.
+#[test]
+fn rotated_cone_sphere_intersection_spells_its_seam_crossing_once() {
+    assert_congruent_under_rigid_motion(
+        CurvedPair::ConeSphere {
+            r0: 1.3349179317523205,
+            r1: 0.39975031088258045,
+            h: 1.5175876890038718,
+            rs: 0.7583766968240289,
+            dz: 0.9003742526990948,
+        },
+        "intersection",
+        Vector3::new(0.9945308802412439, 0.07291325396949949, 0.07477958038231758),
+        1.291_045_380_566_108_8,
+        Point3::new(-0.498921734881804, -0.7589253275022948, -0.9661416303069399),
     );
 }
 

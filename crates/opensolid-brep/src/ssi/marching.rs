@@ -714,6 +714,33 @@ fn march_boxed<A: MarchSurface, B: MarchSurface>(
         if path.len() < 2 {
             continue;
         }
+        // A trace that never took a step is not a branch (of-kzhd).
+        //
+        // Both directions get pinned on their first predictor when the
+        // seed sits where the two surfaces' domain cuts coincide AND the
+        // branch runs through them with opposite parameter senses — a
+        // coaxial cone/sphere is exactly that, its ring leaving `a`'s `u`
+        // bound going one way and `b`'s going the other. `trace` then
+        // returns one corrected boundary landing per direction and the
+        // "curve" is the seed with a landing either side of it, spanning
+        // less than a rounding error's worth of arc.
+        //
+        // The branch itself is traced anyway, from a seed far enough along
+        // it to clear `merge_dist`, and it ends at this same junction — so
+        // the stub is a second, degenerate spelling of a locus the real
+        // curve already carries. Downstream it becomes a duplicate imprint
+        // (`find_imprints` reads its coincident endpoints as a seam-cut
+        // ring, since it is longer than the welding snap), then a spurious
+        // extra edge in the reconstructed shell, which shows up as an odd
+        // Euler characteristic in `boolean::build_output`.
+        //
+        // The bar is the marcher's own floor: `h_min` is the shortest step
+        // it will take before declaring a branch stalled, so a whole curve
+        // below it never marched. Real branches are seeded from a grid of
+        // `h0`-scale cells and are orders above it.
+        if path_extent(&path) < marcher.h_min {
+            continue;
+        }
         let mut curve = MarchedCurve {
             points: Vec::with_capacity(path.len()),
             params_a: Vec::with_capacity(path.len()),
@@ -728,6 +755,11 @@ fn march_boxed<A: MarchSurface, B: MarchSurface>(
         curves.push(curve);
     }
     Ok(curves)
+}
+
+/// Arc length of a traced path, as the sum of its chords.
+fn path_extent(path: &[(MarchState, Point3)]) -> f64 {
+    path.windows(2).map(|w| (w[1].1 - w[0].1).norm()).sum()
 }
 
 /// Bounding sphere `(center, radius)` of a compact primitive; `None` for
@@ -1860,6 +1892,47 @@ mod tests {
         assert_marched_on_both(&swapped, &cone, &sph);
         // Same loop, same vertices (order preserved by the shared driver).
         assert_eq!(canon[0].points, swapped[0].points);
+    }
+
+    /// A coaxial sphere/cone pair yields one curve per ring and no stub
+    /// beside it (of-kzhd).
+    ///
+    /// Coaxial is the configuration that makes both directions of a trace
+    /// leave the domain at once: the ring runs through the two surfaces'
+    /// `u = 0` cuts, which sit on the same meridian, with opposite
+    /// parameter senses. A seed refined onto that meridian is pinned by
+    /// `a`'s bound going one way and `b`'s going the other, so `trace`
+    /// returns a single corrected landing per direction and the seed comes
+    /// back as a "curve" spanning a rounding error's worth of arc. The
+    /// ring itself is traced anyway, from a seed further along it, and
+    /// ends at that same junction — so the stub is a second spelling of a
+    /// locus the real curve already covers, and downstream it becomes a
+    /// duplicate imprint and a spurious extra edge (an odd Euler
+    /// characteristic out of `boolean::build_output`).
+    #[test]
+    fn marched_coaxial_sphere_cone_has_no_seam_stub() {
+        // The cone's frame axis is -z and the sphere's is +z — an
+        // antiparallel pair, which is what `primitives::cone` builds for
+        // any frustum wider at the bottom, since its axis points at the
+        // bigger cap. Both charts take their `e_u` from `plane_basis` of
+        // their own axis, so the seams land on one meridian and the ring
+        // runs through it with opposite senses.
+        let cone =
+            Surface3::cone(Point3::origin(), -Vector3::z(), 30f64.to_radians(), 1.0).unwrap();
+        // Large enough to cross the nappe twice: the wall is at
+        // r = 1 - z·tan30°, the sphere at r = sqrt(2.5² - (z+2)²).
+        let sph = Surface3::sphere(Point3::new(0.0, 0.0, -2.0), Vector3::z(), 2.5).unwrap();
+        let curves = intersect_marched(&sph, &cone, &default_tol()).unwrap();
+        assert_marched_on_both(&curves, &sph, &cone);
+        for (ci, curve) in curves.iter().enumerate() {
+            let extent: f64 = curve.points.windows(2).map(|w| (w[1] - w[0]).norm()).sum();
+            assert!(
+                extent > 1.0,
+                "curve {ci} is a {} point stub of extent {extent:e}, not a ring",
+                curve.points.len()
+            );
+        }
+        assert_eq!(curves.len(), 2, "exactly the two coaxial rings expected");
     }
 
     #[test]

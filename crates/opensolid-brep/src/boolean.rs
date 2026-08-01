@@ -3189,11 +3189,30 @@ impl<'a> Pipeline<'a> {
             // within a fraction of a pitch of the endpoint never loses
             // geometry: the neighboring chord's sagitta over one station
             // step is the same error the sampling already accepts.
+            //
+            // A station the polish moved *past* is superseded whatever the
+            // distance (of-kzhd). Proximity catches it only when the
+            // junction is where the marcher stopped anyway; when the two
+            // are a real gap apart it does not. A rotated cone/sphere is
+            // that case: the ring is cut at the chart's `u` bound while
+            // the cover's seam edge — the junction the polish is aiming
+            // at — has rotated off it, so the polish steps the endpoint a
+            // whole station pitch or more along the ring, past stations
+            // that then hang beyond it. The run's own uv image is longer
+            // than the cover's period, self-overlapping in parameter
+            // space, and the tessellation of that face is not closed.
+            //
+            // Being past the endpoint is a matter of direction, not of
+            // distance: the terminal chord runs *against* the run. A
+            // marched step turns by a fraction of a degree, so the sign
+            // of that dot product never flips on a run that has not
+            // doubled back.
             let band = self.snap * EDGE_MATCH_SNAP * 4.0;
             while pts.len() > 2 {
                 let gap = (pts[1] - pts[0]).norm();
                 let pitch = (pts[2] - pts[1]).norm();
-                if gap <= band || gap <= pitch * 0.1 {
+                let backtracks = (pts[1] - pts[0]).dot(&(pts[2] - pts[1])) < 0.0;
+                if gap <= band || gap <= pitch * 0.1 || backtracks {
                     pts.remove(1);
                 } else {
                     break;
@@ -3203,7 +3222,8 @@ impl<'a> Pipeline<'a> {
                 let n = pts.len();
                 let gap = (pts[n - 2] - pts[n - 1]).norm();
                 let pitch = (pts[n - 3] - pts[n - 2]).norm();
-                if gap <= band || gap <= pitch * 0.1 {
+                let backtracks = (pts[n - 1] - pts[n - 2]).dot(&(pts[n - 2] - pts[n - 3])) < 0.0;
+                if gap <= band || gap <= pitch * 0.1 || backtracks {
                     pts.remove(n - 2);
                 } else {
                     break;
@@ -3534,6 +3554,33 @@ impl<'a> Pipeline<'a> {
             // non-coaxial cone-cone pair is exactly that — its companion
             // imprint is a full-wrap ellipse clipped to an arc, and the
             // ring it forms spans the cone's whole u-cover.
+            //
+            // One junction, one spelling (of-kzhd). Both hosts scan the
+            // same imprint, so a crossing where their two seams fall on
+            // the same meridian — a coaxial pair, whose charts share an
+            // `e_u` — is found twice, and `polish_seam_crossing` then
+            // solves for it twice, pinned to a different surface each
+            // time. Both solves stop at `snap * 0.5` on the gap, so the
+            // two answers differ by up to a snap: enough for the two face
+            // covers to embed the same junction at two positions, which
+            // tears the tessellation between them (the topology welds
+            // them into one vertex and reports itself valid, so nothing
+            // upstream of the mesh notices).
+            //
+            // Fuse each crossing onto the first spelling already accepted
+            // for this imprint within a snap. The run's own endpoints seed
+            // that list: they are the polished clip junctions, the
+            // spelling every imprint meeting there and every split of the
+            // crossed edge already agrees on, so a crossing that lands on
+            // one is that junction and must be it exactly.
+            let mut junctions: Vec<Point3> = if imp.sampled.closed {
+                Vec::new()
+            } else {
+                vec![
+                    imp.sampled.points[0],
+                    imp.sampled.points[imp.sampled.points.len() - 1],
+                ]
+            };
             for (s, f) in [(0usize, imp.face_a), (1usize, imp.face_b)] {
                 let fp = &self.face_polys[s][f];
                 for (axis, period) in [
@@ -3554,7 +3601,15 @@ impl<'a> Pipeline<'a> {
                         // A marched imprint is its own chords, so the
                         // bisected crossing sits a sagitta off the seam
                         // meridian it is supposed to be on (of-ntkk).
-                        let seam_point = self.polish_seam_crossing(imp, s, axis, level, crossing);
+                        let mut seam_point =
+                            self.polish_seam_crossing(imp, s, axis, level, crossing);
+                        match junctions
+                            .iter()
+                            .find(|j| (*j - seam_point).norm() <= self.snap)
+                        {
+                            Some(&known) => seam_point = known,
+                            None => junctions.push(seam_point),
+                        }
                         events.push((CurveSource::Imprint { index: ii }, seam_point));
                         // Exact-curve edge matching: sphere/torus seam edges
                         // are circular arcs whose sampled polylines sag far
