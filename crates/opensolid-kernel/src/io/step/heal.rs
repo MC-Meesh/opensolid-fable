@@ -20,10 +20,13 @@
 //!
 //! - **Gap closure** ([`GeometryHealer::fix_gaps`]) — cluster vertices that
 //!   lie within `max_gap` of each other into one, then weld the duplicate
-//!   edges that clustering exposes (edges that now span the same vertex pair
-//!   *and* whose curves sample to the same points). Welding re-points the
-//!   orphaned fins onto the surviving edge, so a shell whose faces never
-//!   shared a boundary becomes watertight. The distance closed is absorbed
+//!   edges that clustering exposes (edges that are still open on one side,
+//!   now span the same vertex pair, *and* whose curves sample to the same
+//!   points). Welding re-points the orphaned fins onto the surviving edge, so
+//!   a shell whose faces never shared a boundary becomes watertight. Two
+//!   coincident edges that are both already two-sided are left alone: they
+//!   are two sheets touching, and joining them would make a non-manifold edge
+//!   rather than repair one. The distance closed is absorbed
 //!   into the surviving entity's tolerance — this is tolerant modelling
 //!   (`spec/08-tolerances.md`), not a silent snap. It is absorbed *on top of*
 //!   what the merged-away entities were already carrying, not merely up to
@@ -529,7 +532,7 @@ fn plan_gaps(
     max_gap: f64,
     notes: &mut Vec<String>,
 ) -> GapPlan {
-    let merges = plan_vertex_merges(store, body, max_gap, notes);
+    let merges = plan_vertex_merges(store, geo, body, max_gap, notes);
 
     // Edge grouping keys use the *post-merge* vertex identity, so the plan is
     // computed in one pass with no mutation in between.
@@ -548,6 +551,7 @@ fn plan_gaps(
 
 fn plan_vertex_merges(
     store: &TopologyStore,
+    geo: &GeometryStore,
     body: EntityId<Body>,
     max_gap: f64,
     notes: &mut Vec<String>,
@@ -603,8 +607,24 @@ fn plan_vertex_merges(
     }
 
     // A cluster spanning two shells would sew them together at a point, which
-    // is non-manifold between shells; a cluster containing both ends of an
-    // edge would collapse that edge to nothing. Neither is a phase-1 repair.
+    // is non-manifold between shells; a cluster that swallows an edge whole
+    // would collapse that edge to nothing. Neither is a phase-1 repair.
+    //
+    // Holding both ends of an edge is not by itself swallowing it. A circle
+    // whose seam vertex the writer spelled as two coincident `VERTEX_POINT`
+    // entities — what OCC emits when the circle is tangent to a neighbouring
+    // face, so the seam has to fall on the corner the tangency creates — puts
+    // both ends in one cluster and still travels a full turn in between.
+    // Merging that pair does not destroy the edge; it makes it the closed
+    // edge the file meant, which the store already carries elsewhere (seam
+    // meridians, circular caps).
+    //
+    // What survives the merge is precisely a loop, so both halves of that
+    // word are checked: the curve must come back to where it started, or one
+    // vertex cannot carry both ends, and it must leave the cluster in
+    // between, or there is no edge left to carry. A sliver fails the second
+    // test; a full-length curve whose endpoints were merely dragged together
+    // fails the first.
     let shell_of = vertex_shells(store, body);
     let mut spans_edge: HashMap<usize, bool> = HashMap::new();
     for edge_id in body_edges(store, body) {
@@ -616,8 +636,21 @@ fn plan_vertex_merges(
         else {
             continue;
         };
-        if dsu.find(a) == dsu.find(b) {
-            spans_edge.insert(dsu.find(a), true);
+        let root = dsu.find(a);
+        if root != dsu.find(b) {
+            continue;
+        }
+        // Without sampleable geometry there is nothing to prove the edge is a
+        // loop, so assume the merge would collapse it.
+        let survives = edge_curve_closes(store, geo, edge_id, max_gap)
+            && edge_samples(store, geo, edge_id).is_some_and(|samples| {
+                let members = clusters.get(&root).map(Vec::as_slice).unwrap_or(&[]);
+                samples
+                    .iter()
+                    .any(|p| members.iter().all(|&i| (p - points[i]).norm() > max_gap))
+            });
+        if !survives {
+            spans_edge.insert(root, true);
         }
     }
 
@@ -727,6 +760,14 @@ fn plan_edge_welds(
     let mut order: Vec<WeldKey> = Vec::new();
     for edge_id in body_edges(store, body) {
         let edge = store.edge(edge_id).expect("live edge");
+        // Welding closes an *open* boundary. An edge that already has both
+        // its sides is not open, and folding another edge into it could only
+        // push it past two fins — the non-manifold state this pass exists to
+        // avoid. Two coincident two-sided edges are two sheets touching, and
+        // sewing them together is a decision about the model, not a repair.
+        if edge.fins.len() >= 2 {
+            continue;
+        }
         let (a, b) = (canon(edge.start_vertex), canon(edge.end_vertex));
         let pair = ordered(a, b);
         let key = (pair.0, pair.1, shell_of.get(&edge_id).copied().flatten());
@@ -828,6 +869,25 @@ fn curve_match(
     } else {
         None
     }
+}
+
+/// Whether the edge's own curve ends where it began, so a single vertex can
+/// stand at both of its ends. True of the full circle a tangency forces a
+/// writer to spell with two coincident vertices; false of a line, whatever
+/// its vertices claim.
+fn edge_curve_closes(
+    store: &TopologyStore,
+    geo: &GeometryStore,
+    edge_id: EntityId<Edge>,
+    tolerance: f64,
+) -> bool {
+    let Some(edge) = store.edge(edge_id) else {
+        return false;
+    };
+    let Some(curve) = edge.curve.and_then(|c| geo.curve(c)) else {
+        return false;
+    };
+    (curve.point(edge.t_end) - curve.point(edge.t_start)).norm() <= tolerance
 }
 
 fn edge_samples(
@@ -1821,7 +1881,7 @@ mod tests {
         // difference.
         let mut notes = Vec::new();
         let max_gap = derived_max_gap(&f.store, f.body);
-        for merge in plan_vertex_merges(&f.store, f.body, max_gap, &mut notes) {
+        for merge in plan_vertex_merges(&f.store, &f.geo, f.body, max_gap, &mut notes) {
             let members = std::iter::once(merge.kept).chain(merge.merged.iter().copied());
             let carried = members
                 .map(|v| f.store.vertex(v).expect("live vertex").tolerance)
@@ -2057,6 +2117,41 @@ mod tests {
         assert!(result.operations.is_empty());
         assert_eq!(result.remaining, result.failures_before);
         assert_eq!(f.store.vertices.len(), 24);
+    }
+
+    /// The predicate that decides whether a vertex cluster holding both ends
+    /// of an edge may merge (of-zdx). A full circle survives — one vertex can
+    /// stand at both ends of it, which is what a closed edge is. A line does
+    /// not, however close together its vertices have drifted: merging them
+    /// would leave an edge whose curve runs from a point back to itself
+    /// through three metres of nowhere.
+    #[test]
+    fn only_a_closed_curve_survives_having_its_ends_merged() {
+        let mut store = TopologyStore::new();
+        let mut geo = GeometryStore::new();
+        let seam = Point3::new(6.0, 0.0, 0.0);
+        let a = store.create_vertex(seam, SYSTEM_RESOLUTION);
+        let b = store.create_vertex(seam, SYSTEM_RESOLUTION);
+
+        let circle = geo.add_curve(Curve3::circle(Point3::origin(), Vector3::z(), 6.0).unwrap());
+        let round = store.create_edge_with_curve(
+            a,
+            b,
+            SYSTEM_RESOLUTION,
+            circle,
+            0.0,
+            std::f64::consts::TAU,
+        );
+        assert!(edge_curve_closes(&store, &geo, round, SYSTEM_RESOLUTION));
+
+        let line = geo.add_curve(Curve3::line(Point3::origin(), Vector3::x()).unwrap());
+        let straight = store.create_edge_with_curve(a, b, SYSTEM_RESOLUTION, line, 0.0, 3.0);
+        assert!(!edge_curve_closes(
+            &store,
+            &geo,
+            straight,
+            SYSTEM_RESOLUTION
+        ));
     }
 
     #[test]

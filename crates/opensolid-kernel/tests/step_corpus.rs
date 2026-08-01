@@ -1771,12 +1771,10 @@ mod corpus {
                 );
             }
         }
-        // 2026-07-26 baseline: 31 of 34. Three files fail:
+        // 2026-08-01 baseline: 33 of 34. One file fails:
         // - nist_ctc_05 (of-kwn): edge geometry that misses its vertex points.
-        // - occ/tangent/{cylinder,hole}_tangent_to_wall (of-zdx): a circular
-        //   edge closed on itself by tangency reads as a zero-sweep conic, so
-        //   both the exact path and the mesh fallback refuse the part.
-        const FLOOR: usize = 31;
+        // The two occ/tangent parts joined the passing set with of-zdx.
+        const FLOOR: usize = 33;
         assert!(
             passed.len() >= FLOOR,
             "corpus pass count regressed below {FLOOR}: only {passed:?} pass"
@@ -1957,6 +1955,48 @@ mod corpus {
             offenders.is_empty(),
             "faces whose sense contradicts their outer loop (file, count): {offenders:?}"
         );
+    }
+
+    /// The tangent-boolean parts import with every edge two-sided (of-zdx).
+    ///
+    /// A tangency pinches the solid, and OCC spells the pinch by hanging four
+    /// fins on one `EDGE_CURVE`: the hole's cylindrical face uses it twice as
+    /// its seam, and the two coplanar halves the tangency splits the block's
+    /// wall into use it once each. The reader moves the seam onto its own
+    /// edge, so `hole_tangent_to_wall` comes out with one edge more than the
+    /// file declares and nothing over two fins. `check` would refuse the body
+    /// otherwise, which is how the part used to fail.
+    #[test]
+    fn tangent_parts_import_with_no_edge_over_two_fins() {
+        for (name, declared_edges) in [
+            ("occ/tangent/cylinder_tangent_to_wall.stp", 21),
+            ("occ/tangent/hole_tangent_to_wall.stp", 18),
+        ] {
+            let path = format!("{}/tests/data/step/{name}", env!("CARGO_MANIFEST_DIR"));
+            let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+            let (store, _, report) = import_bytes(&bytes);
+            let [solid] = &report.solids[..] else {
+                panic!("{name}: expected exactly one solid");
+            };
+            let SolidOutcome::BRep(body) = solid.outcome else {
+                panic!("{name}: expected an exact B-Rep import");
+            };
+            let overshared: Vec<usize> = store
+                .edges
+                .iter()
+                .map(|(_, edge)| edge.fins.len())
+                .filter(|&fins| fins > 2)
+                .collect();
+            assert!(
+                overshared.is_empty(),
+                "{name}: edges with more than two fins: {overshared:?}"
+            );
+            assert_eq!(
+                store.euler_counts(body).edges,
+                declared_edges,
+                "{name}: edge count moved — the seam split is off"
+            );
+        }
     }
 
     fn corpus_files() -> Vec<std::path::PathBuf> {

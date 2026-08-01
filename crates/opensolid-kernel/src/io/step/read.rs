@@ -44,7 +44,13 @@
 //! mapper recovers each edge's parameter range by inverse-projecting the
 //! vertex points onto the mapped curve, and re-orients the curve when
 //! `edge_curve.same_sense` is false so every edge satisfies
-//! `t_start < t_end`. Every mapped body is validated with
+//! `t_start < t_end`. A conic whose two vertices land on the same point
+//! sweeps a full period rather than nothing, whether the file spelled that
+//! with one vertex or two coincident ones. Where a writer has parked a face's
+//! seam on an `edge_curve` other faces also use — what a tangent boolean
+//! produces — the seam is moved onto an edge of its own
+//! ([`split_overshared_seams`](SolidBuilder::split_overshared_seams)) so no
+//! edge carries more than two fins. Every mapped body is validated with
 //! [`TopologyStore::check`].
 //!
 //! # Mesh fallback
@@ -2073,6 +2079,13 @@ fn conic_angle(curve: &Curve3, p: &Point3) -> Option<f64> {
     }
 }
 
+/// How far apart two of an edge's points may be and still count as the
+/// same point. Grows with distance from the origin, because the decimals
+/// STEP writes lose absolute precision as coordinates grow.
+fn trim_tol(a: Point3, b: Point3) -> f64 {
+    TRIM_TOL_REL * (1.0 + a.coords.norm().max(b.coords.norm()))
+}
+
 /// Trim an analytic curve to an edge's vertices: orient it along the edge
 /// (STEP `same_sense` false means the edge opposes the curve direction)
 /// and recover the parameter range, always with `t_start < t_end`.
@@ -2137,7 +2150,16 @@ fn trim_curve(
                     "edge geometry has no angular parameterization to trim by",
                 ));
             };
-            if closed {
+            // A full circle has two spellings in STEP. The tidy one names a
+            // single vertex twice, which is what `closed` reports. The other
+            // names two distinct `VERTEX_POINT` entities that happen to sit
+            // on the same point — what OCC writes when the circle is tangent
+            // to a neighbouring face, because the tangency is a real corner
+            // of the model and the seam has to land on it. Both spellings
+            // mean the same thing: the edge sweeps a whole period. Reading
+            // the second one literally gives a zero sweep, and an edge that
+            // swept nothing would not be an edge at all.
+            if closed || (end - start).norm() <= trim_tol(start, end) {
                 (t0, t0 + TAU)
             } else {
                 let sweep = (conic_angle(conic, &end).expect("conic") - t0).rem_euclid(TAU);
@@ -2181,8 +2203,7 @@ fn verify_trim(
     end: Point3,
     entity: u64,
 ) -> MapResult<(f64, f64)> {
-    let scale = start.coords.norm().max(end.coords.norm());
-    let tol = TRIM_TOL_REL * (1.0 + scale);
+    let tol = trim_tol(start, end);
     let at_start = trimmed.curve.point(trimmed.t_start);
     let at_end = trimmed.curve.point(trimmed.t_end);
     let (start_residual, end_residual) = ((at_start - start).norm(), (at_end - end).norm());
@@ -2281,6 +2302,10 @@ struct SolidBuilder<'a> {
     /// `EDGE_CURVE` #id → mapped edge (shared between faces, so mated
     /// fins arise naturally when both faces reference the same edge).
     edges: HashMap<u64, EntityId<Edge>>,
+    /// One entry per (loop, edge) where the loop walks that edge twice — a
+    /// seam. Settled by [`split_overshared_seams`](Self::split_overshared_seams)
+    /// once the whole body is mapped and the edge's full fin count is known.
+    seams: Vec<(EntityId<Loop>, EntityId<Edge>)>,
 }
 
 impl SolidBuilder<'_> {
@@ -2309,12 +2334,96 @@ impl SolidBuilder<'_> {
             )?;
         }
 
+        self.split_overshared_seams();
+
         // STEP carries no genus; recover it from the Euler-Poincaré formula
         // so `check` validates the imported topology's own consistency (an
         // odd or negative implied genus still fails the formula). The healer
         // re-runs this after any repair that changes the counts.
         super::heal::recover_genus(self.store, body);
         Ok(body)
+    }
+
+    /// Give a seam its own edge when the file hung other faces on it too.
+    ///
+    /// A seam is private to the face it opens: the cylinder's `EDGE_CURVE`
+    /// spelled twice in one loop is a cut in that face's parameterization,
+    /// not a boundary it shares with anything. Usually nothing else names
+    /// that `EDGE_CURVE` and the two fins make an ordinary two-sided edge.
+    /// But when the seam falls on a line that is *also* a real boundary —
+    /// which is what a tangent boolean produces, the cylinder's seam landing
+    /// exactly on the line where the block's wall was split by the tangency —
+    /// OCC writes one `EDGE_CURVE` for both and the edge collects four fins.
+    /// Read literally that is a non-manifold edge and `check` refuses the
+    /// body, though nothing about the solid is actually ambiguous: two
+    /// two-sided sheets happen to meet along one locus.
+    ///
+    /// So the seam moves onto its own copy of the edge, leaving the shared
+    /// boundary with exactly the two fins it always had. The topology is the
+    /// same solid; only the double-booking is undone. OCC keeps the single
+    /// edge, so our edge count comes out one higher per split.
+    fn split_overshared_seams(&mut self) {
+        for (loop_id, edge_id) in std::mem::take(&mut self.seams) {
+            let Some(edge) = self.store.edge(edge_id) else {
+                continue;
+            };
+            // Two fins is a seam nobody else touched — the common case, and
+            // already manifold. Only over-sharing needs undoing.
+            if edge.fins.len() <= 2 {
+                continue;
+            }
+            let (start, end, tolerance, t_start, t_end) = (
+                edge.start_vertex,
+                edge.end_vertex,
+                edge.tolerance,
+                edge.t_start,
+                edge.t_end,
+            );
+            let Some(curve) = edge.curve.and_then(|c| self.geo.curve(c)).cloned() else {
+                continue;
+            };
+            let Some(loop_ref) = self.store.loop_(loop_id) else {
+                continue;
+            };
+            let moved: Vec<EntityId<Fin>> = loop_ref
+                .fins
+                .iter()
+                .copied()
+                .filter(|&fin| self.store.fin(fin).is_some_and(|fin| fin.edge == edge_id))
+                .collect();
+            // The seam is exactly the pair; anything else is a shape this
+            // repair does not understand, so leave it for `check` to report.
+            if moved.len() != 2 {
+                continue;
+            }
+
+            let curve_id = self.geo.add_curve(curve);
+            self.created.curves.push(curve_id);
+            let copy = self
+                .store
+                .create_edge_with_curve(start, end, tolerance, curve_id, t_start, t_end);
+            self.created.edges.push(copy);
+
+            for &fin in &moved {
+                self.store.fins.get_mut(fin).expect("live fin").edge = copy;
+            }
+            let old = self.store.edges.get_mut(edge_id).expect("live edge");
+            old.fins.retain(|fin| !moved.contains(fin));
+            let remaining = old.fins.clone();
+            self.store.edges.get_mut(copy).expect("just created").fins = moved.clone();
+            // Both edges lost or gained a side, so re-mate from scratch:
+            // a pair mates, anything else is left open for `check`.
+            for group in [moved, remaining] {
+                let pair = (group.len() == 2).then(|| (group[0], group[1]));
+                for &fin in &group {
+                    self.store.fins.get_mut(fin).expect("live fin").mate = match pair {
+                        Some((a, b)) if fin == a => Some(b),
+                        Some((a, b)) if fin == b => Some(a),
+                        _ => None,
+                    };
+                }
+            }
+        }
     }
 
     fn build_shell(
@@ -2460,7 +2569,17 @@ impl SolidBuilder<'_> {
                     } else {
                         LoopType::Inner
                     };
-                    self.store.create_loop(face, loop_type, &loop_edges)
+                    let loop_id = self.store.create_loop(face, loop_type, &loop_edges);
+                    // An edge this loop walks twice is a seam: the cut that
+                    // opens a closed surface into a rectangle. Note it now,
+                    // decide later — whether it needs an edge of its own
+                    // depends on what the rest of the shell does with it.
+                    for (i, &(edge, _)) in loop_edges.iter().enumerate() {
+                        if loop_edges[..i].iter().any(|&(e, _)| e == edge) {
+                            self.seams.push((loop_id, edge));
+                        }
+                    }
+                    loop_id
                 }
             };
             self.created.loops.push(loop_id);
@@ -3951,6 +4070,7 @@ fn map_solid(
         multi_bound_faces: Vec::new(),
         vertices: HashMap::new(),
         edges: HashMap::new(),
+        seams: Vec::new(),
     };
     let built = builder.build(msb_id, shell_ref, &voids);
     let created = builder.created;
@@ -5709,6 +5829,36 @@ mod tests {
         let trimmed = trim_curve(&circle, true, vertex, vertex, true, 1).unwrap();
         assert!((trimmed.t_end - trimmed.t_start - TAU).abs() < 1e-12);
         assert!((trimmed.curve.point(trimmed.t_start) - vertex).norm() < 1e-12);
+    }
+
+    /// The other spelling of a full circle: two `VERTEX_POINT` entities at
+    /// the same place, so `closed` is false but the edge still goes all the
+    /// way round (of-zdx). Reading the sweep literally gives zero.
+    #[test]
+    fn coincident_vertices_span_the_full_circle() {
+        let circle = Curve3::circle(Point3::new(14.0, 0.0, 10.0), Vector3::z(), 6.0).unwrap();
+        // The two coordinates OCC writes for the tangency point, which differ
+        // only in the last bits of the y component.
+        let start = Point3::new(20.0, -7.347880794884e-16, 10.0);
+        let end = Point3::new(20.0, 0.0, 10.0);
+        let trimmed = trim_curve(&circle, true, start, end, false, 1).unwrap();
+        assert!((trimmed.t_end - trimmed.t_start - TAU).abs() < 1e-12);
+        // Halfway round is the far side of the circle, not the seam.
+        let mid = trimmed.curve.point((trimmed.t_start + trimmed.t_end) / 2.0);
+        assert!((mid - Point3::new(8.0, 0.0, 10.0)).norm() < 1e-12, "{mid}");
+    }
+
+    /// The same coincidence on a line is not a closed edge — a line has no
+    /// period to come back through — so it stays an error.
+    #[test]
+    fn coincident_vertices_on_a_line_are_still_refused() {
+        let line = Curve3::line(Point3::origin(), Vector3::x()).unwrap();
+        let vertex = Point3::new(3.0, 0.0, 0.0);
+        let err = trim_curve(&line, true, vertex, vertex, false, 7).unwrap_err();
+        assert!(
+            matches!(err, MapError::Invalid { entity: 7, .. }),
+            "{err:?}"
+        );
     }
 
     #[test]

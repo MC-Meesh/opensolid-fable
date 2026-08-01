@@ -29,7 +29,9 @@
 //!   delta recorded in [`SEAM_DELTAS`]. OCC rebuilds closed faces with
 //!   explicit seam and degenerate edges that the file never spelled; we keep
 //!   the file's own topology. Every delta below was verified to be exactly
-//!   that: our count equals the file's `EDGE_CURVE`/`VERTEX_POINT` count.
+//!   that: our count equals the file's `EDGE_CURVE`/`VERTEX_POINT` count —
+//!   with one file, `hole_tangent_to_wall`, one edge *over* it, where the
+//!   reader splits a seam OCC leaves double-booked (see [`SEAM_DELTAS`]).
 //! - **Volume, centroid, area** — 0.1% relative, the tolerance spec §7.4
 //!   sets for STEP import, on the [`MEASURED_FILES`] the tessellator can
 //!   close (18 of 34 today; the rest hit the CDT deferral). Our figures come
@@ -66,7 +68,7 @@ use opensolid_kernel::core::EntityId;
 use opensolid_kernel::core::tolerance::ToleranceContext;
 use opensolid_kernel::core::types::{Point3, Vector3};
 use opensolid_kernel::io::step::read::{SolidOutcome, StepReadOptions, read_step_bytes};
-use opensolid_kernel::mass_properties;
+use opensolid_kernel::{brep_mass_properties, mass_properties};
 
 /// Relative tolerance for every measured quantity (spec/11 §7.4).
 const TOLERANCE: f64 = 1.0e-3;
@@ -88,11 +90,6 @@ const KNOWN_IMPORT_FAILURES: &[(&str, &str)] = &[
     // of-kwn: verify_trim's tolerance is tighter than the vertex slop CATIA
     // authored into this part's CIRCLE edges.
     ("nist/nist_ctc_05_asme1_rd.stp", "of-kwn"),
-    // of-zdx: a circular edge that closes on itself (tangency) is read as a
-    // zero-sweep conic, so both the exact path and the mesh fallback refuse
-    // the part.
-    ("occ/tangent/cylinder_tangent_to_wall.stp", "of-zdx"),
-    ("occ/tangent/hole_tangent_to_wall.stp", "of-zdx"),
 ];
 
 /// Per-file (edges, vertices) that OCC reports *in addition* to ours.
@@ -106,9 +103,10 @@ const KNOWN_IMPORT_FAILURES: &[(&str, &str)] = &[
 /// that is what we import, while OCC seams its two cylindrical faces up to
 /// 12 edges and 8 vertices.
 ///
-/// A delta is never negative: OCC only ever adds. Anything not listed must
-/// match exactly.
-const SEAM_DELTAS: &[(&str, usize, usize)] = &[
+/// A delta is normally positive — OCC adds seams, we do not — with one
+/// documented exception in the other direction, `hole_tangent_to_wall`, where
+/// we split an edge OCC keeps whole. Anything not listed must match exactly.
+const SEAM_DELTAS: &[(&str, isize, isize)] = &[
     ("nist/nist_ctc_01_asme1_ap242-e1.stp", 4, 0),
     ("nist/nist_ctc_01_asme1_rd.stp", 20, 6),
     ("nist/nist_ctc_02_asme1_rc.stp", 148, 0),
@@ -124,6 +122,13 @@ const SEAM_DELTAS: &[(&str, usize, usize)] = &[
     ("occ/periodic/cone_apex.stp", 1, 0),
     ("occ/periodic/sphere_full.stp", 3, 1),
     ("occ/tangent/sphere_in_matching_pocket.stp", 1, 0),
+    // The one negative delta (of-zdx). The tangency splits the block's wall
+    // into two coplanar faces, and OCC writes the hole's cylindrical seam on
+    // the very same `EDGE_CURVE` as that split, giving one edge four fins.
+    // The reader gives the seam its own edge so both the seam and the shared
+    // wall boundary are two-sided; OCC keeps the single edge and reports 17
+    // where we have 18.
+    ("occ/tangent/hole_tangent_to_wall.stp", -1, 0),
 ];
 
 /// Measured files whose surface area does not agree with OCC, with the bug.
@@ -568,14 +573,14 @@ fn occ_agrees_on_edge_and_vertex_counts_up_to_seams() {
             .unwrap_or((0, 0));
         unused.retain(|f| f != name);
         assert_eq!(
-            edges + edge_delta,
-            totals.field("edges").as_usize(),
+            edges as isize + edge_delta,
+            totals.field("edges").as_usize() as isize,
             "{name}: edge count differs from OCC by other than the recorded \
              seam delta of {edge_delta}"
         );
         assert_eq!(
-            vertices + vertex_delta,
-            totals.field("vertices").as_usize(),
+            vertices as isize + vertex_delta,
+            totals.field("vertices").as_usize() as isize,
             "{name}: vertex count differs from OCC by other than the recorded \
              seam delta of {vertex_delta}"
         );
@@ -585,6 +590,58 @@ fn occ_agrees_on_edge_and_vertex_counts_up_to_seams() {
         "SEAM_DELTAS lists files that are no longer in the corpus (or no \
          longer import): {unused:?}"
     );
+}
+
+/// Corpus files whose solids are pinched — the material touches itself along
+/// a tangency — so a mesh of them is non-manifold by construction and they
+/// can never join [`MEASURED_FILES`]. [`tangent_parts_have_occs_volume`]
+/// measures them the other way instead.
+const PINCHED_FILES: &[&str] = &[
+    "occ/tangent/cylinder_tangent_to_wall.stp",
+    "occ/tangent/hole_tangent_to_wall.stp",
+];
+
+/// The tangent parts' volumes, integrated over the imported B-Rep surfaces
+/// rather than a mesh, against OCC (of-zdx).
+///
+/// They are the only corpus files the volume gate above cannot reach. Their
+/// tangency pinches the solid — the hole's wall touches the block's, so the
+/// boundary is non-manifold along one line — and a mesh of that is
+/// non-manifold too, which is what [`MEASURED_FILES`] requires the absence
+/// of. That is a property of the shape, not a meshing defect, so waiting for
+/// it to become measurable would mean never checking these two at all. The
+/// surface integral has no such requirement, and it is the sharper instrument
+/// besides: with no chord error in the way, both parts land within 1e-11
+/// relative of OCC rather than spending most of [`TOLERANCE`] on
+/// discretization.
+#[test]
+fn tangent_parts_have_occs_volume() {
+    for name in PINCHED_FILES {
+        let file = corpus_root().join(name);
+        let bytes = std::fs::read(&file).unwrap_or_else(|e| panic!("read {file:?}: {e}"));
+        let mut store = TopologyStore::new();
+        let mut geo = GeometryStore::new();
+        let report = read_step_bytes(&bytes, &mut store, &mut geo, &StepReadOptions::default())
+            .unwrap_or_else(|e| panic!("{name}: must parse: {e}"));
+        let [solid] = &report.solids[..] else {
+            panic!("{name}: expected exactly one solid");
+        };
+        let SolidOutcome::BRep(body) = solid.outcome else {
+            panic!("{name}: no longer imports as an exact B-Rep");
+        };
+        let volume = brep_mass_properties(&store, &geo, body)
+            .unwrap_or_else(|e| panic!("{name}: exact mass properties: {e}"))
+            .volume;
+        let expected = load_reference(&file)
+            .field("totals")
+            .field("volume")
+            .as_f64();
+        assert!(
+            (volume - expected).abs() <= TOLERANCE * expected.abs(),
+            "{name}: exact B-Rep volume {volume} differs from OCC's {expected} \
+             by more than {TOLERANCE}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------
