@@ -1,0 +1,7 @@
+# Pin to the toolchain CI uses (.github/workflows/ci.yml). Local rustup stable
+# drifted to 1.97.1, whose clippy fails `-D warnings` on code that is green in
+# CI. Toolchain bumps are deliberate: move this pin and CI together, paired
+# with a lint-sweep bead for any new lints (see of-3jzj).
+[toolchain]
+channel = "1.88.0"
+components = ["clippy", "rustfmt"]
