@@ -19,7 +19,8 @@
 //!   `surface_of_revolution` reduce to the exact quadric where one exists
 //!   (line → plane/cylinder/cone, axis-coplanar circle → sphere/torus,
 //!   circle along its normal → cylinder; NURBS bases extrude to an exact
-//!   ruled patch).
+//!   ruled patch, sized to the face that carries it — the entity itself is
+//!   unbounded along the sweep).
 //! - **Topology**: `vertex_point`, `edge_curve`, `oriented_edge`,
 //!   `edge_loop`, `face_bound` / `face_outer_bound`, `advanced_face`,
 //!   `closed_shell`, `manifold_solid_brep` → `Vertex` / `Edge` / `Loop` /
@@ -915,6 +916,14 @@ pub(super) fn resolve_axis2(
 enum RawSurface {
     Analytic(Surface3),
     Nurbs(Box<NurbsSurface>),
+    /// `SURFACE_OF_LINEAR_EXTRUSION` of a NURBS basis: an exact ruled patch
+    /// once the face says how far along `dir` it reaches (the STEP surface
+    /// is unbounded there, so only the face's own bounds can size it — see
+    /// [`extrude_nurbs_curve`]).
+    ExtrudedNurbs {
+        curve: Box<NurbsCurve>,
+        dir: Vector3,
+    },
     /// `SURFACE_OF_LINEAR_EXTRUSION` with no analytic/NURBS reduction:
     /// tessellation-only (the basis polyline swept along `dir`).
     Extruded {
@@ -999,8 +1008,10 @@ fn resolve_surface(
         // `SURFACE_OF_LINEAR_EXTRUSION(name, swept_curve, extrusion_axis)`.
         // A line extrudes to a plane and a circle along its own normal to a
         // cylinder — the forms real exporters emit for prismatic walls —
-        // giving an exact import; NURBS bases extrude to an exact ruled
-        // NURBS patch; anything else keeps the swept form for tessellation.
+        // giving an exact import; a NURBS basis extrudes to an exact ruled
+        // NURBS patch, built per face by [`extruded_nurbs_surface`] because
+        // the extent is the face's to state and not the entity's; anything
+        // else keeps the swept form for tessellation.
         "SURFACE_OF_LINEAR_EXTRUSION" => {
             let basis = resolve_curve(file, ref_attr(rec, 1, id)?, id, scale, angle_scale)?;
             let dir = resolve_vector(file, ref_attr(rec, 2, id)?, id, scale)?;
@@ -1014,10 +1025,8 @@ fn resolve_surface(
             if let Some(reduced) = reduce_extrusion(basis.analytic_basis(), &dir, id)? {
                 return Ok(RawSurface::Analytic(reduced));
             }
-            if let RawCurve::Nurbs(curve) = &basis {
-                return Ok(RawSurface::Nurbs(Box::new(extrude_nurbs_curve(
-                    curve, &dir, id,
-                )?)));
+            if let RawCurve::Nurbs(curve) = basis {
+                return Ok(RawSurface::ExtrudedNurbs { curve, dir });
             }
             Ok(RawSurface::Extruded {
                 basis: Box::new(basis),
@@ -1189,23 +1198,252 @@ fn reduce_revolution(
     }
 }
 
-/// Extrude a NURBS curve along `dir` into the exact ruled patch: the curve
-/// as both `v` rows (`v = 1` translated by `dir`), degree 1 in `v`, the
-/// curve's weights repeated (a translate preserves rationality).
-fn extrude_nurbs_curve(curve: &NurbsCurve, dir: &Vector3, entity: u64) -> MapResult<NurbsSurface> {
+/// Extrude a NURBS curve into the exact ruled patch spanning `span` — the
+/// two signed distances along the *unit* extrusion direction the rows sit
+/// at, measured from the curve. `v = 0` is the `span.0` row and `v = 1` the
+/// `span.1` row; degree 1 in `v`, the curve's weights repeated (a translate
+/// preserves rationality).
+///
+/// The span cannot come from the STEP entity. `SURFACE_OF_LINEAR_EXTRUSION`
+/// is unbounded in the sweep direction and its `VECTOR` magnitude is
+/// routinely 1 whatever the part measures, so only the faces built on the
+/// surface say how far — and which way — it has to reach (of-8ulj). See
+/// [`extruded_nurbs_surface`].
+fn extrude_nurbs_curve(
+    curve: &NurbsCurve,
+    unit: &Vector3,
+    span: (f64, f64),
+    entity: u64,
+) -> MapResult<NurbsSurface> {
     let knots_v =
         KnotVector::new(1, vec![0.0, 0.0, 1.0, 1.0]).map_err(|e| nurbs_error(entity, &e))?;
+    let (lo, hi) = span;
     // Control grid outer index runs over u — the curve direction — so the
     // surface normal du × dv matches curve-tangent × extrusion, the STEP
     // convention for surface_of_linear_extrusion.
     let grid: Vec<Vec<Point3>> = curve
         .control_points()
         .iter()
-        .map(|p| vec![*p, p + dir])
+        .map(|p| vec![p + unit * lo, p + unit * hi])
         .collect();
     let weights: Vec<Vec<f64>> = curve.weights().iter().map(|&w| vec![w, w]).collect();
     NurbsSurface::new(grid, weights, curve.knot_vector().clone(), knots_v)
         .map_err(|e| nurbs_error(entity, &e))
+}
+
+/// Slack added to a measured extrusion span, relative to the span itself:
+/// the patch is meant to *contain* its face, not to end exactly on it, so a
+/// boundary edge never lands on the knot-domain edge where a projection has
+/// to clamp.
+///
+/// Small on purpose. The tessellator reads a face as an untrimmed patch —
+/// and grids it directly, rather than deferring to the CDT pass — only while
+/// its boundary sits within `1e-6` of the knot domain's border
+/// (`nurbs_lattice`), and the usual profile (perpendicular to the sweep) is
+/// measured exactly, so this margin is all that stands between such a face
+/// and the fast path.
+const EXTRUSION_SPAN_MARGIN: f64 = 1e-9;
+
+/// The ruled patch one `ADVANCED_FACE` needs from its
+/// `SURFACE_OF_LINEAR_EXTRUSION` of a NURBS curve: the curve swept far
+/// enough along `dir` — in *both* directions — to cover the face's own
+/// bounds (of-8ulj).
+///
+/// The extent has to be measured because the entity does not carry one: the
+/// surface is unbounded along the sweep, and the `VECTOR`'s magnitude and
+/// sign say nothing about the faces built on it (`bspline_patch_prism.stp`
+/// spells a magnitude-1 `+z` sweep for faces reaching 20 mm along `−z`).
+fn extruded_nurbs_surface(
+    file: &StepFile,
+    bounds: &[u64],
+    face_ref: u64,
+    scale: f64,
+    angle_scale: f64,
+    curve: &NurbsCurve,
+    dir: &Vector3,
+) -> MapResult<NurbsSurface> {
+    let unit = dir / dir.norm();
+    let span = extrusion_span(file, bounds, face_ref, scale, angle_scale, curve, &unit)?;
+    extrude_nurbs_curve(curve, &unit, span, face_ref)
+}
+
+/// How far along `unit` a face's bounds reach, as signed distances from the
+/// swept curve — the `(lo, hi)` [`extrude_nurbs_curve`] sweeps between.
+///
+/// Every point of the surface is `C(u) + unit·t`, so the `t` to cover is
+/// what the bounding curves' points measure *minus* the swept curve's own
+/// displacement along `unit` at the matching `u`. That displacement is not
+/// known per point without inverting the curve, so its full range over the
+/// control hull is subtracted instead: the result always contains the true
+/// span and overshoots by at most the profile's own extent along the sweep
+/// — zero for the usual perpendicular profile, and harmless otherwise
+/// (a patch may reach past its face; it may never fall short of it).
+fn extrusion_span(
+    file: &StepFile,
+    bounds: &[u64],
+    face_ref: u64,
+    scale: f64,
+    angle_scale: f64,
+    curve: &NurbsCurve,
+    unit: &Vector3,
+) -> MapResult<(f64, f64)> {
+    if bounds.is_empty() {
+        return Err(invalid(face_ref, "ADVANCED_FACE has no bounds"));
+    }
+    let origin = curve.control_points()[0];
+    let (profile_lo, profile_hi) = extent_of(curve.control_points(), &origin, unit);
+
+    let mut lo = f64::INFINITY;
+    let mut hi = f64::NEG_INFINITY;
+    for &bound_ref in bounds {
+        let (b_lo, b_hi) =
+            bound_extent(file, bound_ref, face_ref, scale, angle_scale, &origin, unit)?;
+        lo = lo.min(b_lo);
+        hi = hi.max(b_hi);
+    }
+    let (lo, hi) = (lo - profile_hi, hi - profile_lo);
+
+    // NaN-safe: only a strictly positive span is a patch at all.
+    if (hi - lo).partial_cmp(&1e-12) != Some(std::cmp::Ordering::Greater) {
+        return Err(invalid(
+            face_ref,
+            "face boundary does not span the extrusion direction",
+        ));
+    }
+    let margin = (hi - lo) * EXTRUSION_SPAN_MARGIN;
+    Ok((lo - margin, hi + margin))
+}
+
+/// The `(lo, hi)` of `(p - origin)·unit` over every point one `FACE_BOUND`
+/// can reach, without discretizing it (the exact path has no polylines).
+fn bound_extent(
+    file: &StepFile,
+    bound_ref: u64,
+    referrer: u64,
+    scale: f64,
+    angle_scale: f64,
+    origin: &Point3,
+    unit: &Vector3,
+) -> MapResult<(f64, f64)> {
+    let inst = instance(file, bound_ref, referrer)?;
+    let rec = inst
+        .entity
+        .part("FACE_OUTER_BOUND")
+        .or_else(|| inst.entity.part("FACE_BOUND"))
+        .ok_or_else(|| {
+            invalid(
+                bound_ref,
+                format!("expected FACE_BOUND, found {}", type_names(inst)),
+            )
+        })?;
+    let loop_ref = ref_attr(rec, 1, bound_ref)?;
+
+    let loop_inst = instance(file, loop_ref, bound_ref)?;
+    // A VERTEX_LOOP is one point — degenerate as a bound, but it still sits
+    // on the surface and so still has to be covered.
+    if let Some(vertex_loop) = loop_inst.entity.part("VERTEX_LOOP") {
+        let point = vertex_point(file, ref_attr(vertex_loop, 1, loop_ref)?, loop_ref, scale)?;
+        return Ok(extent_of(&[point], origin, unit));
+    }
+
+    let loop_rec = typed_record(file, loop_ref, "EDGE_LOOP", bound_ref)?;
+    let mut lo = f64::INFINITY;
+    let mut hi = f64::NEG_INFINITY;
+    for oe_ref in ref_list(loop_rec, 1, loop_ref)? {
+        let oe = typed_record(file, oe_ref, "ORIENTED_EDGE", loop_ref)?;
+        let edge_ref = ref_attr(oe, 3, oe_ref)?;
+        let edge = typed_record(file, edge_ref, "EDGE_CURVE", oe_ref)?;
+        let start = vertex_point(file, ref_attr(edge, 1, edge_ref)?, edge_ref, scale)?;
+        let end = vertex_point(file, ref_attr(edge, 2, edge_ref)?, edge_ref, scale)?;
+        let geometry = resolve_curve(
+            file,
+            ref_attr(edge, 3, edge_ref)?,
+            edge_ref,
+            scale,
+            angle_scale,
+        )?;
+        let (e_lo, e_hi) = curve_extent(&geometry, [start, end], origin, unit);
+        lo = lo.min(e_lo);
+        hi = hi.max(e_hi);
+    }
+    if lo > hi {
+        return Err(invalid(loop_ref, "EDGE_LOOP has no edges"));
+    }
+    Ok((lo, hi))
+}
+
+/// A `VERTEX_POINT`'s location.
+fn vertex_point(file: &StepFile, vertex_ref: u64, referrer: u64, scale: f64) -> MapResult<Point3> {
+    let rec = typed_record(file, vertex_ref, "VERTEX_POINT", referrer)?;
+    resolve_point(file, ref_attr(rec, 1, vertex_ref)?, vertex_ref, scale)
+}
+
+/// The `(lo, hi)` of `(p - origin)·unit` over `points`; `(+inf, -inf)` when
+/// empty, so unions compose.
+fn extent_of(points: &[Point3], origin: &Point3, unit: &Vector3) -> (f64, f64) {
+    points
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), p| {
+            let d = (p - origin).dot(unit);
+            (lo.min(d), hi.max(d))
+        })
+}
+
+/// A **containing** bound on `(p - origin)·unit` over an edge's curve,
+/// trimmed by its vertices `ends`.
+///
+/// Never tighter than the truth, and cheap: a segment is its endpoints, a
+/// conic section its whole conic (an arc's own trim would be tighter), a
+/// NURBS curve its control hull — which contains the curve because
+/// [`NurbsCurve`] admits only positive weights. A parabola/hyperbola has no
+/// bound without its trim, so its ends stand in — those never reach the
+/// exact path anyway, and the mesh path sizes nothing.
+fn curve_extent(raw: &RawCurve, ends: [Point3; 2], origin: &Point3, unit: &Vector3) -> (f64, f64) {
+    let around = |center: &Point3, reach: f64| {
+        let d = (center - origin).dot(unit);
+        (d - reach, d + reach)
+    };
+    match raw {
+        RawCurve::Analytic(Curve3::Line { .. }) => extent_of(&ends, origin, unit),
+        RawCurve::Analytic(Curve3::Polyline { points, .. }) => extent_of(points, origin, unit),
+        RawCurve::Analytic(Curve3::Circle {
+            center,
+            axis,
+            radius,
+        }) => {
+            // The circle's plane meets `unit` in a line; the reach along it
+            // is the radius foreshortened by the axis tilt.
+            let tilt = axis.dot(unit).clamp(-1.0, 1.0);
+            around(center, radius * (1.0 - tilt * tilt).max(0.0).sqrt())
+        }
+        RawCurve::Analytic(Curve3::Ellipse {
+            center,
+            axis,
+            major_dir,
+            major_radius,
+            minor_radius,
+        }) => {
+            let minor_dir = axis.cross(major_dir);
+            let (a, b) = (
+                major_radius * major_dir.dot(unit),
+                minor_radius * minor_dir.dot(unit),
+            );
+            around(center, (a * a + b * b).sqrt())
+        }
+        RawCurve::Analytic(Curve3::Nurbs(curve)) => extent_of(curve.control_points(), origin, unit),
+        RawCurve::Nurbs(curve) => extent_of(curve.control_points(), origin, unit),
+        RawCurve::Conic(_) => extent_of(&ends, origin, unit),
+        RawCurve::Trimmed { basis, .. } | RawCurve::OnSurface { basis } => {
+            curve_extent(basis, ends, origin, unit)
+        }
+        RawCurve::Composite(segments) => segments.iter().fold(
+            (f64::INFINITY, f64::NEG_INFINITY),
+            |(lo, hi), (segment, _)| {
+                let (s_lo, s_hi) = curve_extent(segment, ends, origin, unit);
+                (lo.min(s_lo), hi.max(s_hi))
+            },
+        ),
+    }
 }
 
 /// A resolved `AXIS1_PLACEMENT`: location plus its axis direction
@@ -2488,6 +2726,17 @@ impl SolidBuilder<'_> {
         )? {
             RawSurface::Analytic(surface) => surface,
             RawSurface::Nurbs(nurbs) => Surface3::nurbs(*nurbs),
+            // Sized here rather than in `resolve_surface`: only the face
+            // knows how far along the sweep the patch has to reach.
+            RawSurface::ExtrudedNurbs { curve, dir } => Surface3::nurbs(extruded_nurbs_surface(
+                self.file,
+                &bounds,
+                face_ref,
+                self.scale,
+                self.angle_scale,
+                &curve,
+                &dir,
+            )?),
             RawSurface::Extruded { .. } | RawSurface::Revolved { .. } => {
                 return Err(unsupported(
                     surface_ref,
@@ -2911,6 +3160,22 @@ impl FallbackMesher<'_> {
                               (trimming bounds ignored)"
                         .to_string(),
                 });
+                mesh_nurbs_face(mesh, &surface, same_sense);
+                Ok(())
+            }
+            // The patch is sized to the face's own bounds, so meshing its
+            // full parameter domain covers the face and no more — the one
+            // NURBS case where ignoring the trim costs nothing.
+            RawSurface::ExtrudedNurbs { curve, dir } => {
+                let surface = extruded_nurbs_surface(
+                    self.file,
+                    &bounds,
+                    face_ref,
+                    self.scale,
+                    self.angle_scale,
+                    &curve,
+                    &dir,
+                )?;
                 mesh_nurbs_face(mesh, &surface, same_sense);
                 Ok(())
             }
@@ -6433,6 +6698,182 @@ mod tests {
         assert!(skew.is_none());
         // Sweeping a line along itself is degenerate, not a plane.
         assert!(reduce_extrusion(Some(&line), &Vector3::x(), 1).is_err());
+    }
+
+    /// One `ADVANCED_FACE` on a `SURFACE_OF_LINEAR_EXTRUSION` of a NURBS
+    /// profile, spelled the way `bspline_patch_prism.stp` does it: the
+    /// `VECTOR` is one unit of `+z` and the face reaches 20 units along
+    /// `−z`. The face's own bounds are the only statement of extent, so
+    /// the patch must be built from them (of-8ulj).
+    fn nurbs_extrusion_face_fixture(depth: f64) -> StepFile {
+        parse_fixture(&format!(
+            "#1 = CARTESIAN_POINT('', (0., 0., 0.));
+             #2 = CARTESIAN_POINT('', (0., 10., 0.));
+             #3 = CARTESIAN_POINT('', (0., 10., {depth:.6}));
+             #4 = CARTESIAN_POINT('', (0., 0., {depth:.6}));
+             #5 = VERTEX_POINT('', #1);
+             #6 = VERTEX_POINT('', #2);
+             #7 = VERTEX_POINT('', #3);
+             #8 = VERTEX_POINT('', #4);
+             #9 = DIRECTION('', (0., 0., 1.));
+             #10 = VECTOR('', #9, 1.);
+             #11 = B_SPLINE_CURVE_WITH_KNOTS('', 1, (#1, #2), .UNSPECIFIED., .F., .F., \
+                   (2, 2), (0., 1.), .PIECEWISE_BEZIER_KNOTS.);
+             #12 = SURFACE_OF_LINEAR_EXTRUSION('', #11, #10);
+             #13 = DIRECTION('', (0., 1., 0.));
+             #14 = VECTOR('', #13, 1.);
+             #15 = DIRECTION('', (0., 0., -1.));
+             #16 = VECTOR('', #15, 1.);
+             #17 = LINE('', #1, #14);
+             #18 = LINE('', #2, #16);
+             #19 = LINE('', #4, #14);
+             #20 = LINE('', #1, #16);
+             #21 = EDGE_CURVE('', #5, #6, #17, .T.);
+             #22 = EDGE_CURVE('', #6, #7, #18, .T.);
+             #23 = EDGE_CURVE('', #8, #7, #19, .T.);
+             #24 = EDGE_CURVE('', #5, #8, #20, .T.);
+             #25 = ORIENTED_EDGE('', *, *, #21, .T.);
+             #26 = ORIENTED_EDGE('', *, *, #22, .T.);
+             #27 = ORIENTED_EDGE('', *, *, #23, .F.);
+             #28 = ORIENTED_EDGE('', *, *, #24, .F.);
+             #29 = EDGE_LOOP('', (#25, #26, #27, #28));
+             #30 = FACE_OUTER_BOUND('', #29, .T.);
+             #31 = ADVANCED_FACE('', (#30), #12, .T.);"
+        ))
+    }
+
+    /// The patch a face gets covers the face — in the direction the face
+    /// actually reaches, not the one unit of `VECTOR` the entity spells.
+    #[test]
+    fn extruded_nurbs_patch_is_sized_to_its_face_not_its_vector() {
+        let file = nurbs_extrusion_face_fixture(-20.0);
+        let RawSurface::ExtrudedNurbs { curve, dir } =
+            resolve_surface(&file, 12, 0, 1.0, 1.0).expect("the extrusion resolves")
+        else {
+            panic!("a NURBS basis extrudes to a ruled patch");
+        };
+        // The entity on its own says +z, one unit long.
+        assert!((dir - Vector3::z()).norm() < 1e-12);
+
+        let patch = extruded_nurbs_surface(&file, &[30], 31, 1.0, 1.0, &curve, &dir)
+            .expect("the face's bounds size the patch");
+        // v = 0 is the far row (−20), v = 1 the near one, both just past
+        // the face by the margin.
+        let margin = 20.0 * EXTRUSION_SPAN_MARGIN;
+        for u in [0.0, 0.5, 1.0] {
+            assert!(
+                (patch.point(u, 0.0).z + 20.0 + margin).abs() < 1e-9,
+                "far row at u = {u} is {:?}",
+                patch.point(u, 0.0)
+            );
+            assert!(
+                (patch.point(u, 1.0).z - margin).abs() < 1e-9,
+                "near row at u = {u} is {:?}",
+                patch.point(u, 1.0)
+            );
+        }
+        // Every corner of the face lies on the patch (the bug: they used to
+        // lie 20 mm off it, since the patch stopped one unit the other way).
+        for (corner, v) in [
+            (Point3::new(0.0, 10.0, -20.0), 0.0),
+            (Point3::new(0.0, 0.0, -20.0), 0.0),
+            (Point3::new(0.0, 10.0, 0.0), 1.0),
+        ] {
+            let u = corner.y / 10.0;
+            let v = v * (1.0 - EXTRUSION_SPAN_MARGIN) + (1.0 - v) * EXTRUSION_SPAN_MARGIN;
+            assert!(
+                (patch.point(u, v) - corner).norm() < 1e-9,
+                "{corner:?} is off the patch at ({u}, {v}): {:?}",
+                patch.point(u, v)
+            );
+        }
+    }
+
+    /// A face whose bounds do not move along the sweep at all sizes no
+    /// patch: better a structured refusal (and the mesh fallback) than a
+    /// degenerate surface.
+    #[test]
+    fn an_extrusion_face_that_does_not_span_the_sweep_is_refused() {
+        let file = nurbs_extrusion_face_fixture(0.0);
+        let RawSurface::ExtrudedNurbs { curve, dir } =
+            resolve_surface(&file, 12, 0, 1.0, 1.0).unwrap()
+        else {
+            panic!("a NURBS basis extrudes to a ruled patch");
+        };
+        let err = extruded_nurbs_surface(&file, &[30], 31, 1.0, 1.0, &curve, &dir)
+            .expect_err("a flat face spans nothing");
+        assert!(
+            err.diagnostic().message.contains("does not span"),
+            "unexpected error: {:?}",
+            err.diagnostic()
+        );
+    }
+
+    /// The extent a bounding curve is sized against must *contain* the
+    /// curve, whatever kind it is — a bound that is too tight is exactly
+    /// the patch-too-short bug again.
+    #[test]
+    fn curve_extent_contains_every_curve_kind() {
+        let origin = Point3::origin();
+        let unit = Vector3::z();
+        let ends = [Point3::new(0.0, 0.0, -3.0), Point3::new(1.0, 0.0, 5.0)];
+
+        // A segment is exactly its endpoints.
+        let line = RawCurve::Analytic(Curve3::line(ends[0], Vector3::x()).unwrap());
+        assert_eq!(curve_extent(&line, ends, &origin, &unit), (-3.0, 5.0));
+
+        // A circle in a plane normal to the sweep has no extent along it;
+        // one standing on edge reaches its full radius either way.
+        let flat = RawCurve::Analytic(
+            Curve3::circle(Point3::new(0.0, 0.0, 4.0), Vector3::z(), 2.0).unwrap(),
+        );
+        assert_eq!(curve_extent(&flat, ends, &origin, &unit), (4.0, 4.0));
+        let upright = RawCurve::Analytic(
+            Curve3::circle(Point3::new(0.0, 0.0, 4.0), Vector3::x(), 2.0).unwrap(),
+        );
+        assert_eq!(curve_extent(&upright, ends, &origin, &unit), (2.0, 6.0));
+
+        // An ellipse reaches its major radius along the sweep when its
+        // major axis points that way.
+        let ellipse = RawCurve::Analytic(
+            Curve3::ellipse(
+                Point3::new(0.0, 0.0, 1.0),
+                Vector3::x(),
+                Vector3::z(),
+                3.0,
+                0.5,
+            )
+            .unwrap(),
+        );
+        assert_eq!(curve_extent(&ellipse, ends, &origin, &unit), (-2.0, 4.0));
+
+        // A NURBS curve is bounded by its control hull, which contains it.
+        let spline = NurbsCurve::bspline(
+            vec![
+                Point3::new(0.0, 0.0, 0.0),
+                Point3::new(1.0, 0.0, 9.0),
+                Point3::new(2.0, 0.0, 0.0),
+            ],
+            KnotVector::new(2, vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0]).unwrap(),
+        )
+        .unwrap();
+        let hull = curve_extent(
+            &RawCurve::Nurbs(Box::new(spline.clone())),
+            ends,
+            &origin,
+            &unit,
+        );
+        assert_eq!(hull, (0.0, 9.0));
+        // The curve itself peaks at half the hull's height, well inside it.
+        assert!((spline.point(0.5).z - 4.5).abs() < 1e-12);
+
+        // Wrappers are transparent, as they are everywhere else here.
+        let wrapped = RawCurve::OnSurface {
+            basis: Box::new(RawCurve::Analytic(
+                Curve3::circle(Point3::new(0.0, 0.0, 4.0), Vector3::x(), 2.0).unwrap(),
+            )),
+        };
+        assert_eq!(curve_extent(&wrapped, ends, &origin, &unit), (2.0, 6.0));
     }
 
     #[test]

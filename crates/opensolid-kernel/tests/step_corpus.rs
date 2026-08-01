@@ -1772,22 +1772,20 @@ mod corpus {
                 );
             }
         }
-        // 2026-08-01: 31 of 34, measured on this branch rebased onto of-zdx.
-        // That is the 33 of-zdx left minus the two below; the two occ/tangent
-        // parts it brought in are untouched by the measurement here and still
-        // pass. Three files fail:
+        // 2026-08-01: 32 of 34, measured on this branch rebased onto of-bb6.
+        // That is the 31 of-bb6 left plus bspline_patch_prism, which this bead
+        // returns to the exact path: its extrusion walls were patches one
+        // `VECTOR` long, so they stopped 20 mm short of the faces they carried
+        // and the edges on them needed a tolerance past MAX_ALLOWED_TOLERANCE.
+        // Sizing the patch to its face removes the miss at the source. Two
+        // files still fail:
         // - nist_ctc_05 (of-kwn): edge geometry that misses its vertex points.
-        // - nist_ctc_02, occ/nurbs/bspline_patch_prism (of-05ac): the two the
-        //   edge half of of-bb6 took off the exact path. Each has an edge
-        //   further from a face's surface than MAX_ALLOWED_TOLERANCE — 0.0386
-        //   mm of authored gap in nist_ctc_02, and in bspline_patch_prism a
-        //   whole 20 mm, because the extrusion patch we build for its faces
-        //   is a twentieth of the length it needs and points the other way
-        //   (of-8ulj). Refusing both is right; what costs the two counts is
-        //   that the mesh fallback does not close for either (of-05ac), so a
-        //   degrade becomes a loss. This floor returns to 33 with of-05ac,
-        //   and does not need of-8ulj first.
-        const FLOOR: usize = 31;
+        // - nist_ctc_02 (of-05ac): 0.0386 mm of authored gap puts an edge
+        //   further from its face's surface than MAX_ALLOWED_TOLERANCE.
+        //   Refusing it is right; what costs the count is that the mesh
+        //   fallback does not close for it either, turning a degrade into a
+        //   loss. This floor returns to 33 with of-05ac.
+        const FLOOR: usize = 32;
         assert!(
             passed.len() >= FLOOR,
             "corpus pass count regressed below {FLOOR}: only {passed:?} pass"
@@ -1862,13 +1860,16 @@ mod corpus {
                 );
             }
         }
-        // 2026-08-01: 31 files clear this, up from a measured 20 on of-zdx's
-        // main — every corpus file that still imports as a B-Rep at all
-        // (of-bb6's edge half). The eleven of-bb6 brought in are as1-oc-214,
-        // both nist_ctc_01s, nist_ctc_03_rc, nist_ctc_04, nist_ftc_06,
-        // nist_ftc_07, nist_ftc_08, nist_ftc_09, nist_ftc_10 and
-        // nist_stc_06. Nothing that was clean before stopped being clean.
-        const FLOOR: usize = 31;
+        // 2026-08-01: 32 files clear this, up from a measured 31 on of-bb6's
+        // main — every corpus file that imports as a B-Rep at all is also
+        // geometrically clean, so this list and the pass-rate list above are
+        // the same 32 files. The one this bead adds is bspline_patch_prism:
+        // its four extrusion walls were patches one `VECTOR` long and did not
+        // contain their own faces, which showed up here as 12 EdgeOffSurface
+        // (to 20 mm) and 8 PcurveDeviation. Sizing the patch to the face it
+        // carries takes all 20 to zero. Nothing that was clean before stopped
+        // being clean.
+        const FLOOR: usize = 32;
         assert!(
             clean.len() >= FLOOR,
             "geometrically clean corpus count regressed below {FLOOR}: only {clean:?} pass"
@@ -2296,6 +2297,56 @@ mod corpus {
             assert_counts_equal(&store, body, &store2, breps2[0], "dm1 NURBS round trip");
             assert_edges_lie_on_faces(&store2, &geo2, breps2[0]);
         }
+    }
+
+    /// A prism whose four walls are `SURFACE_OF_LINEAR_EXTRUSION`s of
+    /// degree-5 B-splines (of-8ulj).
+    ///
+    /// The entity states no extent: it is unbounded along the sweep, and
+    /// this file — like most — spells a `VECTOR` of magnitude 1 pointing
+    /// `+z` for faces that reach 20 mm along `−z`. Sweeping the profile by
+    /// that vector, as the reader used to, built four patches that contained
+    /// none of their own faces but the `z = 0` rim: 12 `EdgeOffSurface`
+    /// reports up to 20 mm, and a tessellation that called the geometry
+    /// degenerate. The patches are sized from the faces' own bounds now, so
+    /// the exact import has to be geometrically clean, not merely
+    /// structurally valid.
+    #[test]
+    fn bspline_extrusion_prism_imports_on_patches_that_reach_its_faces() {
+        let name = "occ/nurbs/bspline_patch_prism.stp";
+        let (store, geo, report) = import_bytes(&load(name));
+        assert!(
+            report.diagnostics.is_empty(),
+            "{name}: expected a clean exact import, got: {:?}",
+            report.diagnostics
+        );
+        let breps = assert_all_outcomes_structured(&store, &report);
+        assert_eq!(breps.len(), 1, "{name}: expected an exact B-Rep import");
+        let body = breps[0];
+
+        let failures = store.check_geometry(&geo, body);
+        assert!(
+            failures.is_empty(),
+            "{name}: extrusion patches do not reach their faces: {failures:?}"
+        );
+
+        // OCC reads this part as 50000 mm³ (`reference/occ/nurbs/`), and
+        // both of our measurements have to find the same solid. The
+        // tessellated one carries the chord error of a degree-5 profile at
+        // the default 32-segments-per-turn pitch (0.36% here; `occ_reference`
+        // measures it at its own finer pitch and lands inside 0.01%). The
+        // exact one integrates the B-Rep faces through their stored pcurves
+        // and has no such excuse.
+        let volume = closed_volume(&store, &geo, body).expect("the prism must tessellate closed");
+        assert!(
+            (volume - 50_000.0).abs() / 50_000.0 < 1e-2,
+            "{name}: tessellated volume {volume} is not OCC's 50000"
+        );
+        let exact = exact_volume(&store, &geo, body).expect("the prism must integrate");
+        assert!(
+            (exact - 50_000.0).abs() / 50_000.0 < 1e-9,
+            "{name}: exact volume {exact} is not OCC's 50000"
+        );
     }
 
     /// An exact import is only *usable* once it has a mesh: the wasm layer
