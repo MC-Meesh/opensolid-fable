@@ -1801,6 +1801,15 @@ mod corpus {
     /// bounds by area silenced every `FaceSenseContradictsLoop` in the corpus
     /// (see `no_imported_face_contradicts_its_outer_loop`), but the four NIST
     /// files it fixed still fail this gate on the defects above.
+    ///
+    /// of-bbh8 is the second of those: carrying the trim residual as the
+    /// vertex's tolerance took every `VertexOffEdge` in the corpus to zero
+    /// (116 of them, see [`no_imported_vertex_is_off_its_edges`]) and again
+    /// moved this count by nothing. Both times the same six files were held
+    /// down by a *second* defect underneath. What is left is of-bb6's edge
+    /// half — `EdgeOffSurface`, the authored curve straying from its faces'
+    /// surfaces, which the reader still does not measure — and that is now the
+    /// whole of the work list.
     #[test]
     fn corpus_geometric_pass_rate_does_not_regress() {
         let mut clean = Vec::new();
@@ -1839,6 +1848,63 @@ mod corpus {
         assert!(
             clean.len() >= FLOOR,
             "geometrically clean corpus count regressed below {FLOOR}: only {clean:?} pass"
+        );
+    }
+
+    /// No imported vertex may sit further from the endpoint of an adjacent
+    /// edge's curve than its own tolerance permits — `spec/08-tolerances.md`
+    /// §7.1 invariant 2, the vertex half of of-bb6.
+    ///
+    /// The reader has to *accept* such a miss: STEP writes finite decimals, so
+    /// a `VERTEX_POINT` and the `EDGE_CURVE` it sits on are rounded apart, and
+    /// `verify_trim` allows the difference up to `TRIM_TOL_REL`. What it used
+    /// to do was accept it and then create the vertex at `SYSTEM_RESOLUTION`
+    /// anyway, which is a claim the file does not support: 116 `VertexOffEdge`
+    /// reports across six vendored files, 78 of them in nist_ctc_02 alone. The
+    /// trim residual is carried as the vertex's tolerance now (of-bbh8) and the
+    /// count is zero.
+    ///
+    /// An absolute gate, not a floor, like
+    /// [`no_imported_face_contradicts_its_outer_loop`]: the reader measures
+    /// this deviation directly, so there is no file it cannot be right about.
+    /// The *edge* half of of-bb6 — `EdgeOffSurface`, where the authored curve
+    /// strays from its faces' surfaces — is not measured at import and is
+    /// still what [`corpus_geometric_pass_rate_does_not_regress`] is held down
+    /// by.
+    #[test]
+    fn no_imported_vertex_is_off_its_edges() {
+        let mut offenders: Vec<(String, usize)> = Vec::new();
+        for file in &corpus_files() {
+            let bytes = std::fs::read(file).unwrap_or_else(|e| panic!("read {file:?}: {e}"));
+            let (store, geo, report) = import_bytes(&bytes);
+            let count: usize = report
+                .solids
+                .iter()
+                .filter_map(|s| match &s.outcome {
+                    SolidOutcome::BRep(body) => Some(*body),
+                    _ => None,
+                })
+                .map(|body| {
+                    store
+                        .check_geometry(&geo, body)
+                        .iter()
+                        .filter(|f| matches!(f, CheckFailure::VertexOffEdge { .. }))
+                        .count()
+                })
+                .sum();
+            if count > 0 {
+                offenders.push((
+                    file.file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned(),
+                    count,
+                ));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "imported vertices off their edges' curves: {offenders:?}"
         );
     }
 

@@ -148,9 +148,9 @@ use opensolid_brep::curve::plane_basis;
 use opensolid_brep::triangulate::{ear_clip_rings, signed_area2};
 use opensolid_brep::{
     Body, BodyType, Curve3, CurveEval, CurveProject, Edge, Face, FaceSense, Fin, FinSense,
-    GeometryStore, KnotVector, Loop, LoopType, NurbsCurve, NurbsError, NurbsSurface,
-    SYSTEM_RESOLUTION, Shell, ShellOrientation, Surface3, SurfaceEval, SurfaceProject,
-    TessellationOptions, TopologyStore, Vertex, attach_body_pcurves,
+    GeometryStore, KnotVector, Loop, LoopType, MAX_ALLOWED_TOLERANCE, NurbsCurve, NurbsError,
+    NurbsSurface, SYSTEM_RESOLUTION, Shell, ShellOrientation, Surface3, SurfaceEval,
+    SurfaceProject, TessellationOptions, TopologyStore, Vertex, attach_body_pcurves,
 };
 use opensolid_core::error::CoreError;
 use opensolid_core::mesh::TriangleMesh;
@@ -1996,6 +1996,12 @@ struct TrimmedCurve {
     curve: Curve3,
     t_start: f64,
     t_end: f64,
+    /// How far the curve's start point actually lands from the start
+    /// vertex's point, and likewise for the end. Non-zero for any file whose
+    /// vertices and curves were rounded independently, which is most of
+    /// them; [`verify_trim`] bounds it and the vertex then carries it.
+    start_residual: f64,
+    end_residual: f64,
 }
 
 /// Reverse an analytic curve's parameterization (each edge gets its own
@@ -2142,29 +2148,59 @@ fn trim_curve(
             }
         }
     };
-    let trimmed = TrimmedCurve {
+    let mut trimmed = TrimmedCurve {
         curve: oriented,
         t_start,
         t_end,
+        start_residual: 0.0,
+        end_residual: 0.0,
     };
-    verify_trim(&trimmed, start, end, entity)?;
+    let (start_residual, end_residual) = verify_trim(&trimmed, start, end, entity)?;
+    trimmed.start_residual = start_residual;
+    trimmed.end_residual = end_residual;
     Ok(trimmed)
 }
 
 /// Verify the trimmed curve interpolates the edge's vertex points; catches
 /// vertices off their curve (wrong radius, off-plane, bad `same_sense`).
-fn verify_trim(trimmed: &TrimmedCurve, start: Point3, end: Point3, entity: u64) -> MapResult<()> {
+/// Returns how far it misses each of them by, which the caller records as
+/// the vertices' tolerance.
+///
+/// The two bounds are different questions. `TRIM_TOL_REL` asks whether the
+/// vertex is on this curve *at all* — past it, the record is describing some
+/// other edge and the file is wrong, not imprecise. [`MAX_ALLOWED_TOLERANCE`]
+/// asks whether a vertex carrying the miss is an entity the kernel will
+/// accept; past that, `check` would reject the imported body for tolerance
+/// alone, so the exact path declines it here and the solid tessellates
+/// instead. On a model small enough for the trim bound to be the tighter of
+/// the two — anything under ten metres at millimetre scale — only the first
+/// can fire.
+fn verify_trim(
+    trimmed: &TrimmedCurve,
+    start: Point3,
+    end: Point3,
+    entity: u64,
+) -> MapResult<(f64, f64)> {
     let scale = start.coords.norm().max(end.coords.norm());
     let tol = TRIM_TOL_REL * (1.0 + scale);
     let at_start = trimmed.curve.point(trimmed.t_start);
     let at_end = trimmed.curve.point(trimmed.t_end);
-    if (at_start - start).norm() > tol || (at_end - end).norm() > tol {
+    let (start_residual, end_residual) = ((at_start - start).norm(), (at_end - end).norm());
+    // NaN-safe: a non-finite residual fails both comparisons below.
+    if !(start_residual <= tol && end_residual <= tol) {
         return Err(invalid(
             entity,
             "edge geometry does not pass through the edge's vertex points",
         ));
     }
-    Ok(())
+    if start_residual.max(end_residual) > MAX_ALLOWED_TOLERANCE {
+        return Err(invalid(
+            entity,
+            "edge geometry misses its vertex points by more than the kernel's \
+             maximum tolerance",
+        ));
+    }
+    Ok((start_residual, end_residual))
 }
 
 // ---------------------------------------------------------------------
@@ -2542,6 +2578,28 @@ impl SolidBuilder<'_> {
             }
         };
         let trimmed = trim_curve(&curve, same_sense, start, end, closed, edge_ref)?;
+
+        // The trim is allowed to miss the vertex by up to `TRIM_TOL_REL` —
+        // STEP writes finite decimals, and a vertex point and the curve it
+        // sits on are rounded independently. That miss is exactly what a
+        // vertex tolerance is for (`spec/08-tolerances.md` §7.1 invariant 2):
+        // leaving it at `SYSTEM_RESOLUTION` would claim a precision the file
+        // never had, and `check_geometry` reports the difference as
+        // `VertexOffEdge`. A vertex is shared, so each edge raises rather
+        // than sets, and a closed edge visits its one vertex twice.
+        //
+        // The edge's own tolerance is left alone. §7.1 invariant 4 would have
+        // it rise to match, but an edge tolerance answers a different question
+        // — how far the *curve* strays from the adjacent surfaces — and
+        // inflating it to satisfy an ordering would loosen that check by an
+        // amount unrelated to what it measures. Tracked as of-az8x.
+        for (vertex, residual) in [
+            (v_start, trimmed.start_residual),
+            (v_end, trimmed.end_residual),
+        ] {
+            let vertex = self.store.vertices.get_mut(vertex).expect("just created");
+            vertex.tolerance = vertex.tolerance.max(residual);
+        }
 
         let curve_id = self.geo.add_curve(trimmed.curve);
         self.created.curves.push(curve_id);
@@ -5669,6 +5727,83 @@ mod tests {
             matches!(err, MapError::Invalid { entity: 7, .. }),
             "{err:?}"
         );
+    }
+
+    /// A trim that misses its vertices must say by how much: STEP writes
+    /// finite decimals, so a vertex point and the curve it sits on are
+    /// rounded apart, and the vertex carries the difference as its tolerance
+    /// rather than claiming a precision the file never had (of-bbh8).
+    #[test]
+    fn trim_reports_how_far_it_misses_its_vertices() {
+        let circle = Curve3::circle(Point3::origin(), Vector3::z(), 1.0).unwrap();
+        // Off-radius at the start, off-plane at the end: two different ways
+        // for a rounded coordinate to leave the curve.
+        let trimmed = trim_curve(
+            &circle,
+            true,
+            Point3::new(1.0 + 2e-7, 0.0, 0.0),
+            Point3::new(0.0, 1.0, 3e-7),
+            false,
+            1,
+        )
+        .unwrap();
+        assert!(
+            (trimmed.start_residual - 2e-7).abs() < 1e-15,
+            "got {}",
+            trimmed.start_residual
+        );
+        assert!(
+            (trimmed.end_residual - 3e-7).abs() < 1e-15,
+            "got {}",
+            trimmed.end_residual
+        );
+
+        // A curve that interpolates its vertices exactly owes nothing.
+        let exact = trim_curve(
+            &circle,
+            true,
+            Point3::new(1.0, 0.0, 0.0),
+            Point3::new(0.0, 1.0, 0.0),
+            false,
+            1,
+        )
+        .unwrap();
+        assert!(exact.start_residual < 1e-15 && exact.end_residual < 1e-15);
+    }
+
+    /// A miss the kernel would not accept as a tolerance is refused outright,
+    /// so the exact path never builds a body `check` rejects for tolerance
+    /// alone. Only reachable above ten metres at millimetre scale, where
+    /// `TRIM_TOL_REL` is the looser of the two bounds.
+    #[test]
+    fn trim_rejects_a_miss_beyond_the_kernel_tolerance_limit() {
+        let circle = Curve3::circle(Point3::origin(), Vector3::z(), 5.0e4).unwrap();
+        // 0.02 mm off a 50 m radius: inside the relative trim bound
+        // (1e-6 x 5e4 = 0.05) and outside MAX_ALLOWED_TOLERANCE (0.01).
+        let err = trim_curve(
+            &circle,
+            true,
+            Point3::new(5.0e4 + 0.02, 0.0, 0.0),
+            Point3::new(0.0, 5.0e4, 0.0),
+            false,
+            7,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, MapError::Invalid { entity: 7, .. }),
+            "{err:?}"
+        );
+        // The same geometry inside the limit still imports.
+        let ok = trim_curve(
+            &circle,
+            true,
+            Point3::new(5.0e4 + 0.002, 0.0, 0.0),
+            Point3::new(0.0, 5.0e4, 0.0),
+            false,
+            7,
+        )
+        .unwrap();
+        assert!(ok.start_residual <= MAX_ALLOWED_TOLERANCE);
     }
 
     /// Open cubic B-spline over `[0, 2]`, so a trim recovering `(0, 1)`

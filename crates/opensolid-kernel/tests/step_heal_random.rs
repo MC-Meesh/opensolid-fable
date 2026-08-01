@@ -72,10 +72,8 @@
 //!
 //! Both face-sense campaigns now run the whole corpus — cylinders and cones
 //! included — and [`a_reversed_face_sense_flag_is_corrected_on_import`] pins
-//! the original repro. The cases whose geometry is undamaged also assert
-//! `check_with_geometry`, which is the check that would have caught this on
-//! day one; see [`exact_import_volume_checked`] for why the jittered cases do
-//! not (of-bbh8).
+//! the original repro. They assert `check_with_geometry`, which is the check
+//! that would have caught this on day one.
 //!
 //! # Both directions are asserted
 //!
@@ -85,6 +83,27 @@
 //! for tolerance alone") — so
 //! [`gaps_beyond_the_tolerance_are_not_silently_merged`] asserts the refusal, and
 //! is the half that fails if healing ever becomes indiscriminate.
+//!
+//! # The geometric check is the one that measures this campaign
+//!
+//! `TopologyStore::check` reads the graph and holds no geometry, so it cannot
+//! see a vertex that has drifted off its edge's curve — which is most of what
+//! this campaign's damage does. Every case therefore asserts
+//! [`exact_import_volume_checked`], which runs `check_with_geometry` as well.
+//!
+//! The jittered ones did not, until of-bbh8, and that fence is what it hid: a
+//! body the healer reported as fully repaired came back with `VertexOffEdge` at
+//! ~1.01× the elevated allowance. Two tolerance shortfalls compounded, and
+//! of-hrgt above is the same shape a third time — a validator certifying a body
+//! the stricter one rejects. The reader accepts a vertex
+//! up to `TRIM_TOL_REL` off its edge's curve — it must, since STEP writes
+//! finite decimals and rounds a vertex point and its curve independently — and
+//! then created the vertex at `SYSTEM_RESOLUTION`, claiming a precision the
+//! file never had. Healing then moved a merged corner to its cluster's
+//! centroid and elevated the survivor to `max(existing, displacement)` when
+//! what it owed was `existing + displacement`.
+//! [`sewn_jitter_is_carried_as_tolerance`] pins the reader half on a file with
+//! nothing to heal at all.
 //!
 //! Protocol as `boolean_stress.rs`: deterministic seeded [`Rng`], a repro
 //! string on every failure, failures become `bd` beads and the case is
@@ -354,6 +373,52 @@ fn unsew(text: &str, rng: &mut Rng, amplitude: f64) -> (String, f64) {
     (rewritten.join("\n"), largest)
 }
 
+/// Jitter every `CARTESIAN_POINT` a `VERTEX_POINT` refers to, by at most
+/// `amplitude`, leaving the file otherwise **sewn**. Returns the damaged text
+/// and the largest displacement applied.
+///
+/// The complement of [`unsew`], and the reason this exists despite the module
+/// docs recording that jitter alone gives healing nothing to do: that is the
+/// point. Every corner stays one shared `VERTEX_POINT`, so no gap opens and no
+/// repair is planned — but each vertex has still moved off the curves its
+/// edges carry, and the import has to say so in the vertex's tolerance rather
+/// than in silence (of-bbh8).
+fn jitter_vertex_points(text: &str, rng: &mut Rng, amplitude: f64) -> (String, f64) {
+    use std::collections::HashSet;
+
+    let referenced: HashSet<u64> = text
+        .lines()
+        .filter(|l| l.contains("= VERTEX_POINT("))
+        .filter_map(|l| referenced_ids(l).first().copied())
+        .collect();
+    let mut largest: f64 = 0.0;
+    let out = text
+        .lines()
+        .map(|line| {
+            let Some(id) = record_id(line) else {
+                return line.to_string();
+            };
+            if !line.contains("= CARTESIAN_POINT(") || !referenced.contains(&id) {
+                return line.to_string();
+            }
+            let [x, y, z] = point_coords(line);
+            let step = |rng: &mut Rng| rng.range(-1.0, 1.0) * amplitude / 3.0_f64.sqrt();
+            let (dx, dy, dz) = (step(rng), step(rng), step(rng));
+            largest = largest.max((dx * dx + dy * dy + dz * dz).sqrt());
+            // Fixed-point for the same reason `unsew` uses it: a coordinate
+            // near zero must not come out in exponent notation.
+            format!(
+                "#{id} = CARTESIAN_POINT('',({:.12},{:.12},{:.12}));",
+                x + dx,
+                y + dy,
+                z + dz
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    (out, largest)
+}
+
 /// Flip the orientation flag of a random subset of `ADVANCED_FACE` records.
 /// Returns the damaged text and how many faces were flipped.
 fn flip_face_senses(text: &str, rng: &mut Rng) -> (String, usize) {
@@ -402,17 +467,20 @@ fn read_options(strategy: HealStrategy, max_gap: Option<f64>) -> StepReadOptions
 /// Import `text` and return the exact body's volume, additionally requiring
 /// that the *geometric* check clears it.
 ///
-/// The topology-only `TopologyStore::check` cannot see a face whose sense flag
-/// contradicts its own loop's winding — of-hrgt was exactly that body,
-/// certified by `check()` and then refused by the measurement it was certified
-/// for. `check_with_geometry` is what closes that gap.
+/// The topology-only `TopologyStore::check` holds no geometry, so it can see
+/// neither a face whose sense flag contradicts its own loop's winding — of-hrgt
+/// was exactly that body, certified by `check()` and then refused by the
+/// measurement it was certified for — nor a vertex that has drifted off its
+/// edge's curve, which is the whole subject of a jitter campaign.
+/// `check_with_geometry` measures both.
 ///
-/// Only cases whose *geometry* is undamaged use this. The jittered cases move
-/// vertices off their edges' curves by design, and healing absorbs that into
-/// the surviving entity's tolerance rather than into the vertex — which leaves
-/// `VertexOffEdge` firing at about 1.01× the elevated allowance on a body the
-/// healer reports as repaired (of-bbh8). That disagreement is real but is not
-/// this defect, so it is not asserted against here.
+/// Every case in this file uses this now. The jittered ones were fenced off
+/// from it until of-bbh8: healing absorbed a merged corner's displacement into
+/// the survivor's tolerance up to, rather than on top of, what its members were
+/// already carrying, so `VertexOffEdge` fired at about 1.01× the elevated
+/// allowance on a body the healer reported as repaired. Repairing the graph
+/// while leaving the surviving entities claiming a precision they no longer
+/// have is not a repair, and the fence is retired.
 fn exact_import_volume_checked(
     text: &str,
     options: &StepReadOptions,
@@ -496,7 +564,7 @@ fn undamaged_exports_round_trip_exactly() {
     for case in 0..12 {
         let export = export_random_primitive(&mut rng);
         let repro = format!("case {case}: baseline round trip of {}", export.label);
-        let volume = exact_import_volume(
+        let volume = exact_import_volume_checked(
             &export.text,
             &read_options(HealStrategy::Auto, None),
             &repro,
@@ -543,7 +611,7 @@ fn unsewn_shells_within_the_gap_heal_to_an_exact_import() {
             export.label
         );
 
-        let volume = exact_import_volume(
+        let volume = exact_import_volume_checked(
             &damaged,
             &read_options(HealStrategy::Auto, Some(max_gap)),
             &repro,
@@ -768,7 +836,7 @@ fn non_applying_strategies_do_not_repair_what_auto_repairs() {
         );
 
         // Auto repairs it — establishing that there is something to repair.
-        let healed = exact_import_volume(
+        let healed = exact_import_volume_checked(
             &damaged,
             &read_options(HealStrategy::Auto, Some(max_gap)),
             &format!("{repro}: Auto"),
@@ -903,10 +971,11 @@ fn healing_reaches_a_fixed_point_under_repeated_round_trips() {
             let SolidOutcome::BRep(body) = import.solids[0].outcome else {
                 panic!("{ctx}: a HEALED body failed to re-import exactly");
             };
-            let failures = store.check(body);
+            let failures = store.check_with_geometry(&geo, body);
             assert!(
                 failures.is_empty(),
-                "{ctx}: re-imported body failed check() with {} failures: {failures:#?}",
+                "{ctx}: re-imported body failed check_with_geometry() with {} \
+                 failures: {failures:#?}",
                 failures.len()
             );
             let volume = brep_mass_properties(&store, &geo, body)
@@ -934,5 +1003,55 @@ fn healing_reaches_a_fixed_point_under_repeated_round_trips() {
             FIRST_CYCLE,
             &format!("{repro}: converged volume vs the original part"),
         );
+    }
+}
+
+// =====================================================================
+// (4) The tolerance an import carries
+// =====================================================================
+
+/// A **sewn** file whose vertex coordinates have been jittered must import to
+/// a body that passes `check_with_geometry` — the reader half of of-bbh8.
+///
+/// Nothing here is healing's to fix: every corner is still one shared
+/// `VERTEX_POINT`, so no gap opens, the topology-only check passes, and the
+/// healer is never even consulted. What the jitter does is move each vertex
+/// off the curves its edges carry, by up to the reader's own `TRIM_TOL_REL` —
+/// which the reader *accepts*, then recorded nowhere, creating every vertex at
+/// `SYSTEM_RESOLUTION`. The result was a body certified by `check()` and
+/// rejected by `check_with_geometry()` with a `VertexOffEdge` per corner, on a
+/// file no repair had touched.
+///
+/// The volume assertion is the second half: carrying the miss as tolerance is
+/// the correct repair only if the vertex is *not* moved to make it true. The
+/// jitter is bounded by the trim tolerance, so the part must still measure to
+/// within it.
+#[test]
+fn sewn_jitter_is_carried_as_tolerance() {
+    let mut rng = Rng::new(0x_7011_E7A0);
+    for case in 0..12 {
+        let export = export_random_primitive(&mut rng);
+        let amplitude = export.diagonal * TRIM_TOL_REL * rng.range(0.05, 0.4);
+        let (damaged, largest) = jitter_vertex_points(&export.text, &mut rng, amplitude);
+        assert!(
+            largest > 0.0,
+            "case {case}: the jitter moved nothing — the corpus has no VERTEX_POINT \
+             records to damage"
+        );
+        let repro = format!(
+            "case {case}: {} sewn, jittered by up to {largest:.3e}",
+            export.label
+        );
+
+        // `HealStrategy::Off`: there is no repair to make, and saying so here
+        // is what keeps this a statement about the reader.
+        let volume =
+            exact_import_volume_checked(&damaged, &read_options(HealStrategy::Off, None), &repro)
+                .unwrap_or_else(|| {
+                    panic!("{repro}: a sewn file within the trim tolerance must import exactly")
+                });
+
+        let budget = 6.0 * largest / export.diagonal;
+        assert_within(volume, export.volume, budget.max(1e-9), &repro);
     }
 }

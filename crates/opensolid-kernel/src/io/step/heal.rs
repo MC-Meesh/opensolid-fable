@@ -25,7 +25,10 @@
 //!   orphaned fins onto the surviving edge, so a shell whose faces never
 //!   shared a boundary becomes watertight. The distance closed is absorbed
 //!   into the surviving entity's tolerance — this is tolerant modelling
-//!   (`spec/08-tolerances.md`), not a silent snap.
+//!   (`spec/08-tolerances.md`), not a silent snap. It is absorbed *on top of*
+//!   what the merged-away entities were already carrying, not merely up to
+//!   it: a survivor stands in for its members against everything they were
+//!   attached to, so the two distances add (of-bbh8).
 //! - **Orientation repair** ([`GeometryHealer::fix_orientation`]) — two-colour
 //!   the face adjacency graph so every pair of mated fins traverses its edge
 //!   in opposite directions, flipping the minority side of each connected
@@ -661,11 +664,22 @@ fn plan_vertex_merges(
             .iter()
             .map(|&i| (points[i] - centroid).norm())
             .fold(0.0, f64::max);
-        let existing = members
+        // The surviving vertex must stay within its tolerance of the endpoint
+        // of *every* edge the cluster brings with it — the invariant
+        // `check_geometry` measures as `VertexOffEdge`. Member `i` was already
+        // up to its own tolerance from those endpoints before the merge, and
+        // the move to the centroid adds its displacement on top, so the two
+        // sum per member. Taking `max(existing, gap)` instead was short by
+        // whatever the members were already carrying, which is never zero for
+        // a file whose vertices and curves were rounded independently
+        // (of-bbh8).
+        let tolerance = members
             .iter()
-            .map(|&i| store.vertex(vertices[i]).expect("live vertex").tolerance)
+            .map(|&i| {
+                (points[i] - centroid).norm()
+                    + store.vertex(vertices[i]).expect("live vertex").tolerance
+            })
             .fold(SYSTEM_RESOLUTION, f64::max);
-        let tolerance = existing.max(gap);
         if tolerance > MAX_ALLOWED_TOLERANCE {
             notes.push(format!(
                 "skipped merging {} vertices near {:?}: the merge needs tolerance \
@@ -763,11 +777,18 @@ fn plan_edge_welds(
             }
             let kept = samples[rep].0;
             let gap = members.iter().map(|&(_, _, d)| d).fold(0.0, f64::max);
-            let existing = std::iter::once(kept)
-                .chain(members.iter().map(|&(e, _, _)| e))
-                .map(|e| store.edge(e).expect("live edge").tolerance)
-                .fold(SYSTEM_RESOLUTION, f64::max);
-            let tolerance = existing.max(gap);
+            // The surviving curve inherits every victim's fins, so it is now
+            // measured against faces it was never on. Against victim `j`'s
+            // surface it is off by whatever `j` was off by, plus the distance
+            // between the two curves — the same per-member sum the vertex
+            // merge above makes, for the same reason (of-bbh8).
+            let tolerance = members
+                .iter()
+                .map(|&(e, _, deviation)| deviation + store.edge(e).expect("live edge").tolerance)
+                .fold(
+                    SYSTEM_RESOLUTION.max(store.edge(kept).expect("live edge").tolerance),
+                    f64::max,
+                );
             if tolerance > MAX_ALLOWED_TOLERANCE {
                 notes.push(format!(
                     "skipped welding {} edges onto {kept:?}: the weld needs tolerance \
@@ -1540,6 +1561,87 @@ mod tests {
         BlockFixture { store, geo, body }
     }
 
+    /// An unsewn block whose faces disagree about their *corners* but agree
+    /// about their *edges*: each face's private copy of a corner is displaced
+    /// by `jitter`, while the curve every copy of an edge carries is the one
+    /// true line through the undisplaced corners.
+    ///
+    /// This is what a STEP file actually looks like — the randomized
+    /// campaign's `unsew` duplicates only the topological records and leaves
+    /// the `LINE`s shared — and unlike [`unsewn_block`] it separates the two
+    /// gaps a merge has to account for. A displaced corner is already off the
+    /// end of its own edge's curve, by the perpendicular part of its
+    /// displacement, and the reader records that as the vertex's tolerance
+    /// (`read.rs`). Merging then moves it again, to the cluster's centroid.
+    /// The survivor owes both, which is the accounting of-bbh8 was about.
+    fn unsewn_block_on_shared_curves(jitter: f64) -> BlockFixture {
+        let mut store = TopologyStore::new();
+        let mut geo = GeometryStore::new();
+        let body = store.create_body(BodyType::Solid);
+        let shell = store.create_shell(body, true, ShellOrientation::Outward);
+
+        for (f, (cycle, normal)) in FACES.iter().enumerate() {
+            let normal = Vector3::new(normal[0], normal[1], normal[2]);
+            let nudge = Vector3::new(
+                ((f + 1) as f64 * 0.7).sin(),
+                ((f + 1) as f64 * 1.3).sin(),
+                ((f + 1) as f64 * 2.1).sin(),
+            )
+            .normalize()
+                * jitter;
+
+            let base: Vec<Point3> = cycle
+                .iter()
+                .map(|&c| Point3::new(CORNERS[c][0], CORNERS[c][1], CORNERS[c][2]))
+                .collect();
+            let points: Vec<Point3> = base.iter().map(|&p| p + nudge).collect();
+            let vertices: Vec<_> = points
+                .iter()
+                .map(|&p| store.create_vertex(p, SYSTEM_RESOLUTION))
+                .collect();
+
+            let face = store.create_face(shell, FaceSense::Positive);
+            // The true plane, through the undisplaced corners: the curves lie
+            // exactly on it, so nothing here is an `EdgeOffSurface`.
+            let surface =
+                geo.add_surface(Surface3::plane(base[0], normal).expect("axis-aligned plane"));
+            store.faces.get_mut(face).expect("live face").surface = Some(surface);
+
+            let mut fins = Vec::new();
+            for k in 0..4 {
+                let (a, b) = (k, (k + 1) % 4);
+                let direction = base[b] - base[a];
+                let dir = direction / direction.norm();
+                let curve = Curve3::line(base[a], dir).expect("nonzero direction");
+                // Trim where the displaced corners project onto the shared
+                // line, which is what the reader recovers for them.
+                let t_start = (points[a] - base[a]).dot(&dir);
+                let t_end = (points[b] - base[a]).dot(&dir);
+                for (&vertex, point, t) in [
+                    (&vertices[a], points[a], t_start),
+                    (&vertices[b], points[b], t_end),
+                ] {
+                    let residual = (point - curve.point(t)).norm();
+                    let v = store.vertices.get_mut(vertex).expect("live vertex");
+                    v.tolerance = v.tolerance.max(residual);
+                }
+                let curve = geo.add_curve(curve);
+                let edge = store.create_edge_with_curve(
+                    vertices[a],
+                    vertices[b],
+                    SYSTEM_RESOLUTION,
+                    curve,
+                    t_start,
+                    t_end,
+                );
+                fins.push((edge, FinSense::Forward));
+            }
+            store.create_loop(face, LoopType::Outer, &fins);
+        }
+        recover_genus(&mut store, body);
+        BlockFixture { store, geo, body }
+    }
+
     /// Build a properly sewn block, then break only the orientation of the
     /// listed faces.
     fn sewn_block(reversed_faces: &[usize]) -> BlockFixture {
@@ -1691,6 +1793,59 @@ mod tests {
                 .any(|op| matches!(op, HealOperation::ToleranceElevated { .. })),
             "the elevation must be reported: {:?}",
             result.operations
+        );
+    }
+
+    /// A merged vertex must cover the gap its members were *already* carrying
+    /// on top of the distance it moves them — of-bbh8.
+    ///
+    /// The input is valid geometrically as well as topologically: every corner
+    /// copy is within its own tolerance of the ends of its edges' curves. What
+    /// healing changes is where the survivor sits, and elevating it to
+    /// `max(existing, displacement)` left it short of the endpoints of the
+    /// curves its merged-away members brought with them — a body the healer
+    /// reported as fully repaired and `check_geometry` then rejected.
+    #[test]
+    fn a_merged_vertex_covers_the_gap_its_members_already_had() {
+        let mut f = unsewn_block_on_shared_curves(1e-6);
+        let before = f.store.check_geometry(&f.geo, f.body);
+        assert!(
+            before.is_empty(),
+            "the fixture must be geometrically valid before healing: {before:#?}"
+        );
+
+        // The plan, before it is applied: the elevation the old rule would
+        // have made is `max(displacement, what the members already carried)`,
+        // and every merge here needs strictly more than that. Without this the
+        // test would still pass on a fixture that never exercised the
+        // difference.
+        let mut notes = Vec::new();
+        let max_gap = derived_max_gap(&f.store, f.body);
+        for merge in plan_vertex_merges(&f.store, f.body, max_gap, &mut notes) {
+            let members = std::iter::once(merge.kept).chain(merge.merged.iter().copied());
+            let carried = members
+                .map(|v| f.store.vertex(v).expect("live vertex").tolerance)
+                .fold(SYSTEM_RESOLUTION, f64::max);
+            assert!(
+                merge.tolerance > carried.max(merge.gap),
+                "{:?}: tolerance {:.6e} is what max(carried {:.6e}, gap {:.6e}) already \
+                 gave — the fixture no longer distinguishes the two rules",
+                merge.kept,
+                merge.tolerance,
+                carried,
+                merge.gap
+            );
+        }
+
+        let result = GeometryHealer::heal(f.body, &mut f.store, &f.geo, &HealOptions::default());
+        assert!(result.healed(), "remaining: {:?}", result.remaining);
+        assert_eq!(f.store.vertices.len(), 8);
+        assert_eq!(f.store.edges.len(), 12);
+
+        let failures = f.store.check_geometry(&f.geo, f.body);
+        assert!(
+            failures.is_empty(),
+            "a healed body must satisfy the geometric check too: {failures:#?}"
         );
     }
 
