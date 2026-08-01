@@ -87,9 +87,14 @@ const ANGULAR_STEP: f64 = std::f64::consts::TAU / 192.0;
 /// Every entry names the bug that explains it; the test asserts this set
 /// *equals* the observed one.
 const KNOWN_IMPORT_FAILURES: &[(&str, &str)] = &[
-    // of-kwn: verify_trim's tolerance is tighter than the vertex slop CATIA
-    // authored into this part's CIRCLE edges.
-    ("nist/nist_ctc_05_asme1_rd.stp", "of-kwn"),
+    // of-5cn5: one CIRCLE edge (#4444) whose end VERTEX_POINT sits 7.2e-4 in
+    // off the circle's *plane* — 0.0182 mm, nearly twice
+    // MAX_ALLOWED_TOLERANCE, so no trim tolerance the reader could derive
+    // lets the kernel carry it. of-kwn cleared the five edges underneath it,
+    // whose ~1e-5 in misses are inside the 3.669e-3 in closure this file
+    // declares; this one is a different kind of defect. Like the file below,
+    // what turns the refusal into a lost solid is of-05ac.
+    ("nist/nist_ctc_05_asme1_rd.stp", "of-5cn5"),
     // of-05ac: this lost the exact path when of-bb6 started measuring imported
     // edge tolerances — it carries an edge further from its face's surface
     // than MAX_ALLOWED_TOLERANCE, so there is no tolerance the kernel could
@@ -101,9 +106,10 @@ const KNOWN_IMPORT_FAILURES: &[(&str, &str)] = &[
     //
     // bspline_patch_prism was listed here alongside it for a different reason
     // — its extrusion walls were patches one `VECTOR` long and did not contain
-    // their own faces. That was this bead's bug, not a fallback gap, and
+    // their own faces. That was of-8ulj's bug, not a fallback gap, and
     // sizing the patch to its face restores the *exact* path, so the file
-    // leaves this list here rather than with of-05ac. It is measured below.
+    // leaves this list with of-8ulj rather than with of-05ac. It is measured
+    // in the step_corpus floors.
     ("nist/nist_ctc_02_asme1_rc.stp", "of-05ac"),
 ];
 

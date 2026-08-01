@@ -1772,19 +1772,26 @@ mod corpus {
                 );
             }
         }
-        // 2026-08-01: 32 of 34, measured on this branch rebased onto of-bb6.
-        // That is the 31 of-bb6 left plus bspline_patch_prism, which this bead
-        // returns to the exact path: its extrusion walls were patches one
-        // `VECTOR` long, so they stopped 20 mm short of the faces they carried
-        // and the edges on them needed a tolerance past MAX_ALLOWED_TOLERANCE.
-        // Sizing the patch to its face removes the miss at the source. Two
-        // files still fail:
-        // - nist_ctc_05 (of-kwn): edge geometry that misses its vertex points.
+        // 2026-08-01: 32 of 34, measured with of-8ulj and of-kwn both on main.
+        // of-8ulj returned bspline_patch_prism to the exact path (its
+        // extrusion walls were patches one `VECTOR` long, so they stopped
+        // 20 mm short of the faces they carried); of-kwn cleared the five
+        // nist_ctc_05 edges whose ~1e-5 in misses were slop the file's own
+        // declared 3.67e-3 in closure covers. Two files still fail:
+        // - nist_ctc_05 (of-5cn5): one CIRCLE edge (#4444) whose end
+        //   VERTEX_POINT sits 7.2e-4 in off the circle's *plane* — 0.0182 mm,
+        //   nearly twice MAX_ALLOWED_TOLERANCE, so no tolerance the reader
+        //   could derive would let the kernel carry it. Snapping the vertex is
+        //   no answer either: its CARTESIAN_POINT #374 is the last control
+        //   point of B_SPLINE_CURVE #375 and the other three edges meeting
+        //   there interpolate it exactly, so a snap only moves the 18 um onto
+        //   edges that currently have none.
         // - nist_ctc_02 (of-05ac): 0.0386 mm of authored gap puts an edge
         //   further from its face's surface than MAX_ALLOWED_TOLERANCE.
         //   Refusing it is right; what costs the count is that the mesh
         //   fallback does not close for it either, turning a degrade into a
-        //   loss. This floor returns to 33 with of-05ac.
+        //   loss. This floor returns to 33 with of-05ac — 34 needs
+        //   nist_ctc_05's 18 um vertex as well.
         const FLOOR: usize = 32;
         assert!(
             passed.len() >= FLOOR,

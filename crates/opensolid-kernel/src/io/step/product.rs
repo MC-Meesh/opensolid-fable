@@ -506,7 +506,7 @@ impl ProductStructure {
 /// The item list attribute of a `REPRESENTATION` subtype, if `entity` is
 /// one. `SHAPE_DEFINITION_REPRESENTATION` deliberately does not match: it
 /// relates a definition to a representation rather than being one.
-fn representation_part(entity: &super::EntityRecord) -> Option<&SimpleRecord> {
+pub(super) fn representation_part(entity: &super::EntityRecord) -> Option<&SimpleRecord> {
     let matches = |rec: &SimpleRecord| {
         (rec.type_name == "REPRESENTATION"
             || rec.type_name == "SHAPE_REPRESENTATION"

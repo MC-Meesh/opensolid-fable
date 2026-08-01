@@ -69,6 +69,20 @@
 //! there is no tolerance the kernel could honour, and the solid degrades to
 //! the tessellated import below instead of claiming one.
 //!
+//! How large a gap the reader will *accept* before calling the file wrong
+//! rather than imprecise is the file's own call where it makes one. A
+//! representation's `GLOBAL_UNCERTAINTY_ASSIGNED_CONTEXT` states the
+//! "maximum model space distance between geometric entities at asserted
+//! connectivities", which is exactly the vertex-to-curve miss
+//! [`verify_trim`] bounds, so [`resolve_closure`] reads it (per solid — a
+//! file declares one uncertainty per representation, not one per file) and
+//! it floors [`trim_tol`]'s relative round-off rule. A file declaring
+//! nothing is held to the round-off rule alone; a file declaring more than
+//! [`MAX_ALLOWED_TOLERANCE`] is held to that limit and degrades as above.
+//! That last case is ordinary rather than suspect — four corpus files
+//! declare a thousandth of an inch or looser, and nist_ctc_01 and
+//! nist_ftc_09 among them import exactly — so it is noted, not warned about.
+//!
 //! # Mesh fallback
 //!
 //! B-splines no longer take this path (of-3qy.8) — they map exactly, as
@@ -714,6 +728,92 @@ fn resolve_length_scale(file: &StepFile, diagnostics: &mut Vec<Diagnostic>) -> f
         });
     }
     scale
+}
+
+/// The `REPRESENTATION_CONTEXT` of the representation whose item list names
+/// `item` (`REPRESENTATION(name, items, context_of_items)`). `None` when no
+/// representation holds it, which is what a file assembled by hand or a
+/// geometry-only fragment looks like.
+///
+/// A file carries one context per representation, not one per file: the
+/// `ADVANCED_BREP_SHAPE_REPRESENTATION` holding a solid and the
+/// `SHAPE_REPRESENTATION` holding its datum planes routinely declare
+/// different uncertainties. Only the solid's own context describes the solid.
+fn representation_context(file: &StepFile, item: u64) -> Option<u64> {
+    file.data.iter().find_map(|inst| {
+        let rec = super::product::representation_part(&inst.entity)?;
+        let items = rec.attributes.get(1).and_then(Value::as_list)?;
+        items
+            .iter()
+            .any(|v| v.as_ref_id() == Some(item))
+            .then(|| rec.attributes.get(2)?.as_ref_id())?
+    })
+}
+
+/// The closure distance the file declares for the solid `#msb_id`, in
+/// millimetres: the `UNCERTAINTY_MEASURE_WITH_UNIT` of its representation's
+/// `GLOBAL_UNCERTAINTY_ASSIGNED_CONTEXT`, which ISO 10303-42 defines as the
+/// "maximum model space distance between geometric entities at asserted
+/// connectivities". That is the producer's own answer to the question
+/// [`verify_trim`] asks, so the reader takes it over its own guess where the
+/// file bothers to give one.
+///
+/// `0.0` — no claim, and [`trim_tol`]'s relative rule stands alone — when
+/// the context declares nothing, or nothing about a length. A declaration
+/// past [`MAX_ALLOWED_TOLERANCE`] is clamped to it and noted: the kernel
+/// cannot carry a vertex looser than that whatever the file says. The note
+/// is `Info` because the case is the common one, not a defect — a
+/// thousandth of an inch is 0.0254 mm, and files declaring that import
+/// perfectly well; the clamp only means the reader stops short of believing
+/// the whole declaration. Several uncertainties in one context all apply,
+/// so the widest wins.
+fn resolve_closure(file: &StepFile, msb_id: u64, diagnostics: &mut Vec<Diagnostic>) -> f64 {
+    let declared = representation_context(file, msb_id)
+        .and_then(|ctx_id| file.get(ctx_id))
+        .and_then(|ctx| ctx.entity.part("GLOBAL_UNCERTAINTY_ASSIGNED_CONTEXT"))
+        .and_then(|rec| rec.attributes.first().and_then(Value::as_list))
+        .map(|list| {
+            list.iter()
+                .filter_map(|v| uncertainty_in_mm(file, v.as_ref_id()?))
+                .fold(0.0f64, f64::max)
+        })
+        .unwrap_or(0.0);
+    if declared > MAX_ALLOWED_TOLERANCE {
+        diagnostics.push(Diagnostic {
+            entity: Some(msb_id),
+            severity: Severity::Info,
+            message: format!(
+                "declared closure {declared:.3e} mm exceeds the kernel limit \
+                 {MAX_ALLOWED_TOLERANCE:.3e} mm; edge trims are held to the limit"
+            ),
+        });
+        return MAX_ALLOWED_TOLERANCE;
+    }
+    declared
+}
+
+/// One `UNCERTAINTY_MEASURE_WITH_UNIT(value, unit, name, description)` in
+/// millimetres. `None` unless it measures a length the reader can interpret
+/// as a finite positive distance — an angular or uninterpretable uncertainty
+/// says nothing about how far a vertex may sit from its curve.
+fn uncertainty_in_mm(file: &StepFile, measure_id: u64) -> Option<f64> {
+    let inst = file.get(measure_id)?;
+    let rec = inst
+        .entity
+        .part("UNCERTAINTY_MEASURE_WITH_UNIT")
+        .or_else(|| inst.entity.part("MEASURE_WITH_UNIT"))?;
+    let value = as_number(rec.attributes.first()?)?;
+    if !(value.is_finite() && value > 0.0) {
+        return None;
+    }
+    let unit_id = rec.attributes.get(1)?.as_ref_id()?;
+    if file
+        .get(unit_id)
+        .is_none_or(|u| u.entity.part("LENGTH_UNIT").is_none())
+    {
+        return None;
+    }
+    Some(value * length_unit_in_mm(file, unit_id, 4)?)
 }
 
 /// Radians per one of plane-angle unit `#unit_id`: an `SI_UNIT` is a
@@ -2335,8 +2435,20 @@ fn conic_angle(curve: &Curve3, p: &Point3) -> Option<f64> {
 /// How far apart two of an edge's points may be and still count as the
 /// same point. Grows with distance from the origin, because the decimals
 /// STEP writes lose absolute precision as coordinates grow.
-fn trim_tol(a: Point3, b: Point3) -> f64 {
-    TRIM_TOL_REL * (1.0 + a.coords.norm().max(b.coords.norm()))
+///
+/// `closure` is the file's own declaration of that distance
+/// ([`resolve_closure`], `0.0` where it declares none), and floors the
+/// relative rule rather than replacing it. The relative rule measures
+/// decimal round-off, which is all a file with 13-digit coordinates should
+/// have suffered; what it cannot see is a producer whose *modeller* worked
+/// to a looser fit than its writer printed, which is a claim only the file
+/// can make. nist_ctc_05 is that file: it writes 13 digits of inches and
+/// still parks five circle vertices ~1e-5 in off their circles, well inside
+/// the 3.67e-3 in closure it declares, so believing the printed digits
+/// instead of the declaration refuses geometry the producer never asserted
+/// was tighter (of-kwn).
+fn trim_tol(a: Point3, b: Point3, closure: f64) -> f64 {
+    (TRIM_TOL_REL * (1.0 + a.coords.norm().max(b.coords.norm()))).max(closure)
 }
 
 /// Trim an analytic curve to an edge's vertices: orient it along the edge
@@ -2348,6 +2460,7 @@ fn trim_curve(
     start: Point3,
     end: Point3,
     closed: bool,
+    closure: f64,
     entity: u64,
 ) -> MapResult<TrimmedCurve> {
     let oriented = if same_sense {
@@ -2412,7 +2525,14 @@ fn trim_curve(
             // mean the same thing: the edge sweeps a whole period. Reading
             // the second one literally gives a zero sweep, and an edge that
             // swept nothing would not be an edge at all.
-            if closed || (end - start).norm() <= trim_tol(start, end) {
+            //
+            // The declared closure widens "the same point" here as well as in
+            // [`verify_trim`], and deliberately so: it is the distance the
+            // file says entities at asserted connectivities may be apart, and
+            // two seam vertices are such a connectivity. An arc left over
+            // after reading it this way would be shorter than the closure the
+            // file itself calls indistinguishable from nothing.
+            if closed || (end - start).norm() <= trim_tol(start, end, closure) {
                 (t0, t0 + TAU)
             } else {
                 let sweep = (conic_angle(conic, &end).expect("conic") - t0).rem_euclid(TAU);
@@ -2430,7 +2550,7 @@ fn trim_curve(
         start_residual: 0.0,
         end_residual: 0.0,
     };
-    let (start_residual, end_residual) = verify_trim(&trimmed, start, end, entity)?;
+    let (start_residual, end_residual) = verify_trim(&trimmed, start, end, closure, entity)?;
     trimmed.start_residual = start_residual;
     trimmed.end_residual = end_residual;
     Ok(trimmed)
@@ -2441,22 +2561,23 @@ fn trim_curve(
 /// Returns how far it misses each of them by, which the caller records as
 /// the vertices' tolerance.
 ///
-/// The two bounds are different questions. `TRIM_TOL_REL` asks whether the
+/// The two bounds are different questions. [`trim_tol`] asks whether the
 /// vertex is on this curve *at all* — past it, the record is describing some
 /// other edge and the file is wrong, not imprecise. [`MAX_ALLOWED_TOLERANCE`]
 /// asks whether a vertex carrying the miss is an entity the kernel will
 /// accept; past that, `check` would reject the imported body for tolerance
 /// alone, so the exact path declines it here and the solid tessellates
 /// instead. On a model small enough for the trim bound to be the tighter of
-/// the two — anything under ten metres at millimetre scale — only the first
-/// can fire.
+/// the two — anything under ten metres at millimetre scale, declaring no
+/// closure of its own — only the first can fire.
 fn verify_trim(
     trimmed: &TrimmedCurve,
     start: Point3,
     end: Point3,
+    closure: f64,
     entity: u64,
 ) -> MapResult<(f64, f64)> {
-    let tol = trim_tol(start, end);
+    let tol = trim_tol(start, end, closure);
     let at_start = trimmed.curve.point(trimmed.t_start);
     let at_end = trimmed.curve.point(trimmed.t_end);
     let (start_residual, end_residual) = ((at_start - start).norm(), (at_end - end).norm());
@@ -2545,6 +2666,13 @@ struct SolidBuilder<'a> {
     scale: f64,
     /// Plane-angle factor (rad per file angle unit) applied to angle measures.
     angle_scale: f64,
+    /// The closure distance the file declares for this solid, in millimetres
+    /// ([`resolve_closure`]); floors every edge's trim tolerance.
+    closure: f64,
+    /// How many edges needed that floor — trims whose vertex miss is inside
+    /// the declared closure but outside what [`TRIM_TOL_REL`] alone allows.
+    /// Reported once per solid rather than per edge.
+    closure_trims: usize,
     created: Created,
     /// Faces with more than one real bound, so which one is the outer bound
     /// was an open question at mapping time. [`choose_outer_bounds`] settles
@@ -2960,7 +3088,18 @@ impl SolidBuilder<'_> {
                 ));
             }
         };
-        let trimmed = trim_curve(&curve, same_sense, start, end, closed, edge_ref)?;
+        let trimmed = trim_curve(
+            &curve,
+            same_sense,
+            start,
+            end,
+            closed,
+            self.closure,
+            edge_ref,
+        )?;
+        if trimmed.start_residual.max(trimmed.end_residual) > trim_tol(start, end, 0.0) {
+            self.closure_trims += 1;
+        }
 
         // The trim is allowed to miss the vertex by up to `TRIM_TOL_REL` —
         // STEP writes finite decimals, and a vertex point and the curve it
@@ -3047,6 +3186,12 @@ struct FallbackMesher<'a> {
     scale: f64,
     /// Plane-angle factor (rad per file angle unit) applied to angle measures.
     angle_scale: f64,
+    /// The closure distance the file declares for this solid, in millimetres
+    /// ([`resolve_closure`]); floors every trim tolerance, exactly as on the
+    /// exact path. The fallback shares [`trim_curve`], so a bound the exact
+    /// path refuses is refused here too and the solid is lost rather than
+    /// degraded — which is how of-kwn's file failed outright.
+    closure: f64,
     diagnostics: &'a mut Vec<Diagnostic>,
     /// `EDGE_CURVE` #id → its polyline from start vertex to end vertex.
     /// Shared between adjacent faces so junctions weld watertight.
@@ -3650,7 +3795,15 @@ impl FallbackMesher<'_> {
     ) -> MapResult<Vec<Point3>> {
         match raw {
             RawCurve::Analytic(curve) => {
-                let trimmed = trim_curve(&curve, same_sense, start, end, closed, edge_ref)?;
+                let trimmed = trim_curve(
+                    &curve,
+                    same_sense,
+                    start,
+                    end,
+                    closed,
+                    self.closure,
+                    edge_ref,
+                )?;
                 let segments = match trimmed.curve {
                     Curve3::Line { .. } => 1,
                     _ => angular_segments(trimmed.t_end - trimmed.t_start, self.options),
@@ -3696,7 +3849,7 @@ impl FallbackMesher<'_> {
                         "edge endpoints do not advance along its conic (check same_sense)",
                     ));
                 }
-                let tol = TRIM_TOL_REL * (1.0 + start.coords.norm().max(end.coords.norm()));
+                let tol = trim_tol(start, end, self.closure);
                 if (oriented.point(t0) - start).norm() > tol
                     || (oriented.point(t1) - end).norm() > tol
                 {
@@ -3750,8 +3903,7 @@ impl FallbackMesher<'_> {
         edge_ref: u64,
         what: &str,
     ) {
-        let scale = start.coords.norm().max(end.coords.norm());
-        let tol = TRIM_TOL_REL * (1.0 + scale);
+        let tol = trim_tol(start, end, self.closure);
         let last = points.len() - 1;
         if (points[0] - start).norm() > tol || (points[last] - end).norm() > tol {
             self.diagnostics.push(Diagnostic {
@@ -3825,7 +3977,7 @@ impl FallbackMesher<'_> {
                         "TRIMMED_CURVE over a LINE without cartesian trim points",
                     ));
                 };
-                let tol = TRIM_TOL_REL * (1.0 + p0.coords.norm().max(p1.coords.norm()));
+                let tol = trim_tol(p0, p1, self.closure);
                 let Curve3::Line { origin, dir } = curve else {
                     unreachable!("matched Line");
                 };
@@ -3947,7 +4099,7 @@ impl FallbackMesher<'_> {
                 points.reverse();
             }
             if let (Some(last), Some(first)) = (chain.last(), points.first()) {
-                let tol = TRIM_TOL_REL * (1.0 + last.coords.norm());
+                let tol = trim_tol(*last, *last, self.closure);
                 if (first - last).norm() <= tol {
                     points.remove(0);
                 } else {
@@ -4401,6 +4553,8 @@ fn map_solid(
         Vec::new()
     };
 
+    let closure = resolve_closure(file, msb_id, diagnostics);
+
     // Exact path first.
     let mut builder = SolidBuilder {
         file,
@@ -4408,6 +4562,8 @@ fn map_solid(
         geo,
         scale,
         angle_scale,
+        closure,
+        closure_trims: 0,
         created: Created::default(),
         multi_bound_faces: Vec::new(),
         vertices: HashMap::new(),
@@ -4417,6 +4573,7 @@ fn map_solid(
     let built = builder.build(msb_id, shell_ref, &voids);
     let created = builder.created;
     let multi_bound_faces = builder.multi_bound_faces;
+    let closure_trims = builder.closure_trims;
     match built {
         Ok(body) => {
             let mut failures = store.check(body);
@@ -4449,6 +4606,17 @@ fn map_solid(
                 // measure the edges against.
                 match record_edge_tolerances(store, geo, body) {
                     Ok(raised) => {
+                        if closure_trims > 0 {
+                            diagnostics.push(Diagnostic {
+                                entity: Some(msb_id),
+                                severity: Severity::Info,
+                                message: format!(
+                                    "{closure_trims} edge(s) miss their vertex points by more \
+                                     than decimal round-off, within the {closure:.3e} mm \
+                                     closure this solid is held to"
+                                ),
+                            });
+                        }
                         if raised > 0 {
                             diagnostics.push(Diagnostic {
                                 entity: Some(msb_id),
@@ -4508,6 +4676,7 @@ fn map_solid(
         options: &options.tessellation,
         scale,
         angle_scale,
+        closure,
         diagnostics,
         polylines: HashMap::new(),
     };
@@ -6134,6 +6303,7 @@ mod tests {
             Point3::new(1.0, 0.0, 0.0),
             Point3::new(0.0, 1.0, 0.0),
             false,
+            0.0,
             1,
         )
         .unwrap();
@@ -6152,6 +6322,7 @@ mod tests {
             Point3::new(1.0, 0.0, 0.0),
             Point3::new(0.0, 1.0, 0.0),
             false,
+            0.0,
             1,
         )
         .unwrap();
@@ -6172,6 +6343,7 @@ mod tests {
             Point3::origin(),
             Point3::new(1.0, 0.0, 0.0),
             false,
+            0.0,
             1,
         )
         .unwrap();
@@ -6183,7 +6355,7 @@ mod tests {
     fn closed_edge_spans_the_full_circle() {
         let circle = Curve3::circle(Point3::origin(), Vector3::z(), 2.0).unwrap();
         let vertex = Point3::new(0.0, 2.0, 0.0);
-        let trimmed = trim_curve(&circle, true, vertex, vertex, true, 1).unwrap();
+        let trimmed = trim_curve(&circle, true, vertex, vertex, true, 0.0, 1).unwrap();
         assert!((trimmed.t_end - trimmed.t_start - TAU).abs() < 1e-12);
         assert!((trimmed.curve.point(trimmed.t_start) - vertex).norm() < 1e-12);
     }
@@ -6198,7 +6370,7 @@ mod tests {
         // only in the last bits of the y component.
         let start = Point3::new(20.0, -7.347880794884e-16, 10.0);
         let end = Point3::new(20.0, 0.0, 10.0);
-        let trimmed = trim_curve(&circle, true, start, end, false, 1).unwrap();
+        let trimmed = trim_curve(&circle, true, start, end, false, 0.0, 1).unwrap();
         assert!((trimmed.t_end - trimmed.t_start - TAU).abs() < 1e-12);
         // Halfway round is the far side of the circle, not the seam.
         let mid = trimmed.curve.point((trimmed.t_start + trimmed.t_end) / 2.0);
@@ -6211,7 +6383,7 @@ mod tests {
     fn coincident_vertices_on_a_line_are_still_refused() {
         let line = Curve3::line(Point3::origin(), Vector3::x()).unwrap();
         let vertex = Point3::new(3.0, 0.0, 0.0);
-        let err = trim_curve(&line, true, vertex, vertex, false, 7).unwrap_err();
+        let err = trim_curve(&line, true, vertex, vertex, false, 0.0, 7).unwrap_err();
         assert!(
             matches!(err, MapError::Invalid { entity: 7, .. }),
             "{err:?}"
@@ -6227,6 +6399,7 @@ mod tests {
             Point3::new(5.0, 0.0, 0.0),
             Point3::new(0.0, 1.0, 0.0),
             false,
+            0.0,
             7,
         )
         .unwrap_err();
@@ -6251,6 +6424,7 @@ mod tests {
             Point3::new(1.0 + 2e-7, 0.0, 0.0),
             Point3::new(0.0, 1.0, 3e-7),
             false,
+            0.0,
             1,
         )
         .unwrap();
@@ -6272,6 +6446,7 @@ mod tests {
             Point3::new(1.0, 0.0, 0.0),
             Point3::new(0.0, 1.0, 0.0),
             false,
+            0.0,
             1,
         )
         .unwrap();
@@ -6293,6 +6468,7 @@ mod tests {
             Point3::new(5.0e4 + 0.02, 0.0, 0.0),
             Point3::new(0.0, 5.0e4, 0.0),
             false,
+            0.0,
             7,
         )
         .unwrap_err();
@@ -6307,10 +6483,284 @@ mod tests {
             Point3::new(5.0e4 + 0.002, 0.0, 0.0),
             Point3::new(0.0, 5.0e4, 0.0),
             false,
+            0.0,
             7,
         )
         .unwrap();
         assert!(ok.start_residual <= MAX_ALLOWED_TOLERANCE);
+    }
+
+    // ---- declared closure (of-kwn) ----
+
+    /// A file whose representation over item `#1` carries a context. `parts`
+    /// is the context's own supertype text — a
+    /// `GLOBAL_UNCERTAINTY_ASSIGNED_CONTEXT((...))` where the fixture wants
+    /// one — and `entities` whatever that list refers to. `#9100` is
+    /// millimetres, so a `LENGTH_MEASURE` against it is already in the units
+    /// [`resolve_closure`] answers in.
+    fn closure_file(entities: &str, parts: &str) -> StepFile {
+        let src = wrap(&format!(
+            "{entities}\n\
+             #9100 = ( LENGTH_UNIT() NAMED_UNIT(*) SI_UNIT(.MILLI.,.METRE.) );\n\
+             #9101 = ( NAMED_UNIT(*) PLANE_ANGLE_UNIT() SI_UNIT($,.RADIAN.) );\n\
+             #9102 = ( NAMED_UNIT(*) SI_UNIT($,.STERADIAN.) SOLID_ANGLE_UNIT() );\n\
+             #9110 = ( GEOMETRIC_REPRESENTATION_CONTEXT(3) {parts} \
+             GLOBAL_UNIT_ASSIGNED_CONTEXT((#9100,#9101,#9102)) \
+             REPRESENTATION_CONTEXT('','3D Context') );\n\
+             #9111 = ADVANCED_BREP_SHAPE_REPRESENTATION('',(#1),#9110);"
+        ));
+        super::super::parse::parse(&src).expect("fixture parses")
+    }
+
+    /// One `UNCERTAINTY_MEASURE_WITH_UNIT` of `value` against unit `#unit`.
+    fn uncertainty(id: u64, value: f64, unit: u64) -> String {
+        format!(
+            "#{id} = UNCERTAINTY_MEASURE_WITH_UNIT(LENGTH_MEASURE({value:E}),#{unit},\
+             'closure','maximum model space distance between geometric entities');"
+        )
+    }
+
+    /// [`resolve_closure`] on a fixture, discarding its notes.
+    fn closure_of(file: &StepFile) -> f64 {
+        resolve_closure(file, 1, &mut Vec::new())
+    }
+
+    /// The declared closure floors the round-off rule and never lowers it:
+    /// the two answer different questions, and a file declaring a tight
+    /// closure is not asserting that its own printed decimals are tighter
+    /// than they are.
+    #[test]
+    fn the_declared_closure_floors_the_round_off_rule() {
+        let (a, b) = (Point3::new(1.0, 0.0, 0.0), Point3::new(0.0, 1.0, 0.0));
+        let round_off = trim_tol(a, b, 0.0);
+        assert!((round_off - TRIM_TOL_REL * 2.0).abs() < 1e-18);
+        assert_eq!(trim_tol(a, b, 1.0e-4), 1.0e-4, "a wider closure wins");
+        assert_eq!(
+            trim_tol(a, b, 1.0e-12),
+            round_off,
+            "a tighter closure must not tighten the round-off rule"
+        );
+    }
+
+    #[test]
+    fn declared_closure_is_read_from_the_solids_own_context() {
+        let file = closure_file(
+            &uncertainty(9120, 4.0e-4, 9100),
+            "GLOBAL_UNCERTAINTY_ASSIGNED_CONTEXT((#9120))",
+        );
+        assert!((closure_of(&file) - 4.0e-4).abs() < 1e-18);
+    }
+
+    /// The declaration is measured in the file's own length unit, so it is
+    /// converted the same way coordinates are — nist_ctc_05 declares
+    /// thousandths of an inch (of-kwn).
+    #[test]
+    fn declared_closure_converts_from_the_files_length_unit() {
+        let file = closure_file(
+            &format!(
+                "{}\n\
+                 #9130 = (CONVERSION_BASED_UNIT('INCH',#9131) LENGTH_UNIT() NAMED_UNIT(#9132));\n\
+                 #9132 = DIMENSIONAL_EXPONENTS(1.0,0.0,0.0,0.0,0.0,0.0,0.0);\n\
+                 #9131 = LENGTH_MEASURE_WITH_UNIT(LENGTH_MEASURE(25.4),#9100);",
+                uncertainty(9120, 2.0e-4, 9130)
+            ),
+            "GLOBAL_UNCERTAINTY_ASSIGNED_CONTEXT((#9120))",
+        );
+        assert!(
+            (closure_of(&file) - 2.0e-4 * 25.4).abs() < 1e-15,
+            "got {}",
+            closure_of(&file)
+        );
+    }
+
+    /// A context declaring nothing about a length makes no claim, and the
+    /// round-off rule stands alone.
+    #[test]
+    fn no_declaration_leaves_the_closure_at_zero() {
+        let bare = closure_file("", "");
+        assert_eq!(closure_of(&bare), 0.0, "no uncertainty supertype at all");
+
+        let empty = closure_file("", "GLOBAL_UNCERTAINTY_ASSIGNED_CONTEXT(())");
+        assert_eq!(closure_of(&empty), 0.0, "an empty uncertainty list");
+
+        // An angular uncertainty says nothing about how far a vertex may sit
+        // from its curve, so it is not read as if it did.
+        let angular = closure_file(
+            "#9120 = UNCERTAINTY_MEASURE_WITH_UNIT(PLANE_ANGLE_MEASURE(1.E-4),#9101,'',''); ",
+            "GLOBAL_UNCERTAINTY_ASSIGNED_CONTEXT((#9120))",
+        );
+        assert_eq!(closure_of(&angular), 0.0, "an angular uncertainty");
+
+        // Nor does a non-positive or non-finite one.
+        let zero = closure_file(
+            &uncertainty(9120, 0.0, 9100),
+            "GLOBAL_UNCERTAINTY_ASSIGNED_CONTEXT((#9120))",
+        );
+        assert_eq!(closure_of(&zero), 0.0, "a zero declaration");
+    }
+
+    /// Several uncertainties in one context all apply at once, so the widest
+    /// is the distance the file is asserting connectivity within.
+    #[test]
+    fn the_widest_of_several_declarations_wins() {
+        let file = closure_file(
+            &format!(
+                "{}\n{}",
+                uncertainty(9120, 1.0e-4, 9100),
+                uncertainty(9121, 5.0e-4, 9100)
+            ),
+            "GLOBAL_UNCERTAINTY_ASSIGNED_CONTEXT((#9120,#9121))",
+        );
+        assert!((closure_of(&file) - 5.0e-4).abs() < 1e-18);
+    }
+
+    /// Past [`MAX_ALLOWED_TOLERANCE`] the kernel cannot carry the vertex
+    /// whatever the file says, so the declaration is clamped and noted. The
+    /// note is `Info`: nist_ctc_01 declares 5.08e-2 mm and nist_ftc_09
+    /// 3.38e-2 mm, and both import exactly — declaring a loose closure is
+    /// ordinary, not suspect.
+    #[test]
+    fn a_declaration_past_the_kernel_limit_is_clamped_and_noted() {
+        let file = closure_file(
+            &uncertainty(9120, 5.0e-2, 9100),
+            "GLOBAL_UNCERTAINTY_ASSIGNED_CONTEXT((#9120))",
+        );
+        let mut diagnostics = Vec::new();
+        assert_eq!(
+            resolve_closure(&file, 1, &mut diagnostics),
+            MAX_ALLOWED_TOLERANCE
+        );
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0].severity, Severity::Info);
+        assert!(
+            diagnostics[0].message.contains("exceeds the kernel limit"),
+            "{:?}",
+            diagnostics[0]
+        );
+    }
+
+    /// A 2 mm block whose corner-0 `VERTEX_POINT` is moved `off` mm along
+    /// +x, onto a `CARTESIAN_POINT` of its own. Every `LINE` and `PLANE`
+    /// through that corner stays anchored where the plain fixture puts it,
+    /// so the vertex sits just off the three edges meeting there and nothing
+    /// else about the solid changes — nist_ctc_05's defect (of-kwn) with none
+    /// of a real file's other slop.
+    ///
+    /// `closure`, where given, is declared in millimetres as the
+    /// representation's `UNCERTAINTY_MEASURE_WITH_UNIT`.
+    fn block_with_a_loose_vertex(off: f64, closure: Option<f64>) -> String {
+        let mut b = String::new();
+        let shell = block_shell_at(&mut b, 0, 2.0, 2.0, 2.0);
+        let msb = shell + 1;
+        writeln!(b, "#{msb} = MANIFOLD_SOLID_BREP('block', #{shell});").unwrap();
+
+        let anchored = "#9 = VERTEX_POINT('', #1);\n";
+        assert_eq!(b.matches(anchored).count(), 1, "corner 0's vertex point");
+        b = b.replace(
+            anchored,
+            &format!(
+                "#9000 = CARTESIAN_POINT('', ({:.9}, -1.000000, -1.000000));\n\
+                 #9 = VERTEX_POINT('', #9000);\n",
+                -1.0 + off
+            ),
+        );
+
+        if let Some(closure) = closure {
+            write!(
+                b,
+                "#9100 = ( LENGTH_UNIT() NAMED_UNIT(*) SI_UNIT(.MILLI.,.METRE.) );\n\
+                 #9101 = ( NAMED_UNIT(*) PLANE_ANGLE_UNIT() SI_UNIT($,.RADIAN.) );\n\
+                 #9102 = ( NAMED_UNIT(*) SI_UNIT($,.STERADIAN.) SOLID_ANGLE_UNIT() );\n\
+                 {}\n\
+                 #9110 = ( GEOMETRIC_REPRESENTATION_CONTEXT(3) \
+                 GLOBAL_UNCERTAINTY_ASSIGNED_CONTEXT((#9120)) \
+                 GLOBAL_UNIT_ASSIGNED_CONTEXT((#9100,#9101,#9102)) \
+                 REPRESENTATION_CONTEXT('','3D Context') );\n\
+                 #9111 = ADVANCED_BREP_SHAPE_REPRESENTATION('',(#{msb}),#9110);\n",
+                uncertainty(9120, closure, 9100)
+            )
+            .unwrap();
+        }
+        wrap(&b)
+    }
+
+    /// How far the loose vertex sits from the three lines through its corner:
+    /// they run along the axes from it, so a displacement along +x leaves the
+    /// x-aligned line exactly and misses the other two by the whole `off`.
+    /// Round-off alone allows `1e-6 * (1 + sqrt(3))` there, so 1e-5 mm is a
+    /// miss the relative rule refuses and any real closure covers.
+    const LOOSE_VERTEX_OFFSET: f64 = 1.0e-5;
+
+    /// With no declaration the round-off rule stands alone and refuses the
+    /// vertex — and because the mesh fallback shares [`trim_curve`], the
+    /// refusal costs the whole solid rather than degrading it. That is
+    /// exactly how nist_ctc_05 failed (of-kwn).
+    #[test]
+    fn a_vertex_past_round_off_is_refused_without_a_declaration() {
+        assert!(
+            LOOSE_VERTEX_OFFSET > trim_tol(Point3::origin(), Point3::new(-1.0, -1.0, -1.0), 0.0)
+        );
+        let (_, _, report) = import(&block_with_a_loose_vertex(LOOSE_VERTEX_OFFSET, None));
+        assert!(
+            matches!(report.solids[0].outcome, SolidOutcome::Failed),
+            "got {:?}",
+            report.solids[0].outcome
+        );
+        assert!(
+            report.diagnostics.iter().any(|d| {
+                d.severity >= Severity::Error
+                    && d.message
+                        .contains("does not pass through the edge's vertex points")
+            }),
+            "{:?}",
+            report.diagnostics
+        );
+    }
+
+    /// The same file declaring a closure that covers the miss imports
+    /// exactly, geometrically clean, and says how many edges needed the
+    /// declaration to get there.
+    #[test]
+    fn a_declared_closure_admits_a_vertex_round_off_refuses() {
+        let (store, geo, report) = import(&block_with_a_loose_vertex(
+            LOOSE_VERTEX_OFFSET,
+            Some(1.0e-4),
+        ));
+        no_error_diagnostics(&report);
+        let body = brep_body(&report.solids[0].outcome);
+        assert_eq!(store.check_with_geometry(&geo, body), Vec::new());
+
+        // Three edges meet corner 0; the one running along +x from it still
+        // passes through the moved vertex exactly, so two needed the floor.
+        assert!(
+            report.diagnostics.iter().any(|d| {
+                d.severity == Severity::Info
+                    && d.message.starts_with("2 edge(s) miss their vertex points")
+                    && d.message.contains("closure this solid is held to")
+            }),
+            "the acceptance must say what it accepted: {:?}",
+            report.diagnostics
+        );
+
+        // The miss is carried as the vertex's tolerance, not smoothed over.
+        let loose = store
+            .faces_of_body(body)
+            .into_iter()
+            .flat_map(|f| store.edges_of_face(f))
+            .flat_map(|e| {
+                let edge = store.edge(e).expect("live edge");
+                [edge.start_vertex, edge.end_vertex]
+            })
+            .filter(|&v| store.vertex(v).expect("live vertex").tolerance > SYSTEM_RESOLUTION)
+            .collect::<Vec<_>>();
+        assert!(!loose.is_empty(), "the vertex must carry its own miss");
+        for v in loose {
+            let tolerance = store.vertex(v).expect("live vertex").tolerance;
+            assert!(
+                (tolerance - LOOSE_VERTEX_OFFSET).abs() < 1e-15,
+                "expected the measured miss, got {tolerance}"
+            );
+        }
     }
 
     // ---- edge tolerances (of-bb6) ----
@@ -6471,12 +6921,12 @@ mod tests {
         let curve = bspline_arc();
         let (t0, t1) = curve.domain();
         let (start, end) = (curve.point(t0), curve.point(t1));
-        let trimmed = trim_curve(&curve, true, start, end, false, 1).unwrap();
+        let trimmed = trim_curve(&curve, true, start, end, false, 0.0, 1).unwrap();
         assert!((trimmed.t_start - t0).abs() < 1e-9);
         assert!((trimmed.t_end - t1).abs() < 1e-9);
         // An interior vertex trims to an interior parameter, not the end.
         let mid = curve.point(1.25);
-        let partial = trim_curve(&curve, true, start, mid, false, 1).unwrap();
+        let partial = trim_curve(&curve, true, start, mid, false, 0.0, 1).unwrap();
         assert!((partial.t_end - 1.25).abs() < 1e-6, "got {}", partial.t_end);
     }
 
@@ -6486,7 +6936,7 @@ mod tests {
         let (t0, t1) = curve.domain();
         // The edge runs against the curve: end vertex first.
         let (start, end) = (curve.point(t1), curve.point(t0));
-        let trimmed = trim_curve(&curve, false, start, end, false, 1).unwrap();
+        let trimmed = trim_curve(&curve, false, start, end, false, 0.0, 1).unwrap();
         assert!(trimmed.t_start < trimmed.t_end, "normalized trim direction");
         assert!(matches!(trimmed.curve, Curve3::Nurbs(_)), "stays exact");
         // The reversed curve interpolates the edge's vertices in order.
@@ -6513,7 +6963,7 @@ mod tests {
             .unwrap(),
         );
         let vertex = curve.point(0.0);
-        let trimmed = trim_curve(&curve, true, vertex, vertex, true, 1).unwrap();
+        let trimmed = trim_curve(&curve, true, vertex, vertex, true, 0.0, 1).unwrap();
         assert_eq!((trimmed.t_start, trimmed.t_end), (0.0, 3.0));
     }
 
@@ -6521,8 +6971,16 @@ mod tests {
     fn trim_rejects_bspline_vertices_off_the_curve() {
         let curve = bspline_arc();
         let start = curve.point(0.0);
-        let err =
-            trim_curve(&curve, true, start, Point3::new(0.0, 9.0, 9.0), false, 7).unwrap_err();
+        let err = trim_curve(
+            &curve,
+            true,
+            start,
+            Point3::new(0.0, 9.0, 9.0),
+            false,
+            0.0,
+            7,
+        )
+        .unwrap_err();
         assert!(
             matches!(err, MapError::Invalid { entity: 7, .. }),
             "{err:?}"
@@ -6550,7 +7008,16 @@ mod tests {
     #[test]
     fn trim_rejects_closed_edge_on_a_line() {
         let line = Curve3::line(Point3::origin(), Vector3::x()).unwrap();
-        let err = trim_curve(&line, true, Point3::origin(), Point3::origin(), true, 7).unwrap_err();
+        let err = trim_curve(
+            &line,
+            true,
+            Point3::origin(),
+            Point3::origin(),
+            true,
+            0.0,
+            7,
+        )
+        .unwrap_err();
         assert!(matches!(err, MapError::Invalid { .. }));
     }
 
