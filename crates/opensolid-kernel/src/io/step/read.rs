@@ -1575,11 +1575,13 @@ enum RawCurve {
     ///
     /// Transparent to the exact path, like [`RawCurve::Trimmed`]: the edge
     /// takes the 3D basis. The associated geometry is validated
-    /// ([`validate_associated_geometry`]) but not carried — fin pcurves are
-    /// re-derived in the kernel's own parameterization
+    /// ([`validate_associated_geometry`]) but not carried here — fin
+    /// pcurves are re-derived in the kernel's own parameterization
     /// ([`attach_body_pcurves`]), and the seam an authored
     /// `SEAM_CURVE` marks is equally visible in the topology, as an edge its
-    /// face uses twice.
+    /// face uses twice. The one exception is a freeform edge's authored 2D
+    /// trim, which `map_edge` collects separately for
+    /// [`transplant_authored_pcurves`] (of-50u).
     OnSurface {
         basis: Box<RawCurve>,
     },
@@ -1665,7 +1667,7 @@ fn resolve_trim(
 /// fine would hide the defect.
 ///
 /// The 2D geometry inside the `DEFINITIONAL_REPRESENTATION` is validated as
-/// present but is deliberately not transplanted into the kernel. Two things
+/// present but is not, in general, transplanted into the kernel. Two things
 /// stand in the way, and both make re-deriving it the honest answer:
 ///
 /// - STEP parameterizes the pcurve in its *basis curve's* parameter, while
@@ -1677,6 +1679,10 @@ fn resolve_trim(
 ///   whose `ref_direction` the kernel's [`Surface3`] does not keep: a
 ///   cylinder derives its own angular origin from its axis. Authored `u = 0`
 ///   is therefore not kernel `u = 0`.
+///
+/// Both obstacles dissolve for a B-spline curve on a B-spline surface,
+/// where everything is imported verbatim — that one case is collected and,
+/// after verification, adopted by [`transplant_authored_pcurves`] (of-50u).
 ///
 /// The one thing projection cannot recover — that a `SEAM_CURVE`'s edge is a
 /// parameterization seam, so its two fins need opposite branches — the
@@ -5739,6 +5745,57 @@ mod tests {
             "volume {}",
             signed_volume(&mesh)
         );
+    }
+
+    /// `same_sense = .F.` reverses the 3D basis into the kernel's edge
+    /// direction, so the authored 2D curve must ride along the same
+    /// reflection or it traces the trim backwards. The transplanted control
+    /// points come back in reversed order.
+    #[test]
+    fn a_reversed_freeform_edge_transplants_the_reflected_trim() {
+        let text = split_top_block_step()
+            .replace(
+                "#229 = EDGE_CURVE('', #15, #17, #228, .T.);",
+                "#229 = EDGE_CURVE('', #17, #15, #228, .F.);",
+            )
+            .replace(
+                "#230 = ORIENTED_EDGE('', *, *, #229, .T.);",
+                "#230 = ORIENTED_EDGE('', *, *, #229, .F.);",
+            )
+            .replace(
+                "#242 = ORIENTED_EDGE('', *, *, #229, .F.);",
+                "#242 = ORIENTED_EDGE('', *, *, #229, .T.);",
+            );
+        let (store, geo, report) = import(&text);
+        no_error_diagnostics(&report);
+        let body = brep_body(&report.solids[0].outcome);
+        assert!(store.check(body).is_empty(), "{:?}", store.check(body));
+
+        let mut transplanted = 0;
+        for face in store.faces_of_body(body) {
+            for loop_id in store.loops_of_face(face) {
+                for &fin in store.fins_of_loop(loop_id) {
+                    if let Some(Curve2::Nurbs { curve, fit_params }) = store
+                        .fin(fin)
+                        .unwrap()
+                        .pcurve
+                        .and_then(|id| geo.pcurve(id))
+                    {
+                        assert!(fit_params.is_empty());
+                        assert_eq!(
+                            curve.control_points(),
+                            &[
+                                opensolid_core::Point2::new(1.0, 1.0),
+                                opensolid_core::Point2::new(0.75, 0.25),
+                                opensolid_core::Point2::new(0.0, 0.0),
+                            ]
+                        );
+                        transplanted += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(transplanted, 2);
     }
 
     /// An authored pcurve that does not trace its edge — here shifted a
