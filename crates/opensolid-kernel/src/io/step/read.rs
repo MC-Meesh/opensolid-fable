@@ -169,13 +169,14 @@ use std::collections::HashMap;
 use opensolid_brep::curve::plane_basis;
 use opensolid_brep::triangulate::{ear_clip_rings, signed_area2};
 use opensolid_brep::{
-    Body, BodyType, Curve3, CurveEval, CurveProject, Edge, Face, FaceSense, Fin, FinSense,
-    GeometryStore, KnotVector, Loop, LoopType, MAX_ALLOWED_TOLERANCE, NurbsCurve, NurbsError,
-    NurbsSurface, SYSTEM_RESOLUTION, Shell, ShellOrientation, Surface3, SurfaceEval,
+    Body, BodyType, Curve2, Curve3, CurveEval, CurveProject, Edge, Face, FaceSense, Fin, FinSense,
+    GeometryStore, KnotVector, Loop, LoopType, MAX_ALLOWED_TOLERANCE, NurbsCurve, NurbsCurve2,
+    NurbsError, NurbsSurface, SYSTEM_RESOLUTION, Shell, ShellOrientation, Surface3, SurfaceEval,
     SurfaceProject, TessellationOptions, TopologyStore, Vertex, attach_body_pcurves,
 };
 use opensolid_core::error::CoreError;
 use opensolid_core::mesh::TriangleMesh;
+use opensolid_core::types::Point2;
 use opensolid_core::{EntityId, Point3, Vector3};
 
 use super::heal::{GeometryHealer, HealOptions, HealStrategy, reconcile_face_senses};
@@ -2155,6 +2156,63 @@ fn resolve_bspline_curve(
     .map_err(|e| nurbs_error(id, &e))
 }
 
+/// A 2D `CARTESIAN_POINT` — the coordinates inside a `PCURVE`'s
+/// definitional representation. Surface parameters carry no length unit,
+/// so nothing scales.
+fn resolve_point_2d(file: &StepFile, id: u64, referrer: u64) -> MapResult<Point2> {
+    let rec = typed_record(file, id, "CARTESIAN_POINT", referrer)?;
+    let items = list_attr(rec, 1, id)?;
+    if items.len() != 2 {
+        return Err(invalid(
+            id,
+            format!(
+                "a parameter-space CARTESIAN_POINT expects 2 coordinates, found {}",
+                items.len()
+            ),
+        ));
+    }
+    let mut out = [0.0; 2];
+    for (slot, item) in out.iter_mut().zip(items) {
+        *slot = as_number(item).ok_or_else(|| invalid(id, "non-numeric coordinate"))?;
+    }
+    Ok(Point2::new(out[0], out[1]))
+}
+
+/// The 2D B-spline inside a `PCURVE`'s definitional representation, mapped
+/// verbatim — the same spellings [`resolve_bspline_curve`] accepts, with 2D
+/// control points and no unit scale.
+fn resolve_bspline_curve_2d(file: &StepFile, id: u64, referrer: u64) -> MapResult<NurbsCurve2> {
+    let inst = instance(file, id, referrer)?;
+    let Some(parts) = BSplineParts::curve(&inst.entity) else {
+        return Err(unsupported(id, "authored pcurve geometry is not a B-spline"));
+    };
+    let base = parts.base;
+    let offset = parts.base_offset;
+    let degree = int_attr(base, offset, id)?;
+    let control_points = ref_list(base, offset + 1, id)?
+        .into_iter()
+        .map(|p| resolve_point_2d(file, p, id))
+        .collect::<MapResult<Vec<_>>>()?;
+    let kv = match parts.knots {
+        Some((rec, first)) => {
+            let multiplicities = int_list(rec, first, id)?;
+            let knots = real_list(rec, first + 1, id)?;
+            knot_vector(degree, &knots, &multiplicities, id)?
+        }
+        None => implicit_knot_vector(
+            parts.implicit.expect("knots are explicit or implicit"),
+            degree,
+            control_points.len(),
+            id,
+        )?,
+    };
+    match parts.weights {
+        Some(rec) => NurbsCurve2::new(control_points, real_list(rec, 0, id)?, kv),
+        None => NurbsCurve2::bspline(control_points, kv),
+    }
+    .map_err(|e| nurbs_error(id, &e))
+}
+
 /// A rectangular list-of-lists of `cartesian_point` references at `index`,
 /// resolved row by row. The outer index runs over `u`.
 fn resolve_control_grid(
@@ -2559,6 +2617,14 @@ struct SolidBuilder<'a> {
     /// seam. Settled by [`split_overshared_seams`](Self::split_overshared_seams)
     /// once the whole body is mapped and the edge's full fin count is known.
     seams: Vec<(EntityId<Loop>, EntityId<Edge>)>,
+    /// Authored 2D trim geometry per freeform edge, keyed by the STEP id of
+    /// the `PCURVE`'s basis surface, already reoriented to the edge's
+    /// direction of travel. Candidates for
+    /// [`transplant_authored_pcurves`] once the body's own pcurves exist.
+    authored_pcurves: HashMap<EntityId<Edge>, Vec<(u64, NurbsCurve2)>>,
+    /// Each face's surface as the file named it, so an authored pcurve's
+    /// basis-surface reference can be matched to the fins it trims.
+    face_surface_refs: HashMap<EntityId<Face>, u64>,
 }
 
 impl SolidBuilder<'_> {
@@ -2797,6 +2863,7 @@ impl SolidBuilder<'_> {
         };
         let face = self.store.create_face(shell, sense);
         self.created.faces.push(face);
+        self.face_surface_refs.insert(face, surface_ref);
         // Only a face with two real bounds to choose between has anything to
         // re-decide; one bound (with or without vertex loops beside it) is
         // the outer one whatever the file says.

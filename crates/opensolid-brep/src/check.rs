@@ -1703,24 +1703,30 @@ fn pcurve_deviation(
 
 /// Parameters at which a pcurve is held to the invariant.
 ///
-/// [`Curve2::Line`] and [`Curve2::Circle`] are exact fits and
-/// [`Curve2::Projected`] is an exact inverse, so all three are sampled
-/// evenly across the edge's range — for `Projected` that is not a courtesy
-/// but the strongest check available, since it is the only variant that
-/// claims the invariant at parameters nobody sampled while building it. A
-/// [`Curve2::Polyline`] only
-/// claims to lie on the surface *at its own vertices*: between them it is a
-/// chord, and the error there is bounded by the sample spacing — the
-/// documented, deliberate approximation of freeform trim (see
-/// [`crate::pcurve`]), not a defect. Its vertices are where a pcurve on the
-/// wrong branch, running backwards, or fitted against a different edge shows
-/// up anyway.
+/// [`Curve2::Line`] and [`Curve2::Circle`] are exact fits,
+/// [`Curve2::Projected`] is an exact inverse, and a [`Curve2::Nurbs`]
+/// without fit parameters claims exactness (a transplanted authored trim),
+/// so all four are sampled evenly across the edge's range — for `Projected`
+/// and the transplant that is not a courtesy but the strongest check
+/// available, since they claim the invariant at parameters nobody sampled
+/// while building them. A [`Curve2::Polyline`] — and a fitted
+/// [`Curve2::Nurbs`], which records its interpolation parameters — only
+/// claims to lie on the surface *at its own samples*: between them the
+/// error is bounded by the sample spacing — the documented, deliberate
+/// approximation of freeform trim (see [`crate::pcurve`]), not a defect.
+/// The samples are where a pcurve on the wrong branch, running backwards,
+/// or fitted against a different edge shows up anyway.
 ///
-/// A polyline whose parameters miss the edge's range is not that edge's
-/// pcurve at all, so there the range itself is sampled and the mismatch
-/// measured rather than quietly skipped.
+/// A sampled pcurve whose parameters miss the edge's range is not that
+/// edge's pcurve at all, so there the range itself is sampled and the
+/// mismatch measured rather than quietly skipped.
 fn pcurve_check_params(pcurve: &Curve2, t_start: f64, t_end: f64) -> Vec<f64> {
-    if let Curve2::Polyline { params, .. } = pcurve {
+    let own_params = match pcurve {
+        Curve2::Polyline { params, .. } => Some(params),
+        Curve2::Nurbs { fit_params, .. } if !fit_params.is_empty() => Some(fit_params),
+        _ => None,
+    };
+    if let Some(params) = own_params {
         let inside: Vec<f64> = params
             .iter()
             .copied()

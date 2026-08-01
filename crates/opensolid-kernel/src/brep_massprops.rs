@@ -413,6 +413,16 @@ fn t_panels(surface: &Surface3, pcurve: &Curve2, t0: f64, t1: f64) -> Vec<(f64, 
                 }
             }
         }
+        // Knots are the spline's own structural breaks — continuity drops
+        // there, so a panel boundary at each keeps the integrand smooth
+        // within every panel. Repeated knots collapse to one break.
+        Curve2::Nurbs { curve, .. } => {
+            for &t in curve.knot_vector().knots() {
+                if t > t0 && t < t1 && coarse.last() != Some(&t) {
+                    coarse.push(t);
+                }
+            }
+        }
     }
     coarse.push(t1);
 
@@ -525,6 +535,12 @@ fn shifted(curve: &Curve2, shift: Vector2) -> Curve2 {
         // value is translated afterwards — which is the whole point of
         // keeping the two apart.
         Curve2::Projected(p) => Curve2::Projected(Box::new(p.shifted(shift))),
+        // Translation is affine, so moving the control points moves the
+        // curve exactly; parameters (and hence `fit_params`) are untouched.
+        Curve2::Nurbs { curve, fit_params } => Curve2::Nurbs {
+            curve: Box::new(curve.translated(shift)),
+            fit_params: fit_params.clone(),
+        },
     }
 }
 
