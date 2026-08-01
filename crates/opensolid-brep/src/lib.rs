@@ -60,7 +60,10 @@ pub use ssi::{
 };
 pub use surface::{Surface3, SurfaceEval};
 pub use sweep::{Profile, ProfileSegment, SweptBody, extrude, revolve};
-pub use tessellate::{TessellationOptions, tessellate_body, tessellate_face};
+pub use tessellate::{
+    QuadricUSpan, TessellationOptions, quadric_u_span, tessellate_body, tessellate_face,
+    triangulate_bounded_face,
+};
 pub use topology::{
     Body, BodyType, Edge, Face, FaceSense, Fin, FinSense, Loop, LoopType, SYSTEM_RESOLUTION, Shell,
     ShellOrientation, TopologyStore, Vertex,

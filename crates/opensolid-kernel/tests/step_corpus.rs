@@ -1772,19 +1772,20 @@ mod corpus {
                 );
             }
         }
-        // 2026-08-01: 32 of 34, measured on this branch rebased onto of-bb6.
-        // That is the 31 of-bb6 left plus bspline_patch_prism, which this bead
-        // returns to the exact path: its extrusion walls were patches one
-        // `VECTOR` long, so they stopped 20 mm short of the faces they carried
-        // and the edges on them needed a tolerance past MAX_ALLOWED_TOLERANCE.
-        // Sizing the patch to its face removes the miss at the source. Two
-        // files still fail:
+        // 2026-08-01: 32 of 34, measured with of-8ulj (bspline_patch_prism
+        // back on the exact path) and of-05ac (the mesh fallback closes over
+        // *trimmed* curved faces, so a solid the exact path refuses degrades
+        // to a mesh instead of being lost — spec/06-step-io.md §4). Two files
+        // still fail:
         // - nist_ctc_05 (of-kwn): edge geometry that misses its vertex points.
-        // - nist_ctc_02 (of-05ac): 0.0386 mm of authored gap puts an edge
-        //   further from its face's surface than MAX_ALLOWED_TOLERANCE.
-        //   Refusing it is right; what costs the count is that the mesh
-        //   fallback does not close for it either, turning a degrade into a
-        //   loss. This floor returns to 33 with of-05ac.
+        // - nist_ctc_02 (of-aoml): off the exact path with of-bb6's edge half,
+        //   on 0.0386 mm of authored curve/surface gap, which is four times
+        //   MAX_ALLOWED_TOLERANCE and rightly refused. of-05ac got its
+        //   fallback shell closed — 0 open edges and 0 pinched, from 15843
+        //   and 14569 — but the CDT leaves flat triangles on the rims of the
+        //   part's tilted bores, and MeshSdf::new has no pseudonormal to take
+        //   at the rim vertices between them. That last step is of-aoml, and
+        //   this floor goes to 33 with it.
         const FLOOR: usize = 32;
         assert!(
             passed.len() >= FLOOR,
