@@ -86,6 +86,7 @@ persistence. Exports and screenshots are written to `OPENSOLID_MCP_OUTPUT_DIR`.
 |------------------|----------------------------------------------------|---------|
 | `create_model`   | **`script`**, `name`, `exact`                      | `model_id` + mesh stats + validation summary |
 | `import_step`    | `path` \| `text`, `name`, `circle_segments`        | `model_id` + per-solid outcomes + diagnostics + measure/validate summary |
+| `assemble`       | **`instances`**, `mates`, `solve`, `name`          | `assembly_id` + resolved transforms + solve status + interference report + aggregate mass properties |
 | `get_screenshot` | **`model_id`**, `view` \| `direction`, `region` \| `target` + `zoom`, `mode`, `section`, `accuracy`, `line_width`, `width`, `height` | inline PNG image + the camera that produced it |
 | `export`         | **`model_id`**, **`format`**, `path`, `accuracy`, `unit` | file path + byte size |
 | `measure`        | **`model_id`**, `query`, `accuracy`                | mass properties |
@@ -101,7 +102,8 @@ persistence. Exports and screenshots are written to `OPENSOLID_MCP_OUTPUT_DIR`.
 
 Every tool except `create_model`, `import_step`, `get_capabilities`, and
 `list_models` takes a `model_id` handed back by an earlier `create_model` or
-`import_step` call.
+`import_step` call. `assemble` takes its `model_id`s inside the `instances`
+list, and the `assembly_id` it returns works anywhere a `model_id` does.
 
 ### Which oracle answers which question
 
@@ -124,6 +126,7 @@ making:
 | Did my cut remove the volume it should have? | `diff_models` with `expect_volume_delta` |
 | Does the finished part match what I intended? | `assert_model` |
 | Do two parts collide? Does the solid stay clear of a keep-out? | `measure_clearance` |
+| Do these parts fit together as an assembly? Where does each end up? | `assemble` — mates solve the poses, the interference report lists every clashing pair with its overlap volume |
 | Do the several meshers agree this is a solid? | `validate` (`mesher` field), `meshAgreement` in-script |
 | Does the part *look* like the thing I described? Is a feature on the wrong face? | `get_screenshot` — framed on the feature, and sectioned if the feature is interior. The one probabilistic oracle: it is a smoke test between the machine checks and a human, and it never overrules a measurement |
 
@@ -223,6 +226,67 @@ analytic surfaces, so `export` of a `brep` solid is unaffected.
 Imported models work with `measure`, `validate`, `get_screenshot` and `export`
 like any other. They carry no `param()`s — nothing about an imported file is
 parametric — so `optimize` has nothing to move.
+
+### `assemble`
+
+Composes registered models into a multi-part assembly: place instances,
+constrain them with mates, and get back the solved poses, an interference
+report, and aggregate mass properties. Geometry is never copied — ten instances
+of one bolt are ten poses over one part.
+
+```json
+{
+  "instances": [
+    { "model_id": "model-1-8f3a", "fixed": true, "name": "plate" },
+    { "model_id": "model-2-9be1", "transform": { "translation": [5, 0, 3] },
+      "density": 0.0027, "name": "pin" }
+  ],
+  "mates": [
+    { "kind": "concentric",
+      "a": { "instance": 0, "feature": { "type": "axis", "point": [0, 0, 0], "direction": [0, 1, 0] } },
+      "b": { "instance": 1, "feature": { "type": "axis", "point": [0, 0, 0], "direction": [0, 1, 0] } } }
+  ]
+}
+```
+
+Mates reference instances by index and features in each part's **local** frame —
+the bore axis or seating face as `inspect_topology` reports it on the part,
+before any placement. Three kinds, the trio that seats most fasteners and
+brackets:
+
+- **`coincident`** — plane–plane (flush, anti-parallel normals) or
+  point-on-plane.
+- **`concentric`** — axis–axis: a shaft in a bore.
+- **`distance`** — plane–plane at a signed offset along the first normal, or
+  point–point at a separation; requires `value`.
+
+The solver holds `fixed` instances as ground and moves the floating ones
+(ground at least one, or a mated assembly floats freely). The response:
+
+- **`solve.status`** — `converged`, or `over_constrained` when the mates
+  conflict; the poses are then the least-squares best fit and `residualNorm`
+  says how far off they sit. `skipped` when no solve ran (no mates, or
+  `solve: false` — a purely positional assembly).
+- **`solve.freeDof`** — degrees of freedom still unconstrained. A seated bolt
+  free to spin reports 1; that is normal, not an error.
+- **`instances[i].transform`** — where everything ended up: translation plus
+  rotation as both a quaternion and axis–angle.
+- **`interference`** — every instance pair checked at the solved poses;
+  `pairs` lists each clashing pair with its estimated overlap `volume`. A
+  well-mated assembly reports none: a Ø8 pin seated in a Ø10 bore is clear, a
+  pin forced through an undersized bore shows up with the volume of the
+  overlap.
+- **`massProperties`** — volume, surface area, mass, centroid, and the inertia
+  tensor about the centroid, composed from per-part results with each
+  instance's `density` (default 1). Overlapping instances double-count their
+  overlap, which the interference report keeps honest.
+
+The returned `assembly_id` is a model like any other: `get_screenshot` to see
+the assembly, `measure` it, `diff_models` it, `export` it (faceted geometry —
+the placed union carries no analytic B-Rep). `get_model` on an assembly returns
+the full recipe — instances, mates, and resolved transforms — the way it
+returns a script for a scripted model. Assemblies carry no `param()`s, so
+`optimize` has nothing to move.
 
 ### `get_screenshot`
 

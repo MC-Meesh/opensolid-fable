@@ -10,6 +10,7 @@
 //! wasm-bindgen. Builds for `wasm32-unknown-unknown` with no threading
 //! assumptions (the frep crate has no rayon dependency).
 
+pub mod assembly;
 pub mod bounded;
 pub mod exact;
 pub mod import;
