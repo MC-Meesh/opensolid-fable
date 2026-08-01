@@ -556,7 +556,10 @@ mod tests {
     #[test]
     fn rings_without_holes_match_ear_clip() {
         let outer = square(0.0, 0.0, 1.0);
-        assert_eq!(ear_clip_rings(&[outer.clone()]), Some(ear_clip(&outer)));
+        assert_eq!(
+            ear_clip_rings(std::slice::from_ref(&outer)),
+            Some(ear_clip(&outer))
+        );
         assert_eq!(ear_clip_rings(&[]), Some(Vec::new()));
     }
 

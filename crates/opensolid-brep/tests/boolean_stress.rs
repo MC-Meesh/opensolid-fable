@@ -1366,17 +1366,17 @@ impl Scene {
         let mut surface_ids: Vec<EntityId<Surface3>> = Vec::new();
         let mut vertex_ids = Vec::new();
         for face in self.store.faces_of_body(body) {
-            if let Some(surface) = self.store.face(face).expect("stale Face id").surface {
-                if !surface_ids.contains(&surface) {
-                    surface_ids.push(surface);
-                }
+            if let Some(surface) = self.store.face(face).expect("stale Face id").surface
+                && !surface_ids.contains(&surface)
+            {
+                surface_ids.push(surface);
             }
             for edge_id in self.store.edges_of_face(face) {
                 let edge = self.store.edge(edge_id).expect("stale Edge id");
-                if let Some(curve) = edge.curve {
-                    if !curve_ids.contains(&curve) {
-                        curve_ids.push(curve);
-                    }
+                if let Some(curve) = edge.curve
+                    && !curve_ids.contains(&curve)
+                {
+                    curve_ids.push(curve);
                 }
                 for v in [edge.start_vertex, edge.end_vertex] {
                     if !vertex_ids.contains(&v) {
