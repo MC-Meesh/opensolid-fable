@@ -5,7 +5,7 @@
 import { writeFileSync, readFileSync, mkdirSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve, isAbsolute, join, basename } from 'node:path';
-import { ModelStore, importStep } from './kernel.js';
+import { ModelStore, importStep, Assembly } from './kernel.js';
 import { getMesh, buildBinaryStl, buildObj } from './mesh.js';
 import {
   renderScene,
@@ -572,6 +572,43 @@ export function evaluateAssertion(spec, views) {
   }
 }
 
+/** The mate kinds `assemble` accepts, for the schema and error messages. */
+const MATE_KINDS = ['coincident', 'concentric', 'distance'];
+/** The mate feature types, likewise. */
+const FEATURE_TYPES = ['plane', 'axis', 'point'];
+
+/**
+ * Normalize one side of a mate (`{instance, feature}`) into the flat form the
+ * kernel binding takes. Throws with the side's label (`a` / `b`) in the
+ * message, because "which side was wrong" is the first thing a caller fixing
+ * a mate needs to know.
+ */
+function mateSide(side, label) {
+  if (!side || !Number.isInteger(side.instance) || side.instance < 0) {
+    throw new Error(`mate side '${label}' needs a non-negative integer 'instance' index`);
+  }
+  const f = side.feature;
+  if (!f || !FEATURE_TYPES.includes(f.type)) {
+    throw new Error(
+      `mate side '${label}' needs a feature with type one of ${FEATURE_TYPES.join(', ')}`,
+    );
+  }
+  if (!Array.isArray(f.point) || f.point.length !== 3) {
+    throw new Error(`mate side '${label}': feature.point must be [x, y, z] in the part's local frame`);
+  }
+  // Planes orient by `normal`, axes by `direction`; a point has no direction
+  // (zeros are passed through and ignored kernel-side).
+  const direction = f.type === 'plane' ? f.normal : f.type === 'axis' ? f.direction : [0, 0, 0];
+  if (f.type !== 'point' && (!Array.isArray(direction) || direction.length !== 3)) {
+    throw new Error(
+      `mate side '${label}': a ${f.type} feature needs ${
+        f.type === 'plane' ? "'normal'" : "'direction'"
+      } as [x, y, z]`,
+    );
+  }
+  return { instance: side.instance, type: f.type, point: f.point, direction };
+}
+
 /** Resolve where an export should be written. */
 function exportPath(requested, outputDir, model, format) {
   if (requested) {
@@ -892,6 +929,276 @@ export function createTools(config = {}) {
           // The shapes handed out are independent objects; this releases the
           // import's own wasm handle rather than waiting on a finalizer.
           imported.free();
+        }
+      },
+    },
+
+    assemble: {
+      definition: {
+        name: 'assemble',
+        description:
+          'Compose registered models into a multi-part assembly: place instances, ' +
+          'constrain them with mates, solve for the poses, and get back the resolved ' +
+          'transforms, an interference (clash) report, and aggregate mass properties. ' +
+          'Instances reference models by model_id (the same model may be instanced any ' +
+          'number of times — geometry is shared, never copied). Mates constrain features ' +
+          'given in each part\'s LOCAL frame: coincident (plane–plane flush, or ' +
+          'point-on-plane), concentric (axis–axis, a shaft in a bore), and distance ' +
+          '(plane–plane or point–point, with `value`). The solver holds `fixed` ' +
+          'instances as ground and moves the floating ones; `solve.status` reports ' +
+          '`converged` or `over_constrained` (conflicting mates — poses are the ' +
+          'least-squares best fit), and `solve.freeDof` counts the degrees of freedom ' +
+          'still unconstrained (a seated bolt free to spin reports 1; that is normal, ' +
+          'not an error). The returned assembly_id is a model like any other: ' +
+          'get_screenshot to see the assembly, measure it, export it (faceted geometry ' +
+          '— the placed union has no analytic B-Rep), diff it. Interference is checked ' +
+          'pairwise at the solved poses; `interference.pairs` lists each clashing pair ' +
+          'with its estimated overlap volume. Mass properties compose per-part results ' +
+          'with per-instance `density` (overlapping instances double-count the ' +
+          'overlap, which a well-mated assembly keeps near zero).',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            instances: {
+              type: 'array',
+              description:
+                'The placed parts, in order — mates reference them by this index.',
+              items: {
+                type: 'object',
+                properties: {
+                  model_id: { type: 'string', description: 'A model registered by create_model / import_step.' },
+                  transform: {
+                    type: 'object',
+                    description:
+                      'Initial placement (default identity). For floating instances ' +
+                      'this is the solver\'s starting guess; for fixed instances it is final.',
+                    properties: {
+                      translation: {
+                        type: 'array',
+                        items: { type: 'number' },
+                        minItems: 3,
+                        maxItems: 3,
+                        description: '[x, y, z] offset (default [0,0,0]).',
+                      },
+                      rotation: {
+                        type: 'object',
+                        description: 'Rotation about an axis through the origin, applied before the translation.',
+                        properties: {
+                          axis: { type: 'array', items: { type: 'number' }, minItems: 3, maxItems: 3 },
+                          angle_deg: { type: 'number' },
+                        },
+                        required: ['axis', 'angle_deg'],
+                      },
+                    },
+                  },
+                  fixed: {
+                    type: 'boolean',
+                    description:
+                      'Ground this instance: the solver holds its pose constant. At ' +
+                      'least one fixed instance keeps a mated assembly from floating freely.',
+                  },
+                  density: {
+                    type: 'number',
+                    description:
+                      'Mass per model unit³ (default 1). Only affects the aggregate ' +
+                      'mass properties, not the solve.',
+                  },
+                  name: { type: 'string', description: 'Display name (defaults to the model\'s name).' },
+                },
+                required: ['model_id'],
+              },
+            },
+            mates: {
+              type: 'array',
+              description:
+                'Constraints between instance features. Each side is `{instance, ' +
+                'feature}` where `feature` is `{type: plane|axis|point, point: [x,y,z], ' +
+                'normal|direction: [x,y,z]}` in that instance\'s local (part) frame — ' +
+                'e.g. the bore axis a shaft mates into, as reported by ' +
+                'inspect_topology on the part. Kinds: coincident (plane–plane or ' +
+                'point–plane), concentric (axis–axis), distance (plane–plane or ' +
+                'point–point, requires `value`).',
+              items: {
+                type: 'object',
+                properties: {
+                  kind: { type: 'string', enum: MATE_KINDS },
+                  a: {
+                    type: 'object',
+                    description: 'First side: {instance, feature}.',
+                    properties: {
+                      instance: { type: 'number', description: 'Index into `instances`.' },
+                      feature: {
+                        type: 'object',
+                        properties: {
+                          type: { type: 'string', enum: FEATURE_TYPES },
+                          point: { type: 'array', items: { type: 'number' }, minItems: 3, maxItems: 3 },
+                          normal: { type: 'array', items: { type: 'number' }, minItems: 3, maxItems: 3, description: 'Plane normal (plane features).' },
+                          direction: { type: 'array', items: { type: 'number' }, minItems: 3, maxItems: 3, description: 'Axis direction (axis features).' },
+                        },
+                        required: ['type', 'point'],
+                      },
+                    },
+                    required: ['instance', 'feature'],
+                  },
+                  b: {
+                    type: 'object',
+                    description: 'Second side, same shape as `a`.',
+                    properties: {
+                      instance: { type: 'number' },
+                      feature: {
+                        type: 'object',
+                        properties: {
+                          type: { type: 'string', enum: FEATURE_TYPES },
+                          point: { type: 'array', items: { type: 'number' }, minItems: 3, maxItems: 3 },
+                          normal: { type: 'array', items: { type: 'number' }, minItems: 3, maxItems: 3 },
+                          direction: { type: 'array', items: { type: 'number' }, minItems: 3, maxItems: 3 },
+                        },
+                        required: ['type', 'point'],
+                      },
+                    },
+                    required: ['instance', 'feature'],
+                  },
+                  value: { type: 'number', description: 'Signed offset, for distance mates.' },
+                },
+                required: ['kind', 'a', 'b'],
+              },
+            },
+            solve: {
+              type: 'boolean',
+              description:
+                'Run the mate solver (default: true when mates are given, false ' +
+                'otherwise). With false, instances stay exactly where their transforms ' +
+                'put them — a purely positional assembly.',
+            },
+            name: { type: 'string', description: 'Optional friendly name for the assembly model.' },
+          },
+          required: ['instances'],
+        },
+      },
+      handler(args) {
+        if (!Array.isArray(args.instances) || args.instances.length === 0) {
+          return fail('instances must be a non-empty array of {model_id, …}');
+        }
+        const mateSpecs = args.mates === undefined ? [] : args.mates;
+        if (!Array.isArray(mateSpecs)) {
+          return fail('mates must be an array of {kind, a, b, …} constraints');
+        }
+        const asm = new Assembly();
+        try {
+          const instanceViews = [];
+          for (let i = 0; i < args.instances.length; i += 1) {
+            const spec = args.instances[i];
+            if (!spec || typeof spec.model_id !== 'string') {
+              return fail(`instances[${i}] needs a model_id`);
+            }
+            let model;
+            try {
+              model = store.get(spec.model_id);
+            } catch (err) {
+              return fail(`instances[${i}]: ${err.message}`);
+            }
+            const t = spec.transform || {};
+            const translation = t.translation === undefined ? [0, 0, 0] : t.translation;
+            const rotation = t.rotation || {};
+            const axis = rotation.axis === undefined ? [0, 0, 0] : rotation.axis;
+            const angleDeg = rotation.angle_deg === undefined ? 0 : rotation.angle_deg;
+            const fixed = Boolean(spec.fixed);
+            const density = spec.density === undefined ? 1 : spec.density;
+            const name = spec.name || model.name;
+            try {
+              asm.addInstance(model.shape, translation, axis, angleDeg, fixed, density, name);
+            } catch (err) {
+              return fail(`instances[${i}]: ${errMessage(err)}`);
+            }
+            instanceViews.push({ index: i, model_id: model.id, name, fixed, density });
+          }
+
+          for (let i = 0; i < mateSpecs.length; i += 1) {
+            const spec = mateSpecs[i];
+            if (!spec || !MATE_KINDS.includes(spec.kind)) {
+              return fail(`mates[${i}]: 'kind' must be one of ${MATE_KINDS.join(', ')}`);
+            }
+            let a;
+            let b;
+            try {
+              a = mateSide(spec.a, 'a');
+              b = mateSide(spec.b, 'b');
+            } catch (err) {
+              return fail(`mates[${i}]: ${err.message}`);
+            }
+            try {
+              asm.addMate(
+                spec.kind,
+                a.instance,
+                a.type,
+                a.point,
+                a.direction,
+                b.instance,
+                b.type,
+                b.point,
+                b.direction,
+                spec.value === undefined ? undefined : spec.value,
+              );
+            } catch (err) {
+              return fail(`mates[${i}]: ${errMessage(err)}`);
+            }
+          }
+
+          const solveRequested = args.solve === undefined ? mateSpecs.length > 0 : Boolean(args.solve);
+          const solve = solveRequested
+            ? JSON.parse(asm.solve())
+            : {
+                status: 'skipped',
+                note: 'No solve was run; instances sit exactly where their transforms placed them.',
+              };
+          // Post-solve poses for every instance, solved or not — the answer
+          // to "where did everything end up?".
+          const transforms = JSON.parse(asm.transforms());
+          const interference = JSON.parse(asm.interferences());
+          const massProperties = JSON.parse(asm.massProperties());
+
+          let shape;
+          try {
+            shape = asm.assembledShape();
+          } catch (err) {
+            return fail(errMessage(err));
+          }
+          const placedInstances = instanceViews.map((v, i) => ({ ...v, transform: transforms[i] }));
+          const model = store.registerAssembly({
+            shape,
+            name: args.name,
+            // The recipe, kept whole so `get_model` can reproduce the how —
+            // which models went where, under which constraints, and what the
+            // solver concluded.
+            assembly: { instances: placedInstances, mates: mateSpecs, solve },
+          });
+
+          const measure = JSON.parse(model.shape.measure(undefined));
+          const validation = JSON.parse(model.shape.validate(undefined, undefined));
+          return text(
+            withMassError(
+              {
+                assembly_id: model.id,
+                name: model.name,
+                instances: placedInstances,
+                solve,
+                interference,
+                massProperties,
+                mesh: { triangles: measure.triangles, vertices: measure.vertices },
+                boundingBox: measure.boundingBox,
+                volume: measure.volume,
+                valid: validation.valid,
+                issues: validation.issues,
+                mesher: validation.mesher,
+                brepChecked: validation.brep.available,
+              },
+              measure,
+            ),
+          );
+        } finally {
+          // The registered model owns the assembled shape; this releases the
+          // builder's own wasm handle rather than waiting on a finalizer.
+          asm.free();
         }
       },
     },
@@ -1779,8 +2086,8 @@ export function createTools(config = {}) {
         name: 'list_models',
         description:
           'List the models registered this session (id, name, exact flag, source kind, ' +
-          'creation time). `source` is `script` or `step`; `get_model` returns the ' +
-          'source itself.',
+          'creation time). `source` is `script`, `step`, or `assembly`; `get_model` ' +
+          'returns the source itself.',
         inputSchema: { type: 'object', properties: {} },
       },
       handler() {
@@ -1793,8 +2100,9 @@ export function createTools(config = {}) {
         name: 'get_model',
         description:
           "Return a model's own source: the script it was built from (verbatim, ready " +
-          'to edit and re-submit to `create_model`), or the STEP file it was imported ' +
-          'from. Also its params with their current values — after `optimize` those ' +
+          'to edit and re-submit to `create_model`), the STEP file it was imported ' +
+          'from, or the assembly recipe (`assemble` instances, mates, and resolved ' +
+          'transforms) that composed it. Also its params with their current values — after `optimize` those ' +
           'are the converged numbers, so this is how an optimized design is recovered ' +
           'as something reproducible rather than as a `model_id` that dies with the ' +
           'session.',
@@ -1819,6 +2127,13 @@ export function createTools(config = {}) {
           source: model.origin.kind,
           ...(model.origin.kind === 'script'
             ? { script: model.script }
+            : model.origin.kind === 'assembly'
+            ? {
+                // The recipe `assemble` was called with, plus the resolved
+                // per-instance transforms — enough to re-assemble, the way a
+                // script is enough to re-create.
+                assembly: model.origin.assembly,
+              }
             : {
                 imported: {
                   ...(model.origin.path ? { path: model.origin.path } : { text: true }),

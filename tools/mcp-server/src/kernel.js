@@ -39,6 +39,19 @@ export const OpenPath = wasm.WasmOpenPath2D;
 export const importStep = wasm.importStep;
 
 /**
+ * The assembly builder (of-2y4.8): place instances of existing shapes, mate
+ * them, solve, and interrogate the result.
+ *
+ * Construct with `new Assembly()`, then `addInstance(shape, translation,
+ * axis, angleDeg, fixed, density, name)` and `addMate(...)`. `solve()`,
+ * `interferences()`, and `massProperties()` return JSON strings;
+ * `assembledShape()` returns the placed union as an ordinary Shape. Instances
+ * of the same Shape object share one part kernel-side — no geometry is
+ * copied.
+ */
+export const Assembly = wasm.WasmAssembly;
+
+/**
  * Build the `param()` helper a script uses to declare a design variable, plus
  * the array it records declarations into.
  *
@@ -219,6 +232,36 @@ export class ModelStore {
       // question — whether meshing serves a stored tessellation, which a
       // mesh-fallback solid also does.
       exact,
+      createdAt: new Date().toISOString(),
+    };
+    this._models.set(id, entry);
+    return entry;
+  }
+
+  /**
+   * Register a solved assembly's placed union as a model (of-2y4.8).
+   *
+   * Like an import, an assembly has no script and no params — `optimize`
+   * has nothing to move. Its `origin` carries the full recipe instead:
+   * which models were instanced where, the mates, and the resolved
+   * transforms, so `get_model` can answer "how was this assembled?" the way
+   * it answers "what script built this?" for a script model.
+   *
+   * @param {{shape:object, name?:string, assembly:object}} req `assembly` is
+   *   the recipe: `{instances, mates, solve}` as resolved by the tool.
+   */
+  registerAssembly({ shape, name, assembly }) {
+    const id = newId();
+    const entry = {
+      id,
+      name: name || id,
+      script: null,
+      origin: { kind: 'assembly', assembly },
+      shape,
+      params: [],
+      // The placed union is an SDF composition; there is no exact B-Rep
+      // body behind it, so booleans (none are pending) route the SDF path.
+      exact: false,
       createdAt: new Date().toISOString(),
     };
     this._models.set(id, entry);

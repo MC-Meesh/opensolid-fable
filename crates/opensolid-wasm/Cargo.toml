@@ -15,4 +15,7 @@ opensolid-frep = { path = "../opensolid-frep" }
 # opensolid-brep transitively; size cost measured in the bead's design
 # note (~+340 KB pre-wasm-opt).
 opensolid-kernel = { path = "../opensolid-kernel" }
+# Assembly bindings (of-2y4.8) build poses (quaternions) and inertia tensors
+# directly; nalgebra is already in the tree via every opensolid crate.
+nalgebra = { workspace = true }
 wasm-bindgen = "0.2"

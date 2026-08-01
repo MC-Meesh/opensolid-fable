@@ -10,6 +10,7 @@
 //! wasm-bindgen. Builds for `wasm32-unknown-unknown` with no threading
 //! assumptions (the frep crate has no rayon dependency).
 
+pub mod assembly;
 pub mod bounded;
 pub mod exact;
 pub mod import;
@@ -1359,7 +1360,7 @@ impl WasmShape {
     /// is not positive.
     #[wasm_bindgen(js_name = fieldClearance)]
     pub fn field_clearance(&self, probes: &[f64], softness: f64) -> Result<f64, String> {
-        if probes.is_empty() || probes.len() % 3 != 0 {
+        if probes.is_empty() || !probes.len().is_multiple_of(3) {
             return Err("probes must be a non-empty flat [x,y,z,…] buffer".to_string());
         }
         // Rejects zero, negatives, and NaN (a NaN softness would poison the softmin).
