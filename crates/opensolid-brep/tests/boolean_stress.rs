@@ -82,6 +82,15 @@
 //! approximation. `RIGID_MOTION_RTOL` is what carries that, at 5e-4 rather
 //! than the `EXACT_RTOL` every other pair class now meets.
 //!
+//! What that sampler then exposed was accuracy rather than failure —
+//! of-lpsd, the last frame dependence left in the campaign. A cone-sphere
+//! ring was marched, so the imprint bounding the intersection was a polyline
+//! whose stations do not follow a rotation, and the three cone-sphere cases
+//! came out up to 2.7e-4 apart between frames with *neither* frame right.
+//! Every pair the sampler builds is coaxial, and a coaxial cone and sphere
+//! meet in circles, so `ssi::analytic` now solves them in closed form. That
+//! took [`RIGID_MOTION_RTOL`] to [`EXACT_RTOL`].
+//!
 //! of-ukcq is retired as well: mesh
 //! `mass_properties` integrated tetrahedra from the absolute origin and was
 //! 191× wrong at offset 1e6, and now references them to the mesh's own
@@ -188,6 +197,66 @@ fn spherical_cap_volume(r: f64, h: f64) -> f64 {
 fn sphere_lens_volume(r1: f64, r2: f64, d: f64) -> f64 {
     let x = (d * d - r2 * r2 + r1 * r1) / (2.0 * d);
     spherical_cap_volume(r1, r1 - x) + spherical_cap_volume(r2, r2 - (d - x))
+}
+
+/// Volume shared by a coaxial frustum and sphere: the frustum has radius
+/// `r0` at `z = -h/2` and `r1` at `z = +h/2`, the sphere radius `rs` about
+/// `(0, 0, dz)` (of-lpsd).
+///
+/// Both are solids of revolution about `z`, so the shared solid is one too:
+/// at each height its cross-section is the smaller of the two disks and the
+/// volume is `∫ π·min(Rc, Rs)² dz`. This asserts the campaign's arrangement
+/// — the sphere's south pole strictly inside the frustum's wall, its north
+/// pole strictly above the top cap — which puts exactly one crossing of the
+/// two profiles in between and splits the integral in two closed-form
+/// pieces. The crossing itself is bisected rather than solved, so this
+/// stays independent of the algebra in `ssi::analytic::cone_sphere`.
+fn cone_sphere_lens_volume(r0: f64, r1: f64, h: f64, rs: f64, dz: f64) -> f64 {
+    let (top, bottom) = (h / 2.0, -h / 2.0);
+    let (a, b) = (dz - rs, (r0 + r1) / 2.0);
+    let slope = (r1 - r0) / h;
+    let cone_r = |z: f64| b + slope * z;
+    let sphere_r = |z: f64| (rs * rs - (z - dz) * (z - dz)).max(0.0).sqrt();
+    assert!(
+        a > bottom && dz + rs > top,
+        "the sphere must straddle the frustum's top cap: bottom {a} vs {bottom}, \
+         top {} vs {top}",
+        dz + rs
+    );
+    assert!(
+        sphere_r(top) > cone_r(top),
+        "the frustum's top cap must be swallowed: sphere radius {} vs cap {}",
+        sphere_r(top),
+        cone_r(top)
+    );
+
+    // One sign change on [a, top]: the sphere's profile starts at radius 0
+    // (inside the wall) and ends outside it. Bisect it to the last bit.
+    let (mut lo, mut hi) = (a, top);
+    for _ in 0..200 {
+        let mid = 0.5 * (lo + hi);
+        if mid <= lo || mid >= hi {
+            break;
+        }
+        if sphere_r(mid) < cone_r(mid) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    let cross = 0.5 * (lo + hi);
+
+    // Sphere below the crossing: ∫ π(rs² − (z−dz)²) dz, with the lower limit
+    // at the south pole where (z − dz)³ = −rs³.
+    let t = cross - dz;
+    let cap = PI * (rs * rs * (cross - a) - (t * t * t + rs * rs * rs) / 3.0);
+    // Frustum above it: ∫ π(b + slope·z)² dz, integrated as (R³)/(3·slope).
+    let wall = if slope.abs() > 0.0 {
+        PI * (cone_r(top).powi(3) - cone_r(cross).powi(3)) / (3.0 * slope)
+    } else {
+        PI * b * b * (top - cross)
+    };
+    cap + wall
 }
 
 fn torus_volume(major: f64, minor: f64) -> f64 {
@@ -8288,24 +8357,20 @@ fn random_curved_pairs_satisfy_the_volume_identities() {
 
 /// Budget for a quantity that a rigid motion may not change at all.
 ///
-/// It should be [`EXACT_RTOL`], and for four of the five sampled pair classes
-/// it could be: torus+block, sphere+block, sphere+cylinder and sphere+sphere
-/// all reproduce under a random rotation to `1e-15`, i.e. exactly. The one
-/// class that does not is cone+sphere, which deviates by up to `2.7e-4` in
-/// volume and `1.4e-4` in centroid — of-lpsd. It is the only class here whose
-/// intersection curve is a quartic and so must be *marched* rather than fitted
-/// as a conic, which puts the error in the edge geometry itself rather than in
-/// anything the measurement does with it.
+/// It is [`EXACT_RTOL`], as it should be: every configuration this campaign
+/// samples is now frame-independent to floating point (worst deviation over
+/// the eight cases, three booleans each: `6.7e-15` on volume, `2.3e-15` on
+/// the centroid). It spent a while at `5e-3` because the exact path was
+/// measurably frame-dependent on two pair classes, and both are retired —
+/// sphere-sphere by d0258d7 (the of-7bnv budget split lands in this tree
+/// too, with [`sphere_lens_volume_is_exact_and_frame_independent`] live),
+/// and cone-sphere by of-lpsd, which gave the coaxial pair a closed-form
+/// ring instead of a marched one.
 ///
-/// `5e-4` sits just above that spread, so this stays a live test of everything
-/// larger: a misclassified region is orders of magnitude bigger than a marching
-/// error and still fails here. The tight statement for the remaining class is
-/// [`cone_sphere_volume_is_frame_independent`], parked `#[ignore]`d against
-/// of-lpsd.
-///
-/// This was `5e-3` while of-7bnv was open, absorbing a `3.9e-3` sphere-sphere
-/// deviation that no longer exists.
-const RIGID_MOTION_RTOL: f64 = 5e-4;
+/// It is kept as a named constant rather than folded into `EXACT_RTOL` at
+/// the call sites because it says which statement is being made: not "this
+/// matches a closed form" but "a rigid motion changed nothing".
+const RIGID_MOTION_RTOL: f64 = EXACT_RTOL;
 
 /// A rigid motion applied to BOTH operands must leave the result congruent:
 /// the same volume, and a centroid that has moved exactly as the operands
@@ -8411,6 +8476,15 @@ fn random_curved_pairs_are_invariant_under_rigid_motion() {
 /// outside it at `z = 0.4`. Nothing is tangent; the surfaces cross cleanly.
 /// It used to fail with `Degenerate { context: "boolean::classify", reason:
 /// "could not find an interior sample point for a face region" }`.
+///
+/// NOTE (of-lpsd): every `CurvedPair::ConeSphere` is *coaxial*, and coaxial
+/// cone-sphere now has an exact SSI arm, so this pair no longer reaches the
+/// marcher. This and the four repros below therefore still assert their
+/// end-to-end statements, but they no longer fence the marched-imprint code
+/// they were written against — `marched_coaxial_sphere_cone_has_no_seam_stub`
+/// in `ssi::marching` still does, at the `intersect_marched` level, and
+/// of-1r19 tracks restoring the downstream two at boolean level with an
+/// off-axis sphere.
 #[test]
 fn cone_sphere_union_takes_the_exact_path() {
     let pair = CurvedPair::ConeSphere {
@@ -8684,6 +8758,106 @@ fn rotated_cone_sphere_intersection_spells_its_seam_crossing_once() {
     );
 }
 
+/// A cone-sphere boolean's exact volume must equal its closed form, in every
+/// frame (of-lpsd).
+///
+/// Minimal repro from `random_curved_pairs_are_invariant_under_rigid_motion`
+/// case 5 (seed `0x0009_161D_C0DE`), the worst of the campaign's three
+/// cone-sphere cases. The intersection — the operation whose whole boundary
+/// is the imprinted ring — used to come out `2.7e-4` apart between the two
+/// frames, and *neither* frame was right: `0.29786850` plain and `0.29795019`
+/// rotated against a closed form of `0.29789296`. Both are cured by giving
+/// the coaxial pair an exact ring instead of a marched one, so all three
+/// statements are made here — the closed form in each frame, and the rigid
+/// equivariance of the centroid that says both frames classified alike.
+#[test]
+fn cone_sphere_volume_is_frame_independent() {
+    let (r0, r1, h, rs, dz) = (
+        0.9270325696370899,
+        0.23376846828406542,
+        1.914976910373373,
+        0.7879077392858235,
+        0.9687850333476096,
+    );
+    let pair = CurvedPair::ConeSphere { r0, r1, h, rs, dz };
+    let want_inter = cone_sphere_lens_volume(r0, r1, h, rs, dz);
+    let want_cone = frustum_volume(r0, r1, h);
+    let want_sphere = sphere_volume(rs);
+    let unit = Unit::new_normalize(Vector3::new(
+        -0.7996494317234822,
+        -0.5498082118686047,
+        0.24139535311633337,
+    ));
+    let angle = 1.5257527560161017;
+    let center = Point3::new(
+        -0.8107116227771001,
+        0.7446959747969766,
+        -0.07577175550684201,
+    );
+    let rot = Rotation3::from_axis_angle(&unit, angle);
+
+    let mut plain = Scene::new();
+    let (a, b) = pair.build(&mut plain);
+    let mut turned = Scene::new();
+    let (ar, br) = pair.build(&mut turned);
+    for body in [ar, br] {
+        rotate_body(
+            &mut turned.store,
+            &mut turned.geo,
+            body,
+            center,
+            unit.into_inner(),
+            angle,
+        )
+        .expect("rotate_body");
+    }
+
+    type BoolOp = fn(&Scene, EntityId<Body>, EntityId<Body>) -> CoreResult<BooleanOutput>;
+    let ops: [(&str, BoolOp, f64); 3] = [
+        (
+            "union",
+            |s, a, b| s.unite(a, b),
+            want_cone + want_sphere - want_inter,
+        ),
+        ("intersection", |s, a, b| s.intersect(a, b), want_inter),
+        (
+            "difference",
+            |s, a, b| s.subtract(a, b),
+            want_cone - want_inter,
+        ),
+    ];
+    for (op, run, want) in ops {
+        let out = run(&plain, a, b).unwrap_or_else(|e| panic!("plain {op} failed: {e:?}"));
+        let out_rot = run(&turned, ar, br).unwrap_or_else(|e| panic!("rotated {op} failed: {e:?}"));
+        let plain_props = measured(&out, &format!("plain {op}")).1;
+        let rot_props = measured(&out_rot, &format!("rotated {op}")).1;
+
+        assert_close(
+            plain_props.volume,
+            want,
+            EXACT_RTOL,
+            &format!("cone-sphere {op} vs closed form"),
+        );
+        assert_close(
+            rot_props.volume,
+            want,
+            EXACT_RTOL,
+            &format!("rotated cone-sphere {op} vs closed form"),
+        );
+
+        let want_centroid = center + rot * (plain_props.centroid - center);
+        let gap = (rot_props.centroid - want_centroid).norm();
+        let scale = 1.0 + want_centroid.coords.norm();
+        assert!(
+            gap <= EXACT_RTOL * scale,
+            "rotated cone-sphere {op} centroid {:?} is not the rigid image of {:?} \
+             (expected {want_centroid:?}, off by {gap:.3e})",
+            rot_props.centroid,
+            plain_props.centroid
+        );
+    }
+}
+
 /// The exact measurement of a sphere-sphere lens must equal its closed form,
 /// in every frame (of-7bnv, fixed).
 ///
@@ -8755,80 +8929,5 @@ fn sphere_lens_volume_is_exact_and_frame_independent() {
         want,
         EXACT_RTOL,
         "rotated sphere lens vs closed form",
-    );
-}
-
-/// A cone+sphere intersection must measure the same in every frame. It does
-/// not (of-lpsd).
-///
-/// Minimal repro from `random_curved_pairs_are_invariant_under_rigid_motion`
-/// case 5 (seed `0x0009_161D_C0DE`), the worst of the three cone+sphere cases
-/// that campaign draws, reduced to the intersection — the operation whose
-/// entire curved boundary is the imprinted edge, and consistently an order of
-/// magnitude worse than the union or the difference on the same pair.
-///
-/// There is no closed form to weigh this against, and none is needed: the two
-/// frames disagree by `2.7e-4` with each other, so at most one of them can be
-/// right. Every other pair class the campaign samples reproduces exactly here
-/// (`1e-15`); this one is alone in having a *quartic* intersection curve, with
-/// no conic to fit and therefore a marched approximation whose samples land
-/// differently once the pair is rotated. That puts the defect in the edge
-/// geometry rather than in the measurement — the opposite of of-7bnv, which
-/// this file's [`sphere_lens_volume_is_exact_and_frame_independent`] now
-/// asserts is fixed.
-///
-/// Kept live and `#[ignore]`d per the never-soften policy. The live campaign
-/// carries the same statement at [`RIGID_MOTION_RTOL`], just above the
-/// observed spread.
-#[test]
-#[ignore = "of-lpsd: exact cone-sphere boolean volume is frame-dependent at ~3e-4"]
-fn cone_sphere_volume_is_frame_independent() {
-    let pair = CurvedPair::ConeSphere {
-        r0: 0.9270325696370899,
-        r1: 0.23376846828406542,
-        h: 1.914976910373373,
-        rs: 0.7879077392858235,
-        dz: 0.9687850333476096,
-    };
-
-    let mut plain = Scene::new();
-    let (a, b) = pair.build(&mut plain);
-    let inter = plain.intersect(a, b).expect("transversal cone and sphere");
-    let got = measured(&inter, "cone-sphere lens").1.volume;
-
-    let axis = Unit::new_normalize(Vector3::new(
-        -0.7996494317234822,
-        -0.5498082118686047,
-        0.24139535311633337,
-    ));
-    let angle = 1.5257527560161017;
-    let center = Point3::new(
-        -0.8107116227771001,
-        0.7446959747969766,
-        -0.07577175550684201,
-    );
-    let mut turned = Scene::new();
-    let (ar, br) = pair.build(&mut turned);
-    for body in [ar, br] {
-        rotate_body(
-            &mut turned.store,
-            &mut turned.geo,
-            body,
-            center,
-            axis.into_inner(),
-            angle,
-        )
-        .expect("valid rotation");
-    }
-    let inter_rot = turned
-        .intersect(ar, br)
-        .expect("transversal cone and sphere after rotation");
-    let got_rot = measured(&inter_rot, "rotated cone-sphere lens").1.volume;
-
-    assert_close(
-        got_rot,
-        got,
-        EXACT_RTOL,
-        "cone-sphere intersection volume under rigid motion",
     );
 }

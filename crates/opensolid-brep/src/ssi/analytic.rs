@@ -18,10 +18,12 @@
 //! their shared meridian profile (circles of latitude about the common
 //! axis). Coaxial cone-cone joins them: two cones sharing an axis line meet
 //! in a single latitude circle where their profile rays cross (or a shared
-//! apex point, or coincide). Configurations whose intersection needs curves
-//! we cannot represent yet (plane-cone parabolas/hyperbolas, non-coaxial
-//! cone-cone quartics, oblique plane-torus, skew or unequal-radius cylinder
-//! pairs, off-axis sphere/torus quartics) return
+//! apex point, or coincide). So does cone-sphere with the center on the cone
+//! axis — up to two latitude circles where the sphere cuts the profile ray,
+//! or one where it is inscribed. Configurations whose intersection needs
+//! curves we cannot represent yet (plane-cone parabolas/hyperbolas,
+//! non-coaxial cone-cone quartics, oblique plane-torus, skew or
+//! unequal-radius cylinder pairs, off-axis sphere/torus/cone quartics) return
 //! [`CoreError::NotImplemented`] — never a misleading `Empty`.
 //! The sphere/torus pairs' general positions march instead: see
 //! [`super::intersect_marched`].
@@ -127,6 +129,8 @@ pub fn intersect(
         (Torus { .. }, Cylinder { .. }) => cylinder_torus(b, a, tol),
         (Torus { .. }, Torus { .. }) => torus_torus(a, b, tol),
         (Cone { .. }, Cone { .. }) => cone_cone(a, b, tol),
+        (Cone { .. }, Sphere { .. }) => cone_sphere(a, b, tol),
+        (Sphere { .. }, Cone { .. }) => cone_sphere(b, a, tol),
         // A NURBS patch has no implicit form and its intersection with
         // anything — including a plane — is not expressible with the
         // current `Curve3` variants, so there is no analytic arm to write:
@@ -140,8 +144,8 @@ pub fn intersect(
                       ssi::intersect_marched_bounded)",
         }),
         _ => Err(CoreError::NotImplemented {
-            feature: "analytic SSI for cone pairs other than plane-cone \
-                      and coaxial cone-cone",
+            feature: "analytic SSI for cone pairs other than plane-cone, \
+                      coaxial cone-cone and coaxial cone-sphere",
         }),
     }
 }
@@ -1020,6 +1024,111 @@ fn cone_cone(
     })
 }
 
+/// Cone against sphere, exact when the sphere's center lies on the cone's
+/// axis line (of-lpsd).
+///
+/// The general position is a quartic with no [`Curve3`] closed form and
+/// marches. The coaxial one does not need the meridian *circle* machinery
+/// [`coaxial_profiles`] provides, because the cone's profile is a ray, not a
+/// circle: measuring along that ray from the apex turns the whole
+/// configuration into a quadratic in one variable. With `s` the distance
+/// from the apex along a generator and `z` the sphere center's height above
+/// the apex, a generator point sits at distance `s` from the apex and
+/// `z·cos α` of that projects onto the axis, so
+///
+/// ```text
+/// |p − center|² = s² − 2·s·z·cos α + z² = r²
+/// s = z·cos α ± sqrt(r² − z²·sin²α)
+/// ```
+///
+/// The discriminant is `r² − d²` for `d = |z|·sin α`, the distance from the
+/// center to the generator *line* — so tangency is `d == r` and is tested
+/// that way, in length units, rather than on the squared quantity.
+///
+/// Each root sweeps to a circle of latitude. Roots at `s < 0` lie on the
+/// mirror nappe, which the physical cone does not include, and are dropped;
+/// `s == 0` is the apex, where the locus is a circle plus an isolated point
+/// (or the point alone) that [`SurfaceIntersection`] cannot spell, so those
+/// configurations keep marching.
+fn cone_sphere(
+    cone: &Surface3,
+    sphere: &Surface3,
+    tol: &ToleranceContext,
+) -> CoreResult<SurfaceIntersection> {
+    let (
+        &Surface3::Cone {
+            origin,
+            axis,
+            half_angle,
+            radius,
+        },
+        &Surface3::Sphere {
+            center, radius: r, ..
+        },
+    ) = (cone, sphere)
+    else {
+        unreachable!("dispatched on Cone/Sphere")
+    };
+
+    let (sin_a, cos_a) = half_angle.sin_cos();
+    let apex = origin - axis * (radius / half_angle.tan());
+    let m = center - apex;
+    let z = axis.dot(&m);
+    if !tol.vector_approx_zero(&(m - axis * z)) {
+        return Err(CoreError::NotImplemented {
+            feature: "cone-sphere intersection with the sphere center off the \
+                      cone axis (general quartic; use ssi::intersect_marched)",
+        });
+    }
+
+    // Distance from the center to the generator line, and the half-chord the
+    // sphere cuts out of it.
+    let d = z.abs() * sin_a;
+    let circle_at = |s: f64| Curve3::Circle {
+        center: apex + axis * (s * cos_a),
+        axis,
+        radius: s * sin_a,
+    };
+
+    if tol.approx_eq(d, r) {
+        // Inscribed sphere: it touches along one circle, or on the mirror
+        // nappe (which the cone does not carry), never at the apex — `s = 0`
+        // there would need `r = 0`.
+        let s = z * cos_a;
+        return Ok(if s > 0.0 {
+            SurfaceIntersection::tangential(circle_at(s))
+        } else {
+            SurfaceIntersection::Empty
+        });
+    }
+    if d > r {
+        return Ok(SurfaceIntersection::Empty);
+    }
+
+    let half = ((r - d) * (r + d)).sqrt();
+    let roots = [z * cos_a - half, z * cos_a + half];
+    if roots.iter().any(|s| s.abs() <= tol.linear) {
+        // The sphere passes through the apex: the locus is a latitude circle
+        // and the apex point, or (center below the apex) the apex alone.
+        return Err(CoreError::NotImplemented {
+            feature: "cone-sphere intersection through the cone apex (a circle \
+                      and an isolated point; use ssi::intersect_marched)",
+        });
+    }
+    let circles: Vec<Curve3> = roots
+        .into_iter()
+        .filter(|&s| s > 0.0)
+        .map(circle_at)
+        .collect();
+    Ok(if circles.is_empty() {
+        // Both crossings are on the mirror nappe: the sphere sits behind the
+        // apex and never reaches the cone the solid carries.
+        SurfaceIntersection::Empty
+    } else {
+        SurfaceIntersection::transversal(circles)
+    })
+}
+
 /// Midpoint of two points (avoids pulling nalgebra into scope here).
 fn na_center(a: &Point3, b: &Point3) -> Point3 {
     Point3::from((a.coords + b.coords) / 2.0)
@@ -1462,6 +1571,134 @@ mod tests {
             intersect(&a, &b, &tol()),
             Err(CoreError::NotImplemented { .. })
         ));
+    }
+
+    // ── cone-sphere (coaxial) ──────────────────────────────────────────
+
+    /// A 30° cone with its apex at the origin, widening along +z: the
+    /// profile ray is `rho = h·tan30°`, so a sphere centered at height `z`
+    /// sits `z/2` from the generator line and cuts it at
+    /// `s = z·√3/2 ± √(r² − z²/4)`.
+    fn cone_30deg_apex_origin() -> Surface3 {
+        Surface3::Cone {
+            origin: Point3::origin(),
+            axis: Vector3::z(),
+            half_angle: FRAC_PI_6,
+            radius: 0.0,
+        }
+    }
+
+    #[test]
+    fn cone_sphere_coaxial_two_circles() {
+        // z = 2, r = √2: s = √3 ± 1, both on the physical nappe.
+        let cone = cone_30deg_apex_origin();
+        let sph = sphere_at(Point3::new(0.0, 0.0, 2.0), SQRT_2);
+        let curves = expect_curves(&cone, &sph, 2);
+        let mut got: Vec<(f64, f64)> = curves
+            .iter()
+            .map(|ic| {
+                assert_eq!(ic.kind, IntersectionKind::Transversal);
+                let Curve3::Circle { center, radius, .. } = ic.curve else {
+                    panic!("expected circles, got {:?}", ic.curve);
+                };
+                (center.z, radius)
+            })
+            .collect();
+        got.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let root3 = 3.0_f64.sqrt();
+        for (i, s) in [root3 - 1.0, root3 + 1.0].into_iter().enumerate() {
+            assert!((got[i].0 - s * root3 / 2.0).abs() < EPS, "height {i}");
+            assert!((got[i].1 - s / 2.0).abs() < EPS, "radius {i}");
+        }
+    }
+
+    /// The apex is derived from the cone's `radius` at its `origin`, not
+    /// assumed to be at the origin — a frustum's surface carries a positive
+    /// one. Here the apex is at `z = −√3` and only the far root is physical.
+    #[test]
+    fn cone_sphere_coaxial_one_circle_off_a_frustum_surface() {
+        let curves = expect_curves(&cone_30deg(), &unit_sphere_at_origin(2.0), 1);
+        assert_eq!(curves[0].kind, IntersectionKind::Transversal);
+        let Curve3::Circle { center, radius, .. } = curves[0].curve else {
+            panic!("expected a circle, got {:?}", curves[0].curve);
+        };
+        // s = 1.5 + √3.25 on a ray from (0, 0, −√3).
+        let s = 1.5 + 3.25_f64.sqrt();
+        assert!((center.z - (s * 3.0_f64.sqrt() / 2.0 - 3.0_f64.sqrt())).abs() < EPS);
+        assert!((radius - s / 2.0).abs() < EPS);
+    }
+
+    #[test]
+    fn cone_sphere_inscribed_tangent_circle() {
+        // z·sin30° = r: the sphere is inscribed and touches along a circle.
+        let cone = cone_30deg_apex_origin();
+        let sph = sphere_at(Point3::new(0.0, 0.0, 4.0), 2.0);
+        let curves = expect_curves(&cone, &sph, 1);
+        assert_eq!(curves[0].kind, IntersectionKind::Tangential);
+        let Curve3::Circle { center, radius, .. } = curves[0].curve else {
+            panic!("expected a circle, got {:?}", curves[0].curve);
+        };
+        assert!((center.z - 3.0).abs() < EPS);
+        assert!((radius - 3.0_f64.sqrt()).abs() < EPS);
+    }
+
+    #[test]
+    fn cone_sphere_clear_of_the_generator_empty() {
+        // z = 4, r = 1: the center is 2 from the generator line.
+        let result = intersect(
+            &cone_30deg_apex_origin(),
+            &sphere_at(Point3::new(0.0, 0.0, 4.0), 1.0),
+            &tol(),
+        )
+        .unwrap();
+        assert_eq!(result, SurfaceIntersection::Empty);
+    }
+
+    #[test]
+    fn cone_sphere_behind_the_apex_empty() {
+        // Both crossings (and, at z = −4, the tangency) land on the mirror
+        // nappe, which the cone the solid carries does not include.
+        for (z, r) in [(-2.0, SQRT_2), (-4.0, 2.0)] {
+            let result = intersect(
+                &cone_30deg_apex_origin(),
+                &sphere_at(Point3::new(0.0, 0.0, z), r),
+                &tol(),
+            )
+            .unwrap();
+            assert_eq!(result, SurfaceIntersection::Empty, "z = {z}, r = {r}");
+        }
+    }
+
+    #[test]
+    fn cone_sphere_through_the_apex_not_implemented() {
+        // z = r = 2: one root is the apex, so the locus is a circle plus an
+        // isolated point — not something `SurfaceIntersection` can spell.
+        let result = intersect(
+            &cone_30deg_apex_origin(),
+            &sphere_at(Point3::new(0.0, 0.0, 2.0), 2.0),
+            &tol(),
+        );
+        assert!(matches!(result, Err(CoreError::NotImplemented { .. })));
+    }
+
+    #[test]
+    fn cone_sphere_off_axis_not_implemented() {
+        let result = intersect(
+            &cone_30deg_apex_origin(),
+            &sphere_at(Point3::new(0.5, 0.0, 2.0), SQRT_2),
+            &tol(),
+        );
+        assert!(matches!(result, Err(CoreError::NotImplemented { .. })));
+    }
+
+    #[test]
+    fn cone_sphere_dispatch_is_symmetric() {
+        let cone = cone_30deg_apex_origin();
+        let sph = sphere_at(Point3::new(0.0, 0.0, 2.0), SQRT_2);
+        assert_eq!(
+            intersect(&cone, &sph, &tol()).unwrap(),
+            intersect(&sph, &cone, &tol()).unwrap()
+        );
     }
 
     // ── plane-torus ────────────────────────────────────────────────────
@@ -2066,12 +2303,20 @@ mod tests {
 
     // ── dispatch ───────────────────────────────────────────────────────
 
+    /// Cone against cylinder has no arm at all — not even a coaxial one, the
+    /// coaxial pair being a pair of latitude circles nobody has needed yet —
+    /// so it is what is left in the dispatch's catch-all. (Cone-sphere used
+    /// to stand here; of-lpsd gave it its coaxial arm.)
     #[test]
     fn unsupported_pair_not_implemented() {
         let a = cone_30deg();
-        let b = unit_sphere_at_origin(2.0);
+        let b = cylinder_z(0.5);
         let result = intersect(&a, &b, &tol());
         assert!(matches!(result, Err(CoreError::NotImplemented { .. })));
+        assert!(matches!(
+            intersect(&b, &a, &tol()),
+            Err(CoreError::NotImplemented { .. })
+        ));
     }
 
     #[test]
