@@ -43,6 +43,18 @@ const MAX_ITERATIONS: usize = 64;
 /// `|tangent · residual| ≤ COS_TOL · |tangent| · |residual|`.
 const COS_TOL: f64 = 1e-10;
 
+/// How far below the other tangent one tangent must fall for its direction
+/// to count as collapsed. A genuinely collapsed control row gives exactly
+/// zero up to rounding, so the bar sits at the rounding rather than at any
+/// modelling tolerance: this must not fire on a merely short tangent.
+const POLE_TANGENT_RATIO: f64 = 1e-12;
+
+/// Halvings a surface step may take before the candidate is abandoned.
+/// Steps enter the search no longer than the parameter domain, so this is
+/// enough halvings to bisect a full domain down past
+/// [`SYSTEM_RESOLUTION`]; it is a backstop, not the usual exit.
+const MAX_BACKTRACK: usize = 40;
+
 /// Result of projecting a point onto a curve.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CurveProjection {
@@ -212,12 +224,42 @@ trait NewtonSurface: SurfaceEval {
     }
 }
 
+/// Solve `[[a, b], [b, c]] · d = -[f, g]` for one parameter step.
+///
+/// When the system is rank-deficient the joint solve is `0/0`, and the
+/// directions decouple: each is solved on its own, and one whose diagonal
+/// entry vanishes carries no information at all and is held. That is the
+/// pole case — a collapsed control row makes a whole edge of the patch a
+/// single point, so `S_u ≡ 0` there and `f = S_u·r` is identically zero
+/// whatever `u` is. Holding `u` and stepping `v` walks off the pole, and
+/// one step off it the `u` equation means something again.
+fn solve_step(a: f64, b: f64, c: f64, f: f64, g: f64) -> (f64, f64) {
+    let det = a * c - b * b;
+    let (du, dv) = ((b * g - c * f) / det, (b * f - a * g) / det);
+    if du.is_finite() && dv.is_finite() {
+        return (du, dv);
+    }
+    let alone = |num: f64, den: f64| if den > 0.0 { -num / den } else { 0.0 };
+    (alone(f, a), alone(g, c))
+}
+
 /// Newton iteration for `argmin_{u,v} |S(u,v) - P|²` from `(seed_u, seed_v)`.
 ///
 /// Solves the 2×2 system for the stationarity conditions
 /// `f = S_u·r = 0`, `g = S_v·r = 0` with the full Hessian (Piegl & Tiller
 /// Eq. 6.5). Convergence criteria mirror [`newton_curve`], applied per
 /// direction.
+///
+/// The bare Newton step of Eq. 6.5 is only reliable where the Hessian is
+/// definite, which it need not be while the residual is still large — most
+/// sharply near a pole, where `|S_u| → 0` drives `|S_u|²` down to the same
+/// order as the second-order term `r·S_uu` that sits beside it. So each
+/// step is a search rather than an assignment: three candidate matrices are
+/// tried in order — the Newton Hessian, the Gauss-Newton first fundamental
+/// form, and that form with its off-diagonal dropped — and each candidate's
+/// step is halved until it actually shortens the distance. The first one
+/// that does is taken. The last candidate is what makes the search
+/// pole-robust; see its comment below (of-37i.7.1).
 fn newton_surface<S: NewtonSurface>(
     surface: &S,
     point: &Point3,
@@ -236,6 +278,8 @@ fn newton_surface<S: NewtonSurface>(
         hi: v_hi,
         period: surface.wrap_v(),
     };
+    let span_u = bounds_u.period.unwrap_or(u_hi - u_lo);
+    let span_v = bounds_v.period.unwrap_or(v_hi - v_lo);
     let mut u = bounds_u.restrict(seed_u);
     let mut v = bounds_v.restrict(seed_v);
     let mut best = (u, v);
@@ -257,47 +301,124 @@ fn newton_surface<S: NewtonSurface>(
             converged = true;
             break;
         }
-        let a = jet.su.norm_squared() + r.dot(&jet.suu);
-        let b = jet.su.dot(&jet.sv) + r.dot(&jet.suv);
-        let c = jet.sv.norm_squared() + r.dot(&jet.svv);
-        let det = a * c - b * b;
-        let du = (b * g - c * f) / det;
-        let dv = (b * f - a * g) / det;
-        if !du.is_finite() || !dv.is_finite() {
-            break;
-        }
-        let mut u_next = bounds_u.restrict(u + du);
-        let mut v_next = bounds_v.restrict(v + dv);
-        // Active-set fallback: if the joint step runs a clamped (aperiodic)
-        // parameter out of its domain, that parameter pins to the bound and
-        // the optimum must be re-sought along the free direction alone —
-        // the pinned component of the joint solve would otherwise stall the
-        // free one short of the constrained minimum.
-        let u_pinned = bounds_u.period.is_none() && (u + du < bounds_u.lo || u + du > bounds_u.hi);
-        let v_pinned = bounds_v.period.is_none() && (v + dv < bounds_v.lo || v + dv > bounds_v.hi);
-        if u_pinned && !v_pinned {
-            let dv_1d = -g / c;
-            if dv_1d.is_finite() {
-                v_next = bounds_v.restrict(v + dv_1d);
+        let (e, ff, gg) = (
+            jet.su.norm_squared(),
+            jet.su.dot(&jet.sv),
+            jet.sv.norm_squared(),
+        );
+        let hessians = [
+            (
+                e + r.dot(&jet.suu),
+                ff + r.dot(&jet.suv),
+                gg + r.dot(&jet.svv),
+            ),
+            (e, ff, gg),
+            // Decoupled Gauss-Newton: the first fundamental form with its
+            // off-diagonal dropped, so each direction is solved against its
+            // own tangent alone. This is the pole-safe candidate. At a
+            // collapsed row `S_u ≡ 0`, so `E = 0` *and* `f = S_u·r = 0`
+            // identically — the `u` equation is vacuous, yet the two
+            // candidates above still name a `du` (their `b` does not
+            // vanish, so their determinant is `-b² ≠ 0` and the solve is
+            // not visibly singular). That `du` slides along the pole row
+            // without moving the surface point at all, which reads as a
+            // converged step and pins the answer to the pole. Dropping `b`
+            // makes the vacuous equation *look* vacuous — `0/0` — so
+            // [`solve_step`] holds `u` and steps `v` off the pole, and one
+            // step off it the `u` equation means something again.
+            (e, 0.0, gg),
+        ];
+        // First step that shortens the distance, if any.
+        let mut accepted = None;
+        // A full-length step that cannot move the surface point: the
+        // floating-point floor. Kept only as a last resort, because at a
+        // pole a step of any length fails to move the point, and that is
+        // the one place it does not mean the iteration has arrived.
+        let mut floor = None;
+        // A step that *did* move the point, yet shortened the distance at
+        // no length before shrinking below the floor. Only read when every
+        // candidate came back this way, and the last two are the first
+        // fundamental form, which is positive semi-definite — so their step
+        // descends, and a descent direction that cannot descend has
+        // arrived. The iteration stays where it is and says so.
+        let mut stalled = false;
+        'candidates: for (a, b, c) in hessians {
+            let (mut du, mut dv) = solve_step(a, b, c, f, g);
+            // Active-set fallback: if the joint step runs a clamped
+            // (aperiodic) parameter out of its domain, that parameter pins
+            // to the bound and the optimum must be re-sought along the free
+            // direction alone — the pinned component of the joint solve
+            // would otherwise stall the free one short of the constrained
+            // minimum.
+            let u_pinned = bounds_u.period.is_none() && !(u_lo..=u_hi).contains(&(u + du));
+            let v_pinned = bounds_v.period.is_none() && !(v_lo..=v_hi).contains(&(v + dv));
+            // The pinned component is also cut back to the bound it is
+            // pinned at, rather than left overshooting for `restrict` to
+            // clamp later: the halving below scales both components
+            // together, so an overshoot of a thousand domains would drag
+            // the free component's step down by the same factor and stall
+            // the very direction that still had somewhere to go.
+            if u_pinned && !v_pinned {
+                let dv_1d = -g / c;
+                if dv_1d.is_finite() {
+                    dv = dv_1d;
+                }
+                du = bounds_u.restrict(u + du) - u;
+            } else if v_pinned && !u_pinned {
+                let du_1d = -f / a;
+                if du_1d.is_finite() {
+                    du = du_1d;
+                }
+                dv = bounds_v.restrict(v + dv) - v;
             }
-        } else if v_pinned && !u_pinned {
-            let du_1d = -f / a;
-            if du_1d.is_finite() {
-                u_next = bounds_u.restrict(u + du_1d);
+            if !du.is_finite() || !dv.is_finite() {
+                continue;
+            }
+            // Enter the halving search no longer than the domain itself: a
+            // near-singular solve can name a step many orders past it, and
+            // restriction alone would park every trial on the same bound.
+            let mut scale = (span_u / du.abs()).min(span_v / dv.abs()).min(1.0);
+            for halving in 0..MAX_BACKTRACK {
+                let u_next = bounds_u.restrict(u + du * scale);
+                let v_next = bounds_v.restrict(v + dv * scale);
+                let moved = ((u_next - u) * jet.su + (v_next - v) * jet.sv).norm();
+                if moved <= SYSTEM_RESOLUTION {
+                    // At full length this is the floating-point floor —
+                    // the interior minimum, or a pinned boundary.
+                    if halving == 0 {
+                        floor.get_or_insert((u_next, v_next));
+                    } else {
+                        stalled = true;
+                    }
+                    break;
+                }
+                if (surface.point(u_next, v_next) - point).norm() < dist {
+                    accepted = Some((u_next, v_next));
+                    break 'candidates;
+                }
+                scale *= 0.5;
             }
         }
-        let moved = ((u_next - u) * jet.su + (v_next - v) * jet.sv).norm();
-        if moved <= SYSTEM_RESOLUTION {
+        if let Some((u_next, v_next)) = accepted {
             u = u_next;
             v = v_next;
-            if (surface.point(u, v) - point).norm() < best_dist {
-                best = (u, v);
-            }
-            converged = true;
-            break;
+            continue;
         }
+        // Nothing downhill from here. If some candidate was already at the
+        // floating-point floor at full length, this is the minimum; take it
+        // and report convergence. Failing that, a stalled descent direction
+        // says the same about where the iteration already stands. Otherwise
+        // report the best seen so far, unconverged.
+        let Some((u_next, v_next)) = floor.or(stalled.then_some((u, v))) else {
+            break;
+        };
         u = u_next;
         v = v_next;
+        if (surface.point(u, v) - point).norm() < best_dist {
+            best = (u, v);
+        }
+        converged = true;
+        break;
     }
     let (u, v) = best;
     let closest = surface.point(u, v);
@@ -579,18 +700,47 @@ impl SurfaceProject for NurbsSurface {
     fn project_point(&self, point: &Point3) -> SurfaceProjection {
         let u_samples = span_samples(self.knot_vector_u(), self.degree_u() + 2);
         let v_samples = span_samples(self.knot_vector_v(), self.degree_v() + 2);
-        let mut seed = (u_samples[0], v_samples[0]);
-        let mut best = f64::INFINITY;
-        for &u in &u_samples {
-            for &v in &v_samples {
+        let nearest = |us: &[f64], v: f64| {
+            let mut best = (us[0], f64::INFINITY);
+            for &u in us {
                 let d = (self.point(u, v) - point).norm_squared();
-                if d < best {
-                    best = d;
-                    seed = (u, v);
+                if d < best.1 {
+                    best = (u, d);
                 }
             }
+            best
+        };
+        let (mut seed_u, mut seed_v) = (u_samples[0], v_samples[0]);
+        let (mut best, mut row) = (f64::INFINITY, 0);
+        for (j, &v) in v_samples.iter().enumerate() {
+            let (u, d) = nearest(&u_samples, v);
+            if d < best {
+                best = d;
+                row = j;
+                (seed_u, seed_v) = (u, v);
+            }
         }
-        newton_surface(self, point, seed.0, seed.1)
+        // A collapsed control row is a single point stretched over the whole
+        // `u` domain, so on that row every sample ties and `seed_u` is
+        // merely whichever was scanned first — no information at all. The
+        // solver cannot recover it either: `S_u ≡ 0` there, so the `u`
+        // equation is vacuous until a step carries the iteration off the
+        // row, and if the `v` step off it happens to point out of the
+        // domain the seed's arbitrary `u` is where it stays (of-37i.7.1).
+        // Take `u` from the nearest row that is not collapsed, which is the
+        // `u` the iteration wants the moment it does step off (the pole's
+        // own `v` is kept: the row really is the closest one).
+        if self.du(seed_u, seed_v).norm() <= POLE_TANGENT_RATIO * self.dv(seed_u, seed_v).norm()
+            && v_samples.len() > 1
+        {
+            let inward = if row + 1 < v_samples.len() {
+                row + 1
+            } else {
+                row - 1
+            };
+            seed_u = nearest(&u_samples, v_samples[inward]).0;
+        }
+        newton_surface(self, point, seed_u, seed_v)
     }
 
     /// Newton straight from `seed`, skipping the per-span search. The seed
@@ -1330,6 +1480,110 @@ mod tests {
         assert!(proj.converged);
         assert_near(proj.v, 1.0, "v pinned at the top of the patch");
         assert_near(proj.distance, 3.0, "distance to the top rim");
+    }
+
+    /// A quarter of an exact 45° cone with a **collapsed control row**:
+    /// apex at `(0, 0, 1)`, unit base circle at `z = 0`, `u ∈ [0, 1]`
+    /// sweeping a quarter turn and `v ∈ [0, 1]` running apex to base. Every
+    /// control point of the `v = 0` row is the apex, so that whole edge of
+    /// the patch is a single point and `S_u ≡ 0` along it — the pole this
+    /// section is about (of-37i.7.1).
+    fn cone_tip_patch() -> NurbsSurface {
+        let apex = Point3::new(0.0, 0.0, 1.0);
+        let base = [
+            Point3::new(1.0, 0.0, 0.0),
+            Point3::new(1.0, 1.0, 0.0),
+            Point3::new(0.0, 1.0, 0.0),
+        ];
+        let w = [1.0, FRAC_1_SQRT_2, 1.0];
+        let grid = base.iter().map(|&b| vec![apex, b]).collect();
+        let weights = w.iter().map(|&w| vec![w, w]).collect();
+        NurbsSurface::new(
+            grid,
+            weights,
+            KnotVector::clamped_uniform(2, 3).unwrap(),
+            KnotVector::clamped_uniform(1, 2).unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// A point *on* a collapsed-row patch must invert back to its own
+    /// parameters, however close to the pole it sits (of-37i.7.1).
+    ///
+    /// This is the failure the bead was filed for. `(0.5, 0.125)` is the
+    /// original report to scale — a point an eighth of the way down from the
+    /// apex, exactly on the surface, which `Chart::param` could not invert
+    /// and so refused the whole boolean. Two things had to give: near the
+    /// pole `|S_u| → 0` leaves the `u` equation carrying no information, and
+    /// the seed grid's only row down there is the pole itself, where every
+    /// `u` sample ties.
+    #[test]
+    fn pole_patch_inverts_points_on_it() {
+        let patch = cone_tip_patch();
+        for (u, v) in [
+            (0.0, 0.02),
+            (0.3, 0.1),
+            (0.5, 0.01),
+            (0.5, 0.5),
+            (0.7, 0.005),
+            (0.5, 0.125),
+        ] {
+            let p = patch.point(u, v);
+            let proj = patch.project_point(&p);
+            check_surface_projection(&patch, &p, &proj);
+            assert!(
+                proj.distance < EPS,
+                "on-patch point at ({u}, {v}) inverted {} off its own surface \
+                 (landed at ({}, {}))",
+                proj.distance,
+                proj.u,
+                proj.v
+            );
+            assert_near(proj.u, u, "recovered u");
+            assert_near(proj.v, v, "recovered v");
+        }
+    }
+
+    /// The apex itself is the one place `u` is genuinely arbitrary — the
+    /// whole `v = 0` row is that single point — so only the geometry is
+    /// asserted. A query on the axis above it has the apex for its answer
+    /// too, and reaching that answer means stepping *back onto* the pole
+    /// rather than off it.
+    #[test]
+    fn pole_patch_answers_at_the_pole_itself() {
+        let patch = cone_tip_patch();
+        let apex = Point3::new(0.0, 0.0, 1.0);
+        for p in [apex, Point3::new(0.0, 0.0, 1.5)] {
+            let proj = patch.project_point(&p);
+            check_surface_projection(&patch, &p, &proj);
+            assert_near(proj.v, 0.0, "v at the pole row");
+            assert_point_near(&proj.point, &apex, "foot at the apex");
+        }
+    }
+
+    /// Queries *off* a collapsed-row patch, near enough to the pole that the
+    /// seed grid still starts on it, reach the true minimum and say so. The
+    /// first two sit outside the quarter sweep in `u` and answer at a `u`
+    /// bound; the third is nearly on the surface, where the constrained
+    /// minimum is at the floating-point floor and the iteration has to
+    /// recognize a step that can no longer improve.
+    #[test]
+    fn pole_patch_projection_is_globally_optimal() {
+        let patch = cone_tip_patch();
+        for p in [
+            Point3::new(0.05, -0.3, 0.95),
+            Point3::new(-0.3, 0.05, 0.95),
+            Point3::new(0.02, -0.1, 0.99),
+        ] {
+            let proj = patch.project_point(&p);
+            check_surface_projection(&patch, &p, &proj);
+            let sampled = sampled_surface_min(&patch, &p, (0.0, 1.0), (0.0, 1.0));
+            assert!(
+                proj.distance <= sampled + 1e-4,
+                "not optimal for {p:?}: {} vs sampled {sampled}",
+                proj.distance
+            );
+        }
     }
 
     #[test]

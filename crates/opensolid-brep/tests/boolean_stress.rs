@@ -4324,6 +4324,18 @@ fn box_inside_test(min: [f64; 3], max: [f64; 3]) -> impl Fn(&Point3) -> Option<b
     move |p: &Point3| Some((0..3).all(|i| p[i] > min[i] && p[i] < max[i]))
 }
 
+/// [`box_inside_test`] for a [`Scene::nurbs_cone`]: strictly inside the
+/// open cone of base radius `r` centred on `(cx, cy, z0)` and apex `h`
+/// above it. Exact in closed form, so like the box's it never abstains.
+fn cone_inside_test(cx: f64, cy: f64, r: f64, z0: f64, h: f64) -> impl Fn(&Point3) -> Option<bool> {
+    move |p: &Point3| {
+        let t = (p.z - z0) / h;
+        Some(
+            t > 0.0 && t < 1.0 && (p.x - cx).powi(2) + (p.y - cy).powi(2) < (r * (1.0 - t)).powi(2),
+        )
+    }
+}
+
 /// Connected components and total genus of a closed manifold triangle
 /// mesh, as [`assert_valid`] establishes: every undirected index edge is
 /// shared by exactly two consistently-oriented triangles, so per component
@@ -4975,6 +4987,60 @@ fn nurbs_tip_body_emits_no_3d_degenerate_triangles() {
         mesh.is_closed_manifold(),
         "a NURBS tip body must weld watertight, got {} triangles that do not",
         mesh.triangle_count()
+    );
+}
+
+/// of-37i.7.1: with the tip patch admitted, an **exact boolean** on a
+/// collapsed-row body now runs, instead of erroring out of `Chart::param`
+/// and diverting to F-Rep.
+///
+/// The cut is the one that walks straight into the pole: a half-space that
+/// lops the apex off, so the imprint runs around the cone a quarter of the
+/// way from the tip and every seam point near it has to be inverted against
+/// a patch whose `u` tangent is vanishing. That inversion is what used to
+/// fail — `[0.125, 0, 1.75]` is exactly on this cone, and `newton_surface`
+/// reported no convergence for it because at a collapsed row `S_u ≡ 0`
+/// makes the `u` equation vacuous while the seed grid offered nothing but
+/// the pole row to start from.
+///
+/// Bracketed rather than approximated, exactly as the sibling above: the
+/// cut plane is exact, but both rims are inscribed polygons at the default
+/// `angular_step`, so the result holds less than the exact frustum and more
+/// than the frustum on that polygon (which is the same closed form with the
+/// polygon's `½n·sin(τ/n)` in place of `π`).
+#[test]
+fn nurbs_tip_body_truncates_on_the_exact_path() {
+    let (r, h, cut) = (1.0, 2.0, 1.75);
+    let (lo, hi) = ([-2.0, -2.0, cut], [2.0, 2.0, 3.0]);
+    let mut scene = Scene::new();
+    let cone = scene.nurbs_cone(0.0, 0.0, r, 0.0, h);
+    let tool = scene.block(lo, hi);
+    let inside_cone = cone_inside_test(0.0, 0.0, r, 0.0, h);
+    let inside_tool = box_inside_test(lo, hi);
+    let tests: [Option<InsideTest>; 2] = [Some(&inside_cone), Some(&inside_tool)];
+
+    let out = boolean_with_inside_tests(
+        BooleanOp::Subtract,
+        &scene.store,
+        &scene.geo,
+        cone,
+        tool,
+        &tol(),
+        tests,
+    )
+    .expect("the exact pipeline truncates a collapsed-row body");
+    let volume = volume_checked(&out, 1, 0, "truncated NURBS tip body");
+
+    // Radius of the cone where the plane cuts it, and so the frustum left.
+    let top = r * (1.0 - cut / h);
+    let exact = frustum_volume(r, top, cut);
+    let segments = 4.0 * (FRAC_PI_2 / (std::f64::consts::TAU / 32.0)).ceil();
+    let polygonal =
+        exact * (0.5 * segments * (std::f64::consts::TAU / segments).sin()) / std::f64::consts::PI;
+    assert!(
+        volume > polygonal && volume < exact,
+        "the truncated tip body's volume {volume} must sit between the \
+         inscribed {segments}-gon frustum {polygonal} and the exact one {exact}"
     );
 }
 
