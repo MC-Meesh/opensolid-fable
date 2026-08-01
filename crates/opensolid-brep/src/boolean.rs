@@ -8119,6 +8119,11 @@ fn refine_curved_region(
         }
     }
 
+    // Last, because it deliberately trades Delaunay-ness for 3D validity and
+    // nothing may flip it back: fan the pole's triangles across meridians
+    // instead of down one (of-37i.7.2).
+    unfan_pole_slivers(&mut mesh, all_uv, all_p, chart, &constraints);
+
     // Read back. Insertion and flips only ever retriangulate the same point
     // set inside the seed's boundary, so the mesh still tiles exactly the
     // region the seed covered — nothing to cull. Zero-area uv slivers are
@@ -8126,6 +8131,113 @@ fn refine_curved_region(
     // chord edges; the emitter drops only zero-3D-length ones).
     tris.clear();
     tris.extend_from_slice(&mesh.tris);
+}
+
+/// How much thinner than the kernel's own bar a pole triangle may be before
+/// [`unfan_pole_slivers`] rebuilds it: `MeshSdf::new` refuses a triangle whose
+/// doubled area falls to `1e-12` of its longest edge squared, and this fires
+/// three orders of magnitude earlier.
+///
+/// The margin is the point. A triangle that clears the kernel's bar by a
+/// hair still has a normal made of round-off, and the operand field is built
+/// from those normals; a sliver that merely *passes* is not a mesh anyone
+/// should ship. Nothing well-shaped is ever this thin, so the wider bar costs
+/// no flips on a healthy fan.
+const POLE_SLIVER_REL: f64 = 1e-9;
+
+/// Rebuild the triangles around a **pole** so each joins it to points on
+/// *different* meridians, undoing the one configuration a parameter-space
+/// triangulation cannot see is wrong (of-37i.7.2).
+///
+/// Every `uv` on a pole row lifts to the same 3D point, so a triangle joining
+/// a pole vertex to two points at the **same `u`** puts all three of its
+/// corners on one meridian. On a ruled patch — the lofted-to-a-point tip, an
+/// exact NURBS cone — that meridian is a straight line, so the triangle is
+/// *exactly* collinear in 3D however well-shaped it is in parameter space:
+/// on an `r = 1, h = 2` cone, 8 of 574 triangles came out at ~1e-18 area and
+/// `MeshSdf::new` refused the operand outright, which stops the exact boolean
+/// and the F-Rep fallback alike (FREEFORM.md §7.1's recurring lesson).
+///
+/// It is not a rare configuration. A quarter patch's seam edges carry only
+/// their two endpoints, and the interior lattice keeps a quarter-cell clear
+/// of them, so the strip between a seam and the first lattice column holds no
+/// vertices at all: it can only be triangulated as two fans, one from each end
+/// of the seam. The fan from the *pole* end is entirely degenerate — and the
+/// fan from the other end is entirely fine, since it joins two meridians. The
+/// cure is to move the split between them all the way to the pole.
+///
+/// So: **flip an edge incident to the pole**, not the one opposite it. The
+/// opposite edge (the column edge) cannot be flipped — the pole sits far
+/// enough off the column that the quad across it is reflex — and splitting it
+/// would only mint another point on the same meridian. Flipping a pole-incident
+/// edge instead hands one triangle of the pole's star to the vertex across the
+/// quad, exactly the transfer that walks the fan split upward, and the star
+/// shrinks by one every time so the loop cannot cycle.
+///
+/// Dropping the degenerate triangles instead would be wrong, and is worth
+/// stating because it is the obvious move: each one's three edges would be
+/// left with a single incident face, which opens the mesh — and an open mesh
+/// has no SDF either, so it trades a refused operand for a refused operand.
+///
+/// Triangles with *two* pole corners are left alone. They are already
+/// zero-area in 3D, but the emitter collapses a pole row to one mesh vertex,
+/// which turns them into a repeated index it drops — and their other two
+/// edges are the same undirected edge traversed twice, so dropping them
+/// removes nothing from the mesh's edge parity.
+fn unfan_pole_slivers(
+    mesh: &mut FlipMesh,
+    all_uv: &[(f64, f64)],
+    all_p: &[Point3],
+    chart: &Chart,
+    constraints: &std::collections::HashSet<(usize, usize)>,
+) {
+    let is_pole: Vec<bool> = all_p.iter().map(|p| chart.pole_v(p).is_some()).collect();
+    if !is_pole.iter().any(|&b| b) {
+        return; // no pole in this region: nothing here can be a pole fan
+    }
+    // Each successful flip removes one triangle from a pole's star, so a
+    // budget of one per triangle-corner is already generous; it is a safety
+    // valve for a chart carrying several poles, where a flip may hand a
+    // triangle from one pole's star to another's.
+    let mut budget = 3 * mesh.tris.len() + 64;
+    while budget > 0 {
+        let mut flipped = false;
+        for t in 0..mesh.tris.len() {
+            let tri = mesh.tris[t];
+            // Exactly one corner on a pole, and the triangle 3D-degenerate.
+            let mut corners = (0..3).filter(|&k| is_pole[tri[k]]);
+            let (Some(k), None) = (corners.next(), corners.next()) else {
+                continue;
+            };
+            if !is_sliver_3d(tri.map(|i| all_p[i])) {
+                continue;
+            }
+            // The two edges meeting at the pole corner `k`: edge `k` runs
+            // from it, edge `k + 2` runs into it. Either flip removes this
+            // triangle from the pole's star; take whichever the quad admits.
+            for j in [k, (k + 2) % 3] {
+                if mesh.raw_flip(t, j, all_uv, constraints) {
+                    flipped = true;
+                    budget -= 1;
+                    break;
+                }
+            }
+        }
+        if !flipped {
+            break;
+        }
+    }
+}
+
+/// Whether a 3D triangle is a sliver by [`POLE_SLIVER_REL`] — the same
+/// area-against-longest-edge shape test `MeshSdf::new` refuses on, at a
+/// margin.
+fn is_sliver_3d([a, b, c]: [Point3; 3]) -> bool {
+    let longest_sq = (b - a)
+        .norm_squared()
+        .max((c - a).norm_squared())
+        .max((c - b).norm_squared());
+    (b - a).cross(&(c - a)).norm() <= POLE_SLIVER_REL * longest_sq
 }
 
 /// Do the open segments `a-b` and `c-d` cross at a point interior to both?

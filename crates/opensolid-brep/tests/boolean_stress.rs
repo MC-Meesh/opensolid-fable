@@ -4922,6 +4922,62 @@ fn nurbs_tip_body_is_admitted_and_tessellates_watertight() {
     );
 }
 
+/// of-37i.7.2: the tip body's mesh must also be **usable**, which
+/// watertightness alone does not buy. `MeshSdf::new` — the operand field
+/// both hybrid paths need — refuses any triangle whose area is negligible
+/// against its own longest edge, and the pole fan used to emit eight of
+/// them on an exact cone: the apex joined to two lattice points on ONE
+/// ruling, which is a straight line in 3D however well-shaped the triangle
+/// is in `uv`.
+///
+/// Asserted here rather than only at the kernel level for the same reason
+/// the watertightness bar is: this is the cheapest statement of it, and the
+/// defect belongs to what the tessellator emits near a pole. The predicate
+/// is `MeshSdf::new`'s own, duplicated because this crate sits below the
+/// kernel.
+#[test]
+fn nurbs_tip_body_emits_no_3d_degenerate_triangles() {
+    let (r, h) = (1.0, 2.0);
+    let mut scene = Scene::new();
+    let body = scene.nurbs_cone(0.0, 0.0, r, 0.0, h);
+    let mesh = tessellate_body(
+        &scene.store,
+        &scene.geo,
+        body,
+        &TessellationOptions::default(),
+    )
+    .expect("a collapsed-row NURBS body tessellates");
+
+    let bad: Vec<_> = mesh
+        .indices
+        .iter()
+        .enumerate()
+        .filter(|(_, tri)| {
+            let [a, b, c] = tri.map(|i| mesh.positions[i]);
+            let longest_sq = (b - a)
+                .norm_squared()
+                .max((c - a).norm_squared())
+                .max((c - b).norm_squared());
+            (b - a).cross(&(c - a)).norm() <= 1e-12 * longest_sq
+        })
+        .map(|(t, tri)| (t, tri.map(|i| mesh.positions[i])))
+        .collect();
+    assert!(
+        bad.is_empty(),
+        "the tip body emits {} sliver/collinear triangles of {}, e.g. {:?}",
+        bad.len(),
+        mesh.triangle_count(),
+        &bad[..bad.len().min(3)]
+    );
+    // Still watertight: the cure for a degenerate triangle is never to drop
+    // it, which would leave each of its three edges with one incident face.
+    assert!(
+        mesh.is_closed_manifold(),
+        "a NURBS tip body must weld watertight, got {} triangles that do not",
+        mesh.triangle_count()
+    );
+}
+
 /// §9's **phase-4 gate** (of-37i.6): every NURBS-hosted result in the
 /// corpus tessellates within one F-Rep cell, so `hybrid::boolean` keeps
 /// the exact mesh instead of diverting to the fallback on the deviation
