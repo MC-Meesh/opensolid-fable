@@ -31,6 +31,17 @@ pub enum NurbsError {
     NonFiniteKnot { index: usize, knot: f64 },
     #[error("knot vector has an empty domain (start knot equals end knot)")]
     DegenerateDomain,
+    #[error("knot span at index {index} is empty ({knot} repeated across a domain end)")]
+    DegenerateEndSpan { index: usize, knot: f64 },
+    #[error(
+        "interior knot {knot} at index {index} is repeated {multiplicity} times, above degree {degree}"
+    )]
+    InteriorMultiplicityTooHigh {
+        index: usize,
+        knot: f64,
+        multiplicity: usize,
+        degree: usize,
+    },
     #[error("{control_points} control points given, knot vector expects {expected}")]
     ControlCountMismatch {
         control_points: usize,
@@ -43,6 +54,8 @@ pub enum NurbsError {
     },
     #[error("weight at index {index} must be finite and positive")]
     NonPositiveWeight { index: usize },
+    #[error("control point at index {index} has a non-finite coordinate")]
+    NonFiniteControlPoint { index: usize },
     #[error("knot {knot} lies outside the open domain ({start}, {end})")]
     KnotOutOfDomain { knot: f64, start: f64, end: f64 },
     #[error("inserting knot {knot} would raise its multiplicity above degree {degree}")]
@@ -63,7 +76,14 @@ pub enum NurbsError {
 ///
 /// Invariants (enforced at construction): every knot finite, non-decreasing,
 /// at least `2 * (degree + 1)` knots (so at least `degree + 1` control
-/// points), and a non-empty domain `knots[degree] < knots[len - degree - 1]`.
+/// points), a non-empty domain `knots[degree] < knots[len - degree - 1]`,
+/// non-empty spans at both ends of that domain
+/// (`knots[degree] < knots[degree + 1]` and the mirror of it), and
+/// multiplicity at most `degree` strictly inside the domain.
+///
+/// The vector need not be clamped: a raw AP203 knot list is not required to
+/// repeat its end knots, and an unclamped vector evaluates fine over the
+/// domain its interior knots define.
 ///
 /// Finiteness is checked first and is not redundant with the ordering check:
 /// `NaN < x` and `NaN >= x` are both false, so a NaN knot satisfies both the
@@ -104,12 +124,69 @@ impl KnotVector {
         if knots[degree] >= knots[knots.len() - degree - 1] {
             return Err(NurbsError::DegenerateDomain);
         }
+        // The two spans at the ends of the domain must have width, because
+        // they are the two `find_span` hands back without checking: its
+        // `u <= knots[degree]` and `u >= knots[n + 1]` shortcuts return them
+        // for any parameter at or past the domain end. If either is empty,
+        // `basis_funs` divides by its zero width and every coordinate comes
+        // back NaN — `KnotVector::new(1, [0, 0, 0, 1, 1])` evaluated to
+        // `[NaN, NaN, NaN]` at `t0` with nothing reporting why (of-sj1h).
+        //
+        // This is where an over-repeated end knot is caught, and it catches
+        // more than counting the multiplicity of `t0`/`t1` would: the run can
+        // straddle the domain-end index, as in
+        // `[a, b, c, c, d]` at degree 1, whose `t1 = c` has multiplicity only
+        // `degree + 1` and whose last span is still empty.
+        let last = knots.len() - degree - 2;
+        for index in [degree, last] {
+            if knots[index] >= knots[index + 1] {
+                return Err(NurbsError::DegenerateEndSpan {
+                    index,
+                    knot: knots[index],
+                });
+            }
+        }
+        // Strictly inside the domain, multiplicity is bounded by the degree
+        // (Piegl & Tiller §2.5). One above that drops the basis below C^0, so
+        // the "curve" jumps: the two halves are disjoint loci, and every
+        // consumer here — tessellation, marching, the convex-hull bound —
+        // assumes a connected one. Evaluation stays finite there, unlike the
+        // empty-end-span case above; what fails is the meaning of the result.
+        //
+        // The bound takes no special case at degree 0, where it admits no
+        // interior knot at all: a piecewise-constant spline jumps at every
+        // one of them, which is the same disconnection the bound exists to
+        // exclude. That leaves `[a, b]`, a single constant point, as the only
+        // degree-0 vector — nothing here builds one, and the STEP reader
+        // rejects `degree < 1` outright.
+        let (t0, t1) = (knots[degree], knots[knots.len() - degree - 1]);
+        let mut i = 0;
+        while i < knots.len() {
+            let mut j = i + 1;
+            while j < knots.len() && knots[j] == knots[i] {
+                j += 1;
+            }
+            if knots[i] > t0 && knots[i] < t1 && j - i > degree {
+                return Err(NurbsError::InteriorMultiplicityTooHigh {
+                    index: i,
+                    knot: knots[i],
+                    multiplicity: j - i,
+                    degree,
+                });
+            }
+            i = j;
+        }
         Ok(Self { degree, knots })
     }
 
     /// Clamped uniform knot vector on `[0, 1]` for `control_count` control
     /// points: end knots repeated `degree + 1` times, interior knots evenly
     /// spaced.
+    ///
+    /// Every interior knot is distinct, so this satisfies the multiplicity
+    /// bounds for any `degree >= 1`. At degree 0 the bound leaves only the
+    /// single-span vector, so `control_count > 1` there returns
+    /// [`NurbsError::KnotMultiplicityTooHigh`].
     pub fn clamped_uniform(degree: usize, control_count: usize) -> Result<Self, NurbsError> {
         let expected = 2 * (degree + 1);
         if control_count < degree + 1 {
@@ -312,6 +389,16 @@ impl NurbsCurve {
         // coordinates into NaN at evaluation time (of-ipt.15).
         if let Some(index) = weights.iter().position(|&w| !(w.is_finite() && w > 0.0)) {
             return Err(NurbsError::NonPositiveWeight { index });
+        }
+        // Control points are a validation boundary for the same reason the
+        // weights are: a `CARTESIAN_POINT` comes straight out of an
+        // untrusted file, and a real literal like `1E400` parses to `+inf`.
+        // A non-finite coordinate constructs a curve that evaluates to NaN
+        // everywhere in its span, and every consumer downstream —
+        // tessellation, projection, SSI marching — assumes evaluation
+        // returns a finite point (of-sj1h).
+        if let Some(index) = control_points.iter().position(|p| !is_finite(*p)) {
+            return Err(NurbsError::NonFiniteControlPoint { index });
         }
         Ok(Self {
             control_points,
@@ -530,6 +617,11 @@ impl CurveEval for NurbsCurve {
     }
 }
 
+/// Whether every coordinate of a control point is finite.
+pub(crate) fn is_finite(p: Point3) -> bool {
+    p.x.is_finite() && p.y.is_finite() && p.z.is_finite()
+}
+
 pub(crate) fn binomial(n: usize, k: usize) -> f64 {
     let k = k.min(n - k);
     let mut result = 1.0;
@@ -648,8 +740,194 @@ mod tests {
         let error = KnotVector::new(1, vec![0.0, 0.0, f64::NAN, 1.0, 1.0, 1.0]).unwrap_err();
         assert!(matches!(error, NurbsError::NonFiniteKnot { index: 2, .. }));
 
-        // Finite knots are unaffected.
-        assert!(KnotVector::new(1, vec![0.0, 0.0, 0.5, 1.0, 1.0, 1.0]).is_ok());
+        // Finite knots are unaffected. (This case used to read
+        // `[0, 0, 0.5, 1, 1, 1]`, whose trailing run of three empties the
+        // last span at degree 1 — it constructed and then evaluated to NaN
+        // at `t1`, which is what `knot_vector_rejects_an_empty_end_span` now
+        // covers.)
+        assert!(KnotVector::new(1, vec![0.0, 0.0, 0.5, 1.0, 1.0]).is_ok());
+    }
+
+    /// Regression for of-sj1h: a knot vector whose first or last span is
+    /// empty used to construct and then evaluate to NaN.
+    ///
+    /// `find_span` returns those two spans unchecked from its
+    /// `u <= knots[degree]` / `u >= knots[n + 1]` shortcuts, so a zero width
+    /// there divides the basis into NaN rather than merely being an unused
+    /// span: `KnotVector::new(1, [0, 0, 0, 1, 1])` evaluated to
+    /// `[NaN, NaN, NaN]` at `t0`.
+    #[test]
+    fn knot_vector_rejects_an_empty_end_span() {
+        for (degree, index, knots) in [
+            // Over-repeated domain ends.
+            (1, 1, vec![0.0, 0.0, 0.0, 1.0, 1.0]),
+            (1, 2, vec![0.0, 0.0, 1.0, 1.0, 1.0]),
+            (2, 2, vec![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0]),
+            (2, 3, vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0]),
+            (1, 3, vec![0.0, 0.0, 0.5, 1.0, 1.0, 1.0]),
+            // A run that straddles the domain-end index: `t1 = 2.0` is
+            // repeated only `degree + 1` times, and the last span is still
+            // empty. Counting the multiplicity of `t1` alone would miss it.
+            (1, 2, vec![-2.0, -1.0, 2.0, 2.0, 3.0]),
+        ] {
+            let error = KnotVector::new(degree, knots.clone()).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    NurbsError::DegenerateEndSpan { index: i, .. } if i == index
+                ),
+                "degree {degree} knots {knots:?} gave {error:?}"
+            );
+        }
+    }
+
+    /// Regression for of-sj1h: interior multiplicity above the degree used to
+    /// construct. Unlike an empty end span it evaluates finitely — what it
+    /// costs is continuity, so the "curve" is two disjoint loci and no
+    /// consumer downstream expects that.
+    #[test]
+    fn knot_vector_rejects_interior_multiplicity_above_the_degree() {
+        for (degree, index, multiplicity, knots) in [
+            (1, 2, 2, vec![0.0, 0.0, 0.5, 0.5, 1.0, 1.0]),
+            (2, 3, 3, vec![0.0, 0.0, 0.0, 0.5, 0.5, 0.5, 1.0, 1.0, 1.0]),
+            (
+                2,
+                3,
+                4,
+                vec![0.0, 0.0, 0.0, 0.5, 0.5, 0.5, 0.5, 1.0, 1.0, 1.0],
+            ),
+        ] {
+            let error = KnotVector::new(degree, knots.clone()).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    NurbsError::InteriorMultiplicityTooHigh { index: i, multiplicity: m, .. }
+                        if i == index && m == multiplicity
+                ),
+                "degree {degree} knots {knots:?} gave {error:?}"
+            );
+        }
+
+        // What stays accepted: interior multiplicity exactly the degree (a
+        // C^0 corner), fully clamped ends, and an unclamped vector.
+        assert!(KnotVector::new(2, vec![0.0, 0.0, 0.0, 0.5, 0.5, 1.0, 1.0, 1.0]).is_ok());
+        assert!(KnotVector::new(2, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]).is_ok());
+
+        // Degree 0 takes the same bound with no special case, so the only
+        // vector it admits is a single constant span.
+        assert!(KnotVector::new(0, vec![0.0, 1.0]).is_ok());
+        assert_eq!(
+            KnotVector::new(0, vec![0.0, 1.0, 2.0]).unwrap_err(),
+            NurbsError::InteriorMultiplicityTooHigh {
+                index: 1,
+                knot: 1.0,
+                multiplicity: 1,
+                degree: 0,
+            }
+        );
+    }
+
+    /// What the two rules above are for, checked exhaustively rather than by
+    /// example: over every non-decreasing knot vector of degree 0–3 drawn
+    /// from `{0, 1, 2, 3}` at the three shortest lengths — 1280 vectors, 139
+    /// of them accepted — an accepted vector evaluates finitely across its
+    /// whole domain, ends included, and so do its first two derivatives.
+    ///
+    /// This is the property the validator exists to establish. Before
+    /// of-sj1h the same sweep produced `[NaN, NaN, NaN]` at a domain end for
+    /// every vector whose first or last span was empty.
+    #[test]
+    fn every_accepted_knot_vector_evaluates_finitely() {
+        /// Non-decreasing sequences of `len` values drawn from `0..alphabet`.
+        fn sequences(len: usize, alphabet: usize) -> Vec<Vec<f64>> {
+            let mut out = vec![vec![]];
+            for _ in 0..len {
+                out = out
+                    .into_iter()
+                    .flat_map(|seq| {
+                        let start = seq.last().copied().unwrap_or(0.0) as usize;
+                        (start..alphabet).map(move |v| {
+                            let mut next = seq.clone();
+                            next.push(v as f64);
+                            next
+                        })
+                    })
+                    .collect();
+            }
+            out
+        }
+
+        let mut accepted = 0;
+        for degree in 0..=3usize {
+            for extra in 0..=2usize {
+                for knots in sequences(2 * (degree + 1) + extra, 4) {
+                    let Ok(kv) = KnotVector::new(degree, knots.clone()) else {
+                        continue;
+                    };
+                    accepted += 1;
+                    let count = kv.control_count();
+                    let points: Vec<Point3> = (0..count)
+                        .map(|i| Point3::new(i as f64, (i % 3) as f64, (i % 5) as f64))
+                        .collect();
+                    let curve = NurbsCurve::bspline(points, kv).expect("finite control points");
+                    let (t0, t1) = curve.domain();
+                    for i in 0..=16 {
+                        let t = t0 + (t1 - t0) * i as f64 / 16.0;
+                        let p = curve.point(t);
+                        assert!(
+                            is_finite(p),
+                            "degree {degree} knots {knots:?}: point({t}) = {p:?}"
+                        );
+                        for (k, d) in curve.derivatives(t, 2).iter().enumerate() {
+                            assert!(
+                                d.x.is_finite() && d.y.is_finite() && d.z.is_finite(),
+                                "degree {degree} knots {knots:?}: derivative {k} at {t} = {d:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(accepted, 139, "the accepted set changed shape");
+    }
+
+    /// Regression for of-sj1h: a NaN or infinite control point coordinate
+    /// used to construct and then evaluate to NaN. A STEP `CARTESIAN_POINT`
+    /// carries whatever the file says, and a real literal like `1E400`
+    /// parses to `+inf`.
+    #[test]
+    fn curve_rejects_non_finite_control_points() {
+        let knots = KnotVector::clamped_uniform(1, 3).unwrap();
+        for (index, bad) in [
+            (0, Point3::new(f64::NAN, 0.0, 0.0)),
+            (1, Point3::new(0.0, f64::INFINITY, 0.0)),
+            (2, Point3::new(0.0, 0.0, f64::NEG_INFINITY)),
+        ] {
+            let mut points = vec![Point3::new(0.0, 0.0, 0.0); 3];
+            points[index] = bad;
+            assert_eq!(
+                NurbsCurve::bspline(points.clone(), knots.clone()),
+                Err(NurbsError::NonFiniteControlPoint { index }),
+                "control points {points:?} were accepted"
+            );
+            assert_eq!(
+                NurbsCurve::new(points, vec![1.0; 3], knots.clone()),
+                Err(NurbsError::NonFiniteControlPoint { index })
+            );
+        }
+
+        // Large but finite coordinates are geometry, not an error.
+        assert!(
+            NurbsCurve::bspline(
+                vec![
+                    Point3::new(0.0, 0.0, 0.0),
+                    Point3::new(1e300, 0.0, 0.0),
+                    Point3::new(1.0, 1.0, 1.0),
+                ],
+                knots,
+            )
+            .is_ok()
+        );
     }
 
     /// `w <= 0.0` is false for NaN and for `+inf`, so both used to construct

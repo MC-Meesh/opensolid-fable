@@ -30,15 +30,22 @@
 //!   whose whole evaluation surface — `point`, `derivative`, `derivatives`,
 //!   `normal`, `insert_knot`, `reversed`, `control_hull_box` — returns.
 //! * **`KnotVector::new` enforces what it documents.** An accepted vector is
-//!   non-decreasing, long enough for its degree, and has a non-empty domain.
-//!   This is the assertion that catches a validator hole: a NaN knot, for
-//!   instance, passes a naive `<` monotonicity scan because every comparison
-//!   against NaN is false.
+//!   finite, non-decreasing, long enough for its degree, has a non-empty
+//!   domain, keeps its multiplicity inside the bounds Cox–de Boor is defined
+//!   for, and has width in the two spans at the domain ends. These are the
+//!   assertions that catch a validator hole: a NaN knot, for instance, passes
+//!   a naive `<` monotonicity scan because every comparison against NaN is
+//!   false, and a knot run covering a domain end can leave the span
+//!   `find_span` hands to `basis_funs` empty.
+//! * **A rejection names a real culprit.** Every validated rejection —
+//!   non-positive weight, non-finite control point — is checked against the
+//!   value it points at. A constructor that rejects valid geometry is as much
+//!   a bug as one that accepts invalid geometry.
 //!
-//! *Conditional on a well-formed spec* (finite bounded control points, finite
-//! positive weights, finite knots with interior multiplicity at most the
-//! degree — see [`WellFormed`]) the harness additionally asserts the
-//! mathematical identities that make a NURBS implementation correct:
+//! *Conditional on a well-formed spec* (control points and weights of
+//! reasonable magnitude, a knot domain of finite extent — see [`WellFormed`]
+//! and [`Coord::is_tame`]) the harness additionally asserts the mathematical
+//! identities that make a NURBS implementation correct:
 //!
 //! * **Finiteness.** Evaluation and derivatives are finite everywhere in the
 //!   domain.
@@ -164,6 +171,14 @@ impl Coord {
     }
 
     /// Whether this value keeps the geometric oracles meaningful.
+    ///
+    /// This is a *magnitude* screen, not a validity one: `Nan` and `Infinite`
+    /// coordinates no longer reach a constructed curve or surface at all
+    /// (`NonFiniteControlPoint`, of-sj1h), and the rejection is asserted
+    /// where it happens. What is screened out here is `Huge`, whose sums
+    /// overflow to infinity inside an otherwise correct evaluation, and
+    /// `Tiny`, whose hull is too thin for a relative tolerance to mean
+    /// anything.
     fn is_tame(self) -> bool {
         matches!(self, Coord::Tame(_))
     }
@@ -206,37 +221,18 @@ impl Weight {
 struct WellFormed;
 
 impl WellFormed {
-    /// A knot vector whose knots are finite, whose interior multiplicity does
-    /// not exceed the degree, and whose end multiplicities do not exceed
-    /// `degree + 1`. Cox–de Boor is only defined under these conditions;
-    /// `KnotVector::new` deliberately accepts a wider set (a raw AP203 knot
-    /// list is not required to be clamped), so the harness screens here
-    /// rather than asserting the wider set is rejected.
+    /// A knot vector whose domain has a finite extent.
+    ///
+    /// Finiteness and the multiplicity bounds Cox–de Boor needs used to be
+    /// screened here too, because `KnotVector::new` accepted vectors past
+    /// them; it now rejects them (of-sj1h) and `build_knots` asserts so,
+    /// which is strictly stronger than screening. What remains is a
+    /// magnitude condition rather than a validity one: knots of `±1e300` are
+    /// each finite while the domain they span overflows to infinity, and the
+    /// geometric oracles below sample that domain by interpolation.
     fn knots(kv: &KnotVector) -> bool {
-        let knots = kv.knots();
-        let p = kv.degree();
-        if !knots.iter().all(|k| k.is_finite()) {
-            return false;
-        }
         let (t0, t1) = kv.domain();
-        if !(t1 - t0).is_finite() || t1 <= t0 {
-            return false;
-        }
-        let mut i = 0;
-        while i < knots.len() {
-            let mut j = i;
-            while j < knots.len() && knots[j] == knots[i] {
-                j += 1;
-            }
-            let multiplicity = j - i;
-            let at_end = knots[i] <= t0 || knots[i] >= t1;
-            let limit = if at_end { p + 1 } else { p };
-            if multiplicity > limit {
-                return false;
-            }
-            i = j;
-        }
-        true
+        (t1 - t0).is_finite()
     }
 }
 
@@ -293,11 +289,16 @@ fn build_knots(spec: &KnotSpec) -> Option<KnotVector> {
 
     // Documented invariants of an accepted knot vector.
     let knots = kv.knots();
+    let p = kv.degree();
     assert!(
         knots.len() >= 2 * (kv.degree() + 1),
         "KnotVector::new accepted {} knots for degree {}",
         knots.len(),
         kv.degree()
+    );
+    assert!(
+        knots.iter().all(|k| k.is_finite()),
+        "KnotVector::new accepted a non-finite knot in {knots:?}"
     );
     for i in 1..knots.len() {
         assert!(
@@ -316,6 +317,35 @@ fn build_knots(spec: &KnotSpec) -> Option<KnotVector> {
         kv.control_count(),
         knots.len() - kv.degree() - 1,
         "control_count disagrees with the knot count"
+    );
+
+    // Multiplicity bounds: at most `degree` strictly inside the domain, at
+    // most `degree + 1` at or outside its ends. These used to be a screen in
+    // `WellFormed::knots`; the validator enforces them now (of-sj1h), so they
+    // are an oracle instead.
+    let mut i = 0;
+    while i < knots.len() {
+        let mut j = i + 1;
+        while j < knots.len() && knots[j] == knots[i] {
+            j += 1;
+        }
+        let interior = knots[i] > t0 && knots[i] < t1;
+        let limit = if interior { p } else { p + 1 };
+        assert!(
+            j - i <= limit,
+            "KnotVector::new accepted knot {} repeated {} times (limit {limit}) in {knots:?} at degree {p}",
+            knots[i],
+            j - i
+        );
+        i = j;
+    }
+    // And the two spans at the domain ends have width, which the bounds above
+    // do not imply: a run can straddle a domain-end index and stay within
+    // `degree + 1`. `find_span` returns those two spans unchecked, so an
+    // empty one divides the basis into NaN rather than merely going unused.
+    assert!(
+        knots[p] < knots[p + 1] && knots[kv.control_count() - 1] < knots[kv.control_count()],
+        "KnotVector::new accepted an empty end span in {knots:?} at degree {p}"
     );
 
     // `find_span` must always land on a usable span, including at and beyond
@@ -381,6 +411,13 @@ fn run_curve(spec: &CurveSpec) {
             assert!(
                 !(weight.is_finite() && weight > 0.0),
                 "rejected finite positive weight {weight} at index {index}"
+            );
+        }
+        Err(NurbsError::NonFiniteControlPoint { index }) => {
+            let point = points[index];
+            assert!(
+                !(point.x.is_finite() && point.y.is_finite() && point.z.is_finite()),
+                "rejected finite control point {point:?} at index {index}"
             );
         }
         // Any other rejection is a shape/count mismatch: nothing to check
@@ -543,8 +580,30 @@ fn run_surface(spec: &SurfaceSpec) {
         .map(|i| (0..cols).map(|j| weights[i * cols + j].value()).collect())
         .collect();
 
-    let Ok(surface) = NurbsSurface::new(grid, weight_grid, ku.clone(), kv.clone()) else {
-        return;
+    // Both rejections name a position in the flattened row-major grid, and
+    // both must name one that really is invalid — a constructor that rejects
+    // valid geometry is as much a bug as one that accepts invalid geometry.
+    let flat_points: Vec<Point3> = grid.iter().flatten().copied().collect();
+    let flat_weights: Vec<f64> = weight_grid.iter().flatten().copied().collect();
+    let surface = match NurbsSurface::new(grid, weight_grid, ku.clone(), kv.clone()) {
+        Err(NurbsError::NonPositiveWeight { index }) => {
+            let weight = flat_weights[index];
+            assert!(
+                !(weight.is_finite() && weight > 0.0),
+                "rejected finite positive weight {weight} at flat index {index}"
+            );
+            return;
+        }
+        Err(NurbsError::NonFiniteControlPoint { index }) => {
+            let point = flat_points[index];
+            assert!(
+                !(point.x.is_finite() && point.y.is_finite() && point.z.is_finite()),
+                "rejected finite control point {point:?} at flat index {index}"
+            );
+            return;
+        }
+        Err(_) => return,
+        Ok(surface) => surface,
     };
 
     let tame = WellFormed::knots(&ku)

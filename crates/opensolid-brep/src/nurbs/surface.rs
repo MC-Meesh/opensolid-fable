@@ -14,7 +14,7 @@
 //! Evaluation outside the knot domains clamps both parameters (clamped
 //! surfaces do not extrapolate).
 
-use crate::nurbs::curve::{KnotVector, NurbsError, binomial};
+use crate::nurbs::curve::{KnotVector, NurbsError, binomial, is_finite};
 use crate::surface::SurfaceEval;
 use nalgebra::Vector4;
 use opensolid_core::SYSTEM_RESOLUTION;
@@ -38,7 +38,8 @@ impl NurbsSurface {
     /// Rational surface from a grid of weighted control points.
     /// `control_points[i][j]` pairs with `weights[i][j]`; the grid must be
     /// rectangular with `knots_u.control_count()` rows of
-    /// `knots_v.control_count()` points, and all weights positive.
+    /// `knots_v.control_count()` points, all weights finite and positive,
+    /// and all control point coordinates finite.
     pub fn new(
         control_points: Vec<Vec<Point3>>,
         weights: Vec<Vec<f64>>,
@@ -78,8 +79,15 @@ impl NurbsSurface {
         {
             return Err(NurbsError::NonPositiveWeight { index });
         }
+        let flat_points: Vec<Point3> = control_points.into_iter().flatten().collect();
+        // Finite coordinates, for the reason given in `NurbsCurve::new`. The
+        // reported index is into the flattened row-major grid, as
+        // `NonPositiveWeight`'s is.
+        if let Some(index) = flat_points.iter().position(|p| !is_finite(*p)) {
+            return Err(NurbsError::NonFiniteControlPoint { index });
+        }
         Ok(Self {
-            control_points: control_points.into_iter().flatten().collect(),
+            control_points: flat_points,
             weights: flat_weights,
             knots_u,
             knots_v,
@@ -1202,5 +1210,43 @@ mod tests {
             KnotVector::new(1, vec![0.0, 0.0, f64::NAN, 1.0, 1.0, 1.0]),
             Err(NurbsError::NonFiniteKnot { index: 2, .. })
         ));
+    }
+
+    /// Regression for of-sj1h: a non-finite control point coordinate used to
+    /// construct and then evaluate to NaN across the whole patch. The
+    /// reported index is into the flattened row-major grid, matching
+    /// `NonPositiveWeight`.
+    #[test]
+    fn surface_rejects_non_finite_control_points() {
+        let knots_u = KnotVector::clamped_uniform(1, 2).unwrap();
+        let knots_v = KnotVector::clamped_uniform(1, 2).unwrap();
+        for (index, bad) in [
+            (0, Point3::new(f64::NAN, 0.0, 0.0)),
+            (1, Point3::new(0.0, f64::INFINITY, 0.0)),
+            (3, Point3::new(0.0, 0.0, f64::NEG_INFINITY)),
+        ] {
+            let mut flat = [
+                Point3::new(0.0, 0.0, 0.0),
+                Point3::new(1.0, 0.0, 0.0),
+                Point3::new(0.0, 1.0, 0.0),
+                Point3::new(1.0, 1.0, 0.0),
+            ];
+            flat[index] = bad;
+            let grid = vec![flat[..2].to_vec(), flat[2..].to_vec()];
+            assert_eq!(
+                NurbsSurface::bspline(grid.clone(), knots_u.clone(), knots_v.clone()),
+                Err(NurbsError::NonFiniteControlPoint { index }),
+                "grid {grid:?} was accepted"
+            );
+            assert_eq!(
+                NurbsSurface::new(
+                    grid,
+                    vec![vec![1.0, 1.0]; 2],
+                    knots_u.clone(),
+                    knots_v.clone()
+                ),
+                Err(NurbsError::NonFiniteControlPoint { index })
+            );
+        }
     }
 }
