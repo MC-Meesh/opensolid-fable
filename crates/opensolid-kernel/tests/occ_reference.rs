@@ -23,8 +23,11 @@
 //! - **Solid count** — exact. OCC's solid list is one entry per *placed
 //!   occurrence*, which is our `instances` list, not our `solids` list
 //!   (as1-oc-214 is 5 parts placed 18 times). Both must agree.
-//! - **Face count** — exact, on every file. Two kernels reading the same
-//!   `ADVANCED_FACE` set have no license to disagree, and today none do.
+//! - **Face count** — exact, on every file that imports as a B-Rep. Two
+//!   kernels reading the same `ADVANCED_FACE` set have no license to
+//!   disagree, and today none do. A file that imports only through the mesh
+//!   fallback ([`MESH_ONLY_FILES`]) has no B-Rep topology to compare and is
+//!   held to the solid count and the measurements instead.
 //! - **Edge / vertex count** — exact, against OCC's count minus a per-file
 //!   delta recorded in [`SEAM_DELTAS`]. OCC rebuilds closed faces with
 //!   explicit seam and degenerate edges that the file never spelled; we keep
@@ -90,17 +93,38 @@ const KNOWN_IMPORT_FAILURES: &[(&str, &str)] = &[
     // of-kwn: verify_trim's tolerance is tighter than the vertex slop CATIA
     // authored into this part's CIRCLE edges.
     ("nist/nist_ctc_05_asme1_rd.stp", "of-kwn"),
-    // of-05ac: these two lost the exact path when of-bb6 started measuring
-    // imported edge tolerances — each carries an edge further from its face's
-    // surface than MAX_ALLOWED_TOLERANCE, so there is no tolerance the kernel
-    // could give it honestly — and the mesh fallback does not close for
-    // either, which is what turns a degrade into a loss. The refusal is
-    // right in both cases (nist_ctc_02 has authored gaps to 0.0386 mm;
-    // bspline_patch_prism's surface is mis-sized by of-8ulj and does not
-    // contain its own face at all). The fallback failing is not: of-05ac
-    // takes both files off this list and back into the step_corpus floors.
-    ("nist/nist_ctc_02_asme1_rc.stp", "of-05ac"),
-    ("occ/nurbs/bspline_patch_prism.stp", "of-05ac"),
+    // of-aoml: this one lost the exact path when of-bb6 started measuring
+    // imported edge tolerances — its authored curve/surface gaps reach
+    // 0.0386 mm, four times MAX_ALLOWED_TOLERANCE, so there is no tolerance
+    // the kernel could give it honestly. Refusing it is right; losing it is
+    // not, and of-05ac got the mesh fallback as far as a closed manifold
+    // shell (0 open edges and 0 pinched, down from 15843 and 14569). What
+    // still keeps it here is one step further on: the fallback's CDT leaves
+    // flat triangles on the rims of the part's tilted bores, facing into the
+    // plate's own triangles, so the rim vertices between them have no
+    // pseudonormal and MeshSdf::new refuses the shell. of-aoml is that.
+    ("nist/nist_ctc_02_asme1_rc.stp", "of-aoml"),
+];
+
+/// Corpus files with at least one solid that imports, but only through the
+/// mesh fallback. Every entry names the bug that keeps it off the exact path;
+/// the test asserts this set *equals* the observed one, in both directions —
+/// a file that quietly stops being exact is caught here rather than passing
+/// the count gates below by being skipped.
+///
+/// These files are held to everything a mesh can answer for — they are in the
+/// pass-rate floor, and `MEASURED_FILES` may measure their volume, area and
+/// centroid off the mesh — but not to the B-Rep topology counts. A fallback
+/// mesh has no faces, edges or vertices in the B-Rep sense, so comparing its
+/// zero against OCC's count says nothing about the reader (of-05ac).
+const MESH_ONLY_FILES: &[(&str, &str)] = &[
+    // of-8ulj: the SURFACE_OF_LINEAR_EXTRUSION patch the reader builds for
+    // this part's four swept faces is a twentieth of the length it needs and
+    // points the other way, so it does not contain its own face and the exact
+    // path refuses the edges as 20 mm off their surface. The fallback keeps
+    // the swept form instead, whose span comes from the face's own boundary
+    // and cannot be mis-sized, and closes the solid (of-05ac).
+    ("occ/nurbs/bspline_patch_prism.stp", "of-8ulj"),
 ];
 
 /// Per-file (edges, vertices) that OCC reports *in addition* to ours.
@@ -306,6 +330,9 @@ struct OurImport {
     solids: Vec<OurSolid>,
     /// Some solid failed to import at all.
     has_failure: bool,
+    /// Some solid took the mesh fallback rather than the exact path, so the
+    /// file has less B-Rep topology than its faces suggest — possibly none.
+    has_mesh: bool,
 }
 
 /// One solid, either as the reader imported it (a prototype) or as the
@@ -377,6 +404,7 @@ fn import_file(file: &Path, measure: bool) -> OurImport {
     };
     let mut prototypes: Vec<Option<OurSolid>> = Vec::new();
     let mut has_failure = false;
+    let mut has_mesh = false;
     for solid in &report.solids {
         match &solid.outcome {
             SolidOutcome::BRep(body) => {
@@ -393,6 +421,7 @@ fn import_file(file: &Path, measure: bool) -> OurImport {
             SolidOutcome::Mesh { mesh, .. } => {
                 // A fallback mesh carries no B-Rep topology to count, but it
                 // is still measurable.
+                has_mesh = true;
                 prototypes.push(Some(OurSolid {
                     faces: 0,
                     edges: 0,
@@ -431,6 +460,7 @@ fn import_file(file: &Path, measure: bool) -> OurImport {
     OurImport {
         solids,
         has_failure,
+        has_mesh,
     }
 }
 
@@ -545,6 +575,28 @@ fn only_the_documented_files_fail_to_import() {
     );
 }
 
+/// The files that import only as a mesh are exactly the documented ones.
+/// Gated as an equality for the same reason as the failure set: the topology
+/// gates below skip these files, so a file degrading to the fallback would
+/// otherwise buy itself silence from them.
+#[test]
+fn only_the_documented_files_import_as_a_mesh() {
+    let mut meshed: Vec<&str> = corpus()
+        .iter()
+        .filter(|(_, _, ours)| ours.has_mesh)
+        .map(|(name, _, _)| name.as_str())
+        .collect();
+    let mut expected: Vec<&str> = MESH_ONLY_FILES.iter().map(|(f, _)| *f).collect();
+    expected.sort();
+    meshed.sort();
+    assert_eq!(
+        meshed, expected,
+        "the set of files that import only as a mesh changed — if one now \
+         takes the exact path, drop it from MESH_ONLY_FILES; if a new one \
+         degraded to the fallback, that is a reader regression"
+    );
+}
+
 /// Solid count and face count must match OCC exactly, on every file that
 /// imports. The solid count is compared against our *instances*: OCC lists
 /// placed occurrences, so an assembly's 5 parts placed 18 times is 18.
@@ -560,6 +612,11 @@ fn occ_agrees_on_solid_and_face_counts() {
             totals.field("solids").as_usize(),
             "{name}: solid occurrence count differs from OCC"
         );
+        // A mesh solid is still an occurrence, and counted as one above, but
+        // it has no B-Rep faces to hold against OCC's.
+        if lookup(MESH_ONLY_FILES, name).is_some() {
+            continue;
+        }
         let (faces, _, _) = ours.totals();
         assert_eq!(
             faces,
@@ -574,7 +631,8 @@ fn occ_agrees_on_solid_and_face_counts() {
 fn occ_agrees_on_edge_and_vertex_counts_up_to_seams() {
     let mut unused: Vec<&str> = SEAM_DELTAS.iter().map(|(f, _, _)| *f).collect();
     for (name, reference, ours) in corpus() {
-        if lookup(KNOWN_IMPORT_FAILURES, name).is_some() {
+        if lookup(KNOWN_IMPORT_FAILURES, name).is_some() || lookup(MESH_ONLY_FILES, name).is_some()
+        {
             continue;
         }
         let totals = reference.field("totals");

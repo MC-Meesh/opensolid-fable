@@ -163,15 +163,16 @@
 //! }
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use opensolid_brep::curve::plane_basis;
 use opensolid_brep::triangulate::{ear_clip_rings, signed_area2};
 use opensolid_brep::{
     Body, BodyType, Curve3, CurveEval, CurveProject, Edge, Face, FaceSense, Fin, FinSense,
     GeometryStore, KnotVector, Loop, LoopType, MAX_ALLOWED_TOLERANCE, NurbsCurve, NurbsError,
-    NurbsSurface, SYSTEM_RESOLUTION, Shell, ShellOrientation, Surface3, SurfaceEval,
+    NurbsSurface, QuadricUSpan, SYSTEM_RESOLUTION, Shell, ShellOrientation, Surface3, SurfaceEval,
     SurfaceProject, TessellationOptions, TopologyStore, Vertex, attach_body_pcurves,
+    quadric_u_span, triangulate_bounded_face,
 };
 use opensolid_core::error::CoreError;
 use opensolid_core::mesh::TriangleMesh;
@@ -1048,6 +1049,49 @@ fn resolve_surface(
         }
         other => Err(unsupported(id, format!("surface type {other}"))),
     }
+}
+
+/// [`resolve_surface`] as the mesh fallback needs it. The two differ in one
+/// place: a `SURFACE_OF_LINEAR_EXTRUSION` over a NURBS basis keeps its swept
+/// form here instead of reducing to the ruled patch the exact path builds.
+///
+/// That reduction spans exactly one `dir` (of-8ulj) while the face standing
+/// on the surface reaches wherever its own edges say — routinely the other
+/// way, and twenty times as far — so the patch need not contain its own
+/// face, and meshing it tessellates empty space. The swept form recovers its
+/// span from the face's boundary, so it cannot be mis-sized. The exact path
+/// needs the patch (a `RawSurface::Extruded` has no geometry to store);
+/// tessellation does not.
+fn resolve_surface_for_mesh(
+    file: &StepFile,
+    id: u64,
+    referrer: u64,
+    scale: f64,
+    angle_scale: f64,
+) -> MapResult<RawSurface> {
+    let inst = instance(file, id, referrer)?;
+    let extrusion = inst
+        .as_simple()
+        .filter(|rec| rec.type_name == "SURFACE_OF_LINEAR_EXTRUSION");
+    let Some(rec) = extrusion else {
+        return resolve_surface(file, id, referrer, scale, angle_scale);
+    };
+    let basis = resolve_curve(file, ref_attr(rec, 1, id)?, id, scale, angle_scale)?;
+    let dir = resolve_vector(file, ref_attr(rec, 2, id)?, id, scale)?;
+    let dir_norm = dir.norm();
+    if dir_norm < 1e-12 || !dir_norm.is_finite() {
+        return Err(invalid(
+            id,
+            "SURFACE_OF_LINEAR_EXTRUSION axis is degenerate",
+        ));
+    }
+    if let Some(reduced) = reduce_extrusion(basis.analytic_basis(), &dir, id)? {
+        return Ok(RawSurface::Analytic(reduced));
+    }
+    Ok(RawSurface::Extruded {
+        basis: Box::new(basis),
+        dir,
+    })
 }
 
 /// Reduction acceptance tolerance for swept-surface geometry: directions
@@ -2782,6 +2826,317 @@ fn angular_segments(sweep: f64, options: &TessellationOptions) -> usize {
     ((sweep.abs() / options.angular_step).ceil() as usize).max(3)
 }
 
+/// How far along `unit` the point `p` sits from the swept profile — the `v`
+/// for which `p ≈ profile(t) + unit * v`, found by matching `p`'s component
+/// perpendicular to `unit` against the profile polyline's.
+///
+/// Measuring from a single profile point instead is right only when the
+/// profile is flat across `unit`, and a `SURFACE_OF_LINEAR_EXTRUSION` carries
+/// no such promise: `bspline_patch_prism`'s arched B-spline rises 6.25 mm
+/// along the very axis it is extruded down. Read from the profile's start,
+/// that rise counts as sweep, and the swept rows land 6.25 mm past the rim
+/// the neighbouring cap meets — 40 of the file's 168 open edges (of-05ac).
+fn sweep_offset(profile: &[Point3], unit: &Vector3, p: &Point3) -> f64 {
+    let perp = |q: &Point3| -> Vector3 {
+        let d = q - profile[0];
+        d - unit * d.dot(unit)
+    };
+    let target = perp(p);
+    let mut nearest = f64::INFINITY;
+    let mut offset = 0.0;
+    for pair in profile.windows(2) {
+        let (a, b) = (perp(&pair[0]), perp(&pair[1]));
+        let span = b - a;
+        let t = if span.norm_squared() > 0.0 {
+            ((target - a).dot(&span) / span.norm_squared()).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let distance = (target - (a + span * t)).norm();
+        if distance < nearest {
+            nearest = distance;
+            offset = (p - (pair[0] + (pair[1] - pair[0]) * t)).dot(unit);
+        }
+    }
+    offset
+}
+
+/// Fraction of a face's boundary extent within which a boundary point still
+/// counts as lying on that face's surface, for the sole purpose of giving it
+/// a `uv` in [`triangulate_bounded_face`].
+///
+/// Ten times what the B-Rep tessellator allows a *stored* face, and for the
+/// reason the fallback exists at all: it runs only because the exact path
+/// refused the body, and for the files that most need it the refusal is
+/// precisely that their edges miss their faces' surfaces. nist_ctc_02's
+/// authored gaps reach 0.0386 mm — four times [`MAX_ALLOWED_TOLERANCE`] —
+/// and its four B-spline pockets carry 0.028 mm against a stored face's
+/// 0.0279 mm allowance, so the tighter band refuses them a second time by
+/// the barest margin and the untrimmed grid it falls back to loses the whole
+/// solid.
+///
+/// Widening is nearly free here, because a `uv` on this path only ever
+/// *places* a 3D point the ring already owns and never produces one: a loose
+/// one costs triangulation combinatorics and shading, never position. It is
+/// still a fraction of the face rather than an absolute, so a part modelled a
+/// kilometre from the origin behaves like one at it (the of-260 lesson).
+const FALLBACK_BOUNDARY_BAND_FRACTION: f64 = 1e-3;
+
+/// Whether any triangle is a sliver — three corners collinear at the relative
+/// measure [`MeshSdf::new`] refuses a mesh by, leaving it no normal to take.
+///
+/// A cone is the surface that produces them: its rulings are straight lines
+/// *through the apex*, and the apex is a chart pole, so three parameter points
+/// the chart sees well spread out — two on one ruling, one on the pole row —
+/// land exactly collinear in 3D. Every other family curves along both
+/// parameters and cannot do it; nist_ctc_02's countersinks did it 404 times.
+fn has_sliver(mesh: &TriangleMesh) -> bool {
+    mesh.indices
+        .iter()
+        .any(|&tri| collinear_middle(mesh, tri).is_some())
+}
+
+/// Which corner of a triangle sits *between* the other two, if the three are
+/// collinear at the relative measure [`MeshSdf`] refuses a triangle by. `None`
+/// for a triangle with real area.
+fn collinear_middle(mesh: &TriangleMesh, tri: [usize; 3]) -> Option<usize> {
+    let [a, b, c] = tri.map(|i| mesh.positions[i]);
+    let sides = [
+        ((c - b).norm_squared(), 0), // opposite corner 0
+        ((c - a).norm_squared(), 1),
+        ((b - a).norm_squared(), 2),
+    ];
+    let longest = sides.iter().map(|&(len, _)| len).fold(0.0, f64::max);
+    if (b - a).cross(&(c - a)).norm() > 1e-12 * longest {
+        return None;
+    }
+    // The middle corner is the one facing the longest side.
+    sides
+        .iter()
+        .max_by(|x, y| x.0.total_cmp(&y.0))
+        .map(|&(_, corner)| corner)
+}
+
+/// Fold every triangle `doomed_corner` picks out into the neighbour across the
+/// side opposite that corner, and return how many went. The corner is dropped
+/// onto that side, so the pair of triangles that results covers what the two
+/// covered before, minus the offending triangle's own (negligible) area.
+///
+/// One caller today, [`collinear_middle`], for the slivers a cone's rulings
+/// hand the CDT: [`MeshSdf::new`] refuses those outright, and a fallback that
+/// kept them faithfully would deliver `SolidOutcome::Failed` instead of a
+/// solid, which is the whole of what of-05ac is about. The predicate is a
+/// parameter because the shape of the repair — drop the corner onto the side
+/// facing it — suits any triangle whose area is not worth keeping, and
+/// of-aoml's flat rim flaps are the next candidate.
+fn absorb_triangles(
+    mesh: &mut TriangleMesh,
+    passes: usize,
+    doomed_corner: impl Fn(&TriangleMesh, [usize; 3]) -> Option<usize>,
+) -> usize {
+    let key = |a: usize, b: usize| if a < b { (a, b) } else { (b, a) };
+    let mut absorbed = 0;
+    for _ in 0..passes {
+        let mut across: HashMap<(usize, usize), Vec<usize>> = HashMap::new();
+        for (index, tri) in mesh.indices.iter().enumerate() {
+            for k in 0..3 {
+                let (a, b) = (tri[k], tri[(k + 1) % 3]);
+                if a != b {
+                    across.entry(key(a, b)).or_default().push(index);
+                }
+            }
+        }
+        let mut doomed: HashSet<usize> = HashSet::new();
+        let original = mesh.indices.len();
+        for index in 0..original {
+            if doomed.contains(&index) {
+                continue;
+            }
+            let tri = mesh.indices[index];
+            let Some(corner) = doomed_corner(mesh, tri) else {
+                continue;
+            };
+            let (m, a, b) = (tri[corner], tri[(corner + 1) % 3], tri[(corner + 2) % 3]);
+            // Exactly one live neighbour to hand the area to.
+            let others: Vec<usize> = across
+                .get(&key(a, b))
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(|&t| t != index && !doomed.contains(&t))
+                .collect();
+            if others.len() != 1 {
+                continue;
+            }
+            let neighbour = others[0];
+            let was = mesh.indices[neighbour];
+            split_triangle_edge(mesh, neighbour, a, b, m);
+            if mesh.indices[neighbour] == was {
+                continue; // the neighbour no longer carries the edge
+            }
+            // Keep `across` current so a chain of adjacent flaps clears in one
+            // pass; rebuilding per absorption is what made this quadratic.
+            let added = mesh.indices.len() - 1;
+            for (triangle, corners) in [(index, tri), (neighbour, was), (usize::MAX, [0, 0, 0])] {
+                if triangle == usize::MAX {
+                    continue;
+                }
+                for k in 0..3 {
+                    if let Some(slot) = across.get_mut(&key(corners[k], corners[(k + 1) % 3])) {
+                        slot.retain(|&t| t != triangle);
+                    }
+                }
+            }
+            for triangle in [neighbour, added] {
+                let corners = mesh.indices[triangle];
+                for k in 0..3 {
+                    let (u, v) = (corners[k], corners[(k + 1) % 3]);
+                    if u != v {
+                        across.entry(key(u, v)).or_default().push(triangle);
+                    }
+                }
+            }
+            doomed.insert(index);
+            absorbed += 1;
+        }
+        if doomed.is_empty() {
+            break;
+        }
+        let mut seen = 0;
+        mesh.indices.retain(|_| {
+            seen += 1;
+            !doomed.contains(&(seen - 1))
+        });
+    }
+    absorbed
+}
+
+/// How many times [`absorb_triangles`] sweeps before giving up. Folding a
+/// corner onto its opposite side leaves the neighbour split into two thinner
+/// triangles, one of which can be thin enough to qualify itself — so the pass
+/// has to be bounded rather than run to a fixed point, or it walks across a
+/// face absorbing the debris of its own repairs. A few sweeps clear an isolated
+/// artefact and the consequences of clearing it, which is all a cone's slivers
+/// are — they sit one to a ruling, not in sheets.
+const ABSORB_PASSES: usize = 4;
+
+/// The triangles traversing one undirected edge, split by direction: those
+/// that run it low index to high, and those that run it the other way.
+type Traversals = (Vec<usize>, Vec<usize>);
+
+/// Split every edge that more than two triangles share, until each is shared
+/// by exactly two, and return how many splits it took. Nothing moves: the new
+/// vertex sits at the edge's own midpoint, so the two triangles it replaces
+/// cover exactly the area they did before.
+///
+/// This repairs the one non-manifold configuration the fallback produces on a
+/// mesh that is otherwise watertight — two adjacent faces independently
+/// drawing the same **chord** between two vertices of the boundary they
+/// share. Neither is wrong to: each triangulates that boundary in its own
+/// parameter space, where the shared polyline curves differently, so a chord
+/// convex on one face's side can be convex on the other's too. nist_ctc_02's
+/// bottom plate and the tilted bore through it do exactly this at seven
+/// chords of the bore's rim, and the shell is closed apart from them.
+///
+/// Splitting one of the two sheets breaks the tie: the edge is left to the
+/// sheet that keeps it, and the other reaches the same two vertices through a
+/// midpoint of its own. Which sheet keeps it does not matter — every vertex
+/// involved is shared, so the triangles cover the same surface either way,
+/// and it is that surface, not the connectivity, that the mesh SDF reads.
+///
+/// An edge whose two traversal directions are *unbalanced* is left alone: the
+/// mesh is inconsistently oriented there, which is a different defect, and
+/// pairing across it would only hide it from [`ManifoldDefects`].
+fn split_shared_edges(mesh: &mut TriangleMesh) -> usize {
+    let mut splits = 0;
+    loop {
+        // Each undirected edge, with the triangles that traverse it each way.
+        let mut uses: HashMap<(usize, usize), Traversals> = HashMap::new();
+        for (index, tri) in mesh.indices.iter().enumerate() {
+            for k in 0..3 {
+                let (a, b) = (tri[k], tri[(k + 1) % 3]);
+                if a == b {
+                    continue;
+                }
+                let slot = uses.entry(if a < b { (a, b) } else { (b, a) }).or_default();
+                if a < b { &mut slot.0 } else { &mut slot.1 }.push(index);
+            }
+        }
+        // Deterministic order: the map's iteration order is not.
+        let mut overused: Vec<((usize, usize), Traversals)> = uses
+            .into_iter()
+            .filter(|(_, (fwd, back))| fwd.len() > 1 && fwd.len() == back.len())
+            .collect();
+        if overused.is_empty() {
+            return splits;
+        }
+        overused.sort_by_key(|(edge, _)| *edge);
+        // As many edges per pass as touch disjoint triangles. A triangle can
+        // carry two overused edges, and splitting rewrites it, so the second
+        // one waits for the next pass rather than reading a stale index.
+        let mut touched: HashSet<usize> = HashSet::new();
+        let mut progressed = false;
+        for ((a, b), (fwd, back)) in overused {
+            if fwd.iter().chain(&back).any(|t| touched.contains(t)) {
+                continue;
+            }
+            touched.extend(fwd.iter().chain(&back));
+            for (&front, &rear) in fwd[1..].iter().zip(&back[1..]) {
+                let midpoint = mesh.positions.len();
+                mesh.positions.push(Point3::from(
+                    mesh.positions[a]
+                        .coords
+                        .lerp(&mesh.positions[b].coords, 0.5),
+                ));
+                let normal = mesh.normals[a] + mesh.normals[b];
+                mesh.normals.push(if normal.norm() > 0.0 {
+                    normal.normalize()
+                } else {
+                    Vector3::zeros()
+                });
+                for triangle in [front, rear] {
+                    split_triangle_edge(mesh, triangle, a, b, midpoint);
+                }
+                splits += 1;
+                progressed = true;
+            }
+        }
+        if !progressed {
+            return splits;
+        }
+    }
+}
+
+/// Replace triangle `index`'s edge `a`–`b` with the two triangles that meet
+/// at `midpoint`, keeping the original winding.
+fn split_triangle_edge(mesh: &mut TriangleMesh, index: usize, a: usize, b: usize, midpoint: usize) {
+    let tri = mesh.indices[index];
+    let Some(k) = (0..3).find(|&k| {
+        let (u, v) = (tri[k], tri[(k + 1) % 3]);
+        (u == a && v == b) || (u == b && v == a)
+    }) else {
+        return;
+    };
+    let (from, to, apex) = (tri[k], tri[(k + 1) % 3], tri[(k + 2) % 3]);
+    mesh.indices[index] = [from, midpoint, apex];
+    mesh.indices.push([midpoint, to, apex]);
+}
+
+/// Diagonal of a ring's 3D bounding box — the size measure that picks a
+/// curved face's outer bound, and scales that face's tolerances. Signed area
+/// cannot do the first: on a curved face the rings share no projection plane.
+fn ring_extent(ring: &[Point3]) -> f64 {
+    let Some(first) = ring.first() else {
+        return 0.0;
+    };
+    let (mut lo, mut hi) = (*first, *first);
+    for p in ring {
+        lo = Point3::new(lo.x.min(p.x), lo.y.min(p.y), lo.z.min(p.z));
+        hi = Point3::new(hi.x.max(p.x), hi.y.max(p.y), hi.z.max(p.z));
+    }
+    (hi - lo).norm()
+}
+
 /// Minimum grid resolution per parameter direction of a NURBS patch.
 const NURBS_MIN_SEGMENTS: usize = 8;
 
@@ -2840,12 +3195,30 @@ impl FallbackMesher<'_> {
             .bounding_box()
             .map(|b| (b.max - b.min).norm() * 1e-7)
             .unwrap_or(0.0);
-        let welded = mesh.weld(epsilon);
+        let mut welded = mesh.weld(epsilon);
+        let absorbed = absorb_triangles(&mut welded, ABSORB_PASSES, collinear_middle);
+        let split = split_shared_edges(&mut welded);
+        if absorbed > 0 || split > 0 {
+            self.diagnostics.push(Diagnostic {
+                entity: Some(msb_id),
+                severity: Severity::Info,
+                message: format!(
+                    "welded shell repaired: {absorbed} zero-area triangle(s) absorbed, \
+                     {split} edge(s) two faces drew at once split apart"
+                ),
+            });
+        }
         if !welded.is_closed_manifold() {
             self.diagnostics.push(Diagnostic {
                 entity: Some(msb_id),
                 severity: Severity::Error,
-                message: "fallback tessellation is not a closed manifold".to_string(),
+                message: format!(
+                    "fallback tessellation is not a closed manifold: {}",
+                    welded
+                        .manifold_defects()
+                        .describe()
+                        .unwrap_or_else(|| "?".to_string())
+                ),
             });
             return None;
         }
@@ -2890,7 +3263,7 @@ impl FallbackMesher<'_> {
         let surface_ref = ref_attr(rec, 2, face_ref)?;
         let same_sense = bool_attr(rec, 3, face_ref)?;
 
-        match resolve_surface(
+        match resolve_surface_for_mesh(
             self.file,
             surface_ref,
             face_ref,
@@ -2898,12 +3271,25 @@ impl FallbackMesher<'_> {
             self.angle_scale,
         )? {
             RawSurface::Analytic(surface @ Surface3::Plane { .. }) => {
+                if self.mesh_trimmed_face(mesh, face_ref, &bounds, &surface, same_sense)? {
+                    return Ok(());
+                }
                 self.mesh_planar_face(mesh, face_ref, &bounds, &surface, same_sense)
             }
             RawSurface::Analytic(surface) => {
+                if self.mesh_trimmed_face(mesh, face_ref, &bounds, &surface, same_sense)? {
+                    return Ok(());
+                }
                 self.mesh_quadric_face(mesh, face_ref, &bounds, &surface, same_sense)
             }
             RawSurface::Nurbs(surface) => {
+                let surface = Surface3::nurbs(*surface);
+                if self.mesh_trimmed_face(mesh, face_ref, &bounds, &surface, same_sense)? {
+                    return Ok(());
+                }
+                let Surface3::Nurbs(nurbs) = &surface else {
+                    unreachable!("built from a NURBS patch");
+                };
                 self.diagnostics.push(Diagnostic {
                     entity: Some(face_ref),
                     severity: Severity::Info,
@@ -2911,7 +3297,7 @@ impl FallbackMesher<'_> {
                               (trimming bounds ignored)"
                         .to_string(),
                 });
-                mesh_nurbs_face(mesh, &surface, same_sense);
+                mesh_nurbs_face(mesh, nurbs, same_sense);
                 Ok(())
             }
             RawSurface::Extruded { basis, dir } => {
@@ -2922,6 +3308,95 @@ impl FallbackMesher<'_> {
                 origin,
                 axis,
             } => self.mesh_revolved_face(mesh, face_ref, &basis, origin, &axis, same_sense),
+        }
+    }
+
+    /// Triangulate a curved face over the region its own bounds enclose,
+    /// through the same constrained-Delaunay pass the B-Rep tessellator uses
+    /// ([`triangulate_bounded_face`]). Returns false — leaving `mesh`
+    /// untouched — when that pass does not apply, so the caller can grid the
+    /// face instead.
+    ///
+    /// This is the arm that makes a *trimmed* curved face weld (of-05ac). The
+    /// grid arms below cover the parameter rectangle they infer from the
+    /// boundary's extent, which is the face only when the boundary runs along
+    /// the rectangle's border: a cylinder carrying a half-round pocket grids
+    /// the whole barrel, overshooting its own rim on one side and leaving the
+    /// neighbouring wall unmet on the other. The CDT arm instead triangulates
+    /// exactly the rings, whose points are the shared `EDGE_CURVE` polylines,
+    /// so both faces on an edge contribute the same vertices.
+    ///
+    /// The grid arms stay for what the CDT cannot close: a face bounded only
+    /// by its own periodicity — a full cylinder wall between two circle
+    /// edges, a whole sphere — has rings that wind a period without ever
+    /// closing in parameter space, which is precisely what
+    /// `triangulate_bounded_face` refuses.
+    fn mesh_trimmed_face(
+        &mut self,
+        mesh: &mut TriangleMesh,
+        face_ref: u64,
+        bounds: &[u64],
+        surface: &Surface3,
+        same_sense: bool,
+    ) -> MapResult<bool> {
+        let mut rings = Vec::with_capacity(bounds.len());
+        for &bound_ref in bounds {
+            let ring = self.bound_polygon(bound_ref, face_ref)?;
+            // A degenerate VERTEX_LOOP bounds no region; the CDT reads the
+            // pole it marks off the chart, not off a ring.
+            if ring.len() >= 3 {
+                rings.push(ring);
+            }
+        }
+        // The widest ring is the outer one, as for a planar face: the
+        // FACE_OUTER_BOUND tag is optional and exporters mislabel it.
+        let Some(outer) = (0..rings.len())
+            .max_by(|&a, &b| ring_extent(&rings[a]).total_cmp(&ring_extent(&rings[b])))
+        else {
+            return Ok(false);
+        };
+        rings.swap(0, outer);
+
+        let mut patch = TriangleMesh::new();
+        let band =
+            (FALLBACK_BOUNDARY_BAND_FRACTION * ring_extent(&rings[0])).max(MAX_ALLOWED_TOLERANCE);
+        let outcome =
+            triangulate_bounded_face(surface, rings, !same_sense, band, self.options, &mut patch);
+        let slivered = has_sliver(&patch);
+        match outcome {
+            Ok(()) if !patch.indices.is_empty() && !slivered => {
+                let base = mesh.positions.len();
+                mesh.positions.append(&mut patch.positions);
+                mesh.normals.append(&mut patch.normals);
+                mesh.indices.extend(
+                    patch
+                        .indices
+                        .iter()
+                        .map(|t| [base + t[0], base + t[1], base + t[2]]),
+                );
+                Ok(true)
+            }
+            // Declining is normal, not a failure: a face bounded only by its
+            // own periodicity always lands here and grids correctly. Say why
+            // anyway — on a *trimmed* face the grid is the wrong region, and
+            // this note is the only place that shows which face it was.
+            outcome => {
+                let reason = match outcome {
+                    Err(e) => e.to_string(),
+                    Ok(()) if slivered => {
+                        "the region triangulated to a sliver with no normal".to_string()
+                    }
+                    Ok(()) => "the region triangulated to nothing".to_string(),
+                };
+                self.diagnostics.push(Diagnostic {
+                    entity: Some(face_ref),
+                    severity: Severity::Info,
+                    message: format!(
+                        "face gridded rather than triangulated over its bounds: {reason}"
+                    ),
+                });
+                Ok(false)
+            }
         }
     }
 
@@ -2950,7 +3425,7 @@ impl FallbackMesher<'_> {
         let mut v_hi = f64::NEG_INFINITY;
         for &bound_ref in bounds {
             for p in self.bound_polygon(bound_ref, face_ref)? {
-                let v = (p - profile[0]).dot(&unit);
+                let v = sweep_offset(&profile, &unit, &p);
                 v_lo = v_lo.min(v);
                 v_hi = v_hi.max(v);
             }
@@ -3207,10 +3682,17 @@ impl FallbackMesher<'_> {
         Ok(())
     }
 
-    /// Grid a quadric face over its parameter rectangle: full `u` period
-    /// anchored at the boundary, `v` range recovered from the boundary
-    /// (like the B-Rep tessellator's MVP, trimmed quadrics are assumed to
-    /// cover the full angular range).
+    /// Grid a quadric face over its parameter rectangle: the `u` arc its own
+    /// boundary covers ([`quadric_u_span`]), `v` from the boundary for a
+    /// cylinder or cone and the full domain for a sphere or torus.
+    ///
+    /// Reading the `u` arc rather than assuming the whole period is what lets
+    /// a *trimmed* wall weld (of-05ac). Assuming it — which this did, on the
+    /// same reasoning the B-Rep tessellator's MVP used — grids the entire
+    /// barrel of a face that covers a third of it, so the grid overshoots its
+    /// own rim on one side and never reaches the neighbouring wall on the
+    /// other. nist_ctc_02 is 476 such cylinders and cones, and not one of them
+    /// met its neighbour.
     fn mesh_quadric_face(
         &mut self,
         mesh: &mut TriangleMesh,
@@ -3227,18 +3709,24 @@ impl FallbackMesher<'_> {
         // The u anchor comes from the first non-singular boundary sample,
         // so grid columns land on the same 3D points as adjacent faces'
         // boundary polylines and weld watertight.
+        let period = surface.period_u().expect("quadric surfaces are u-periodic");
         let mut u_anchor = 0.0;
         let mut v_lo = f64::INFINITY;
         let mut v_hi = f64::NEG_INFINITY;
         let mut anchored = false;
+        let mut samples = Vec::with_capacity(boundary.len());
         for p in &boundary {
             let projected = surface.project_point(p);
-            if !anchored && !surface.is_singular(projected.u, projected.v) {
+            v_lo = v_lo.min(projected.v);
+            v_hi = v_hi.max(projected.v);
+            if surface.is_singular(projected.u, projected.v) {
+                continue;
+            }
+            if !anchored {
                 u_anchor = projected.u;
                 anchored = true;
             }
-            v_lo = v_lo.min(projected.v);
-            v_hi = v_hi.max(projected.v);
+            samples.push((projected.u.rem_euclid(period), projected.v));
         }
 
         let (v_lo, v_hi, wrap_v, n_v) = match surface {
@@ -3256,18 +3744,35 @@ impl FallbackMesher<'_> {
                 (lo, hi, false, angular_segments(hi - lo, self.options))
             }
             Surface3::Torus { .. } => {
-                let period = surface.period_v().expect("torus is v-periodic");
-                (0.0, period, true, angular_segments(period, self.options))
+                let period_v = surface.period_v().expect("torus is v-periodic");
+                (
+                    0.0,
+                    period_v,
+                    true,
+                    angular_segments(period_v, self.options),
+                )
             }
             Surface3::Plane { .. } => unreachable!("caller dispatched planes elsewhere"),
             // `RawSurface::Nurbs` never reaches the analytic path.
             Surface3::Nurbs(_) => unreachable!("caller dispatched NURBS elsewhere"),
         };
+        // A skewed trim grids as its bounding rectangle: an approximation the
+        // face's own rim contradicts, but the honest alternative is no
+        // triangles at all, and the caller has already tried the CDT.
+        let (u_lo, u_hi, wrap_u) = match quadric_u_span(&samples, period, u_anchor, v_lo, v_hi) {
+            Some(QuadricUSpan::Full { u_anchor }) => (u_anchor, u_anchor + period, true),
+            None => (u_anchor, u_anchor + period, true),
+            Some(
+                QuadricUSpan::PartialRect { u_lo, u_hi } | QuadricUSpan::PartialSkew { u_lo, u_hi },
+            ) => (u_lo, u_hi, false),
+        };
         grid_quadric(
             mesh,
             surface,
             GridSpec {
-                u_anchor,
+                u_lo,
+                u_hi,
+                wrap_u,
                 v_lo,
                 v_hi,
                 wrap_v,
@@ -3700,7 +4205,13 @@ impl FallbackMesher<'_> {
 
 /// Parameters for [`grid_quadric`].
 struct GridSpec {
-    u_anchor: f64,
+    /// Start of the `u` arc the face covers, and its end (which may exceed
+    /// the period when the arc straddles the seam).
+    u_lo: f64,
+    u_hi: f64,
+    /// Whether `u` closes on itself — a full-period wall, whose last column
+    /// is the first rather than a repeat of it.
+    wrap_u: bool,
     v_lo: f64,
     v_hi: f64,
     wrap_v: bool,
@@ -3710,8 +4221,8 @@ struct GridSpec {
     outward: bool,
 }
 
-/// Tessellate a quadric face over its parameter rectangle: `u` over the
-/// full period from `u_anchor` (wrapped by index), `v` over `[v_lo, v_hi]`
+/// Tessellate a quadric face over its parameter rectangle: `u` over
+/// `[u_lo, u_hi]` (wrapped by index when `wrap_u`), `v` over `[v_lo, v_hi]`
 /// with `n_v` segments (wrapped if `wrap_v`). Singular rows (sphere poles,
 /// cone apex) collapse to a single vertex.
 fn grid_quadric(
@@ -3720,10 +4231,17 @@ fn grid_quadric(
     spec: GridSpec,
     options: &TessellationOptions,
 ) {
-    let period = surface.period_u().expect("quadric surfaces are u-periodic");
-    let n_u = angular_segments(period, options);
+    let n_u = angular_segments(spec.u_hi - spec.u_lo, options);
+    let column_count = if spec.wrap_u { n_u } else { n_u + 1 };
     let row_count = if spec.wrap_v { spec.n_v } else { spec.n_v + 1 };
     let flip = if spec.outward { 1.0 } else { -1.0 };
+    let at_u = |i: usize| -> f64 {
+        if !spec.wrap_u && i == n_u {
+            spec.u_hi // exact endpoint, no accumulation error
+        } else {
+            spec.u_lo + (spec.u_hi - spec.u_lo) * i as f64 / n_u as f64
+        }
+    };
 
     let mut rows: Vec<Vec<usize>> = Vec::with_capacity(row_count);
     for j in 0..row_count {
@@ -3732,11 +4250,11 @@ fn grid_quadric(
         } else {
             spec.v_lo + (spec.v_hi - spec.v_lo) * j as f64 / spec.n_v as f64
         };
-        let singular = surface.is_singular(spec.u_anchor, v);
-        let columns = if singular { 1 } else { n_u };
+        let singular = surface.is_singular(spec.u_lo, v);
+        let columns = if singular { 1 } else { column_count };
         let mut row = Vec::with_capacity(columns);
         for i in 0..columns {
-            let u = spec.u_anchor + period * i as f64 / n_u as f64;
+            let u = at_u(i);
             row.push(mesh.positions.len());
             mesh.positions.push(surface.point(u, v));
             let normal = surface.normal(u, v).unwrap_or_else(|| {
@@ -7217,5 +7735,147 @@ REPRESENTATION_CONTEXT('2D SPACE','') );
         assert_eq!(report.heal_operations, 0);
         let (_store, _geo, report) = import(&cylinder_step(1.5, 4.0));
         assert_eq!(report.heal_operations, 0);
+    }
+
+    /// The two corpus files whose solids exist only through the fallback:
+    /// both used to take the exact path, and of-bb6's edge half is what takes
+    /// it away — their authored curves stray from their faces' surfaces by up
+    /// to 0.0386 mm, well past `MAX_ALLOWED_TOLERANCE`. From then on the
+    /// fallback is all they have, and it delivered a pile of triangles rather
+    /// than a shell: 15843 open and 14569 pinched edges on nist_ctc_02, 160
+    /// open on bspline_patch_prism, so `read_step` reported
+    /// `SolidOutcome::Failed` and the solid was lost outright (of-05ac).
+    ///
+    /// This drives the fallback directly rather than through `read_step`, to
+    /// pin the contract underneath it — whatever the exact path refuses, the
+    /// fallback closes (`spec/06-step-io.md` §4) — on the two files that
+    /// exercise it, whether or not the exact path happens to refuse them on
+    /// the day. The corpus gates in `tests/` measure the other half, that
+    /// each file ends up with a solid at all.
+    ///
+    /// `bspline_patch_prism` clears the whole contract — it meshes, closes,
+    /// and becomes a `MeshSdf`, which is what `SolidOutcome::Mesh` requires.
+    /// nist_ctc_02 clears the meshing half only, and of-aoml is the other:
+    /// tilted bores through its plate leave flat triangles in the plate's own
+    /// plane, facing the other way, and the rim vertices between them have no
+    /// pseudonormal for `MeshSdf::new` to take. That is a real defect and it
+    /// keeps that one file out of the SDF; it is also a far smaller one than
+    /// what this test was written for, and pinning the closure here is what
+    /// stops it regressing while of-aoml is open.
+    #[test]
+    fn corpus_solids_that_only_the_fallback_can_reach_still_close() {
+        for (name, sdf_too) in [
+            ("nist/nist_ctc_02_asme1_rc.stp", false),
+            ("occ/nurbs/bspline_patch_prism.stp", true),
+        ] {
+            let path = format!("{}/tests/data/step/{name}", env!("CARGO_MANIFEST_DIR"));
+            let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+            let file = super::super::parse_bytes(&bytes).expect("vendored file parses");
+            let mut diagnostics = Vec::new();
+            let scale = resolve_length_scale(&file, &mut diagnostics);
+            let angle_scale = resolve_angle_scale(&file, &mut diagnostics);
+            let options = TessellationOptions::default();
+            let mut solids = 0;
+            for inst in &file.data {
+                let Some(rec) = inst
+                    .entity
+                    .part("BREP_WITH_VOIDS")
+                    .or_else(|| inst.entity.part("MANIFOLD_SOLID_BREP"))
+                else {
+                    continue;
+                };
+                let shell_ref = ref_attr(rec, 1, inst.id).expect("solid names a shell");
+                let mut mesher = FallbackMesher {
+                    file: &file,
+                    options: &options,
+                    scale,
+                    angle_scale,
+                    diagnostics: &mut diagnostics,
+                    polylines: HashMap::new(),
+                };
+                let mesh = mesher
+                    .mesh_solid(inst.id, shell_ref, &[])
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "{name}: solid #{} did not tessellate: {:?}",
+                            inst.id,
+                            diagnostics
+                                .iter()
+                                .filter(|d| d.severity == Severity::Error)
+                                .map(|d| &d.message)
+                                .collect::<Vec<_>>()
+                        )
+                    });
+                assert!(
+                    mesh.is_closed_manifold(),
+                    "{name}: solid #{} is not closed: {:?}",
+                    inst.id,
+                    mesh.manifold_defects().describe()
+                );
+                if sdf_too {
+                    MeshSdf::new(&mesh).unwrap_or_else(|e| {
+                        panic!("{name}: solid #{} rejected as an SDF: {e}", inst.id)
+                    });
+                }
+                solids += 1;
+            }
+            assert!(solids > 0, "{name}: no solid found");
+        }
+    }
+
+    /// Two faces may draw the same chord between two vertices of the boundary
+    /// they share, which leaves four triangles on one edge. Splitting one
+    /// sheet at the chord's midpoint makes the mesh manifold without moving
+    /// anything: two coincident squares, joined along a diagonal each
+    /// triangulates for itself, come out closed and no larger than the split
+    /// requires.
+    #[test]
+    fn a_chord_two_faces_both_draw_is_split_apart() {
+        let mut mesh = TriangleMesh::new();
+        for _ in 0..2 {
+            let base = mesh.positions.len();
+            for p in [
+                Point3::new(0.0, 0.0, 0.0),
+                Point3::new(1.0, 0.0, 0.0),
+                Point3::new(1.0, 1.0, 0.0),
+                Point3::new(0.0, 1.0, 0.0),
+            ] {
+                mesh.positions.push(p);
+                mesh.normals.push(Vector3::z());
+            }
+            // Both sheets split the square on the 0-2 diagonal.
+            mesh.indices.push([base, base + 1, base + 2]);
+            mesh.indices.push([base, base + 2, base + 3]);
+        }
+        let mut welded = mesh.weld(1e-9);
+        assert_eq!(welded.manifold_defects().pinched_edges, 1);
+        assert_eq!(split_shared_edges(&mut welded), 1);
+        assert_eq!(welded.manifold_defects().pinched_edges, 0);
+        assert_eq!(welded.indices.len(), 6, "one sheet gained a midpoint");
+        assert_eq!(welded.positions.len(), 5);
+    }
+
+    /// The repair is only for an edge whose two traversal directions balance.
+    /// An unbalanced one is inconsistently oriented, a different defect, and
+    /// pairing across it would hide it rather than fix it.
+    #[test]
+    fn an_inconsistently_oriented_edge_is_left_for_the_check_to_report() {
+        let mut mesh = TriangleMesh::new();
+        for p in [
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(1.0, 0.0, 0.0),
+            Point3::new(0.0, 1.0, 0.0),
+            Point3::new(0.0, 0.0, 1.0),
+        ] {
+            mesh.positions.push(p);
+            mesh.normals.push(Vector3::z());
+        }
+        // Three triangles all traversing edge 0->1 the same way.
+        mesh.indices.push([0, 1, 2]);
+        mesh.indices.push([0, 1, 3]);
+        mesh.indices.push([0, 1, 2]);
+        let before = mesh.indices.len();
+        assert_eq!(split_shared_edges(&mut mesh), 0);
+        assert_eq!(mesh.indices.len(), before);
     }
 }

@@ -1772,22 +1772,25 @@ mod corpus {
                 );
             }
         }
-        // 2026-08-01: 31 of 34, measured on this branch rebased onto of-zdx.
-        // That is the 33 of-zdx left minus the two below; the two occ/tangent
-        // parts it brought in are untouched by the measurement here and still
-        // pass. Three files fail:
+        // 2026-08-01: 32 of 34, up one with of-05ac, which taught the mesh
+        // fallback to close over a *trimmed* curved face. Two files fail:
         // - nist_ctc_05 (of-kwn): edge geometry that misses its vertex points.
-        // - nist_ctc_02, occ/nurbs/bspline_patch_prism (of-05ac): the two the
-        //   edge half of of-bb6 took off the exact path. Each has an edge
-        //   further from a face's surface than MAX_ALLOWED_TOLERANCE — 0.0386
-        //   mm of authored gap in nist_ctc_02, and in bspline_patch_prism a
-        //   whole 20 mm, because the extrusion patch we build for its faces
-        //   is a twentieth of the length it needs and points the other way
-        //   (of-8ulj). Refusing both is right; what costs the two counts is
-        //   that the mesh fallback does not close for either (of-05ac), so a
-        //   degrade becomes a loss. This floor returns to 33 with of-05ac,
-        //   and does not need of-8ulj first.
-        const FLOOR: usize = 31;
+        // - nist_ctc_02 (of-aoml): off the exact path with of-bb6's edge half,
+        //   on 0.0386 mm of authored curve/surface gap, which is four times
+        //   MAX_ALLOWED_TOLERANCE and rightly refused. of-05ac got its
+        //   fallback shell closed — 0 open edges and 0 pinched, from 15843
+        //   and 14569 — but the CDT leaves flat triangles on the rims of the
+        //   part's tilted bores, and MeshSdf::new has no pseudonormal to take
+        //   at the rim vertices between them. That last step is of-aoml, and
+        //   this floor goes to 33 with it.
+        //
+        // bspline_patch_prism was the third and is now the counterpart that
+        // shows the contract works: still refused by the exact path (its
+        // extrusion patch is mis-sized by of-8ulj and does not contain its
+        // own face), it now degrades to a mesh instead of being lost, which
+        // is what spec/06-step-io.md §4 promises. It clears this floor
+        // without of-8ulj being fixed first.
+        const FLOOR: usize = 32;
         assert!(
             passed.len() >= FLOOR,
             "corpus pass count regressed below {FLOOR}: only {passed:?} pass"

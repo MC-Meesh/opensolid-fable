@@ -383,7 +383,8 @@ fn tessellate_face_into(
             let period = surface.period_u().expect("quadric surfaces are u-periodic");
             let (u_lo, u_hi, wrap_u) = match u_span {
                 QuadricUSpan::Full { u_anchor } => (u_anchor, u_anchor + period, true),
-                QuadricUSpan::PartialRect { u_lo, u_hi } => (u_lo, u_hi, false),
+                QuadricUSpan::PartialRect { u_lo, u_hi }
+                | QuadricUSpan::PartialSkew { u_lo, u_hi } => (u_lo, u_hi, false),
             };
             grid_face(
                 surface, u_lo, u_hi, wrap_u, v_lo, v_hi, false, 1, flip, options, mesh,
@@ -501,9 +502,50 @@ fn face_cdt(
     // inverse, which only the NURBS arm uses and only to judge that a
     // boundary point really does lie on the patch it bounds — see
     // `boundary_band` for why that judgement is made at the face's
-    // discretization scale here rather than at the kernel's linear one.
+    // discretization scale rather than at the kernel's linear one.
+    let band = boundary_band(&rings_p);
+    triangulate_bounded_face(surface, rings_p, flip, band, options, mesh)
+}
+
+/// [`face_cdt`] with the boundary supplied directly instead of sampled from
+/// a stored face: `rings_p` is the outer ring first, then any inner rings,
+/// each a closed 3D polyline with no repeated closing point.
+///
+/// Split out for the STEP reader's mesh fallback (of-05ac), which has the
+/// same job — triangulate a trimmed face so it welds to its neighbours —
+/// but no `TopologyStore` to sample from, because the fallback runs only
+/// *because* the exact path refused to build one. Its rings come from the
+/// shared edge polylines it discretizes once per `EDGE_CURVE`, which is the
+/// same guarantee [`sample_loop`] gives here: both faces on an edge get
+/// byte-identical points, so the weld is exact rather than approximate.
+///
+/// `boundary_band` is how far a ring point may sit off `surface` and still
+/// be inverted for a `uv` (see [`boundary_band`] for the whole argument, and
+/// why the answer is never the kernel's linear tolerance). A stored face
+/// sizes it to the face's extent; the reader's fallback sizes it to its own
+/// sampling step, because it runs on the files whose edges miss their
+/// surfaces by more than any exactness bound would allow.
+///
+/// # Errors
+/// [`CoreError`] if a ring does not close in parameter space (a boundary
+/// that winds a full period — see [`ring_closes`]), if the chart refuses
+/// the surface, or if the triangulation fails.
+pub fn triangulate_bounded_face(
+    surface: &Surface3,
+    mut rings_p: Vec<Vec<Point3>>,
+    flip: bool,
+    boundary_band: f64,
+    options: &TessellationOptions,
+    mesh: &mut TriangleMesh,
+) -> CoreResult<()> {
+    if rings_p.first().is_none_or(|r| r.len() < 3) {
+        return Err(CoreError::InvalidArgument {
+            argument: "rings_p",
+            reason: "outer ring has fewer than 3 points".to_string(),
+        });
+    }
     let tol = ToleranceContext {
-        linear: boundary_band(&rings_p),
+        linear: boundary_band,
         ..ToleranceContext::default()
     };
     let chart = crate::boolean::Chart::build(surface, &tol)?;
@@ -524,10 +566,10 @@ fn face_cdt(
         rings_uv.push(ring_uv);
     }
     if rings_uv[0].len() < 3 {
-        return Err(invalid_face(
-            face_id,
-            "outer loop degenerates to fewer than 3 parameter points at a pole",
-        ));
+        return Err(CoreError::InvalidArgument {
+            argument: "rings_p",
+            reason: "outer ring degenerates to fewer than 3 parameter points at a pole".to_string(),
+        });
     }
 
     let (tris, uv, points) = crate::boolean::triangulate_trimmed_region(
@@ -1072,7 +1114,7 @@ fn is_seam_closed_boundary(
 
 /// How a cylinder/cone face maps onto its surface's `u` period, recovered
 /// from boundary samples by [`boundary_param_range`].
-enum QuadricUSpan {
+pub enum QuadricUSpan {
     /// The boundary covers the full period (primitive/sweep walls): grid the
     /// whole revolution with wrap, columns starting at `u_anchor`. The `u`
     /// columns of a transformed body must start at the same arbitrary anchor
@@ -1084,6 +1126,81 @@ enum QuadricUSpan {
     /// seam): grid that rectangle without `u` wrap. Boolean-trimmed walls such
     /// as a quarter-cylinder notch arrive this way (of-2i3).
     PartialRect { u_lo: f64, u_hi: f64 },
+    /// The boundary is trimmed but is *not* an iso-parameter rectangle — a
+    /// slanted or curved-in-`uv` cut — so no grid over `[u_lo, u_hi] × [v_lo,
+    /// v_hi]` reproduces it. The span is still reported, for a caller with
+    /// nothing better to offer than an approximation.
+    PartialSkew { u_lo: f64, u_hi: f64 },
+}
+
+/// [`QuadricUSpan`] from a face's boundary samples in the surface's own
+/// parameters, `samples` being `(u, v)` pairs with `u` already wrapped into
+/// `[0, period)` and singular points left out.
+///
+/// Split out from [`boundary_param_range`] so the STEP reader's mesh fallback
+/// classifies a trimmed cylinder or cone exactly as the tessellator does
+/// (of-05ac). It has the same question to answer and no `TopologyStore` to
+/// answer it from: its samples come from the polylines it discretizes each
+/// `EDGE_CURVE` into, not from stored fins.
+///
+/// Returns `None` only for an empty `samples`.
+pub fn quadric_u_span(
+    samples: &[(f64, f64)],
+    period: f64,
+    u_anchor: f64,
+    v_lo: f64,
+    v_hi: f64,
+) -> Option<QuadricUSpan> {
+    if samples.is_empty() {
+        return None;
+    }
+    // Largest angular arc between consecutive samples (including the
+    // wrap-around from last back to first) is the uncovered span; record where
+    // it sits so the covered arc's ends can be recovered. `gap_after` indexes
+    // the sample the gap starts at; `n - 1` denotes the wrap gap.
+    let mut us: Vec<f64> = samples.iter().map(|&(u, _)| u).collect();
+    us.sort_unstable_by(f64::total_cmp);
+    let n = us.len();
+    let mut max_gap = period - us[n - 1] + us[0];
+    let mut gap_after = n - 1;
+    for i in 0..n - 1 {
+        let gap = us[i + 1] - us[i];
+        if gap > max_gap {
+            max_gap = gap;
+            gap_after = i;
+        }
+    }
+    if period - max_gap >= MIN_PERIOD_COVERAGE * period {
+        return Some(QuadricUSpan::Full { u_anchor });
+    }
+
+    // Trimmed. The covered arc runs from the sample just after the gap around
+    // to the one just before it; if the gap is the wrap, that is simply
+    // [min, max].
+    let (u_lo, u_hi) = if gap_after == n - 1 {
+        (us[0], us[n - 1])
+    } else {
+        (us[gap_after + 1], us[gap_after] + period)
+    };
+
+    // Only a clean parameter rectangle [u_lo, u_hi] × [v_lo, v_hi] grids
+    // faithfully without hole bridging: every boundary sample must lie on the
+    // rectangle's border (each fin iso-parametric). A diagonal or curved-in-uv
+    // boundary fails this (of-2i3).
+    let tol_u = 1e-6 * (u_hi - u_lo) + 1e-9;
+    let tol_v = 1e-6 * (v_hi - v_lo) + 1e-9;
+    for &(u, v) in samples {
+        let u = if u < u_lo - tol_u { u + period } else { u };
+        let inside = u >= u_lo - tol_u && u <= u_hi + tol_u;
+        let on_border = (u - u_lo).abs() <= tol_u
+            || (u - u_hi).abs() <= tol_u
+            || (v - v_lo).abs() <= tol_v
+            || (v - v_hi).abs() <= tol_v;
+        if !inside || !on_border {
+            return Some(QuadricUSpan::PartialSkew { u_lo, u_hi });
+        }
+    }
+    Some(QuadricUSpan::PartialRect { u_lo, u_hi })
 }
 
 /// Classify how a cylinder/cone face maps onto its `u` period and recover the
@@ -1161,57 +1278,17 @@ fn boundary_param_range(
     }
     let u_anchor = u_anchor.expect("v range implies samples");
 
-    // Largest angular arc between consecutive samples (including the
-    // wrap-around from last back to first) is the uncovered span; record where
-    // it sits so the covered arc's ends can be recovered. `gap_after` indexes
-    // the sample the gap starts at; `n - 1` denotes the wrap gap.
-    let mut us: Vec<f64> = samples.iter().map(|&(u, _)| u).collect();
-    us.sort_unstable_by(f64::total_cmp);
-    let n = us.len();
-    let mut max_gap = period - us[n - 1] + us[0];
-    let mut gap_after = n - 1;
-    for i in 0..n - 1 {
-        let gap = us[i + 1] - us[i];
-        if gap > max_gap {
-            max_gap = gap;
-            gap_after = i;
-        }
+    match quadric_u_span(&samples, period, u_anchor, lo, hi)
+        .expect("a v range implies at least one sample")
+    {
+        // A trim whose boundary is not an iso-parameter rectangle cannot be
+        // gridded without hole bridging, and is deferred to the CDT pass.
+        QuadricUSpan::PartialSkew { .. } => Err(CoreError::NotImplemented {
+            feature: "tessellating non-rectangular trimmed cylinder/cone faces \
+                      (boundary is not an iso-parameter rectangle; needs the CDT pass)",
+        }),
+        span => Ok((span, lo, hi)),
     }
-
-    if period - max_gap >= MIN_PERIOD_COVERAGE * period {
-        return Ok((QuadricUSpan::Full { u_anchor }, lo, hi));
-    }
-
-    // Trimmed. The covered arc runs from the sample just after the gap around
-    // to the one just before it; if the gap is the wrap, that is simply
-    // [min, max].
-    let (u_lo, u_hi) = if gap_after == n - 1 {
-        (us[0], us[n - 1])
-    } else {
-        (us[gap_after + 1], us[gap_after] + period)
-    };
-
-    // Only a clean parameter rectangle [u_lo, u_hi] × [lo, hi] grids faithfully
-    // without hole bridging: every boundary sample must lie on the rectangle's
-    // border (each fin iso-parametric). A diagonal or curved-in-uv boundary
-    // fails this and is deferred to the CDT pass (of-2i3).
-    let tol_u = 1e-6 * (u_hi - u_lo) + 1e-9;
-    let tol_v = 1e-6 * (hi - lo) + 1e-9;
-    for &(u, v) in &samples {
-        let u = if u < u_lo - tol_u { u + period } else { u };
-        let inside = u >= u_lo - tol_u && u <= u_hi + tol_u;
-        let on_border = (u - u_lo).abs() <= tol_u
-            || (u - u_hi).abs() <= tol_u
-            || (v - lo).abs() <= tol_v
-            || (v - hi).abs() <= tol_v;
-        if !inside || !on_border {
-            return Err(CoreError::NotImplemented {
-                feature: "tessellating non-rectangular trimmed cylinder/cone faces \
-                          (boundary is not an iso-parameter rectangle; needs the CDT pass)",
-            });
-        }
-    }
-    Ok((QuadricUSpan::PartialRect { u_lo, u_hi }, lo, hi))
 }
 
 /// Tessellate a quadric face over its parameter rectangle: `u` over
