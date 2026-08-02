@@ -122,6 +122,7 @@ use opensolid_brep::{
     Body, BodyType, Curve2, Curve3, Edge, FaceSense, FinSense, GeometryStore, Loop, NurbsCurve,
     NurbsSurface, Surface3, TopologyStore, Vertex,
 };
+use opensolid_core::types::{Point2, Vector2};
 use opensolid_core::{EntityId, Point3, Transform3, Vector3};
 
 /// Length unit declared in the emitted representation context.
@@ -928,22 +929,13 @@ impl<'a> Emitter<'a> {
     }
 
     /// `PCURVE` naming `surface` with `pcurve`'s 2D geometry, or `None` when
-    /// the variant has no exact Part 42 counterpart.
+    /// the variant has no Part 42 counterpart.
     ///
-    /// The only such variant is a clockwise [`Curve2::Circle`]:
-    /// `AXIS2_PLACEMENT_2D` fixes the perpendicular counterclockwise from
-    /// its reference direction, so a clockwise 2D circle is not expressible
-    /// without changing its parameterization — and a fin's pcurve must keep
-    /// the parameterization of its edge (see [`opensolid_brep::pcurve`]).
-    ///
-    /// That is an ordinary case, not a corner one: a cylinder's two caps
-    /// have opposite normals, so one of the two rim circles is clockwise in
-    /// its face's `(u, v)`. Writing it exactly needs a 2D *rational*
-    /// B-spline, whose control points can run either way. of-3qy.7 built
-    /// exactly that machinery for 3D ([`Emitter::emit_nurbs_curve`] and the
-    /// `RATIONAL_B_SPLINE_CURVE` complex-instance form); porting it to 2D is
-    /// of-50u. Until then the fin associates its bare surface, which is a
-    /// valid `pcurve_or_surface` and loses only the optional trim curve.
+    /// Every current variant has one (since of-50u — see [`Self::emit_curve_2d`]
+    /// for the clockwise-circle case that used to be the exception), so the
+    /// `None` path is kept only as the valid degradation for a future
+    /// variant: the caller then associates the bare surface, a legal
+    /// `pcurve_or_surface` that loses only the optional trim curve.
     fn emit_pcurve(
         &mut self,
         surface: u64,
@@ -989,7 +981,7 @@ impl<'a> Emitter<'a> {
                 ccw,
             } => {
                 if !ccw {
-                    return None;
+                    return Some(self.emit_clockwise_circle_2d(center, *radius, x_dir));
                 }
                 let point = self.emit(format!(
                     "CARTESIAN_POINT('',{})",
@@ -1035,7 +1027,93 @@ impl<'a> Emitter<'a> {
             // `attach_body_pcurves` re-derives every pcurve from the 3D
             // geometry rather than reading the authored 2D curve.
             Curve2::Projected(p) => self.emit_curve_2d(&p.guide()),
+            // Degree, control points and knots verbatim, exactly as the 3D
+            // freeform arm writes them — the fitted-vs-transplanted
+            // distinction (`fit_params`) is a kernel-side accuracy claim
+            // with no Part 42 counterpart, so it does not cross the file
+            // boundary.
+            Curve2::Nurbs { curve, .. } => {
+                let cps: Vec<u64> = curve
+                    .control_points()
+                    .iter()
+                    .map(|p| self.emit(format!("CARTESIAN_POINT('',{})", fmt_pair(p.x, p.y))))
+                    .collect();
+                let points = curve.control_points();
+                let closed = points.first() == points.last() && points.len() > 1;
+                Some(self.emit_bspline_curve_record(
+                    curve.degree(),
+                    &cps,
+                    curve.knot_vector().knots(),
+                    curve.weights(),
+                    closed,
+                ))
+            }
         }
+    }
+
+    /// A clockwise 2D circle as the rational-quadratic full circle (Piegl &
+    /// Tiller §7.5) with its control points running clockwise — the case
+    /// `CIRCLE` cannot spell, because `AXIS2_PLACEMENT_2D` fixes the
+    /// perpendicular counterclockwise from its reference direction. Not a
+    /// corner case: a cylinder's two caps have opposite normals, so exactly
+    /// one of its rim circles is clockwise in its face's `(u, v)` (of-50u).
+    ///
+    /// The knots sit at the quarter angles `0, π/2, …, 2π`, so the emitted
+    /// curve agrees with the kernel's angle parameterization exactly at
+    /// every quarter point and traces the exact locus everywhere; between
+    /// quarter points a rational quadratic arc's parameter deviates from
+    /// angle by a few percent of the span, which is the cost of the only
+    /// exact-locus spelling Part 42 has for this direction of travel.
+    fn emit_clockwise_circle_2d(&mut self, center: &Point2, radius: f64, x_dir: &Vector2) -> u64 {
+        // The kernel evaluates a clockwise circle as
+        // `center + r·(x_dir·cos t + y_dir·sin t)` with `y_dir` the
+        // *clockwise* perpendicular.
+        let y_dir = Vector2::new(x_dir.y, -x_dir.x);
+        let at = |angle: f64, reach: f64| {
+            center + (x_dir * angle.cos() + y_dir * angle.sin()) * (radius * reach)
+        };
+        // Quarter points interleaved with the tangent intersections a
+        // half-quarter further round, at √2 the radius.
+        let corners: Vec<Point2> = (0..9)
+            .map(|i| {
+                let angle = i as f64 * std::f64::consts::FRAC_PI_4;
+                let reach = if i % 2 == 0 {
+                    1.0
+                } else {
+                    std::f64::consts::SQRT_2
+                };
+                at(angle, reach)
+            })
+            .collect();
+        let cps: Vec<u64> = corners
+            .iter()
+            .map(|p| self.emit(format!("CARTESIAN_POINT('',{})", fmt_pair(p.x, p.y))))
+            .collect();
+        let weights: Vec<f64> = (0..9)
+            .map(|i| {
+                if i % 2 == 0 {
+                    1.0
+                } else {
+                    std::f64::consts::FRAC_1_SQRT_2
+                }
+            })
+            .collect();
+        let q = std::f64::consts::FRAC_PI_2;
+        let knots = [
+            0.0,
+            0.0,
+            0.0,
+            q,
+            q,
+            2.0 * q,
+            2.0 * q,
+            3.0 * q,
+            3.0 * q,
+            4.0 * q,
+            4.0 * q,
+            4.0 * q,
+        ];
+        self.emit_bspline_curve_record(2, &cps, &knots, &weights, true)
     }
 
     /// The file's shared 2D parametric representation context. Parameter
@@ -1157,19 +1235,40 @@ impl<'a> Emitter<'a> {
             .iter()
             .map(|p| self.emit_point(*p))
             .collect();
-        let refs = ref_list(&cps);
-        let degree = nurbs.degree();
-        let (knots, mults) = collapse_knots(nurbs.knot_vector().knots());
-        let (knots, mults) = (real_items(&knots), int_items(&mults));
         let points = nurbs.control_points();
-        let closed = step_bool(points.first() == points.last() && points.len() > 1);
+        let closed = points.first() == points.last() && points.len() > 1;
+        self.emit_bspline_curve_record(
+            nurbs.degree(),
+            &cps,
+            nurbs.knot_vector().knots(),
+            nurbs.weights(),
+            closed,
+        )
+    }
 
-        if is_rational(nurbs.weights()) {
+    /// The B-spline curve record shared by the 3D and 2D emissions
+    /// (`cps` are already-emitted `CARTESIAN_POINT`s of either dimension):
+    /// `B_SPLINE_CURVE_WITH_KNOTS`, or the `RATIONAL_B_SPLINE_CURVE`
+    /// complex instance when the weights need one.
+    fn emit_bspline_curve_record(
+        &mut self,
+        degree: usize,
+        cps: &[u64],
+        flat_knots: &[f64],
+        weights: &[f64],
+        closed: bool,
+    ) -> u64 {
+        let refs = ref_list(cps);
+        let (knots, mults) = collapse_knots(flat_knots);
+        let (knots, mults) = (real_items(&knots), int_items(&mults));
+        let closed = step_bool(closed);
+
+        if is_rational(weights) {
             // The partial records carry no inherited attributes, so each
             // one starts at its own first declared attribute — the name
             // lives on REPRESENTATION_ITEM. Parts are in the alphabetical
             // order AP203 exporters conventionally emit.
-            let weights = real_items(nurbs.weights());
+            let weights = real_items(weights);
             self.emit(format!(
                 "( BOUNDED_CURVE() B_SPLINE_CURVE({degree},{refs},.UNSPECIFIED.,{closed},.U.) \
                  B_SPLINE_CURVE_WITH_KNOTS(({mults}),({knots}),.UNSPECIFIED.) CURVE() \
@@ -1502,20 +1601,19 @@ mod tests {
         }
     }
 
-    /// A clockwise 2D circle has no `AXIS2_PLACEMENT_2D` form (the
-    /// perpendicular is fixed counterclockwise), so its fin records the bare
-    /// surface instead — a valid `pcurve_or_surface` association, and never
-    /// a silently resampled approximation.
+    /// A clockwise 2D circle has no `CIRCLE` form (`AXIS2_PLACEMENT_2D`
+    /// fixes the perpendicular counterclockwise), and used to drop its fin
+    /// to a bare-surface association. Since of-50u it emits as the 2D
+    /// rational B-spline instead, so no pcurve drops out.
     #[test]
-    fn an_inexpressible_pcurve_falls_back_to_naming_its_surface() {
+    fn a_clockwise_circle_pcurve_emits_instead_of_dropping_out() {
         let text = export_with_pcurves(|s, g| block(s, g, 2.0, 3.0, 4.0).expect("block"));
         let (mut store, mut geo, bodies) = reimport(&text);
         let before = write_step(&store, &geo, &[bodies[0]], &StepWriteOptions::default())
             .expect("serializes");
 
-        // A block's pcurves are all 2D lines, so every one of them emits;
-        // swapping a single fin's for a clockwise circle isolates the one
-        // that cannot.
+        // A block's pcurves are all 2D lines; swapping a single fin's for a
+        // clockwise circle isolates the arm under test.
         let face = store.faces_of_body(bodies[0])[0];
         let fin = store.fins_of_loop(store.loops_of_face(face)[0])[0];
         let cw = geo.add_pcurve(
@@ -1531,19 +1629,16 @@ mod tests {
         let after = write_step(&store, &geo, &[bodies[0]], &StepWriteOptions::default())
             .expect("still serializes");
 
-        // Exactly one association stopped being a PCURVE — the association
-        // itself survives, so the file still says which surface that fin
-        // trims.
         let pcurves = |text: &str| text.matches("PCURVE('',#").count();
         assert_eq!(
             pcurves(&after),
-            pcurves(&before) - 1,
-            "only the inexpressible pcurve should drop out:\n{after}"
+            pcurves(&before),
+            "the clockwise circle must emit a pcurve like any other:\n{after}"
         );
         assert_eq!(
-            after.matches("SURFACE_CURVE('',#").count(),
-            before.matches("SURFACE_CURVE('',#").count(),
-            "every edge keeps its surface association"
+            after.matches("RATIONAL_B_SPLINE_CURVE").count(),
+            1,
+            "the clockwise circle takes the rational complex form:\n{after}"
         );
         let (store2, _, bodies2) = reimport(&after);
         assert!(store2.check(bodies2[0]).is_empty());
@@ -1551,8 +1646,8 @@ mod tests {
 
     /// A cylinder's two caps have opposite normals, so their parameter
     /// spaces have opposite handedness and exactly one rim circle comes out
-    /// clockwise. The inexpressible case is ordinary, not exotic — which is
-    /// why the fallback associates the surface rather than failing.
+    /// clockwise. The case is ordinary, not exotic — and since of-50u every
+    /// one of the six fins carries real trim geometry in the file.
     #[test]
     fn one_cap_of_a_cylinder_hits_the_clockwise_circle_case() {
         let text = export_with_pcurves(|s, g| cylinder(s, g, 1.5, 4.0).expect("cylinder"));
@@ -1574,11 +1669,60 @@ mod tests {
             clockwise, 1,
             "one cap's rim circle runs clockwise in (u, v)"
         );
-        // Six fins, so five pcurves reach the file — and all three edges
-        // keep an association regardless.
-        assert_eq!(text.matches("PCURVE('',#").count(), 5, "{text}");
+        // Six fins, six pcurves — the clockwise rim included.
+        assert_eq!(text.matches("PCURVE('',#").count(), 6, "{text}");
         assert_eq!(text.matches("SURFACE_CURVE('',#").count(), 2, "{text}");
         assert_eq!(text.matches("SEAM_CURVE('',#").count(), 1, "{text}");
+        assert_eq!(
+            text.matches("RATIONAL_B_SPLINE_CURVE").count(),
+            1,
+            "exactly the clockwise rim takes the rational form:\n{text}"
+        );
+    }
+
+    /// The emitted clockwise-circle B-spline traces the kernel's circle: the
+    /// exact locus everywhere, and the exact parameterization at every
+    /// quarter point (between quarters a rational quadratic arc's parameter
+    /// deviates from angle — that is the documented cost of the only
+    /// exact-locus spelling Part 42 has for this direction of travel).
+    #[test]
+    fn the_emitted_clockwise_circle_matches_the_kernel_parameterization() {
+        use opensolid_brep::Curve2Eval;
+        use std::f64::consts::FRAC_PI_2;
+
+        let circle = Curve2::circle(
+            opensolid_core::Point2::new(0.7, -1.2),
+            2.5,
+            opensolid_core::Vector2::new(0.6, 0.8),
+            false,
+        )
+        .expect("valid");
+
+        let store = TopologyStore::new();
+        let geo = GeometryStore::new();
+        let mut emitter = Emitter::new(&store, &geo);
+        let id = emitter
+            .emit_curve_2d(&circle)
+            .expect("a clockwise circle emits");
+        let text = emitter.finish("cw-circle");
+
+        let file = super::super::parse::parse(&text).expect("emitted text parses");
+        let parsed = super::super::read::resolve_bspline_curve_2d(&file, id, id).expect("resolves");
+        for i in 0..=4 {
+            let t = i as f64 * FRAC_PI_2;
+            assert!(
+                (parsed.point(t) - circle.point(t)).norm() < 1e-9,
+                "quarter point {i} disagrees"
+            );
+        }
+        for i in 0..=256 {
+            let t = i as f64 * 4.0 * FRAC_PI_2 / 256.0;
+            let radius = (parsed.point(t) - opensolid_core::Point2::new(0.7, -1.2)).norm();
+            assert!(
+                (radius - 2.5).abs() < 1e-9,
+                "off the locus at t = {t}: radius {radius}"
+            );
+        }
     }
 
     // ------------------------------------------------------------------

@@ -33,22 +33,31 @@
 //! geometry knows and projection does not — which edges are seams — from the
 //! topology, where a seam shows up as an edge its face uses twice.
 //!
-//! # No NURBS variant yet
+//! # Freeform trim ([`Curve2::Nurbs`], of-50u)
 //!
-//! [`Curve2`] has no freeform variant. Since of-3qy.8 retired the B-spline
-//! mesh fallback, freeform faces *do* reach the exact path, so a trim curve
-//! that is genuinely a 2D NURBS is now reachable — it just has nowhere exact
-//! to go. [`fit_pcurve`] fits what it can as a line or a circle, then as a
-//! [`Curve2::Projected`] wherever the surface has a closed-form inverse, and
-//! otherwise falls back to [`Curve2::Polyline`], whose error is bounded by
-//! the sample spacing rather than exact.
+//! Since of-3qy.8 retired the B-spline mesh fallback, freeform faces reach
+//! the exact path, and their trim geometry is genuinely a NURBS in
+//! `(u, v)`. [`Curve2::Nurbs`] holds it. It arrives two ways:
 //!
-//! That is a real (bounded) loss of fidelity on freeform trim, not a
-//! representational gap that costs nothing, and it is tracked as of-50u
-//! along with the 2D rational B-spline emission the writer needs for the
-//! same reason. It is *not* a correctness problem: a polyline pcurve
-//! describes a curve that really does lie on the surface, and no consumer is
-//! told it is exact.
+//! - **Fitted.** [`fit_pcurve`] interpolates its samples with a cubic
+//!   B-spline wherever the surface has no closed-form inverse to build a
+//!   [`Curve2::Projected`] from — a [`Surface3::Nurbs`]. The fit passes
+//!   through every sample at that sample's own parameter (so the module
+//!   invariant holds there exactly, as a polyline's did) and its error
+//!   between samples is fourth order in the spacing, against the polyline's
+//!   second — the same 33 samples that bought 1.3e-3 of a trimmed region
+//!   buy ~1e-9 of it. The interpolation parameters ride along in the
+//!   variant, so a consumer that must not over-claim (the checker) knows
+//!   where the invariant is exact and where it is approximated.
+//! - **Transplanted.** The STEP reader adopts an authored 2D B-spline trim
+//!   verbatim when its parameterization provably lines up with the kernel's
+//!   (freeform curve on a freeform surface — see the reader), which
+//!   preserves the author's exact trim rather than a refit. Such a curve
+//!   claims the invariant everywhere, and carries no fit parameters.
+//!
+//! Neither is a correctness problem even when approximate: a fitted pcurve
+//! describes a curve that really does lie on the surface at its samples,
+//! and no consumer is told more than the variant records.
 //!
 //! # Why a fitted pcurve is not enough (of-y8qc)
 //!
@@ -74,6 +83,7 @@
 //! [`Fin`]: crate::topology::Fin
 
 use crate::curve::{Curve3, CurveEval, TWO_PI};
+use crate::nurbs::{KnotVector, NurbsCurve2};
 use crate::project::SurfaceProject;
 use crate::surface::{Surface3, SurfaceEval};
 use opensolid_core::error::{CoreError, CoreResult};
@@ -178,6 +188,19 @@ pub enum Curve2 {
     /// Boxed because it owns a curve, a surface and the guide's two
     /// vectors, and inlining that would grow every `Curve2`.
     Projected(Box<ProjectedCurve2>),
+    /// Freeform trim: a NURBS in `(u, v)`, parameterized by the edge's own
+    /// parameter like every other variant.
+    ///
+    /// `fit_params` records where the curve is an *interpolant*: non-empty
+    /// (strictly increasing, one entry per construction sample) for a curve
+    /// [`fit_pcurve`] fitted, whose invariant claim is exact at those
+    /// parameters and fourth-order in their spacing between them. Empty for
+    /// a curve that claims the invariant at every parameter — an authored
+    /// trim the STEP reader verified and transplanted verbatim.
+    Nurbs {
+        curve: Box<NurbsCurve2>,
+        fit_params: Vec<f64>,
+    },
 }
 
 /// The payload of [`Curve2::Projected`]: everything needed to invert a
@@ -378,6 +401,18 @@ impl Curve2 {
             offset: Vector2::zeros(),
         })))
     }
+
+    /// A freeform trim curve that claims the module invariant at every
+    /// parameter — for a caller that has *verified* the claim, the way the
+    /// STEP reader samples an authored trim against its edge before
+    /// transplanting it. A fitted interpolant should come from
+    /// [`fit_pcurve`] instead, which records its fit parameters.
+    pub fn nurbs(curve: NurbsCurve2) -> Self {
+        Curve2::Nurbs {
+            curve: Box::new(curve),
+            fit_params: Vec::new(),
+        }
+    }
 }
 
 /// The well-formedness every sampled pcurve needs: at least two vertices,
@@ -431,6 +466,7 @@ impl Curve2Eval for Curve2 {
                 points[i] + (points[i + 1] - points[i]) * frac
             }
             Curve2::Projected(p) => p.inverse(t) + p.offset,
+            Curve2::Nurbs { curve, .. } => curve.point(t),
         }
     }
 
@@ -481,6 +517,7 @@ impl Curve2Eval for Curve2 {
                     guide_slope()
                 }
             }
+            Curve2::Nurbs { curve, .. } => curve.derivative(t),
         }
     }
 
@@ -490,6 +527,7 @@ impl Curve2Eval for Curve2 {
             Curve2::Circle { .. } => (0.0, TWO_PI),
             Curve2::Polyline { params, .. } => (params[0], params[params.len() - 1]),
             Curve2::Projected(p) => (p.guide_params[0], p.guide_params[p.guide_params.len() - 1]),
+            Curve2::Nurbs { curve, .. } => curve.domain(),
         }
     }
 }
@@ -558,9 +596,10 @@ pub enum SeamSide {
 /// a periodic direction's or the join of a clamped patch that closes on
 /// itself — see [`Surface3::wrap_period_u`]. The samples are then fitted, in
 /// order of preference, as a [`Curve2::Line`] or a [`Curve2::Circle`];
-/// failing that they become the branch guide of a [`Curve2::Projected`], or
-/// — where the pairing has no closed-form inverse — a [`Curve2::Polyline`]
-/// through the samples themselves.
+/// failing that they become the branch guide of a [`Curve2::Projected`];
+/// where the pairing has no closed-form inverse, a fitted [`Curve2::Nurbs`]
+/// interpolating the samples, or — for a [`Curve3::Polyline`], whose chords
+/// are its geometry — a [`Curve2::Polyline`] through the samples themselves.
 ///
 /// The first two cover essentially every *axis-aligned* analytic pairing —
 /// a line or circle on a plane, a cylinder's generators and cross-sections,
@@ -568,7 +607,8 @@ pub enum SeamSide {
 /// every seam — exactly, not to a tolerance. `Projected` covers everything
 /// else on an analytic surface just as exactly, which is what tilting one
 /// operand needs (see the module header, of-y8qc). Only a freeform surface
-/// is left on the polyline, whose error is bounded by the sample spacing.
+/// is left on a fit, whose between-sample error is fourth order in the
+/// sample spacing (see the module header, of-50u).
 ///
 /// `seam` picks the branch for a seam edge, where projection returns one of
 /// two equally valid representatives a period apart. It has no effect on a
@@ -616,7 +656,72 @@ pub fn fit_pcurve(
         let (params, points) = refine_branch_guide(surface, curve, params, points);
         return Curve2::projected(surface, curve, params, points);
     }
+    // A smooth curve on a freeform surface: interpolate the samples with a
+    // cubic instead of chording them, cutting the between-sample error from
+    // second order in the spacing to fourth. A `Curve3::Polyline` stays on
+    // the polyline, which is not a downgrade — the curve itself is piecewise
+    // linear, so the chords are the geometry.
+    if !matches!(curve, Curve3::Polyline { .. })
+        && let Some(nurbs) = fit_nurbs_pcurve(&params, &points)
+    {
+        return Ok(nurbs);
+    }
     Curve2::polyline(params, points)
+}
+
+/// Degree of the interpolating fit below. Cubic is the conventional choice
+/// (Piegl & Tiller §9.2.1): high enough for fourth-order error, low enough
+/// that the interpolant cannot oscillate past what the samples support.
+const FIT_NURBS_DEGREE: usize = 3;
+
+/// Interpolate the sampled parameter-space points with a B-spline that
+/// passes through every sample at that sample's own parameter — global
+/// curve interpolation (Piegl & Tiller §9.2.1), with the knot vector by
+/// parameter averaging (their eq. 9.8) so the collocation system is
+/// guaranteed nonsingular (Schoenberg–Whitney).
+///
+/// The knots being averages of the curve's *own* parameters is what keeps
+/// the module invariant: the interpolant is parameterized by the edge
+/// parameter directly, exact at the samples, fourth-order between them.
+///
+/// `None` if there are too few samples for the degree or the solve fails —
+/// the averaged knot vector makes the matrix nonsingular in exact
+/// arithmetic, but a caller gets the polyline fallback rather than a panic
+/// if floating point disagrees.
+fn fit_nurbs_pcurve(params: &[f64], points: &[Point2]) -> Option<Curve2> {
+    let n = points.len();
+    let p = FIT_NURBS_DEGREE;
+    if n < p + 1 {
+        return None;
+    }
+    let mut knots = vec![params[0]; p + 1];
+    knots.extend((1..=(n - 1 - p)).map(|j| params[j..j + p].iter().sum::<f64>() / p as f64));
+    knots.extend(std::iter::repeat_n(params[n - 1], p + 1));
+    let kv = KnotVector::new(p, knots).ok()?;
+
+    // Collocation matrix: row k holds the p + 1 basis functions alive at
+    // t_k. Banded, but n is FIT_SAMPLES — dense LU costs nothing here.
+    let mut matrix = nalgebra::DMatrix::<f64>::zeros(n, n);
+    let mut rhs = nalgebra::DMatrix::<f64>::zeros(n, 2);
+    for (k, (&t, q)) in params.iter().zip(points).enumerate() {
+        let span = kv.find_span(t);
+        for (j, &b) in kv.basis_funs(span, t).iter().enumerate() {
+            matrix[(k, span - p + j)] = b;
+        }
+        rhs[(k, 0)] = q.x;
+        rhs[(k, 1)] = q.y;
+    }
+    let solution = matrix.lu().solve(&rhs)?;
+    let control_points: Vec<Point2> = (0..n)
+        .map(|i| Point2::new(solution[(i, 0)], solution[(i, 1)]))
+        .collect();
+    // The constructor's finiteness check is the guard against a solve that
+    // technically succeeded but overflowed.
+    let curve = NurbsCurve2::bspline(control_points, kv).ok()?;
+    Some(Curve2::Nurbs {
+        curve: Box::new(curve),
+        fit_params: params.to_vec(),
+    })
 }
 
 /// Whether this pairing can be inverted exactly at an arbitrary parameter,
@@ -628,7 +733,8 @@ pub fn fit_pcurve(
 /// - The surface must have a closed-form inverse. Every analytic variant
 ///   does; [`Surface3::Nurbs`] does not, and iterating a Newton search per
 ///   evaluation would trade a bounded error for an unbounded cost and a
-///   convergence question. Freeform trim fidelity stays under of-50u.
+///   convergence question. Freeform pairings take the fitted
+///   [`Curve2::Nurbs`] instead (of-50u).
 /// - The curve must be smooth, so that the image has a derivative to report
 ///   between guide vertices. A [`Curve3::Polyline`] is not, and it gains
 ///   nothing anyway: it already interpolates its own vertices linearly, so
@@ -1725,14 +1831,10 @@ mod tests {
         assert_close(previous, pcurve.point(0.0));
     }
 
-    /// A NURBS surface has no closed-form inverse, so the polyline fallback
-    /// stays exactly where it was — inverting it per evaluation would trade
-    /// a bounded error for an unbounded cost (of-50u).
-    #[test]
-    fn a_freeform_surface_keeps_the_polyline_fallback() {
+    /// The bulged biquadratic patch the freeform fit tests share: nothing
+    /// about it is a plane, and it has no closed-form inverse.
+    fn bulged_patch() -> Surface3 {
         use crate::nurbs::{KnotVector, NurbsSurface};
-
-        // A biquadratic patch with a bulge, so nothing about it is a plane.
         let control = vec![
             vec![
                 Point3::new(0.0, 0.0, 0.0),
@@ -1752,12 +1854,101 @@ mod tests {
         ];
         let knots = KnotVector::new(2, vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0]).expect("valid knots");
         let patch = NurbsSurface::bspline(control, knots.clone(), knots).expect("valid patch");
-        let surface = Surface3::Nurbs(Box::new(patch));
+        Surface3::Nurbs(Box::new(patch))
+    }
+
+    /// A NURBS surface has no closed-form inverse, so a smooth curve on it
+    /// gets the fitted interpolant: exact at every sample's own parameter,
+    /// fourth-order between them (of-50u).
+    #[test]
+    fn a_freeform_surface_gets_a_fitted_nurbs_pcurve() {
+        let surface = bulged_patch();
         // A straight line in model space is not a straight line in this
         // patch's parameters.
         let curve =
             Curve3::line(Point3::new(0.2, 0.3, 6.0), Vector3::new(1.0, 0.9, 0.0)).expect("valid");
         let pcurve = fit_pcurve(&surface, &curve, 0.0, 3.0, SeamSide::Low).expect("fits");
+        let Curve2::Nurbs { fit_params, .. } = &pcurve else {
+            panic!("expected the fitted NURBS, got {pcurve:?}");
+        };
+        assert_eq!(fit_params.len(), FIT_SAMPLES);
+
+        // At its own parameters the fit is an interpolant: the projection
+        // that produced the samples is the only error left.
+        for &t in fit_params {
+            let uv = pcurve.point(t);
+            let miss = surface
+                .point(uv.x, uv.y)
+                .coords
+                .metric_distance(&surface.project_point(&curve.point(t)).point.coords);
+            assert!(miss < 1e-7, "at fit parameter {t}: missed by {miss}");
+        }
+        // Between them the interpolant stays close to the projected truth —
+        // the fourth-order bound, measured where a chord would be worst.
+        for i in 0..FIT_SAMPLES - 1 {
+            let t = 0.5 * (fit_params[i] + fit_params[i + 1]);
+            let uv = pcurve.point(t);
+            let projected = surface.project_point(&curve.point(t));
+            let miss = (surface.point(uv.x, uv.y) - projected.point).norm();
+            assert!(miss < 1e-6, "between samples at t = {t}: missed by {miss}");
+        }
+    }
+
+    /// A cubic interpolant reproduces anything already in its own space: a
+    /// curve whose `(u, v)` image is a parabola comes back exact at *every*
+    /// parameter, not only the sampled ones.
+    #[test]
+    fn the_fitted_nurbs_reproduces_a_polynomial_image_exactly() {
+        use crate::nurbs::{KnotVector, NurbsCurve, NurbsSurface};
+
+        // Bilinear patch S(u, v) = (u, v, uv)...
+        let control = vec![
+            vec![Point3::new(0.0, 0.0, 0.0), Point3::new(0.0, 1.0, 0.0)],
+            vec![Point3::new(1.0, 0.0, 0.0), Point3::new(1.0, 1.0, 1.0)],
+        ];
+        let kv1 = KnotVector::new(1, vec![0.0, 0.0, 1.0, 1.0]).expect("valid");
+        let patch = NurbsSurface::bspline(control, kv1.clone(), kv1).expect("valid patch");
+        let surface = Surface3::Nurbs(Box::new(patch));
+
+        // ...and the twisted cubic c(t) = (t, t², t³), which lies on it
+        // along (u, v) = (t, t²) — a parabola no line or circle fits.
+        let kv3 = KnotVector::new(3, vec![0.0; 4].into_iter().chain(vec![1.0; 4]).collect())
+            .expect("valid");
+        let cubic = NurbsCurve::bspline(
+            vec![
+                Point3::new(0.0, 0.0, 0.0),
+                Point3::new(1.0 / 3.0, 0.0, 0.0),
+                Point3::new(2.0 / 3.0, 1.0 / 3.0, 0.0),
+                Point3::new(1.0, 1.0, 1.0),
+            ],
+            kv3,
+        )
+        .expect("valid curve");
+        let curve = Curve3::nurbs(cubic);
+
+        let pcurve = fit_pcurve(&surface, &curve, 0.0, 1.0, SeamSide::Low).expect("fits");
+        assert!(
+            matches!(pcurve, Curve2::Nurbs { .. }),
+            "expected the fitted NURBS, got {pcurve:?}"
+        );
+        for i in 0..=257 {
+            let t = i as f64 / 257.0;
+            assert_close(pcurve.point(t), Point2::new(t, t * t));
+        }
+        assert_invariant(&surface, &curve, &pcurve, (0.0, 1.0));
+    }
+
+    /// A `Curve3::Polyline` stays on the polyline pcurve even on a freeform
+    /// surface: its chords *are* the geometry, so interpolating a smooth
+    /// curve through them would claim smoothness the edge does not have.
+    #[test]
+    fn a_polyline_curve_on_a_freeform_surface_keeps_the_polyline() {
+        let surface = bulged_patch();
+        let line =
+            Curve3::line(Point3::new(0.2, 0.3, 6.0), Vector3::new(1.0, 0.9, 0.0)).expect("valid");
+        let points: Vec<Point3> = (0..=8).map(|i| line.point(3.0 * i as f64 / 8.0)).collect();
+        let curve = Curve3::polyline(points, false).expect("valid polyline");
+        let pcurve = fit_pcurve(&surface, &curve, 0.0, 8.0, SeamSide::Low).expect("fits");
         assert!(
             matches!(pcurve, Curve2::Polyline { .. }),
             "expected the polyline fallback, got {pcurve:?}"
