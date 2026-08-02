@@ -12,11 +12,13 @@
 
 pub mod assembly;
 pub mod bounded;
+mod error;
 pub mod exact;
 pub mod import;
 pub mod step;
 
 use bounded::{BoundedShape, flatten_mesh};
+use error::{WireError, wire};
 use exact::{ExactPrim, ExactRep, ExactSpec};
 use opensolid_core::mesh::TriangleMesh;
 use opensolid_core::types::{BoundingBox3, Point3, Vector3};
@@ -211,7 +213,10 @@ impl WasmProfile2D {
     /// back to the start (a no-op if the path already ends there).
     fn build(&self) -> Result<Profile2D, String> {
         if !self.closed {
-            return Err("profile must be closed before sweeping (call close())".into());
+            return Err(WireError::invalid_argument(
+                "profile must be closed before sweeping (call close())",
+            )
+            .json());
         }
         let mut b = Profile2D::builder(self.start);
         let mut cursor = self.start;
@@ -243,7 +248,7 @@ impl WasmProfile2D {
                 }
             };
         }
-        b.build().map_err(|e| e.to_string())
+        b.build().map_err(wire)
     }
 }
 
@@ -370,7 +375,7 @@ impl WasmOpenPath2D {
                 }
             };
         }
-        b.build().map_err(|e| e.to_string())
+        b.build().map_err(wire)
     }
 }
 
@@ -455,9 +460,10 @@ pub struct MeshData {
 /// silently truncated.
 fn pattern_count(count: f64) -> Result<usize, String> {
     if !count.is_finite() || count < 0.5 {
-        return Err(format!(
+        return Err(WireError::invalid_argument(format!(
             "pattern count must be a positive integer, got {count}"
-        ));
+        ))
+        .json());
     }
     Ok(count.round() as usize)
 }
@@ -696,10 +702,26 @@ fn mesh_bbox_json(mesh: &TriangleMesh) -> String {
     )
 }
 
-/// Escape a string for embedding as a JSON string literal (backslash and
-/// quote only — kernel error messages contain no control characters).
+/// Escape a string for embedding as a JSON string literal. Control
+/// characters are escaped too: structured boundary errors ([`error`]) are
+/// *parsed* on the JS side, so the output must be valid JSON even if a
+/// message someday carries a newline.
 fn json_escape(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// The integration domain for a field measure: the shape's tracked box grown
@@ -801,7 +823,7 @@ impl WasmShape {
         let draft = draft_degrees.unwrap_or(0.0).to_radians();
         BoundedShape::extrude_draft(p, height, draft)
             .map(WasmShape::sdf_only)
-            .map_err(|e| e.to_string())
+            .map_err(wire)
     }
 
     /// A half-space for terminating an "up to face" extrude: the solid half
@@ -825,7 +847,7 @@ impl WasmShape {
         let p = profile.build()?;
         BoundedShape::revolve(p, angle_degrees.to_radians())
             .map(WasmShape::sdf_only)
-            .map_err(|e| e.to_string())
+            .map_err(wire)
     }
 
     /// The open path thickened into a support rib and swept along +Y over
@@ -847,14 +869,15 @@ impl WasmShape {
             "first" => RibSide::First,
             "second" => RibSide::Second,
             other => {
-                return Err(format!(
+                return Err(WireError::invalid_argument(format!(
                     "unknown rib side {other:?} (want both/first/second)"
-                ));
+                ))
+                .json());
             }
         };
         BoundedShape::rib(p, thickness, height, side)
             .map(WasmShape::sdf_only)
-            .map_err(|e| e.to_string())
+            .map_err(wire)
     }
 
     /// The closed profile swept along the polyline `path`. The profile's
@@ -865,7 +888,7 @@ impl WasmShape {
         let p = profile.build()?;
         BoundedShape::sweep(p, &path.points)
             .map(WasmShape::sdf_only)
-            .map_err(|e| e.to_string())
+            .map_err(wire)
     }
 
     /// A loft between two closed profiles on parallel planes: `bottom` on
@@ -880,7 +903,7 @@ impl WasmShape {
         let t = top.build()?;
         BoundedShape::loft(b, t, height)
             .map(WasmShape::sdf_only)
-            .map_err(|e| e.to_string())
+            .map_err(wire)
     }
 
     /// This shape moved by `(x, y, z)`.
@@ -916,16 +939,13 @@ impl WasmShape {
         self.inner
             .scale(Vector3::new(sx, sy, sz))
             .map(WasmShape::sdf_only)
-            .map_err(|e| e.to_string())
+            .map_err(wire)
     }
 
     /// This shape scaled uniformly about the origin (`factor > 0`).
     #[wasm_bindgen(js_name = uniformScale)]
     pub fn uniform_scale(&self, factor: f64) -> Result<WasmShape, String> {
-        let inner = self
-            .inner
-            .uniform_scale(factor)
-            .map_err(|e| e.to_string())?;
+        let inner = self.inner.uniform_scale(factor).map_err(wire)?;
         Ok(WasmShape {
             inner,
             exact: self.map_spec(|s| s.uniform_scaled(factor)),
@@ -957,7 +977,7 @@ impl WasmShape {
                 angle_degrees.to_radians(),
             )
             .map(WasmShape::sdf_only)
-            .map_err(|e| e.to_string())
+            .map_err(wire)
     }
 
     /// Boolean union with `other`.
@@ -1033,7 +1053,7 @@ impl WasmShape {
         self.inner
             .shell(thickness)
             .map(WasmShape::sdf_only)
-            .map_err(|e| e.to_string())
+            .map_err(wire)
     }
 
     /// `count` copies of this shape, copy `k` translated by `k·(dx, dy, dz)`.
@@ -1050,7 +1070,7 @@ impl WasmShape {
         self.inner
             .linear_pattern(Vector3::new(dx, dy, dz), n)
             .map(WasmShape::sdf_only)
-            .map_err(|e| e.to_string())
+            .map_err(wire)
     }
 
     /// `count` copies of this shape spaced evenly around the axis through
@@ -1077,7 +1097,7 @@ impl WasmShape {
         self.inner
             .circular_pattern(Point3::new(cx, cy, cz), Vector3::new(ax, ay, az), step, n)
             .map(WasmShape::sdf_only)
-            .map_err(|e| e.to_string())
+            .map_err(wire)
     }
 
     /// This shape unioned with its reflection across the plane through
@@ -1094,7 +1114,7 @@ impl WasmShape {
         self.inner
             .mirror(Point3::new(px, py, pz), Vector3::new(nx, ny, nz))
             .map(WasmShape::sdf_only)
-            .map_err(|e| e.to_string())
+            .map_err(wire)
     }
 
     /// Signed distance from `(x, y, z)` to the surface: negative inside,
@@ -1164,8 +1184,9 @@ impl WasmShape {
     /// `meshAdaptive`; omitted or invalid falls back to 0.5% of the
     /// shape's extent — the exact path ignores it).
     ///
-    /// Throws a string error when the shape cannot produce a valid solid
-    /// (e.g. an empty boolean result).
+    /// Throws a structured JSON error string (`{code, category, message,
+    /// hint?}` — see the `error` module) when the shape cannot produce
+    /// a valid solid (e.g. an empty boolean result).
     ///
     /// `unit` is the document unit key (`"mm"`, `"cm"`, `"m"`, `"in"`); it
     /// sets the STEP length-unit declaration only — coordinates are written
@@ -1361,11 +1382,14 @@ impl WasmShape {
     #[wasm_bindgen(js_name = fieldClearance)]
     pub fn field_clearance(&self, probes: &[f64], softness: f64) -> Result<f64, String> {
         if probes.is_empty() || !probes.len().is_multiple_of(3) {
-            return Err("probes must be a non-empty flat [x,y,z,…] buffer".to_string());
+            return Err(WireError::invalid_argument(
+                "probes must be a non-empty flat [x,y,z,…] buffer",
+            )
+            .json());
         }
         // Rejects zero, negatives, and NaN (a NaN softness would poison the softmin).
         if softness <= 0.0 || softness.is_nan() {
-            return Err("softness must be positive".to_string());
+            return Err(WireError::invalid_argument("softness must be positive").json());
         }
         let pts: Vec<Point3> = probes
             .chunks_exact(3)

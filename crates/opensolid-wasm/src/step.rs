@@ -22,6 +22,7 @@ use opensolid_kernel::convert::sdf_to_brep::{SdfToBrepOptions, sdf_to_brep};
 use opensolid_kernel::io::step::write::{LengthUnit, StepWriteOptions, write_step};
 
 use crate::bounded::BoundedShape;
+use crate::error::WireError;
 use crate::exact::ExactRep;
 
 /// Depth bounds for the faceted path's adaptive meshing, matching the
@@ -62,8 +63,9 @@ fn length_unit(key: Option<&str>) -> LengthUnit {
 /// millimetres.
 ///
 /// # Errors
-/// A human-readable message when the faceted path cannot produce a valid
-/// solid (empty shape, or a surface the mesher cannot close).
+/// A structured JSON error string (see `crate::error`) when the faceted path
+/// cannot produce a valid solid (empty shape, or a surface the mesher
+/// cannot close); its `message` stays human-readable.
 pub fn export_step(
     inner: &BoundedShape,
     exact: Option<&ExactRep>,
@@ -80,7 +82,7 @@ pub fn export_step(
 
     let faceted = faceted_body(inner, accuracy)?;
     let text = write_step(&faceted.store, &faceted.geo, &[faceted.body], &options)
-        .map_err(|e| format!("STEP export failed: {e}"))?;
+        .map_err(|e| WireError::from(&e).context("STEP export failed").json())?;
     Ok(StepExport { text, exact: false })
 }
 
@@ -125,7 +127,7 @@ pub fn faceted_body(inner: &BoundedShape, accuracy: Option<f64>) -> Result<Facet
     let mut store = TopologyStore::new();
     let mut geo = GeometryStore::new();
     let body = sdf_to_brep(&inner.shape, &mut store, &mut geo, &opts)
-        .map_err(|e| format!("STEP export failed: {e}"))?;
+        .map_err(|e| WireError::from(&e).context("STEP export failed").json())?;
     let faces = store
         .bodies
         .get(body)

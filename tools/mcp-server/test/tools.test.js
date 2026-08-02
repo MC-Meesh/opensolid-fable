@@ -41,6 +41,30 @@ test('create_model surfaces syntax errors', () => {
   assert.match(bad.content[0].text, /syntax error|failed/i);
 });
 
+// Kernel errors cross the wasm boundary as structured JSON (of-2y4.9):
+// {code, category, message, hint?}. The tool layer must hand that structure
+// to the agent — code and category to branch on, not just prose.
+test('kernel errors arrive structured with code and category', () => {
+  const t = freshTools();
+  const bad = t.call('create_model', { script: 'return Shape.box3(1,1,1).scale(0, 1, 1);' });
+  assert.equal(bad.isError, true);
+  const text = bad.content[0].text;
+  assert.match(text, /^Error: \{/);
+  const parsed = JSON.parse(text.replace(/^Error: /, ''));
+  assert.equal(parsed.code, 'invalid_argument');
+  assert.equal(parsed.category, 'argument');
+  assert.match(parsed.message, /^script failed: /);
+});
+
+// Non-kernel failures (plain JS errors) still arrive as plain text — the
+// structured path must not swallow or mangle them.
+test('non-kernel script errors stay plain text', () => {
+  const t = freshTools();
+  const bad = t.call('create_model', { script: 'return 42;' });
+  assert.equal(bad.isError, true);
+  assert.match(bad.content[0].text, /^Error: [^{]/);
+});
+
 test('measure returns the exact box volume', () => {
   const t = freshTools();
   const id = jsonOf(t.call('create_model', { script: 'return Shape.box3(1, 0.5, 0.75);' })).model_id;

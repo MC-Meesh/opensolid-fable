@@ -53,13 +53,58 @@ function fail(message) {
   return { content: [{ type: 'text', text: `Error: ${message}` }], isError: true };
 }
 
-// Extract a human-readable message from a thrown value. wasm-bindgen rejects a
-// Rust `Result::Err(String)` by throwing the *raw string* (not an Error), so
-// `err.message` is `undefined` for kernel-side failures — the useful text lives
-// in the value itself. Read `.message` when present, otherwise stringify.
-function errMessage(err) {
+// Extract the raw thrown value as text. wasm-bindgen rejects a Rust
+// `Result::Err(String)` by throwing the *raw string* (not an Error), so
+// `err.message` is `undefined` for kernel-side failures — the useful text
+// lives in the value itself. Read `.message` when present, otherwise
+// stringify.
+function errRaw(err) {
   if (err && typeof err.message === 'string') return err.message;
   return String(err);
+}
+
+// Structured kernel errors (of-2y4.9): every error the wasm boundary throws
+// is one JSON object — {code, category, message, hint?} — so an agent can
+// branch on `code`/`category` instead of pattern-matching prose. Returns the
+// parsed object, or null for errors that are not structured (JS TypeErrors,
+// fs errors, pre-upgrade kernels).
+function errInfo(err) {
+  const raw = errRaw(err);
+  if (!raw.startsWith('{"code":"')) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed.code === 'string' && typeof parsed.message === 'string') {
+      return parsed;
+    }
+  } catch {
+    // Looked structured but was not valid JSON; treat as prose.
+  }
+  return null;
+}
+
+// Human-readable message from a thrown value, structured or not.
+function errMessage(err) {
+  const info = errInfo(err);
+  return info ? info.message : errRaw(err);
+}
+
+// Failure result that keeps the kernel's structure. Structured errors are
+// re-serialized as JSON (with `prefix` folded into the message) so the agent
+// receives code/category/hint verbatim; unstructured errors fall back to the
+// plain-text form.
+function failErr(err, prefix) {
+  const info = errInfo(err);
+  if (!info) {
+    const raw = errRaw(err);
+    return fail(prefix ? `${prefix}: ${raw}` : raw);
+  }
+  const payload = {
+    code: info.code,
+    category: info.category,
+    message: prefix ? `${prefix}: ${info.message}` : info.message,
+  };
+  if (info.hint) payload.hint = info.hint;
+  return { content: [{ type: 'text', text: `Error: ${JSON.stringify(payload, null, 2)}` }], isError: true };
 }
 
 // A null volume is never self-explanatory: the kernel says why in `massError`.
@@ -671,7 +716,7 @@ export function createTools(config = {}) {
             exact: args.exact,
           });
         } catch (err) {
-          return fail(`script failed: ${errMessage(err)}`);
+          return failErr(err, 'script failed');
         }
         const measure = JSON.parse(model.shape.measure(undefined));
         const validation = JSON.parse(model.shape.validate(undefined, undefined));
@@ -793,7 +838,7 @@ export function createTools(config = {}) {
         try {
           imported = importStep(bytes, positiveArg(args.circle_segments));
         } catch (err) {
-          return fail(`import failed: ${errMessage(err)}`);
+          return failErr(err, 'import failed');
         }
 
         try {
@@ -1108,7 +1153,7 @@ export function createTools(config = {}) {
             try {
               asm.addInstance(model.shape, translation, axis, angleDeg, fixed, density, name);
             } catch (err) {
-              return fail(`instances[${i}]: ${errMessage(err)}`);
+              return failErr(err, `instances[${i}]`);
             }
             instanceViews.push({ index: i, model_id: model.id, name, fixed, density });
           }
@@ -1140,7 +1185,7 @@ export function createTools(config = {}) {
                 spec.value === undefined ? undefined : spec.value,
               );
             } catch (err) {
-              return fail(`mates[${i}]: ${errMessage(err)}`);
+              return failErr(err, `mates[${i}]`);
             }
           }
 
@@ -1161,7 +1206,7 @@ export function createTools(config = {}) {
           try {
             shape = asm.assembledShape();
           } catch (err) {
-            return fail(errMessage(err));
+            return failErr(err);
           }
           const placedInstances = instanceViews.map((v, i) => ({ ...v, transform: transforms[i] }));
           const model = store.registerAssembly({
@@ -1344,7 +1389,7 @@ export function createTools(config = {}) {
             height: args.height,
           });
         } catch (err) {
-          return fail(errMessage(err));
+          return failErr(err);
         }
         return {
           content: [
@@ -1443,7 +1488,7 @@ export function createTools(config = {}) {
             writeFileSync(dest, buildObj(mesh.positions, mesh.normals, mesh.indices), 'utf8');
           }
         } catch (err) {
-          return fail(`export failed: ${errMessage(err)}`);
+          return failErr(err, 'export failed');
         }
         return text({
           model_id: model.id,
@@ -1625,7 +1670,7 @@ export function createTools(config = {}) {
         try {
           census = inspectTopology(model.shape, getMesh(model.shape, { accuracy }));
         } catch (err) {
-          return fail(`topology inspection failed: ${errMessage(err)}`);
+          return failErr(err, 'topology inspection failed');
         }
         let probes;
         if (args.probes !== undefined) {
@@ -1647,7 +1692,7 @@ export function createTools(config = {}) {
               };
             });
           } catch (err) {
-            return fail(`probe failed: ${errMessage(err)}`);
+            return failErr(err, 'probe failed');
           }
         }
         const brep = JSON.parse(model.shape.brepCheck(false));
@@ -1886,7 +1931,7 @@ export function createTools(config = {}) {
               volumeDelta,
             );
           } catch (err) {
-            return fail(`expect_volume_delta: ${errMessage(err)}`);
+            return failErr(err, 'expect_volume_delta');
           }
         }
         return text(payload);
@@ -2265,7 +2310,7 @@ export function createTools(config = {}) {
         try {
           result = optimize(model, args);
         } catch (err) {
-          return fail(`optimize failed: ${errMessage(err)}`);
+          return failErr(err, 'optimize failed');
         }
         // Commit the winning point back into the model so the next
         // measure/export/get_screenshot reflects the optimized part.
@@ -2287,7 +2332,7 @@ export function createTools(config = {}) {
       try {
         return tool.handler(args || {});
       } catch (err) {
-        return fail(errMessage(err));
+        return failErr(err);
       }
     },
   };

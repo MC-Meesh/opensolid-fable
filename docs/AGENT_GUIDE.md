@@ -955,6 +955,44 @@ a human-readable message in the text content; they never throw across the wire.
 An agent should branch on `isError` and read the message — each one names a
 specific, actionable cause.
 
+### Structured kernel errors — branch on `code`, not prose
+
+Failures raised by the kernel itself (bad modeling arguments, geometry that
+cannot close, STEP problems) arrive as `Error: ` followed by a JSON object:
+
+```json
+{
+  "code": "non_manifold_mesh",
+  "category": "geometry",
+  "message": "export failed: STEP export failed: non-manifold mesh in sdf_to_brep: 2 pinched edge(s) joining 3+ triangles — …",
+  "hint": "Pinched edges are a mesher defect at near-tangent features; a finer accuracy does not reliably clear them — nudge the feature size or the overall proportions instead."
+}
+```
+
+- **`code`** is stable and machine-readable — branch on it. Never parse the
+  message text to classify a failure.
+- **`category`** is the coarse class when the exact code doesn't matter:
+  `argument` (fix your input and retry), `geometry` (the shape itself is the
+  problem), `tolerance`, `unsupported`, `io`.
+- **`hint`** appears only when there is a concrete next step beyond what the
+  message states — when present, follow it before retrying blind.
+
+| `code` | `category` | Meaning |
+|--------|------------|---------|
+| `invalid_argument` | `argument` | A parameter violated its documented constraint; the message names it |
+| `degenerate_geometry` | `geometry` | Input geometry is degenerate for the operation (zero-length path, …) |
+| `non_manifold_mesh` | `geometry` | Meshing did not close; the hint says whether it's an open rim (bounds) or a pinch (feature proportions) |
+| `tolerance_violation` | `tolerance` | A computed quantity exceeded its allowed tolerance |
+| `not_implemented` | `unsupported` | Capability not available in this build |
+| `degenerate_mate_feature`, `mate_feature_mismatch`, `mate_missing_value` | `argument` | A mate spec problem in `assemble` |
+| `empty_assembly` | `argument` | Assembly operation with no instances |
+| `step_parse_error` | `io` | File is not syntactically valid Part 21 |
+| `step_unsupported`, `invalid_body`, `stale_body` | `io` | STEP writer declined the body |
+
+Errors from the tool layer itself (unknown `model_id`, unsupported `format`,
+script syntax errors, non-Shape returns) stay plain text — structure exists
+where there is a kernel failure kind to branch on.
+
 ### Script errors — caught at `create_model`
 
 | Situation | Reported as |
@@ -1061,9 +1099,14 @@ tool **declines rather than emitting a broken file**:
 ```json
 {
   "isError": true,
-  "text": "Error: export failed: STEP export failed: degenerate geometry in sdf_to_brep: adaptive meshing did not produce a closed manifold; the surface must lie strictly inside the meshing bounds"
+  "text": "Error: {\"code\": \"non_manifold_mesh\", \"category\": \"geometry\", \"message\": \"export failed: STEP export failed: non-manifold mesh in sdf_to_brep: 4 open edge(s) — the surface reaches the meshing bounds instead of closing strictly inside them\", \"hint\": \"Open edges mean the surface reaches the meshing bounds; enlarge the bounds or shrink the shape so the surface closes strictly inside them.\"}"
 }
 ```
+
+The `code` distinguishes the two very different causes that used to share one
+sentence: an open rim at the bounds (fix the model's extent) versus a pinched
+edge at a near-tangent feature (no accuracy fixes it — nudge the feature). Read
+the `hint`; it is defect-specific.
 
 STL is unaffected when this happens — meshing and STEP's planar-region recovery
 are different code paths. To get an analytic STEP of such a part, thicken the

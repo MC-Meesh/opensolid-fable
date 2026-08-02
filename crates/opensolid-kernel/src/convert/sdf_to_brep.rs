@@ -151,9 +151,12 @@ impl SdfToBrepOptions {
 ///
 /// # Errors
 /// [`CoreError::InvalidArgument`] if the surface does not cross
-/// `opts.mesh.bounds`; [`CoreError::Degenerate`] if meshing does not
-/// produce a closed manifold (surface not strictly inside the bounds) or
-/// produces a zero-area triangle.
+/// `opts.mesh.bounds`; [`CoreError::NonManifold`] if meshing does not
+/// produce a closed manifold, with the defect counts naming which kind of
+/// defect (open rim at the bounds vs. pinched edge vs. orientation);
+/// [`CoreError::Degenerate`] if the mesh has a zero-area triangle with a
+/// vanishing field gradient or a component that is not a closed orientable
+/// surface.
 pub fn sdf_to_brep(
     sdf: &dyn Sdf,
     store: &mut TopologyStore,
@@ -174,12 +177,14 @@ pub fn sdf_to_brep(
     // Name the actual defect rather than asserting one cause. The old text
     // blamed the meshing bounds unconditionally, which is wrong — and
     // misleading — for the pinched-edge case, where the surface is strictly
-    // inside the bounds and no accuracy resolves it (of-o0o).
+    // inside the bounds and no accuracy resolves it (of-o0o). The defect
+    // counts ride along so the wasm boundary can emit a branchable code
+    // and a defect-specific hint (of-2y4.9).
     let defects = mesh.manifold_defects();
-    if let Some(reason) = defects.describe() {
-        return Err(CoreError::Degenerate {
+    if !defects.is_closed() {
+        return Err(CoreError::NonManifold {
             context: "sdf_to_brep",
-            reason: format!("adaptive meshing did not produce a closed manifold: {reason}"),
+            defects,
         });
     }
 
@@ -869,7 +874,13 @@ mod tests {
         let mut geo = GeometryStore::new();
         let opts = SdfToBrepOptions::new(bounds(0.8), 4);
         let err = sdf_to_brep(&s, &mut store, &mut geo, &opts).unwrap_err();
-        assert!(matches!(err, CoreError::Degenerate { .. }), "{err}");
+        let CoreError::NonManifold { defects, .. } = &err else {
+            panic!("expected NonManifold, got {err}");
+        };
+        assert!(
+            defects.boundary_edges > 0,
+            "a surface crossing the bounds must be reported as an open rim: {err}"
+        );
         assert_eq!(store.bodies.len(), 0, "stores untouched on failure");
     }
 }
