@@ -4354,7 +4354,24 @@ impl FallbackMesher<'_> {
         // A skewed trim grids as its bounding rectangle: an approximation the
         // face's own rim contradicts, but the honest alternative is no
         // triangles at all, and the caller has already tried the CDT.
-        let (u_lo, u_hi, wrap_u) = match quadric_u_span(&samples, period, u_anchor, v_lo, v_hi) {
+        let span = quadric_u_span(&samples, period, u_anchor, v_lo, v_hi);
+        if std::env::var("OPENSOLID_DEBUG_GRID").is_ok() {
+            let desc = match &span {
+                Some(QuadricUSpan::Full { u_anchor }) => format!("Full anchor={u_anchor}"),
+                Some(QuadricUSpan::PartialRect { u_lo, u_hi }) => {
+                    format!("PartialRect [{u_lo}, {u_hi}]")
+                }
+                Some(QuadricUSpan::PartialSkew { u_lo, u_hi }) => {
+                    format!("PartialSkew [{u_lo}, {u_hi}]")
+                }
+                None => "None".to_string(),
+            };
+            eprintln!(
+                "DEBUG grid face #{face_ref}: {desc}, v=[{v_lo}, {v_hi}] wrap_v={wrap_v} n_v={n_v}, samples={}",
+                samples.len()
+            );
+        }
+        let (u_lo, u_hi, wrap_u) = match span {
             Some(QuadricUSpan::Full { u_anchor }) => (u_anchor, u_anchor + period, true),
             None => (u_anchor, u_anchor + period, true),
             Some(
