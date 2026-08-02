@@ -45,13 +45,30 @@
 //! seeded [`Rng`], a repro string on every failure, failures become `bd`
 //! beads and the case is `#[ignore]`d referencing the bead rather than
 //! softened. `OPENSOLID_CAMPAIGN_SEED=<hex>` remixes every suite seed.
+//!
+//! Bugs filed from this suite (first run, 2026-08-01):
+//! - of-yic4: `NurbsCurve{,2}::reversed` panics when the floating-point
+//!   knot reflection `t0 + t1 − k` collapses two distinct knots (the
+//!   reflected vector fails `KnotVector::new` behind an `expect`).
+//!   Reachable from a crafted STEP file through a `same_sense = .F.`
+//!   freeform edge — `collect_authored_pcurves` reverses the authored 2D
+//!   trim (of-50u) and `trim_curve` the authored 3D basis — so the reader
+//!   aborts instead of diagnosing. See
+//!   [`reversing_a_hostile_knot_vector_must_not_panic`] and
+//!   [`hostile_authored_pcurve_knots_on_a_reversed_edge_must_not_panic_the_reader`].
+//! - of-xsr7: `fit_pcurve` on a *closed* NURBS patch, fitting a curve that
+//!   crosses the patch's join mid-span, interpolates unwrapped samples
+//!   that straddle the knot rectangle; the patch clamps outside its
+//!   domain, so the fitted `Curve2::Nurbs` misses the invariant at its own
+//!   fit parameters by up to a diameter (3.2 measured at radius 1.66). See
+//!   [`seam_crossing_trim_on_a_closed_freeform_tube_holds_the_invariant`].
 
 use std::fmt::Write as _;
 
 use opensolid_kernel::brep::{
     Body, Curve2, Curve2Eval, Curve3, CurveEval, GeometryStore, KnotVector, NurbsCurve,
-    NurbsCurve2, NurbsSurface, SeamSide, Surface3, SurfaceEval, TopologyStore,
-    attach_body_pcurves, fit_pcurve, primitives,
+    NurbsCurve2, NurbsSurface, SeamSide, Surface3, SurfaceEval, TopologyStore, attach_body_pcurves,
+    fit_pcurve, primitives,
 };
 use opensolid_kernel::brep_mass_properties;
 use opensolid_kernel::core::EntityId;
@@ -263,7 +280,11 @@ fn curve_record(
         .map(|r| format!("#{r}"))
         .collect::<Vec<_>>()
         .join(", ");
-    let knots = knot_values.iter().map(|&k| fr(k)).collect::<Vec<_>>().join(", ");
+    let knots = knot_values
+        .iter()
+        .map(|&k| fr(k))
+        .collect::<Vec<_>>()
+        .join(", ");
     let mults = knot_mults
         .iter()
         .map(|m| m.to_string())
@@ -527,7 +548,11 @@ fn split_top_block_step(spec: &SplitSpec, authoring: &TrimAuthoring) -> String {
         }
         TrimAuthoring::HugeCoords => {
             for (i, p) in pts2.iter_mut().enumerate() {
-                *p = if i % 2 == 0 { (1e300, -1e300) } else { (-1e300, 1e300) };
+                *p = if i % 2 == 0 {
+                    (1e300, -1e300)
+                } else {
+                    (-1e300, 1e300)
+                };
             }
         }
         TrimAuthoring::CountMismatch => drop_last_cp = true,
@@ -624,7 +649,9 @@ fn split_edge(
     for face in store.faces_of_body(body) {
         for edge_id in store.edges_of_face(face) {
             let edge = store.edge(edge_id).expect("live edge");
-            let curve = geo.curve(edge.curve.expect("edge curve")).expect("live curve");
+            let curve = geo
+                .curve(edge.curve.expect("edge curve"))
+                .expect("live curve");
             if matches!(curve, Curve3::Nurbs(_)) {
                 return (edge_id, curve.clone(), edge.t_start, edge.t_end);
             }
@@ -690,12 +717,7 @@ fn split_edge_fin_pcurves(
     out
 }
 
-fn assert_clean(
-    store: &TopologyStore,
-    geo: &GeometryStore,
-    body: EntityId<Body>,
-    repro: &str,
-) {
+fn assert_clean(store: &TopologyStore, geo: &GeometryStore, body: EntityId<Body>, repro: &str) {
     let failures = store.check_with_geometry(geo, body);
     assert!(
         failures.is_empty(),
@@ -936,7 +958,10 @@ fn degenerate_authored_pcurves_degrade_without_panic() {
 /// (or onto the domain end). `NurbsCurve2::reversed` — and its 3D twin —
 /// rebuilds the reflected vector through `KnotVector::new` behind an
 /// `expect`, so a collapse is an abort, not an error.
+///
+/// First run: panicked `DegenerateEndSpan { index: 3, knot: 1e17 }`.
 #[test]
+#[ignore = "of-yic4: NurbsCurve2::reversed panics on a collapsing knot reflection"]
 fn reversing_a_hostile_knot_vector_must_not_panic() {
     let knots = KnotVector::new(1, vec![0.0, 0.0, 1.0, 1.0 + f64::EPSILON, 1e17, 1e17])
         .expect("distinct interior knots at multiplicity 1 are valid");
@@ -963,7 +988,11 @@ fn reversing_a_hostile_knot_vector_must_not_panic() {
 /// freeform edge makes `collect_authored_pcurves` reverse the authored 2D
 /// trim before the transplant gate ever sees it, so a crafted file aborts
 /// the reader.
+///
+/// First run: the import call panicked inside `NurbsCurve2::reversed`
+/// (`curve2.rs:165`) before any diagnostic was produced.
 #[test]
+#[ignore = "of-yic4: hostile authored pcurve knots panic the STEP reader"]
 fn hostile_authored_pcurve_knots_on_a_reversed_edge_must_not_panic_the_reader() {
     let mut rng = Rng::new(0x50D5);
     let spec = SplitSpec::random(&mut rng);
@@ -993,7 +1022,11 @@ fn circle_controls(radius: f64, phase: f64, z: f64) -> (Vec<Point3>, Vec<f64>) {
     let mut weights = Vec::with_capacity(9);
     for i in 0..9 {
         let angle = phase + i as f64 * std::f64::consts::FRAC_PI_4;
-        let reach = if i % 2 == 0 { 1.0 } else { std::f64::consts::SQRT_2 };
+        let reach = if i % 2 == 0 {
+            1.0
+        } else {
+            std::f64::consts::SQRT_2
+        };
         points.push(Point3::new(
             radius * reach * angle.cos(),
             radius * reach * angle.sin(),
@@ -1007,7 +1040,9 @@ fn circle_controls(radius: f64, phase: f64, z: f64) -> (Vec<Point3>, Vec<f64>) {
 fn quarter_knots() -> KnotVector {
     KnotVector::new(
         2,
-        vec![0.0, 0.0, 0.0, 0.25, 0.25, 0.5, 0.5, 0.75, 0.75, 1.0, 1.0, 1.0],
+        vec![
+            0.0, 0.0, 0.0, 0.25, 0.25, 0.5, 0.5, 0.75, 0.75, 1.0, 1.0, 1.0,
+        ],
     )
     .expect("quarter-arc knots")
 }
@@ -1033,7 +1068,12 @@ fn closed_tube(radius: f64, height: f64) -> NurbsSurface {
 /// patch evaluates a parameter outside its rectangle to the rectangle's
 /// edge, so any overhang the recentre leaves is arc-length error the fit
 /// silently claims as exact.
+///
+/// First run: every seed failed, worst deviation 3.229 at radius 1.662
+/// (seed 0x50D6) — about 1.9 radii of arc claimed exactly and traced
+/// wrongly.
 #[test]
+#[ignore = "of-xsr7: seam-crossing fit on a closed NURBS patch breaks the invariant"]
 fn seam_crossing_trim_on_a_closed_freeform_tube_holds_the_invariant() {
     for case in 0..12u64 {
         let mut rng = Rng::new(0x50D6 + case);
@@ -1106,9 +1146,7 @@ fn extreme_weight_ratios_evaluate_finitely() {
         let points: Vec<Point2> = (0..n)
             .map(|i| Point2::new(i as f64 + rng.unit(), rng.range(-1.0, 1.0)))
             .collect();
-        let weights: Vec<f64> = (0..n)
-            .map(|_| 10f64.powf(rng.range(-4.0, 4.0)))
-            .collect();
+        let weights: Vec<f64> = (0..n).map(|_| 10f64.powf(rng.range(-4.0, 4.0))).collect();
         let repro = format!(
             "seed 0x{:04X} (cargo test --test step_pcurve_nurbs_random \
              extreme_weight_ratios), weights {weights:?}",
