@@ -51,11 +51,29 @@ use std::f64::consts::PI;
 // repro seed means the same thing in both suites.
 // ---------------------------------------------------------------------
 
+/// Campaign remix (of-5rim): `OPENSOLID_CAMPAIGN_SEED=<hex>` XORs every suite
+/// seed so the same properties walk fresh configurations each run. Unset (CI,
+/// plain `cargo test`), the suite is byte-for-byte deterministic. A campaign
+/// failure reproduces with the same variable value plus the test name — the
+/// campaign driver (`tools/campaign/`) records both in the bead it files.
+fn campaign_seed() -> u64 {
+    static MIX: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MIX.get_or_init(|| match std::env::var("OPENSOLID_CAMPAIGN_SEED") {
+        Ok(raw) => {
+            let hex = raw.trim();
+            let hex = hex.strip_prefix("0x").unwrap_or(hex);
+            u64::from_str_radix(&hex.replace('_', ""), 16)
+                .unwrap_or_else(|_| panic!("OPENSOLID_CAMPAIGN_SEED must be hex, got {raw:?}"))
+        }
+        Err(_) => 0,
+    })
+}
+
 struct Rng(u64);
 
 impl Rng {
     fn new(seed: u64) -> Self {
-        Rng(seed)
+        Rng(seed ^ campaign_seed())
     }
 
     fn next_u64(&mut self) -> u64 {
