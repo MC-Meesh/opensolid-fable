@@ -9453,15 +9453,27 @@ fn severed_torus_rings_walk_the_major_seam() {
 /// orders smaller than the part and a crossing angle that shrinks with
 /// the bite. Every step must keep genus 1, bind readable ranges, and
 /// close the material balance against the intersection.
-// Fenced adversarial discovery (of-rxjs): at bite 0.05 the subtract fails
-// with Degenerate("boolean::imprint", "an imprint chain ends in a face
-// interior without closing or reaching the face boundary"). bite 0.15
-// passes. Un-ignore when of-rxjs lands.
+///
+/// Un-ignored by of-rxjs, whose defect was upstream of the imprint
+/// machinery this section aims at: `march_boxed`'s seed dedup skipped any
+/// seed within a fixed ball (2·h0 — a length of the whole TORUS grid, not
+/// of the loop) of an already-traced point, and once three of the loop's
+/// four seam-quartered cover fragments had traced, every candidate seed
+/// of the fourth sat inside that ball of a traced fragment's *terminus*.
+/// The island reached `boolean::imprint` three-quarters complete and the
+/// chain died in the face interior. bite 0.15 passed only because its
+/// loop is large enough for a seed to land deeper than the ball.
+///
+/// The non-vacuity probe is per configuration. At 0.15 and 0.05 the
+/// block's ±Y planes still cut the tube and each such quartic binds an
+/// edge on a looping curve. At 0.02 NO curve loops — the collapsed
+/// island's only curves are its four quarter arcs, open polylines meeting
+/// at the seam-crossing vertices — so the island is probed structurally
+/// instead: its marched arcs must be bound as edges at all.
 #[test]
-#[ignore = "of-rxjs: shallow graze aborts Degenerate in boolean::imprint"]
 fn grazing_notch_shrinks_the_imprint_loop_to_an_island() {
     let (major, minor) = (2.0, 0.5);
-    for bite in [0.15, 0.05, 0.02] {
+    for (bite, loops) in [(0.15, true), (0.05, true), (0.02, false)] {
         let context = format!("outer-wall graze, bite {bite}");
         let mut scene = Scene::new();
         let ring = scene.torus(Point3::origin(), major, minor);
@@ -9471,12 +9483,32 @@ fn grazing_notch_shrinks_the_imprint_loop_to_an_island() {
             .unwrap_or_else(|e| panic!("{context}: subtract failed: {e:?}"));
         let counts = diff.store.euler_counts(diff.body);
         assert_eq!(counts.genus, 1, "{context}: grazed ring must stay genus 1");
-        let (looping, _) = looping_imprint_edge_ranges(&diff, &context);
-        assert!(
-            looping > 0,
-            "{context}: no edge bound to a looping imprint — the graze \
-             no longer produces the case this section stresses"
-        );
+        if loops {
+            let (looping, _) = looping_imprint_edge_ranges(&diff, &context);
+            assert!(
+                looping > 0,
+                "{context}: no edge bound to a looping imprint — the graze \
+                 no longer produces the case this section stresses"
+            );
+        } else {
+            let mut marched_edges = 0;
+            for face in diff.store.faces_of_body(diff.body) {
+                for edge_id in diff.store.edges_of_face(face) {
+                    let edge = diff.store.edge(edge_id).expect("live edge");
+                    let curve_id = edge.curve.expect("every output edge binds a curve");
+                    let curve = diff.geo.curve(curve_id).expect("live curve");
+                    if matches!(curve, Curve3::Polyline { .. }) {
+                        marched_edges += 1;
+                    }
+                }
+            }
+            assert!(
+                marched_edges >= 4,
+                "{context}: expected the island's four seam-quartered arcs \
+                 bound as edges, found {marched_edges} marched edge(s) — \
+                 the island class this section stresses is gone"
+            );
+        }
         assert_edge_ranges_readable(&diff, &context);
         let inter = scene
             .intersect(ring, tool)

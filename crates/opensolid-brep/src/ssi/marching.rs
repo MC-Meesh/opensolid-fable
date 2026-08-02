@@ -686,13 +686,24 @@ fn march_boxed<A: MarchSurface, B: MarchSurface>(
         {
             continue;
         }
-        // Skip seeds landing on an already-traced curve.
-        let on_existing = curves.iter().any(|curve| {
-            curve
-                .points
-                .iter()
-                .any(|p| (p - seed.1.pa).norm() < merge_dist)
-        });
+        // Skip seeds landing on an already-traced curve. The march from any
+        // seed on a branch covers the whole branch in both directions, so
+        // such a seed can only re-trace it. But nearness to an OPEN
+        // fragment's *terminus* is not the same thing (of-rxjs): the
+        // fragment ended there because a chart bound cut it, and the locus
+        // continues past the cut in the next cover window. A seed on that
+        // continuation sits inside any fixed ball around the terminus once
+        // the branch is small against the seed grid — a shallow graze's
+        // loop, quartered by the torus seams, puts EVERY candidate seed of
+        // the last quadrant within `merge_dist` of an already-traced cut
+        // point, and the quadrant was silently never traced. So the test is
+        // against the polyline's segments, and a nearest point that falls
+        // past an open chain's end does not count as "on" it; a seed
+        // sitting exactly on the cut vertex slips through and re-traces,
+        // which the duplicate check after tracing absorbs.
+        let on_existing = curves
+            .iter()
+            .any(|curve| seed_on_traced(curve, &seed.1.pa, merge_dist));
         if on_existing {
             continue;
         }
@@ -752,9 +763,99 @@ fn march_boxed<A: MarchSurface, B: MarchSurface>(
             curve.params_a.push((s.0[0], s.0[1]));
             curve.params_b.push((s.0[2], s.0[3]));
         }
-        curves.push(curve);
+        // Duplicate backstop for the cap exclusion above: a seed sitting
+        // within a hair of an open fragment's cut vertex is let through and
+        // re-traces that fragment. On a true re-trace every vertex lies on
+        // the same locus, so its distance to the existing polyline is
+        // bounded by that polyline's own discretization error — its chord
+        // sagitta plus the corrector's landing gap — while a genuinely new
+        // fragment only touches existing ones at shared cut points. The
+        // bound is measured off the existing polyline itself rather than
+        // fixed against `h0`: a shallow graze's opposite arcs sit closer
+        // than any fixed fraction of the step without being the same curve.
+        let duplicate = curves.iter().any(|existing| {
+            let tol = chain_sagitta(&existing.points) + 8.0 * gap_tol;
+            curve
+                .points
+                .iter()
+                .all(|p| dist_to_chain(&existing.points, p) <= tol)
+        });
+        if !duplicate {
+            curves.push(curve);
+        }
     }
     Ok(curves)
+}
+
+/// Whether a refined seed lies ON an already-traced curve, measured
+/// against the polyline's segments. For an open fragment the nearest
+/// point falling past either end — the projection clamping at the first
+/// segment's start or the last segment's end — means the seed is beyond
+/// the cut that terminated the trace, i.e. on the branch's continuation
+/// in another cover window, not on the traced part (of-rxjs).
+fn seed_on_traced(curve: &MarchedCurve, p: &Point3, merge_dist: f64) -> bool {
+    let pts = &curve.points;
+    if pts.len() < 2 {
+        return pts.first().is_some_and(|q| (q - p).norm() < merge_dist);
+    }
+    let mut best = f64::INFINITY;
+    let mut best_past_end = false;
+    for i in 0..pts.len() - 1 {
+        let ab = pts[i + 1] - pts[i];
+        let len2 = ab.norm_squared();
+        let t = if len2 > 0.0 {
+            (p - pts[i]).dot(&ab) / len2
+        } else {
+            0.0
+        };
+        let d = (p - (pts[i] + ab * t.clamp(0.0, 1.0))).norm();
+        if d < best {
+            best = d;
+            best_past_end =
+                !curve.closed && ((i == 0 && t <= 0.0) || (i == pts.len() - 2 && t >= 1.0));
+        }
+    }
+    best < merge_dist && !best_past_end
+}
+
+/// Distance from `p` to a polyline, as the minimum over its segments.
+fn dist_to_chain(pts: &[Point3], p: &Point3) -> f64 {
+    if pts.len() < 2 {
+        return pts.first().map_or(f64::INFINITY, |q| (q - p).norm());
+    }
+    let mut best = f64::INFINITY;
+    for i in 0..pts.len() - 1 {
+        let ab = pts[i + 1] - pts[i];
+        let len2 = ab.norm_squared();
+        let t = if len2 > 0.0 {
+            ((p - pts[i]).dot(&ab) / len2).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        best = best.min((p - (pts[i] + ab * t)).norm());
+    }
+    best
+}
+
+/// A polyline's own discretization scale: the largest distance from an
+/// interior vertex to the chord of its two neighbors. For a curve sampled
+/// at pitch `h` this is the sagitta over `2h`, four times the per-chord
+/// sagitta — so a point of the true curve sits within a quarter of this
+/// bound from the polyline, with margin.
+fn chain_sagitta(pts: &[Point3]) -> f64 {
+    let mut sag = 0.0_f64;
+    for w in pts.windows(3) {
+        let chord = w[2] - w[0];
+        let len2 = chord.norm_squared();
+        let d = if len2 > 0.0 {
+            let t = ((w[1] - w[0]).dot(&chord) / len2).clamp(0.0, 1.0);
+            (w[1] - (w[0] + chord * t)).norm()
+        } else {
+            (w[1] - w[0]).norm()
+        };
+        sag = sag.max(d);
+    }
+    sag
 }
 
 /// Arc length of a traced path, as the sum of its chords.
