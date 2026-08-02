@@ -24,6 +24,7 @@
 //! | `mev`   | spur edge to a new vertex              | (+1, +1, 0, 0, 0, 0)  |
 //! | `mef`   | split a face with a new edge           | (0, +1, +1, 0, 0, 0)  |
 //! | `kemr`  | kill edge, split its loop into a ring  | (0, -1, 0, +1, 0, 0)  |
+//! | `kev`   | contract an edge, merging its vertices | (-1, -1, 0, 0, 0, 0)  |
 //! | `kfmrh` | kill face, its loop becomes a ring; adds a handle (same shell) or merges two shells | (0, 0, -1, +1, 0, +1) or (0, 0, -1, +1, -1, 0) |
 //!
 //! Invalid applications (stale ids, vertices not on the face, edges whose
@@ -69,6 +70,24 @@ pub enum EulerError {
     KemrFinsInDifferentLoops(EntityId<Edge>),
     #[error("kemr on edge {0:?} would leave an empty loop (use a kill-edge-vertex op instead)")]
     KemrDegenerate(EntityId<Edge>),
+    #[error(
+        "kev edge {0:?} is closed (both ends are one vertex), so contracting it \
+         would kill no vertex"
+    )]
+    KevClosedEdge(EntityId<Edge>),
+    #[error("kev keep vertex {vertex:?} is not an end of edge {edge:?}")]
+    KevKeepNotOnEdge {
+        edge: EntityId<Edge>,
+        vertex: EntityId<Vertex>,
+    },
+    #[error(
+        "kev on edge {edge:?} would leave loop {loop_id:?} with no fins and no \
+         vertex to degenerate to"
+    )]
+    KevWouldEmptyLoop {
+        edge: EntityId<Edge>,
+        loop_id: EntityId<Loop>,
+    },
     #[error("kfmrh target and killed face are the same face {0:?}")]
     KfmrhSameFace(EntityId<Face>),
     #[error("kfmrh face {face:?} still carries {rings} ring(s); kill those first")]
@@ -458,6 +477,116 @@ impl TopologyStore {
 
         self.debug_check_invariants(body);
         Ok(ring)
+    }
+
+    /// Kill Edge Vertex: contract `edge`, deleting it together with its fins
+    /// and merging its two distinct end vertices into `keep`.
+    ///
+    /// Every loop that traversed the edge loses exactly the fins that did the
+    /// traversing (the chains on either side reconnect through the merged
+    /// vertex), and every other edge at the dead vertex is re-pointed at
+    /// `keep`. Δ(V, E) = (−1, −1), which leaves the Euler-Poincaré formula
+    /// alone. A spur edge's loop — nothing on it but the spur's two fins —
+    /// degenerates back to a vertex loop at `keep`, making this the exact
+    /// inverse of [`mev`](Self::mev).
+    ///
+    /// Purely topological: `keep`'s point and tolerance are left untouched.
+    /// Where the merged vertex should sit, and what tolerance covers the
+    /// distance the collapse closed, is the caller's accounting (the STEP
+    /// healer's sliver-collapse pass does both).
+    ///
+    /// # Errors
+    /// - [`EulerError::StaleEdge`] / [`EulerError::StaleVertex`] for dead ids.
+    /// - [`EulerError::KevClosedEdge`] if the edge starts and ends at one
+    ///   vertex: contracting it would kill no vertex, so it is not this
+    ///   operator (Δ would be (0, −1) and break the formula).
+    /// - [`EulerError::KevKeepNotOnEdge`] if `keep` is neither end.
+    /// - [`EulerError::KevWouldEmptyLoop`] if a loop holds only *one* of the
+    ///   edge's fins and nothing else — removing it leaves neither fins nor a
+    ///   vertex to degenerate to. (Such a loop is already invalid for an open
+    ///   edge, so this arises only from corrupt input.)
+    pub fn kev(&mut self, edge: EntityId<Edge>, keep: EntityId<Vertex>) -> Result<(), EulerError> {
+        let e = self.edges.get(edge).ok_or(EulerError::StaleEdge(edge))?;
+        let (a, b) = (e.start_vertex, e.end_vertex);
+        if a == b {
+            return Err(EulerError::KevClosedEdge(edge));
+        }
+        if keep != a && keep != b {
+            return Err(EulerError::KevKeepNotOnEdge { edge, vertex: keep });
+        }
+        let kill = if keep == a { b } else { a };
+        let fins = e.fins.clone();
+        for v in [keep, kill] {
+            if self.vertices.get(v).is_none() {
+                return Err(EulerError::StaleVertex(v));
+            }
+        }
+
+        // Validate every affected loop before mutating anything: an `Err`
+        // must leave the store untouched. A loop made of nothing but this
+        // edge's fins is only recoverable when it holds the full spur (both
+        // fins) — it degenerates to a vertex loop, undoing `mev`.
+        let mut affected: Vec<EntityId<Loop>> = Vec::new();
+        for &fin_id in &fins {
+            let loop_id = self.fin_loop(fin_id);
+            if !affected.contains(&loop_id) {
+                affected.push(loop_id);
+            }
+        }
+        for &loop_id in &affected {
+            let lp = self.loops.get(loop_id).expect("live fin's loop");
+            let ours = lp.fins.iter().filter(|f| fins.contains(f)).count();
+            if ours == lp.fins.len() && ours != 2 {
+                return Err(EulerError::KevWouldEmptyLoop { edge, loop_id });
+            }
+        }
+        let body = fins.first().map(|&f| self.body_of_face(self.fin_face(f)));
+
+        for &loop_id in &affected {
+            let lp = self.loops.get_mut(loop_id).expect("live fin's loop");
+            lp.fins.retain(|f| !fins.contains(f));
+            if lp.fins.is_empty() {
+                lp.vertex = Some(keep);
+                lp.loop_type = LoopType::Vertex;
+            } else {
+                self.relink_loop(loop_id);
+            }
+        }
+        for fin_id in fins {
+            self.fins.remove(fin_id);
+        }
+
+        // Re-point everything at the dead vertex to the survivor.
+        let dead = self.vertices.remove(kill).expect("checked live above");
+        for other in dead.edges {
+            if other == edge {
+                continue;
+            }
+            let Some(oe) = self.edges.get_mut(other) else {
+                continue;
+            };
+            if oe.start_vertex == kill {
+                oe.start_vertex = keep;
+            }
+            if oe.end_vertex == kill {
+                oe.end_vertex = keep;
+            }
+            let kept = self.vertices.get_mut(keep).expect("checked live above");
+            if !kept.edges.contains(&other) {
+                kept.edges.push(other);
+            }
+        }
+        self.vertices
+            .get_mut(keep)
+            .expect("checked live above")
+            .edges
+            .retain(|&other| other != edge);
+        self.edges.remove(edge);
+
+        if let Some(body) = body {
+            self.debug_check_invariants(body);
+        }
+        Ok(())
     }
 
     // ------------------------------------------------------------------
@@ -1143,8 +1272,100 @@ mod tests {
         assert!(store.mef(v0, detached, f_bottom).is_err());
         assert!(store.kemr(store.edges_of_face(f_bottom)[0]).is_err());
         assert!(store.kfmrh(f_bottom, f_bottom).is_err());
+        assert!(
+            store
+                .kev(store.edges_of_face(f_bottom)[0], detached)
+                .is_err()
+        );
 
         assert_eq!(store.euler_counts(body), before);
+        checked_counts(&store, body);
+    }
+
+    #[test]
+    fn kev_is_the_inverse_of_mev() {
+        let mut store = TopologyStore::new();
+        let (body, v0, face, _shell) = store.mvfs(p(0.0, 0.0, 0.0));
+        let (spur, _v1) = store.mev(v0, face, p(1.0, 0.0, 0.0)).unwrap();
+
+        store.kev(spur, v0).unwrap();
+
+        let counts = checked_counts(&store, body);
+        assert_eq!((counts.vertices, counts.edges, counts.faces), (1, 0, 1));
+        // The loop degenerated back to a vertex loop at the survivor.
+        let outer = store.face(face).unwrap().outer_loop.unwrap();
+        let lp = store.loop_(outer).unwrap();
+        assert_eq!(lp.loop_type, LoopType::Vertex);
+        assert_eq!(lp.vertex, Some(v0));
+        assert!(lp.fins.is_empty());
+        assert!(store.vertex(v0).unwrap().edges.is_empty());
+    }
+
+    #[test]
+    fn kev_contracts_a_shared_edge_of_a_lamina() {
+        let (mut store, body, [v0, v1, ..], f_bottom, f_top) = build_square_lamina();
+        let shared = store
+            .vertex(v0)
+            .unwrap()
+            .edges
+            .iter()
+            .copied()
+            .find(|&e| {
+                let e = store.edge(e).unwrap();
+                (e.start_vertex, e.end_vertex) == (v0, v1)
+                    || (e.start_vertex, e.end_vertex) == (v1, v0)
+            })
+            .expect("lamina has a v0-v1 edge");
+
+        store.kev(shared, v0).unwrap();
+
+        let counts = checked_counts(&store, body);
+        assert_eq!((counts.vertices, counts.edges, counts.faces), (3, 3, 2));
+        // Both square loops became triangles, and nothing references v1.
+        for face in [f_bottom, f_top] {
+            let outer = store.face(face).unwrap().outer_loop.unwrap();
+            assert_eq!(store.fins_of_loop(outer).len(), 3);
+        }
+        assert!(store.vertex(v1).is_none());
+        for edge in store.edges_of_face(f_bottom) {
+            let e = store.edge(edge).unwrap();
+            assert_ne!(e.start_vertex, v1);
+            assert_ne!(e.end_vertex, v1);
+        }
+    }
+
+    #[test]
+    fn kev_rejects_closed_edges_and_foreign_keeps() {
+        let (mut store, body, [v0, v1, ..], _f_bottom, _f_top) = build_square_lamina();
+
+        // A closed edge (both ends one vertex) kills no vertex.
+        let ring = store.create_edge(v0, v0, SYSTEM_RESOLUTION);
+        assert_eq!(store.kev(ring, v0), Err(EulerError::KevClosedEdge(ring)));
+        store.edges.remove(ring);
+        store
+            .vertices
+            .get_mut(v0)
+            .unwrap()
+            .edges
+            .retain(|&e| e != ring);
+
+        // `keep` must be one of the edge's ends.
+        let far = store.create_vertex(p(9.0, 9.0, 9.0), SYSTEM_RESOLUTION);
+        let edge = store.vertex(v1).unwrap().edges[0];
+        assert_eq!(
+            store.kev(edge, far),
+            Err(EulerError::KevKeepNotOnEdge { edge, vertex: far })
+        );
+
+        // Stale edge.
+        let (va, vb) = (
+            store.create_vertex(p(7.0, 0.0, 0.0), SYSTEM_RESOLUTION),
+            store.create_vertex(p(8.0, 0.0, 0.0), SYSTEM_RESOLUTION),
+        );
+        let free = store.create_edge(va, vb, SYSTEM_RESOLUTION);
+        store.edges.remove(free);
+        assert_eq!(store.kev(free, va), Err(EulerError::StaleEdge(free)));
+
         checked_counts(&store, body);
     }
 }
