@@ -2567,6 +2567,26 @@ fn trim_tol(a: Point3, b: Point3, closure: f64) -> f64 {
     (TRIM_TOL_REL * (1.0 + a.coords.norm().max(b.coords.norm()))).max(closure)
 }
 
+/// How far apart two distinct `VERTEX_POINT`s may be and still read as the
+/// one point of a full circle's seam. This is a different question from
+/// [`trim_tol`]'s "is this vertex on this curve at all", and the declared
+/// closure deliberately does not feed it: the declaration states how far
+/// apart *distinct* entities at an asserted connectivity may sit, not the
+/// model's minimum feature size, and taking it as a seam-identity bound
+/// rewrites any genuinely short arc under the declaration into a full
+/// circle — a silent, checker-clean volume corruption (of-5rnp).
+///
+/// What decides seam identity end-to-end is whether the kernel itself will
+/// call the two vertices one point, which is heal's vertex merge at
+/// [`HEAL_GAP_REL`](super::heal::HEAL_GAP_REL) × the body diagonal — so the
+/// bound is that same ratio over [`trim_tol`]'s origin-distance proxy for
+/// model scale, one decade looser than the round-off rule. An arc shorter
+/// than this is indistinguishable from a seam anyway: reading it as one
+/// hands the merged vertex to the same fate heal would deal it.
+fn seam_tol(a: Point3, b: Point3) -> f64 {
+    super::heal::HEAL_GAP_REL * (1.0 + a.coords.norm().max(b.coords.norm()))
+}
+
 /// Trim an analytic curve to an edge's vertices: orient it along the edge
 /// (STEP `same_sense` false means the edge opposes the curve direction)
 /// and recover the parameter range, always with `t_start < t_end`.
@@ -2642,13 +2662,14 @@ fn trim_curve(
             // the second one literally gives a zero sweep, and an edge that
             // swept nothing would not be an edge at all.
             //
-            // The declared closure widens "the same point" here as well as in
-            // [`verify_trim`], and deliberately so: it is the distance the
-            // file says entities at asserted connectivities may be apart, and
-            // two seam vertices are such a connectivity. An arc left over
-            // after reading it this way would be shorter than the closure the
-            // file itself calls indistinguishable from nothing.
-            if closed || (end - start).norm() <= trim_tol(start, end, closure) {
+            // "Sit on the same point" is [`seam_tol`]'s question, not the
+            // declared closure's: a genuinely short arc — an ordinary boolean
+            // sliver — has a chord well under the closures real files declare,
+            // and reading its vertices as a seam rewrites it into a full
+            // circle (of-5rnp). Past the bound the arc is read literally;
+            // whether its endpoints then hold together is the loop's problem,
+            // judged by the same heal merge this bound mirrors.
+            if closed || (end - start).norm() <= seam_tol(start, end) {
                 (t0, t0 + TAU)
             } else {
                 let sweep = (conic_angle(conic, &end).expect("conic") - t0).rem_euclid(TAU);
@@ -7585,6 +7606,48 @@ mod tests {
         // Halfway round is the far side of the circle, not the seam.
         let mid = trimmed.curve.point((trimmed.t_start + trimmed.t_end) / 2.0);
         assert!((mid - Point3::new(8.0, 0.0, 10.0)).norm() < 1e-12, "{mid}");
+    }
+
+    /// A genuinely short arc — chord three decades above round-off but under
+    /// the closure any thousandth-of-an-inch file declares — must read
+    /// literally: the declared closure states connectivity slop, not minimum
+    /// feature size, and must not rewrite the arc into a full circle
+    /// (of-5rnp).
+    #[test]
+    fn a_wide_closure_does_not_collapse_a_short_arc() {
+        let r = 1.6;
+        let circle = Curve3::circle(Point3::origin(), Vector3::z(), r).unwrap();
+        let chord = 8.0e-3f64;
+        let sweep = 2.0 * (chord / (2.0 * r)).asin();
+        let start = Point3::new(r, 0.0, 0.0);
+        let end = Point3::new(r * sweep.cos(), r * sweep.sin(), 0.0);
+        let trimmed = trim_curve(&circle, true, start, end, false, 9.0e-3, 1).unwrap();
+        assert!(
+            (trimmed.t_end - trimmed.t_start - sweep).abs() < 1e-9,
+            "expected the literal {sweep:.3e} sweep, got {:.3e}",
+            trimmed.t_end - trimmed.t_start
+        );
+    }
+
+    /// A seam gap the kernel's own vertex merge would close (inside
+    /// [`seam_tol`]'s heal-scale bound) still reads as a full period — the
+    /// two-vertex spelling with the slop real files carry keeps working
+    /// without leaning on the declaration.
+    #[test]
+    fn a_seam_gap_within_the_heal_scale_bound_still_collapses() {
+        let r = 5.0;
+        let circle = Curve3::circle(Point3::origin(), Vector3::z(), r).unwrap();
+        let gap = 5.0e-5f64;
+        let phi = gap / r;
+        let start = Point3::new(r, 0.0, 0.0);
+        let end = Point3::new(r * phi.cos(), r * phi.sin(), 0.0);
+        assert!((end - start).norm() > trim_tol(start, end, 0.0));
+        let trimmed = trim_curve(&circle, true, start, end, false, 1.0e-3, 1).unwrap();
+        assert!(
+            (trimmed.t_end - trimmed.t_start - TAU).abs() < 1e-12,
+            "expected a full period, got {:.3e}",
+            trimmed.t_end - trimmed.t_start
+        );
     }
 
     /// The same coincidence on a line is not a closed edge — a line has no
