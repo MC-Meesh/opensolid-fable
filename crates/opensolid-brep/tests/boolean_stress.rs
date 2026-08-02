@@ -9330,3 +9330,413 @@ fn sphere_lens_volume_is_exact_and_frame_independent() {
         "rotated sphere lens vs closed form",
     );
 }
+
+// =====================================================================
+// (19) Adversarial: closed imprint loops and the parameter ranges bound
+//      to their edges (of-xbgp — standing adversarial pair for of-i7ka)
+// =====================================================================
+//
+// of-i7ka's defect lived at one joint: an imprint that is geometrically a
+// *ring* reaches `build_output` as an open polyline (its uv image runs
+// cover edge to cover edge on the host it was cut on), and only
+// `ring_polyline`'s closed re-spelling gives the bound copy a period for
+// its edge ranges to unwrap by. Without it the whole-ring edge bound
+// `t_start == t_end` and the seam-straddling edge bound `t_start >
+// t_end`. The fences that landed with the fix
+// ([`looping_imprint_edge_ranges`],
+// [`torus_notch_edges_carry_ranges_check_geometry_can_read`]) pin the two
+// configurations the bug was FILED on and nothing else.
+//
+// This section is the independent-adversary pass over that joint. It
+// varies everything those fences hold fixed: where the loop sits relative
+// to the host chart's seams (walked across the u-seam and parked on the
+// atan2 branch cut), how big the loop is (down to a shallow graze whose
+// loop is an imprint island two orders smaller than the part), what cut
+// it (plane sections and a curved cylinder wall, whose loops come from
+// the curved-curved marcher), how many loops one result carries (a
+// double sever with four rings, two per plane section), the model scale,
+// and — in the seeded campaign — all of the above at once under a random
+// rigid pose.
+//
+// Oracles per result, all reused from this suite: the structural
+// `check()` pass, closed-manifold tessellation and the meshed-vs-exact
+// volume cross-check (via [`volume`]); the direct range fence
+// [`looping_imprint_edge_ranges`]; the `InvalidEdgeRange` class of
+// `check_geometry` ([`assert_edge_ranges_readable`]); Euler genus where
+// the topology is forced; and volume identities where both halves are
+// computed.
+//
+// Protocol as ever (module preamble): a failure files a bead carrying the
+// case's full context string — every parameter is in it, so it IS the
+// repro — and the case goes `#[ignore]` referencing the bead. Never
+// softened.
+
+/// No edge of `out` may carry a parameter range `check_geometry` refuses
+/// to read. The `InvalidEdgeRange` class alone is asserted — the same
+/// scoping as [`torus_notch_edges_carry_ranges_check_geometry_can_read`]
+/// and for the same reason: an adversarial configuration may carry some
+/// unrelated geometric defect, and this fence must stay aimed at ranges.
+///
+/// Complements [`looping_imprint_edge_ranges`] rather than repeating it:
+/// that fence classifies looping curves geometrically at an absolute
+/// 1e-9, which an open-spelled ring's endpoint gap can exceed at large
+/// model scale (the gap is polished to the boolean's snap, 1e-9 of
+/// *extent*) — this one reads every edge's range against its curve's
+/// reported domain and does not care how the loop is spelled.
+fn assert_edge_ranges_readable(out: &BooleanOutput, context: &str) {
+    let insane: Vec<CheckFailure> = out
+        .store
+        .check_geometry(&out.geo, out.body)
+        .into_iter()
+        .filter(|f| matches!(f, CheckFailure::InvalidEdgeRange { .. }))
+        .collect();
+    assert!(
+        insane.is_empty(),
+        "{context}: {} edge(s) carry a range check_geometry cannot read, \
+         so nothing about their geometry is measured: {insane:#?}",
+        insane.len(),
+    );
+}
+
+/// The severing notch of [`block_severs_torus_tube`], walked around the
+/// torus axis so its two tube-encircling imprint rings sweep across the
+/// chart's u-seam. At the filed configuration (θ = 0) both rings sit
+/// clear of u = 0 and bind as whole-curve edges. A ring's u-interval is
+/// about ±0.16 rad wide here, so θ near 0.16 drives one ring across the
+/// seam: the u-seam then cuts it and its edges become arcs meeting the
+/// ring's own cut point — the configuration of-i7ka's *wrapped* spelling
+/// (`t_start > t_end`) appeared in, reached from the other side. The
+/// angles bracket that transition on both flanks, where an atom pinched
+/// between the seam and the ring's own start is nearly empty and its
+/// range must still come out forward and positive; θ = π parks the notch
+/// on the atan2 branch cut instead.
+#[test]
+fn severed_torus_rings_walk_the_major_seam() {
+    let (major, minor) = (2.0, 0.5);
+    for theta in [0.08, 0.16, 0.24, PI - 0.16, PI] {
+        let context = format!("severing notch walked to theta={theta}");
+        let mut scene = Scene::new();
+        let ring = scene.torus(Point3::origin(), major, minor);
+        let tool = scene.block([1.3, -0.35, -1.0], [2.7, 0.35, 1.0]);
+        let rot = Rotation3::from_axis_angle(&Unit::new_normalize(Vector3::z()), theta);
+        scene.rotate(tool, &rot, &Point3::origin());
+        let diff = scene
+            .subtract(ring, tool)
+            .unwrap_or_else(|e| panic!("{context}: subtract failed: {e:?}"));
+        let counts = diff.store.euler_counts(diff.body);
+        assert_eq!(counts.genus, 0, "{context}: severed ring must be genus 0");
+        let (looping, _) = looping_imprint_edge_ranges(&diff, &context);
+        assert!(
+            looping > 0,
+            "{context}: no edge bound to a looping imprint — the walked \
+             notch no longer produces the case this section stresses"
+        );
+        assert_edge_ranges_readable(&diff, &context);
+        let vol = volume(&diff, &context);
+        let whole = torus_volume(major, minor);
+        assert!(
+            vol > 0.0 && vol < whole,
+            "{context}: severed volume {vol} outside (0, {whole})"
+        );
+    }
+}
+
+/// The outer-wall bite of [`block_notches_torus_outer_wall`], made
+/// progressively shallower. At bite 0.15 the notch boundary is still an
+/// arc chain stitched from three block planes. By bite 0.02 the block's
+/// inner face has cleared the ±Y planes entirely (they reach the torus
+/// only inside x ≈ 2.475), and the imprint collapses to a single small
+/// closed loop wholly interior to both host faces — an imprint *island*
+/// with no vertex contributed by any other plane, the island class of
+/// of-6viu/of-x8tn but produced by a shallow graze, sitting astride BOTH
+/// torus seams (it is centered on the +X outer equator), with a loop two
+/// orders smaller than the part and a crossing angle that shrinks with
+/// the bite. Every step must keep genus 1, bind readable ranges, and
+/// close the material balance against the intersection.
+#[test]
+fn grazing_notch_shrinks_the_imprint_loop_to_an_island() {
+    let (major, minor) = (2.0, 0.5);
+    for bite in [0.15, 0.05, 0.02] {
+        let context = format!("outer-wall graze, bite {bite}");
+        let mut scene = Scene::new();
+        let ring = scene.torus(Point3::origin(), major, minor);
+        let tool = scene.block([major + minor - bite, -0.35, -1.0], [2.7, 0.35, 1.0]);
+        let diff = scene
+            .subtract(ring, tool)
+            .unwrap_or_else(|e| panic!("{context}: subtract failed: {e:?}"));
+        let counts = diff.store.euler_counts(diff.body);
+        assert_eq!(counts.genus, 1, "{context}: grazed ring must stay genus 1");
+        let (looping, _) = looping_imprint_edge_ranges(&diff, &context);
+        assert!(
+            looping > 0,
+            "{context}: no edge bound to a looping imprint — the graze \
+             no longer produces the case this section stresses"
+        );
+        assert_edge_ranges_readable(&diff, &context);
+        let inter = scene
+            .intersect(ring, tool)
+            .unwrap_or_else(|e| panic!("{context}: intersect failed: {e:?}"));
+        assert_edge_ranges_readable(&inter, &context);
+        let vol_diff = volume(&diff, &format!("{context}: difference"));
+        let vol_inter = volume(&inter, &format!("{context}: intersection"));
+        assert!(
+            vol_inter > 0.0,
+            "{context}: graze removed nothing — the bite is vacuous"
+        );
+        assert_close(
+            vol_diff + vol_inter,
+            torus_volume(major, minor),
+            CURVED_VOLUME_RTOL,
+            &format!("{context}: difference + intersection vs torus volume"),
+        );
+    }
+}
+
+/// The severing notch at 1000× and 1/1000× model scale. The ring
+/// re-spelling keys off the boolean's snap (1e-9 of joint extent), the
+/// range unwrap off the polyline's own vertex-count domain, and the
+/// tolerance recording off an absolute ceiling — three different length
+/// regimes in one code path, so scale is where a mismatch between them
+/// would surface (of-abwf found exactly such a seam in the tolerance
+/// leg). Genus and readable ranges must be scale-invariant.
+#[test]
+fn scaled_torus_sever_keeps_readable_ranges() {
+    for scale in [1e-3, 1e3] {
+        let context = format!("severing notch at {scale}x");
+        let (major, minor) = (2.0 * scale, 0.5 * scale);
+        let mut scene = Scene::new();
+        let ring = scene.torus(Point3::origin(), major, minor);
+        let tool = scene.block(
+            [1.3 * scale, -0.35 * scale, -scale],
+            [2.7 * scale, 0.35 * scale, scale],
+        );
+        let diff = scene
+            .subtract(ring, tool)
+            .unwrap_or_else(|e| panic!("{context}: subtract failed: {e:?}"));
+        let counts = diff.store.euler_counts(diff.body);
+        assert_eq!(counts.genus, 0, "{context}: severed ring must be genus 0");
+        let (looping, _) = looping_imprint_edge_ranges(&diff, &context);
+        assert!(
+            looping > 0,
+            "{context}: no edge bound to a looping imprint at this scale"
+        );
+        assert_edge_ranges_readable(&diff, &context);
+        let vol = volume(&diff, &context);
+        let whole = torus_volume(major, minor);
+        assert!(
+            vol > 0.0 && vol < whole,
+            "{context}: severed volume {vol} outside (0, {whole})"
+        );
+    }
+}
+
+/// A block long enough to sever the tube at BOTH x-axis crossings. Each
+/// ±Y plane now meets the torus in a section with TWO connected
+/// components — the marcher must find both, where a single seeded march
+/// finds one — so the result carries four tube-encircling rings at once,
+/// the −X pair parked against the u chart's atan2 branch cut at ±π. The
+/// difference is two disjoint C-shaped solids in one body, which the
+/// closed-manifold and volume oracles must survive; the union threads
+/// the block through the bore with the same four rings on its skin.
+#[test]
+fn long_block_severs_the_tube_twice() {
+    let context = "long block severing the tube at both x crossings";
+    let (major, minor) = (2.0, 0.5);
+    let mut scene = Scene::new();
+    let ring = scene.torus(Point3::origin(), major, minor);
+    let tool = scene.block([-2.7, -0.35, -1.0], [2.7, 0.35, 1.0]);
+    let diff = scene
+        .subtract(ring, tool)
+        .unwrap_or_else(|e| panic!("{context}: subtract failed: {e:?}"));
+    let (looping, _) = looping_imprint_edge_ranges(&diff, context);
+    assert!(
+        looping >= 4,
+        "{context}: expected the four severing rings bound to looping \
+         imprints, found {looping}"
+    );
+    assert_edge_ranges_readable(&diff, context);
+    let inter = scene
+        .intersect(ring, tool)
+        .unwrap_or_else(|e| panic!("{context}: intersect failed: {e:?}"));
+    assert_edge_ranges_readable(&inter, context);
+    let union = scene
+        .unite(ring, tool)
+        .unwrap_or_else(|e| panic!("{context}: unite failed: {e:?}"));
+    assert_edge_ranges_readable(&union, context);
+    let vol_diff = volume(&diff, &format!("{context}: difference"));
+    let vol_inter = volume(&inter, &format!("{context}: intersection"));
+    let vol_union = volume(&union, &format!("{context}: union"));
+    let torus_vol = torus_volume(major, minor);
+    let block_vol = 5.4 * 0.7 * 2.0;
+    assert_close(
+        vol_diff + vol_inter,
+        torus_vol,
+        CURVED_VOLUME_RTOL,
+        &format!("{context}: difference + intersection vs torus volume"),
+    );
+    assert_close(
+        vol_union + vol_inter,
+        torus_vol + block_vol,
+        CURVED_VOLUME_RTOL,
+        &format!("{context}: inclusion-exclusion"),
+    );
+}
+
+/// A cylinder drilled through the tube: a CURVED tool, so the entry and
+/// exit loops come from the curved-curved marcher rather than a plane
+/// section, and each loop wraps the cylinder chart's periodic direction
+/// while sitting contractible on the torus chart — the two hosts must
+/// re-merge the seam-cut fragments into the same ring (of-43n) before
+/// [`ring_polyline`] can re-spell it. Radially the drill runs along the
+/// +X spoke through both tube walls (bore to outside); axially it runs
+/// parallel to the torus axis through top and bottom of the tube. Both
+/// tunnel the solid: genus 1 → 2.
+#[test]
+fn cylinder_drilled_through_the_tube_binds_readable_loops() {
+    let (major, minor) = (2.0, 0.5);
+    for (name, base, axis) in [
+        ("radial drill", Point3::new(1.3, 0.0, 0.0), Vector3::x()),
+        ("axial drill", Point3::new(2.0, 0.0, -1.0), Vector3::z()),
+    ] {
+        let context = format!("{name} through the torus tube");
+        let mut scene = Scene::new();
+        let ring = scene.torus(Point3::origin(), major, minor);
+        let tool = scene.cylinder(
+            base,
+            axis,
+            0.2,
+            if name == "radial drill" { 1.7 } else { 2.0 },
+        );
+        let diff = scene
+            .subtract(ring, tool)
+            .unwrap_or_else(|e| panic!("{context}: subtract failed: {e:?}"));
+        let counts = diff.store.euler_counts(diff.body);
+        assert_eq!(
+            counts.genus, 2,
+            "{context}: a through-drilled tube must be genus 2"
+        );
+        let (looping, _) = looping_imprint_edge_ranges(&diff, &context);
+        assert!(
+            looping >= 2,
+            "{context}: expected both drill loops bound to looping \
+             imprints, found {looping}"
+        );
+        assert_edge_ranges_readable(&diff, &context);
+        let inter = scene
+            .intersect(ring, tool)
+            .unwrap_or_else(|e| panic!("{context}: intersect failed: {e:?}"));
+        assert_edge_ranges_readable(&inter, &context);
+        let vol_diff = volume(&diff, &format!("{context}: difference"));
+        let vol_inter = volume(&inter, &format!("{context}: intersection"));
+        assert!(
+            vol_inter > 0.0,
+            "{context}: drill removed nothing — the bore is vacuous"
+        );
+        assert_close(
+            vol_diff + vol_inter,
+            torus_volume(major, minor),
+            CURVED_VOLUME_RTOL,
+            &format!("{context}: difference + intersection vs torus volume"),
+        );
+    }
+}
+
+/// Seeded campaign over the whole configuration space above at once:
+/// random torus proportions, a severing or grazing notch of random depth
+/// and width walked to a random angle — so the imprint rings land at
+/// arbitrary offsets from both chart seams — and, for half the cases, the
+/// entire configuration under a random rigid pose (the torus rebuilt
+/// about the rotated axis via [`Scene::torus_with_axis`], exactly as the
+/// boolean chart will see it; the tool rotated into place). Sampling
+/// margins keep every case transversal: tangency is section (3)'s
+/// subject, and mixing it in would make a failure ambiguous between
+/// "the pipeline is wrong" and "the configuration is degenerate".
+///
+/// Failures reproduce from the case's context string — every sampled
+/// value is printed in it — plus the fixed suite seed below (remixed by
+/// `OPENSOLID_CAMPAIGN_SEED` under the campaign driver, of-5rim).
+#[test]
+fn randomized_torus_notch_campaign() {
+    let mut rng = Rng::new(0xAD5A_0FB6);
+    for case in 0..6 {
+        let major = rng.range(1.6, 2.4);
+        let minor = rng.range(0.3, 0.55);
+        let sever = case % 2 == 0;
+        let theta = rng.range(0.0, 2.0 * PI);
+        // Severing: the inner face undercuts the bore wall by delta, and
+        // the width stays inside the chord the bore's cross-section
+        // allows at that depth so the block meets no other part of the
+        // tube. Grazing: the bite stays inside the tube's outer half so
+        // only the outer wall is touched and genus is preserved.
+        let (x_min, w) = if sever {
+            let x_min = major - minor - rng.range(0.1, 0.3);
+            let clearance = ((major - minor).powi(2) - x_min * x_min).sqrt();
+            (x_min, rng.range(0.15, (0.7 * clearance).min(0.34)))
+        } else {
+            (
+                major + minor - rng.range(0.35 * minor, 0.85 * minor),
+                rng.range(0.18, 0.34),
+            )
+        };
+        let x_max = major + minor + 0.2;
+        let z_half = minor + 0.5;
+        let posed = case >= 3;
+        let pose = Rotation3::from_axis_angle(
+            &Unit::new_normalize(Vector3::new(
+                rng.range(-1.0, 1.0),
+                rng.range(-1.0, 1.0),
+                rng.range(-1.0, 1.0),
+            )),
+            rng.range(0.3, 2.8),
+        );
+        let context = format!(
+            "case {case}: torus(major {major:.6}, minor {minor:.6}) vs \
+             {} notch (x_min {x_min:.6}, x_max {x_max:.6}, half-width {w:.6}, \
+             half-height {z_half:.6}) walked to theta {theta:.6}, posed {posed} \
+             (pose {pose:?}) [seed 0xAD5A_0FB6]",
+            if sever { "severing" } else { "grazing" },
+        );
+        let mut scene = Scene::new();
+        let ring = if posed {
+            scene.torus_with_axis(Point3::origin(), pose * Vector3::z(), major, minor)
+        } else {
+            scene.torus(Point3::origin(), major, minor)
+        };
+        let tool = scene.block([x_min, -w, -z_half], [x_max, w, z_half]);
+        let walk = Rotation3::from_axis_angle(&Unit::new_normalize(Vector3::z()), theta);
+        let placement = if posed { pose * walk } else { walk };
+        scene.rotate(tool, &placement, &Point3::origin());
+        let diff = scene
+            .subtract(ring, tool)
+            .unwrap_or_else(|e| panic!("{context}: subtract failed: {e:?}"));
+        let counts = diff.store.euler_counts(diff.body);
+        assert_eq!(
+            counts.genus,
+            if sever { 0 } else { 1 },
+            "{context}: wrong genus after the notch"
+        );
+        let (looping, _) = looping_imprint_edge_ranges(&diff, &context);
+        assert!(
+            looping > 0,
+            "{context}: no edge bound to a looping imprint — the sampled \
+             notch no longer produces the case this campaign stresses"
+        );
+        assert_edge_ranges_readable(&diff, &context);
+        let inter = scene
+            .intersect(ring, tool)
+            .unwrap_or_else(|e| panic!("{context}: intersect failed: {e:?}"));
+        assert_edge_ranges_readable(&inter, &context);
+        let vol_diff = volume(&diff, &format!("{context}: difference"));
+        let vol_inter = volume(&inter, &format!("{context}: intersection"));
+        assert!(
+            vol_inter > 0.0,
+            "{context}: notch removed nothing — the case is vacuous"
+        );
+        assert_close(
+            vol_diff + vol_inter,
+            torus_volume(major, minor),
+            CURVED_VOLUME_RTOL,
+            &format!("{context}: difference + intersection vs torus volume"),
+        );
+    }
+}
