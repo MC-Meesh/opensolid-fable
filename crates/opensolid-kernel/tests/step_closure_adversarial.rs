@@ -24,11 +24,12 @@
 //!   [`MAX_ALLOWED_TOLERANCE`] is clamped, so slop between the limit and a
 //!   looser declaration must refuse even though the file blesses it.
 //! - **Declaring a closure must never break a body that imported without
-//!   one.** The floor only ever widens acceptance of vertex misses — but it
-//!   also widens [`trim_curve`]'s "two distinct seam vertices are really the
-//!   same point" test, which *rewrites an arc into a full circle*. A
-//!   genuinely short arc (chord under the declaration) is destroyed by the
-//!   declaration; see [`a_declared_closure_must_not_collapse_a_short_arc`].
+//!   one.** The floor only ever widens acceptance of vertex misses — until
+//!   of-5rnp it also widened [`trim_curve`]'s "two distinct seam vertices
+//!   are really the same point" test, which *rewrote an arc into a full
+//!   circle*, destroying any genuinely short arc whose chord sat under the
+//!   declaration. That branch now uses a heal-scale seam bound the closure
+//!   does not feed; see [`a_declared_closure_must_not_collapse_a_short_arc`].
 //!
 //! Protocol as `step_heal_random.rs` / `boolean_stress.rs`: deterministic
 //! seeded [`Rng`] (remixed by `OPENSOLID_CAMPAIGN_SEED`), a repro string on
@@ -37,17 +38,17 @@
 //!
 //! # Failures this campaign found (both deterministic, no seed required)
 //!
-//! - **of-5rnp** (P1): a declared closure rewrites a genuinely short arc
-//!   (chord under the declaration) into a full circle, and the fabricated
-//!   body imports *checker-clean* at 1257× the authored volume — silent
-//!   corruption. Repro: [`a_declared_closure_must_not_collapse_a_short_arc`].
-//! - **of-00pu** (P2): the OCC two-vertex full-circle seam spelling the
-//!   closure widening was written to admit still dies whenever the seam gap
-//!   exceeds heal's merge allowance (~1e-5 × diagonal): `trim_curve` honours
-//!   the declaration but heal's vertex merge never consults it, so the loop
-//!   fails vertex continuity. Measured cliff between 5e-5 and 1e-4 on a
-//!   ⌀10 mm cylinder declaring 1e-3. Repro:
-//!   [`a_declared_closure_admits_a_slopped_two_vertex_seam`].
+//! - **of-5rnp** (P1, FIXED): a declared closure rewrote a genuinely short
+//!   arc (chord under the declaration) into a full circle, and the
+//!   fabricated body imported *checker-clean* at 1257× the authored volume —
+//!   silent corruption. The seam test no longer consults the closure; the
+//!   repro [`a_declared_closure_must_not_collapse_a_short_arc`] now passes.
+//! - **of-00pu** (P2): the OCC two-vertex full-circle seam spelling dies
+//!   whenever the seam gap exceeds heal's merge allowance (~1e-5 ×
+//!   diagonal): neither heal's vertex merge nor (since of-5rnp) the seam
+//!   test consults the declaration, so the loop fails vertex continuity.
+//!   Measured cliff between 5e-5 and 1e-4 on a ⌀10 mm cylinder declaring
+//!   1e-3. Repro: [`a_declared_closure_admits_a_slopped_two_vertex_seam`].
 
 use opensolid_brep::MAX_ALLOWED_TOLERANCE;
 use opensolid_brep::{GeometryStore, TopologyStore};
@@ -835,20 +836,20 @@ fn a_short_arc_sector_imports_exactly_without_a_declaration() {
     assert_within(volume, sweep / 2.0 * r * r * h, 1.0e-6, &repro);
 }
 
-/// Declaring a closure must only ever *widen* acceptance — yet with one
-/// covering the chord, [`trim_curve`]'s closure-widened seam test reads the
-/// short arc's two distinct vertices as "the same point" and rewrites the
-/// arc as a **full circle**.
+/// Declaring a closure must only ever *widen* acceptance — with one
+/// covering the chord, [`trim_curve`]'s seam test must still read the short
+/// arc's two distinct vertices as an arc, never rewrite it as a **full
+/// circle**.
 ///
-/// FOUND FAILING, filed as **of-5rnp**: the body comes back as a
-/// *checker-clean exact B-Rep* measuring 24.147 mm³ where the authored
-/// solid is 0.0192 mm³ — 1257× the volume, silently: the 8e-3 end miss is
-/// carried as vertex tolerance, so `check_with_geometry` certifies the
-/// fabricated solid. Any thousandth-of-an-inch declaration (0.0254 mm,
-/// clamped to 0.01) covers such a chord, so the corpus-real declarations
-/// of-kwn cites reach this. Not softened; un-ignore when of-5rnp lands.
+/// FOUND FAILING, filed as **of-5rnp** (now fixed): the closure-widened
+/// seam test handed back a *checker-clean exact B-Rep* measuring 24.147 mm³
+/// where the authored solid is 0.0192 mm³ — 1257× the volume, silently: the
+/// 8e-3 end miss was carried as vertex tolerance, so `check_with_geometry`
+/// certified the fabricated solid. Any thousandth-of-an-inch declaration
+/// (0.0254 mm, clamped to 0.01) covers such a chord, so the corpus-real
+/// declarations of-kwn cites reached this. The seam test now uses a
+/// heal-scale bound the declaration does not feed.
 #[test]
-#[ignore = "of-5rnp: the declared closure rewrites a genuinely short arc into a full circle"]
 fn a_declared_closure_must_not_collapse_a_short_arc() {
     let (r, h, chord, sweep) = short_arc_sector();
     let expected = sweep / 2.0 * r * r * h;
@@ -936,21 +937,22 @@ fn a_two_vertex_seam_within_the_heal_gap_imports() {
     );
 }
 
-/// The deliberate half of the seam test (of-kwn widened it on purpose): a
-/// full circle written with two *distinct* seam vertices that agree only to
-/// within the declared closure must still read as a full circle and import
-/// exactly. This is OCC's spelling of a tangent seam, with the slop real
-/// files carry.
+/// The aspirational half of the seam test: a full circle written with two
+/// *distinct* seam vertices that agree only to within the declared closure
+/// should read as a full circle and import exactly. This is OCC's spelling
+/// of a tangent seam, with the slop real files carry.
 ///
-/// FOUND FAILING, filed as **of-00pu**: [`trim_curve`] honours the
-/// declaration (the edge reads as a full period), but the topology still
-/// carries two distinct vertices, heal's merge gap never consults the
-/// declared closure (5e-4 > ~1.3e-4 here), the loop fails vertex
-/// continuity, and the solid dies — measured cliff between 5e-5 and 1e-4,
-/// which is the heal gap and not the declaration. Not softened; un-ignore
-/// when of-00pu lands.
+/// FOUND FAILING, filed as **of-00pu**: the gap never survives end-to-end —
+/// heal's merge gap does not consult the declared closure (5e-4 > ~1.3e-4
+/// here), so the loop fails vertex continuity and the solid dies; measured
+/// cliff between 5e-5 and 1e-4, which is the heal gap and not the
+/// declaration. Since of-5rnp the seam test in [`trim_curve`] is held to
+/// the same heal-scale bound (the closure must not collapse genuinely short
+/// arcs), so a fix for of-00pu has to teach *both* ends about the
+/// declaration — or decide the spelling stays bounded by the heal gap. Not
+/// softened; un-ignore when of-00pu lands.
 #[test]
-#[ignore = "of-00pu: heal's vertex merge ignores the declared closure trim_curve honours"]
+#[ignore = "of-00pu: neither heal's vertex merge nor the seam bound consults the declared closure"]
 fn a_declared_closure_admits_a_slopped_two_vertex_seam() {
     let (r, h) = (5.0, 8.0);
     let closure = 1.0e-3;
