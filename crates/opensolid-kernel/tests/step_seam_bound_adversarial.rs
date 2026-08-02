@@ -3,9 +3,12 @@
 //!
 //! of-5rnp moved [`trim_curve`]'s "two distinct seam vertices are really the
 //! same point" test off the declared closure and onto `seam_tol`: the
-//! `HEAL_GAP_REL` ratio (1e-5) over the same origin-distance model-scale
-//! proxy `trim_tol` uses. This campaign attacks the new boundary itself
-//! rather than re-proving the of-5rnp repro:
+//! `HEAL_GAP_REL` ratio (1e-5) over the solid's model scale. (As first
+//! landed that scale was the origin-distance proxy `trim_tol` uses; of-85rt
+//! — found by this campaign — replaced it with the vertex bounding-box
+//! diagonal heal's own merge measures, clamped like heal's, so the bound is
+//! translation invariant.) This campaign attacks the boundary itself rather
+//! than re-proving the of-5rnp repro:
 //!
 //! - **Arcs just above the bound must read literally** — exact, checker
 //!   clean, correct volume, across randomized radii, heights and chords.
@@ -14,9 +17,10 @@
 //! - **A declared closure must not move the cliff in either direction** —
 //!   neither a loose closure widening it (of-5rnp's bug) nor a tight
 //!   closure narrowing it.
-//! - **The bound must be a model-scale bound, not a placement bound** — the
-//!   origin-distance proxy grows with translation, while the heal merge it
-//!   claims to mirror uses the translation-invariant body diagonal.
+//! - **The bound must be a model-scale bound, not a placement bound** — a
+//!   translated part must keep the reading, and the exact volume, it has at
+//!   the origin, because the heal merge the bound mirrors uses the
+//!   translation-invariant body diagonal.
 //! - **Round-trip volume certification** — everything that imports exactly
 //!   must measure the authored volume and survive write→read unchanged.
 //!
@@ -27,13 +31,14 @@
 //!
 //! # Failures this campaign found (both deterministic, no seed required)
 //!
-//! - **of-85rt** (P1): `seam_tol`'s origin-distance proxy resurrects the
-//!   of-5rnp corruption for off-origin parts. The identical clean sector
-//!   (r = 1.6, chord 8e-3, closure 9e-3) that imports correctly at the
-//!   origin imports *checker-clean at 24.1466 mm³ vs authored 0.0192 mm³* —
-//!   the same 1257× silent corruption — at `cx = 1200`; without a
-//!   declaration it silently loses its exact import there. Heal's merge gap
-//!   is diagonal-based and clamped; `seam_tol` is neither. Repros:
+//! - **of-85rt** (P1, fixed): `seam_tol`'s original origin-distance proxy
+//!   resurrected the of-5rnp corruption for off-origin parts. The identical
+//!   clean sector (r = 1.6, chord 8e-3, closure 9e-3) that imported
+//!   correctly at the origin imported *checker-clean at 24.1466 mm³ vs
+//!   authored 0.0192 mm³* — the same 1257× silent corruption — at
+//!   `cx = 1200`; without a declaration it silently lost its exact import
+//!   there. Heal's merge gap is diagonal-based and clamped; `seam_tol` was
+//!   neither, and now is both. Repros (kept as regression tests):
 //!   [`translating_the_of_5rnp_sector_must_not_resurrect_the_collapse`],
 //!   [`translating_a_clean_short_arc_sector_must_not_cost_its_exact_import`].
 //! - **of-a5me** (P3): inside the bound the ambiguity window is not merely
@@ -306,17 +311,14 @@ fn two_vertex_seam_cylinder(r: f64, h: f64, gap: f64, closure_mm: Option<f64>) -
 // The bound, restated per arc
 // ---------------------------------------------------------------------
 
-/// The seam-identity bound `trim_curve` applies to the *bottom* arc of an
-/// offset sector: its endpoints' larger origin distance is exactly `cx + r`.
-fn bottom_seam_bound(cx: f64, r: f64) -> f64 {
-    SEAM_TOL_REL * (1.0 + (cx + r))
-}
-
-/// The bound applied to the *top* arc, whose endpoints also carry `z = h` —
-/// strictly wider than [`bottom_seam_bound`], so chords between the two see
-/// the two arcs decided differently (the campaign's mixed zone).
-fn top_seam_bound(cx: f64, r: f64, h: f64) -> f64 {
-    SEAM_TOL_REL * (1.0 + ((cx + r) * (cx + r) + h * h).sqrt())
+/// The seam-identity bound `trim_curve` applies to *both* arcs of an offset
+/// sector: `SEAM_TOL_REL` × the diagonal of the sector's vertex bounding
+/// box, which is translation invariant — `cx` does not appear (of-85rt).
+/// The sliver's y extent (≈ the chord, from the swept arc endpoints) shifts
+/// the diagonal by under one part in 10⁹ at every chord this campaign aims,
+/// so it is omitted.
+fn seam_bound(r: f64, h: f64) -> f64 {
+    SEAM_TOL_REL * (r * r + h * h).sqrt()
 }
 
 /// The sweep whose chord is `chord`.
@@ -430,9 +432,9 @@ fn a_chord_just_above_the_bound_reads_literally() {
         let r = rng.range(1.0, 8.0);
         let h = rng.range(2.0, 12.0);
         let cx = rng.range(0.0, 40.0);
-        let bound = top_seam_bound(cx, r, h);
-        // Log-uniform in [1.001, 1000] × the wider (top-arc) bound, capped
-        // well under the radius so the sweep stays a genuine sliver.
+        let bound = seam_bound(r, h);
+        // Log-uniform in [1.001, 1000] × the bound, capped well under the
+        // radius so the sweep stays a genuine sliver.
         let factor = 10.0f64.powf(rng.range(0.000434, 3.0));
         let chord = (bound * factor).min(0.4 * r);
         let closure = match rng.pick(3) {
@@ -457,33 +459,29 @@ fn a_chord_just_above_the_bound_reads_literally() {
 // (2) The collapse cliff sits at the bound and is never silently wrong
 // =====================================================================
 
-/// Scan chords across the bound (no declaration). Below the *bottom* arc's
-/// bound both arcs collapse; between the bottom and top bounds only the top
-/// arc does (the mixed zone); above the top bound both read literally. The
-/// literal side must import exactly at the authored volume; everywhere else
-/// the import must be honest — `verify_trim` refuses the collapsed circle's
-/// chord-sized end miss, so no exact body may appear. Acceptance must flip
-/// exactly once, at the top bound.
+/// Scan chords across the bound (no declaration). Both arcs see the one
+/// vertex-bbox-diagonal bound — placement and z height no longer split them
+/// into a mixed zone — so below it both collapse and above it both read
+/// literally. The literal side must import exactly at the authored volume;
+/// below the bound the import must be honest — `verify_trim` refuses the
+/// collapsed circle's chord-sized end miss, so no exact body may appear.
+/// Acceptance must flip exactly once, at the bound.
 #[test]
 fn the_collapse_cliff_sits_at_the_seam_bound() {
     let (r, h) = (5.0, 3.0);
-    let lo = bottom_seam_bound(0.0, r);
-    let hi = top_seam_bound(0.0, r, h);
+    let bound = seam_bound(r, h);
     let mut seen_exact = false;
     for (zone, chord) in [
-        ("both collapse", 0.5 * lo),
-        ("both collapse", 0.999 * lo),
-        ("mixed zone", 1.001 * lo),
-        ("mixed zone", 0.5 * (lo + hi)),
-        ("mixed zone", 0.999 * hi),
-        ("literal", 1.001 * hi),
-        ("literal", 1.05 * hi),
-        ("literal", 2.0 * hi),
+        ("collapse", 0.5 * bound),
+        ("collapse", 0.999 * bound),
+        ("literal", 1.001 * bound),
+        ("literal", 1.05 * bound),
+        ("literal", 2.0 * bound),
     ] {
         let sweep = sweep_for_chord(r, chord);
         let repro = format!(
-            "sector(r = {r}, h = {h}), chord {chord:.6e} ({zone}; bounds \
-             [{lo:.6e}, {hi:.6e}]), no declaration"
+            "sector(r = {r}, h = {h}), chord {chord:.6e} ({zone}; bound \
+             {bound:.6e}), no declaration"
         );
         let text = offset_cylinder_sector(0.0, r, h, sweep, None);
         let expected = sector_volume(r, h, sweep);
@@ -526,7 +524,7 @@ fn a_loose_closure_must_not_widen_the_seam_bound() {
         let r = rng.range(1.0, 8.0);
         let h = rng.range(2.0, 12.0);
         let closure = if rng.pick(2) == 0 { 9.0e-3 } else { 2.54e-2 };
-        let bound = top_seam_bound(0.0, r, h);
+        let bound = seam_bound(r, h);
         // Between the bound and the declaration: covered by the closure,
         // above the seam bound — the collapse would be silent corruption.
         let chord = rng.range(1.05 * bound, 8.0e-3);
@@ -550,11 +548,13 @@ fn a_loose_closure_must_not_widen_the_seam_bound() {
 /// `seam_tol`'s question and the cylinder must still import whole.
 #[test]
 fn a_tight_closure_must_not_narrow_the_seam_bound() {
-    let (r, h, gap) = (5.0f64, 8.0, 5.0e-6);
+    let (r, h, gap) = (5.0f64, 8.0f64, 5.0e-6f64);
     let repro = format!(
         "two-vertex seam cylinder(r = {r}, h = {h}), gap {gap:.1e} inside the seam \
          bound {:.3e}, declared closure 1e-9",
-        SEAM_TOL_REL * (1.0 + (r * r + h * h / 4.0).sqrt())
+        // The fixture's three vertices all sit on the seam: its bbox is the
+        // gap wide and the full height tall.
+        SEAM_TOL_REL * (h * h + gap * gap).sqrt()
     );
     let text = two_vertex_seam_cylinder(r, h, gap, Some(1.0e-9));
     let volume = exact_checked_volume(&text, &repro)
@@ -582,7 +582,7 @@ fn a_sub_bound_arc_under_a_covering_closure_must_not_be_silently_rewritten() {
     let repro = format!(
         "sector(r = {r}, h = {h}), chord {chord:.1e} under the seam bound \
          {:.3e}, declared closure {closure:.1e} covers the chord",
-        bottom_seam_bound(0.0, r)
+        seam_bound(r, h)
     );
     assert_never_silently_wrong(
         &offset_cylinder_sector(0.0, r, h, sweep, Some(closure)),
@@ -595,10 +595,11 @@ fn a_sub_bound_arc_under_a_covering_closure_must_not_be_silently_rewritten() {
 // (4) The bound must not depend on where the part sits
 // =====================================================================
 
-/// A moderate offset must not change the reading: at `cx = 300` the bound
-/// (~3e-3) is still under the 8e-3 chord, so the of-5rnp sector stays
-/// literal, exact and correct — with and without its covering closure.
-/// Guards the passing side of the of-85rt cliff.
+/// A moderate offset must not change the reading: the extent bound
+/// (~3.4e-5) is well under the 8e-3 chord at any placement, so the of-5rnp
+/// sector stays literal, exact and correct at `cx = 300` — with and without
+/// its covering closure. Guarded the passing side of the of-85rt cliff when
+/// the bound still moved with `cx`.
 #[test]
 fn a_moderate_offset_keeps_the_short_arc_literal() {
     let (r, h, chord) = (1.6, 3.0, 8.0e-3);
@@ -607,7 +608,7 @@ fn a_moderate_offset_keeps_the_short_arc_literal() {
         let repro = format!(
             "sector(cx = 300, r = {r}, h = {h}), chord {chord:.1e} above bound \
              {:.3e}, closure {closure:?}",
-            top_seam_bound(300.0, r, h)
+            seam_bound(r, h)
         );
         let volume =
             exact_checked_volume(&offset_cylinder_sector(300.0, r, h, sweep, closure), &repro)
@@ -620,16 +621,16 @@ fn a_moderate_offset_keeps_the_short_arc_literal() {
 /// seam bound claims to mirror heal's vertex merge, and heal's merge gap is
 /// the (translation-invariant) body diagonal.
 ///
-/// FOUND FAILING, filed as **of-85rt** (P1): at `cx = 1200` the
-/// origin-distance proxy inflates `seam_tol` to ~1.2e-2 > the 8e-3 chord,
-/// the arc is rewritten into a full circle, the declared closure covers the
-/// chord-sized end miss in `verify_trim`, and the import is *checker-clean
-/// at 24.1466 mm³ vs authored 0.0192 mm³* — the exact 1257× of-5rnp
-/// corruption, resurrected by translation. Also reproduces under the
-/// corpus-real 2.54e-2 declaration. Not softened; un-ignore when of-85rt
-/// lands.
+/// FOUND FAILING, filed and fixed as **of-85rt** (P1): at `cx = 1200` the
+/// original origin-distance proxy inflated `seam_tol` to ~1.2e-2 > the 8e-3
+/// chord, the arc was rewritten into a full circle, the declared closure
+/// covered the chord-sized end miss in `verify_trim`, and the import was
+/// *checker-clean at 24.1466 mm³ vs authored 0.0192 mm³* — the exact 1257×
+/// of-5rnp corruption, resurrected by translation. The bound is now the
+/// vertex-bbox diagonal (~3.4e-5 here, at any `cx`), so the arc reads
+/// literally; kept as the regression test. Also reproduced under the
+/// corpus-real 2.54e-2 declaration.
 #[test]
-#[ignore = "of-85rt: seam_tol's origin-distance proxy resurrects the of-5rnp collapse at cx = 1200"]
 fn translating_the_of_5rnp_sector_must_not_resurrect_the_collapse() {
     let (r, h, chord) = (1.6, 3.0, 8.0e-3);
     let sweep = sweep_for_chord(r, chord);
@@ -646,15 +647,14 @@ fn translating_the_of_5rnp_sector_must_not_resurrect_the_collapse() {
     }
 }
 
-/// The declaration-free half of of-85rt: with no closure the collapse is
-/// refused by `verify_trim`, so the translated part is not corrupted — but
-/// it silently loses the exact import it gets at the origin. Fidelity must
+/// The declaration-free half of of-85rt: with no closure the collapse was
+/// refused by `verify_trim`, so the translated part was not corrupted — but
+/// it silently lost the exact import it gets at the origin. Fidelity must
 /// not depend on placement.
 ///
-/// FOUND FAILING, filed as **of-85rt** (P1) with the corruption above. Not
-/// softened; un-ignore when of-85rt lands.
+/// FOUND FAILING, filed and fixed as **of-85rt** (P1) with the corruption
+/// above; kept as the regression test.
 #[test]
-#[ignore = "of-85rt: the translated short-arc sector falls back to tessellation at cx = 1200"]
 fn translating_a_clean_short_arc_sector_must_not_cost_its_exact_import() {
     let (r, h, chord) = (1.6, 3.0, 8.0e-3);
     let sweep = sweep_for_chord(r, chord);
@@ -686,7 +686,7 @@ fn an_exact_import_round_trips_through_write_and_read() {
         let sweep = if rng.pick(2) == 0 {
             rng.range(0.1, 1.2)
         } else {
-            sweep_for_chord(r, top_seam_bound(cx, r, h) * rng.range(1.5, 20.0))
+            sweep_for_chord(r, seam_bound(r, h) * rng.range(1.5, 20.0))
         };
         let repro = format!(
             "case {case}: round trip sector(cx = {cx:.6}, r = {r:.6}, h = {h:.6}, \

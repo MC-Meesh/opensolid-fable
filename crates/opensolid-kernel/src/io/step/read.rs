@@ -2578,18 +2578,85 @@ fn trim_tol(a: Point3, b: Point3, closure: f64) -> f64 {
 ///
 /// What decides seam identity end-to-end is whether the kernel itself will
 /// call the two vertices one point, which is heal's vertex merge at
-/// [`HEAL_GAP_REL`](super::heal::HEAL_GAP_REL) × the body diagonal — so the
-/// bound is that same ratio over [`trim_tol`]'s origin-distance proxy for
-/// model scale, one decade looser than the round-off rule. An arc shorter
-/// than this is indistinguishable from a seam anyway: reading it as one
-/// hands the merged vertex to the same fate heal would deal it.
-fn seam_tol(a: Point3, b: Point3) -> f64 {
-    super::heal::HEAL_GAP_REL * (1.0 + a.coords.norm().max(b.coords.norm()))
+/// [`HEAL_GAP_REL`](super::heal::HEAL_GAP_REL) × the body's vertex
+/// bounding-box diagonal, clamped to [`MAX_ALLOWED_TOLERANCE`] (heal.rs
+/// `resolve_max_gap`) — so the bound is that same rule, over the diagonal
+/// [`solid_seam_tol`] measures from the solid's `VERTEX_POINT`s before
+/// mapping. Extent, not placement: an earlier origin-distance proxy here
+/// grew without bound under translation and resurrected the of-5rnp
+/// collapse for off-origin parts (of-85rt), while heal's merge gap — the
+/// thing this bound exists to mirror — never moves when the part does. An
+/// arc shorter than this is indistinguishable from a seam anyway: reading
+/// it as one hands the merged vertex to the same fate heal would deal it.
+fn seam_tol(diagonal: f64) -> f64 {
+    (super::heal::HEAL_GAP_REL * diagonal).clamp(SYSTEM_RESOLUTION, MAX_ALLOWED_TOLERANCE)
+}
+
+/// The seam-identity bound for one solid: [`seam_tol`] over the diagonal of
+/// the bounding box of every `VERTEX_POINT` reachable from its shells — the
+/// same vertex set heal's merge measures once the body exists
+/// (`derived_max_gap`), walked here straight off the STEP graph because
+/// [`trim_curve`] needs the bound before any topology is built. A reference
+/// that fails to resolve is skipped, not an error: whatever is wrong with it
+/// will be reported by the real mapping.
+fn solid_seam_tol(file: &StepFile, shell_roots: &[u64], scale: f64) -> f64 {
+    let mut stack: Vec<u64> = shell_roots.to_vec();
+    let mut visited: HashSet<u64> = stack.iter().copied().collect();
+    let mut lo = [f64::INFINITY; 3];
+    let mut hi = [f64::NEG_INFINITY; 3];
+    let mut any = false;
+    while let Some(id) = stack.pop() {
+        let Some(inst) = file.get(id) else { continue };
+        if let Some(rec) = inst.entity.part("VERTEX_POINT") {
+            if let Ok(point_ref) = ref_attr(rec, 1, id)
+                && let Ok(p) = resolve_point(file, point_ref, id, scale)
+            {
+                any = true;
+                for k in 0..3 {
+                    lo[k] = lo[k].min(p[k]);
+                    hi[k] = hi[k].max(p[k]);
+                }
+            }
+            continue;
+        }
+        let records = match &inst.entity {
+            EntityRecord::Simple(rec) => std::slice::from_ref(rec),
+            EntityRecord::Complex(recs) => recs.as_slice(),
+        };
+        for rec in records {
+            let mut values: Vec<&Value> = rec.attributes.iter().collect();
+            while let Some(value) = values.pop() {
+                match value {
+                    Value::Ref(target) => {
+                        if visited.insert(*target) {
+                            stack.push(*target);
+                        }
+                    }
+                    Value::List(items) => values.extend(items),
+                    Value::Typed { value, .. } => values.push(value),
+                    _ => {}
+                }
+            }
+        }
+    }
+    if !any {
+        return seam_tol(0.0);
+    }
+    let diagonal = (0..3)
+        .map(|k| {
+            let d = hi[k] - lo[k];
+            d * d
+        })
+        .sum::<f64>()
+        .sqrt();
+    seam_tol(diagonal)
 }
 
 /// Trim an analytic curve to an edge's vertices: orient it along the edge
 /// (STEP `same_sense` false means the edge opposes the curve direction)
 /// and recover the parameter range, always with `t_start < t_end`.
+/// `seam_tol` is the solid's seam-identity bound ([`solid_seam_tol`]).
+#[allow(clippy::too_many_arguments)]
 fn trim_curve(
     curve: &Curve3,
     same_sense: bool,
@@ -2597,6 +2664,7 @@ fn trim_curve(
     end: Point3,
     closed: bool,
     closure: f64,
+    seam_tol: f64,
     entity: u64,
 ) -> MapResult<TrimmedCurve> {
     let oriented = if same_sense {
@@ -2669,7 +2737,7 @@ fn trim_curve(
             // circle (of-5rnp). Past the bound the arc is read literally;
             // whether its endpoints then hold together is the loop's problem,
             // judged by the same heal merge this bound mirrors.
-            if closed || (end - start).norm() <= seam_tol(start, end) {
+            if closed || (end - start).norm() <= seam_tol {
                 (t0, t0 + TAU)
             } else {
                 let sweep = (conic_angle(conic, &end).expect("conic") - t0).rem_euclid(TAU);
@@ -2806,6 +2874,8 @@ struct SolidBuilder<'a> {
     /// The closure distance the file declares for this solid, in millimetres
     /// ([`resolve_closure`]); floors every edge's trim tolerance.
     closure: f64,
+    /// The solid's seam-identity bound ([`solid_seam_tol`]), in millimetres.
+    seam_tol: f64,
     /// How many edges needed that floor — trims whose vertex miss is inside
     /// the declared closure but outside what [`TRIM_TOL_REL`] alone allows.
     /// Reported once per solid rather than per edge.
@@ -3241,6 +3311,7 @@ impl SolidBuilder<'_> {
             end,
             closed,
             self.closure,
+            self.seam_tol,
             edge_ref,
         )?;
         if trimmed.start_residual.max(trimmed.end_residual) > trim_tol(start, end, 0.0) {
@@ -3733,6 +3804,9 @@ struct FallbackMesher<'a> {
     /// path refuses is refused here too and the solid is lost rather than
     /// degraded — which is how of-kwn's file failed outright.
     closure: f64,
+    /// The solid's seam-identity bound ([`solid_seam_tol`]), shared with the
+    /// exact path for the same reason as `closure`.
+    seam_tol: f64,
     diagnostics: &'a mut Vec<Diagnostic>,
     /// `EDGE_CURVE` #id → its polyline from start vertex to end vertex.
     /// Shared between adjacent faces so junctions weld watertight.
@@ -4545,6 +4619,7 @@ impl FallbackMesher<'_> {
                     end,
                     closed,
                     self.closure,
+                    self.seam_tol,
                     edge_ref,
                 )?;
                 let segments = match trimmed.curve {
@@ -5493,6 +5568,11 @@ fn map_solid(
     };
 
     let closure = resolve_closure(file, msb_id, diagnostics);
+    let seam_tol = {
+        let mut shell_roots = vec![shell_ref];
+        shell_roots.extend(voids.iter().map(|&(void_ref, _)| void_ref));
+        solid_seam_tol(file, &shell_roots, scale)
+    };
 
     // Exact path first.
     let mut builder = SolidBuilder {
@@ -5502,6 +5582,7 @@ fn map_solid(
         scale,
         angle_scale,
         closure,
+        seam_tol,
         closure_trims: 0,
         created: Created::default(),
         multi_bound_faces: Vec::new(),
@@ -5622,6 +5703,7 @@ fn map_solid(
         scale,
         angle_scale,
         closure,
+        seam_tol,
         diagnostics,
         polylines: HashMap::new(),
     };
@@ -7587,6 +7669,7 @@ mod tests {
             Point3::new(0.0, 1.0, 0.0),
             false,
             0.0,
+            2.0e-5,
             1,
         )
         .unwrap();
@@ -7606,6 +7689,7 @@ mod tests {
             Point3::new(0.0, 1.0, 0.0),
             false,
             0.0,
+            2.0e-5,
             1,
         )
         .unwrap();
@@ -7627,6 +7711,7 @@ mod tests {
             Point3::new(1.0, 0.0, 0.0),
             false,
             0.0,
+            2.0e-5,
             1,
         )
         .unwrap();
@@ -7638,7 +7723,7 @@ mod tests {
     fn closed_edge_spans_the_full_circle() {
         let circle = Curve3::circle(Point3::origin(), Vector3::z(), 2.0).unwrap();
         let vertex = Point3::new(0.0, 2.0, 0.0);
-        let trimmed = trim_curve(&circle, true, vertex, vertex, true, 0.0, 1).unwrap();
+        let trimmed = trim_curve(&circle, true, vertex, vertex, true, 0.0, 4.0e-5, 1).unwrap();
         assert!((trimmed.t_end - trimmed.t_start - TAU).abs() < 1e-12);
         assert!((trimmed.curve.point(trimmed.t_start) - vertex).norm() < 1e-12);
     }
@@ -7653,7 +7738,7 @@ mod tests {
         // only in the last bits of the y component.
         let start = Point3::new(20.0, -7.347880794884e-16, 10.0);
         let end = Point3::new(20.0, 0.0, 10.0);
-        let trimmed = trim_curve(&circle, true, start, end, false, 0.0, 1).unwrap();
+        let trimmed = trim_curve(&circle, true, start, end, false, 0.0, 1.2e-4, 1).unwrap();
         assert!((trimmed.t_end - trimmed.t_start - TAU).abs() < 1e-12);
         // Halfway round is the far side of the circle, not the seam.
         let mid = trimmed.curve.point((trimmed.t_start + trimmed.t_end) / 2.0);
@@ -7673,7 +7758,9 @@ mod tests {
         let sweep = 2.0 * (chord / (2.0 * r)).asin();
         let start = Point3::new(r, 0.0, 0.0);
         let end = Point3::new(r * sweep.cos(), r * sweep.sin(), 0.0);
-        let trimmed = trim_curve(&circle, true, start, end, false, 9.0e-3, 1).unwrap();
+        // The seam bound heal-scale derivation gives the of-5rnp sector
+        // (vertex bbox diagonal ~3.4 mm).
+        let trimmed = trim_curve(&circle, true, start, end, false, 9.0e-3, 3.4e-5, 1).unwrap();
         assert!(
             (trimmed.t_end - trimmed.t_start - sweep).abs() < 1e-9,
             "expected the literal {sweep:.3e} sweep, got {:.3e}",
@@ -7694,7 +7781,8 @@ mod tests {
         let start = Point3::new(r, 0.0, 0.0);
         let end = Point3::new(r * phi.cos(), r * phi.sin(), 0.0);
         assert!((end - start).norm() > trim_tol(start, end, 0.0));
-        let trimmed = trim_curve(&circle, true, start, end, false, 1.0e-3, 1).unwrap();
+        // The bound a ~8 mm body derives; the 5e-5 gap sits inside it.
+        let trimmed = trim_curve(&circle, true, start, end, false, 1.0e-3, 8.0e-5, 1).unwrap();
         assert!(
             (trimmed.t_end - trimmed.t_start - TAU).abs() < 1e-12,
             "expected a full period, got {:.3e}",
@@ -7708,7 +7796,7 @@ mod tests {
     fn coincident_vertices_on_a_line_are_still_refused() {
         let line = Curve3::line(Point3::origin(), Vector3::x()).unwrap();
         let vertex = Point3::new(3.0, 0.0, 0.0);
-        let err = trim_curve(&line, true, vertex, vertex, false, 0.0, 7).unwrap_err();
+        let err = trim_curve(&line, true, vertex, vertex, false, 0.0, 2.0e-5, 7).unwrap_err();
         assert!(
             matches!(err, MapError::Invalid { entity: 7, .. }),
             "{err:?}"
@@ -7725,6 +7813,7 @@ mod tests {
             Point3::new(0.0, 1.0, 0.0),
             false,
             0.0,
+            2.0e-5,
             7,
         )
         .unwrap_err();
@@ -7750,6 +7839,7 @@ mod tests {
             Point3::new(0.0, 1.0, 3e-7),
             false,
             0.0,
+            2.0e-5,
             1,
         )
         .unwrap();
@@ -7772,6 +7862,7 @@ mod tests {
             Point3::new(0.0, 1.0, 0.0),
             false,
             0.0,
+            2.0e-5,
             1,
         )
         .unwrap();
@@ -7794,6 +7885,7 @@ mod tests {
             Point3::new(0.0, 5.0e4, 0.0),
             false,
             0.0,
+            MAX_ALLOWED_TOLERANCE,
             7,
         )
         .unwrap_err();
@@ -7809,6 +7901,7 @@ mod tests {
             Point3::new(0.0, 5.0e4, 0.0),
             false,
             0.0,
+            MAX_ALLOWED_TOLERANCE,
             7,
         )
         .unwrap();
@@ -8246,12 +8339,12 @@ mod tests {
         let curve = bspline_arc();
         let (t0, t1) = curve.domain();
         let (start, end) = (curve.point(t0), curve.point(t1));
-        let trimmed = trim_curve(&curve, true, start, end, false, 0.0, 1).unwrap();
+        let trimmed = trim_curve(&curve, true, start, end, false, 0.0, 2.0e-5, 1).unwrap();
         assert!((trimmed.t_start - t0).abs() < 1e-9);
         assert!((trimmed.t_end - t1).abs() < 1e-9);
         // An interior vertex trims to an interior parameter, not the end.
         let mid = curve.point(1.25);
-        let partial = trim_curve(&curve, true, start, mid, false, 0.0, 1).unwrap();
+        let partial = trim_curve(&curve, true, start, mid, false, 0.0, 2.0e-5, 1).unwrap();
         assert!((partial.t_end - 1.25).abs() < 1e-6, "got {}", partial.t_end);
     }
 
@@ -8261,7 +8354,7 @@ mod tests {
         let (t0, t1) = curve.domain();
         // The edge runs against the curve: end vertex first.
         let (start, end) = (curve.point(t1), curve.point(t0));
-        let trimmed = trim_curve(&curve, false, start, end, false, 0.0, 1).unwrap();
+        let trimmed = trim_curve(&curve, false, start, end, false, 0.0, 2.0e-5, 1).unwrap();
         assert!(trimmed.t_start < trimmed.t_end, "normalized trim direction");
         assert!(matches!(trimmed.curve, Curve3::Nurbs(_)), "stays exact");
         // The reversed curve interpolates the edge's vertices in order.
@@ -8288,7 +8381,7 @@ mod tests {
             .unwrap(),
         );
         let vertex = curve.point(0.0);
-        let trimmed = trim_curve(&curve, true, vertex, vertex, true, 0.0, 1).unwrap();
+        let trimmed = trim_curve(&curve, true, vertex, vertex, true, 0.0, 2.0e-5, 1).unwrap();
         assert_eq!((trimmed.t_start, trimmed.t_end), (0.0, 3.0));
     }
 
@@ -8303,6 +8396,7 @@ mod tests {
             Point3::new(0.0, 9.0, 9.0),
             false,
             0.0,
+            2.0e-5,
             7,
         )
         .unwrap_err();
@@ -8340,6 +8434,7 @@ mod tests {
             Point3::origin(),
             true,
             0.0,
+            2.0e-5,
             7,
         )
         .unwrap_err();
@@ -9500,12 +9595,14 @@ REPRESENTATION_CONTEXT('2D SPACE','') );
                 };
                 let shell_ref = ref_attr(rec, 1, inst.id).expect("solid names a shell");
                 let closure = resolve_closure(&file, inst.id, &mut diagnostics);
+                let seam_tol = solid_seam_tol(&file, &[shell_ref], scale);
                 let mut mesher = FallbackMesher {
                     file: &file,
                     options: &options,
                     scale,
                     angle_scale,
                     closure,
+                    seam_tol,
                     diagnostics: &mut diagnostics,
                     polylines: HashMap::new(),
                 };

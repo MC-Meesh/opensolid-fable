@@ -1350,7 +1350,10 @@ fn plan_degenerate_collapses(
         };
         let length = (vb.point - va.point).norm();
         // NaN-safe: only a provably short edge is a candidate.
-        if !(length <= max_gap) {
+        if !matches!(
+            length.partial_cmp(&max_gap),
+            Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+        ) {
             continue;
         }
         let mid = Point3::from((va.point.coords + vb.point.coords) / 2.0);
@@ -2014,7 +2017,10 @@ fn plan_pcurve_refits(
                 let Some(curve) = edge.curve.and_then(|id| geo.curve(id)) else {
                     continue;
                 };
-                if !edge.t_start.is_finite() || !(edge.t_end > edge.t_start) {
+                // NaN-safe: only a provably advancing range is refittable.
+                if !edge.t_start.is_finite()
+                    || edge.t_end.partial_cmp(&edge.t_start) != Some(std::cmp::Ordering::Greater)
+                {
                     continue;
                 }
                 let allowed = edge.tolerance.max(SYSTEM_RESOLUTION);
@@ -2085,7 +2091,7 @@ fn apply_pcurve_refits(
         }
         let new_id = geo.add_pcurve(refit.pcurve);
         let fin = store.fins.get_mut(refit.fin).expect("checked above");
-        if let Some(stale) = std::mem::replace(&mut fin.pcurve, Some(new_id)) {
+        if let Some(stale) = fin.pcurve.replace(new_id) {
             geo.pcurves.remove(stale);
         }
         operations.push(HealOperation::PcurveRecomputed {
