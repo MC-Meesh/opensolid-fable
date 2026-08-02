@@ -52,6 +52,8 @@
 //!   fraction of the domain, and `nurbs_param` converts the stall into a
 //!   hard `Degenerate` error that refuses to tessellate the whole solid
 //!   (seed 0xADF2_0001, trial 9, face 0: degree 1×1, weights in [0.6, 1.8]).
+//!   Fixed: `nurbs_project` now retries a stalled seeded projection from the
+//!   global per-span search before erroring.
 
 use std::f64::consts::{FRAC_1_SQRT_2, PI, TAU};
 
@@ -421,8 +423,6 @@ fn random_bspline_parallelepipeds_measure_exactly() {
 /// trimmed standalone path (`face_cdt`), which `nurbs_lattice` refused
 /// before of-37i.6.
 #[test]
-#[ignore = "of-w3hj: seeded NURBS projection stalls at feature scale on flat rational \
-            patches (trial 9); un-ignore when the projection fallback lands"]
 fn random_interior_trimmed_bspline_parallelepipeds_measure_exactly() {
     let mut rng = Rng::new(0xADF2_0001);
     for trial in 0..12 {

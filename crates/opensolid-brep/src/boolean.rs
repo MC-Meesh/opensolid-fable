@@ -1259,10 +1259,20 @@ fn nurbs_project(
     // A seeded Newton both costs less than the per-span search and, more
     // importantly, picks the intended sheet where the patch approaches
     // itself and several local minima compete.
-    let proj = match hint {
+    let mut proj = match hint {
         Some(seed) => surface.project_point_seeded(p, seed),
         None => surface.project_point(p),
     };
+    // A stalled seeded iteration is a solver artifact, not evidence about
+    // the point: the damped Newton's basin can be a fraction of the knot
+    // domain even on a flat rational patch, and ring-embedding hints hop
+    // corner to corner, well past it (of-w3hj). Retry from the global
+    // per-span search before erroring. Sheet preference is not lost —
+    // the seeded answer never arrived, so there is nothing to overrule —
+    // and the caller's residual gate still judges whatever this returns.
+    if !proj.converged && hint.is_some() {
+        proj = surface.project_point(p);
+    }
     if !proj.converged {
         return Err(CoreError::Degenerate {
             context: "boolean::Chart::param(Nurbs)",
@@ -12937,6 +12947,90 @@ mod tests {
             let p = chart_point(&chart, (u, v));
             let (u2, v2) = chart.param(&p, None).expect("inverts unseeded");
             assert!(tol.points_approx_eq(&chart_point(&chart, (u2, v2)), &p));
+        }
+    }
+
+    /// A bad hint must not veto an on-patch point (of-w3hj). The seeded
+    /// Newton's basin can be a fraction of the knot domain even on a
+    /// completely flat rational patch — this fixture is the of-w3hj repro's
+    /// face 0, where seeds ~0.2 of the domain from the answer stall at
+    /// feature-scale residual — and ring embedding chains hints corner to
+    /// corner, well past that. `param` must fall back to the global
+    /// per-span search (which converges from anywhere here) instead of
+    /// escalating the stall into a `Degenerate` that refuses to tessellate
+    /// the whole solid.
+    #[test]
+    fn nurbs_param_survives_a_hint_outside_the_newton_basin() {
+        let tol = tol();
+        // Parallelepiped face quad from the of-w3hj repro (seed 0xADF2_0001,
+        // trial 9, face 0), traversed in its face-cycle order.
+        let o = Point3::new(2.2176785644779358, -0.6534000159384838, -1.191015763402663);
+        let a = Vector3::new(2.010419513546255, -1.8267728529578675, -0.6068175285939144);
+        let b = Vector3::new(1.0639051241216864, -2.1528392886121543, -1.2204463195701554);
+        let (q0, q1, q2, q3) = (o, o + b, o + a + b, o + a);
+        // Interior-trim margins extend the patch past the quad; Greville
+        // placement of the affine map keeps it exactly planar.
+        let [mu0, mu1, mv0, mv1] = [
+            1.0309888883056686,
+            1.1834097350963173,
+            0.0,
+            0.7334494225079166,
+        ];
+        let bilerp = |u: f64, v: f64| {
+            let bottom = q0 + (q1 - q0) * u;
+            let top = q3 + (q2 - q3) * u;
+            bottom + (top - bottom) * v
+        };
+        // Degree (1,1), 3×3 grid: Grevilles of the uniform clamped knots
+        // are [0, 1/2, 1] in each direction.
+        let grevilles = [0.0, 0.5, 1.0];
+        let grid: Vec<Vec<Point3>> = grevilles
+            .iter()
+            .map(|&gu| {
+                let s = -mu0 + gu * (1.0 + mu0 + mu1);
+                grevilles
+                    .iter()
+                    .map(|&gv| {
+                        let t = -mv0 + gv * (1.0 + mv0 + mv1);
+                        bilerp(s, t)
+                    })
+                    .collect()
+            })
+            .collect();
+        // Product-form rational weights from the repro: variation
+        // diminishing keeps the parameterization injective, yet the damped
+        // Newton still stalls from moderate seeds.
+        let wu = [0.841485660476368, 1.3677624649390996, 0.9720710632966594];
+        let wv = [0.758981496541939, 0.8781958925763509, 0.6621813507353957];
+        let weights: Vec<Vec<f64>> = wu
+            .iter()
+            .map(|wu| wv.iter().map(|wv| wu * wv).collect())
+            .collect();
+        let patch = NurbsSurface::new(
+            grid,
+            weights,
+            KnotVector::clamped_uniform(1, 3).expect("valid knots"),
+            KnotVector::clamped_uniform(1, 3).expect("valid knots"),
+        )
+        .expect("planar rational bilinear patch");
+        let chart = build_chart(&Surface3::nurbs(patch)).expect("regular patch");
+
+        // The repro's failing point: face corner q1, exactly on the patch.
+        let p = q1;
+        // Every hint on a domain-wide lattice must invert — including the
+        // stall seeds from the repro probe ((0.35, 0), (0, 0), (1, 1)…),
+        // which sit past the seeded Newton's basin.
+        for i in 0..=4 {
+            for j in 0..=4 {
+                let hint = (0.25 * f64::from(i), 0.25 * f64::from(j));
+                let (u, v) = chart.param(&p, Some(hint)).unwrap_or_else(|e| {
+                    panic!("on-patch corner must invert from hint {hint:?}: {e:?}")
+                });
+                assert!(
+                    tol.points_approx_eq(&chart_point(&chart, (u, v)), &p),
+                    "hint {hint:?}: inverted uv ({u}, {v}) does not reproduce the corner"
+                );
+            }
         }
     }
 
