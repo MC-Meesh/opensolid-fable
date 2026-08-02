@@ -1478,11 +1478,15 @@ const BRANCH_MATCH_FACTOR: f64 = 10.0;
 
 /// One planned repair for an edge that leaves its faces' surfaces.
 enum ConsistencyRepair {
-    /// Raise the edge's tolerance to the measured deviation — the honest
-    /// minimal repair while the deviation fits under the kernel cap.
+    /// Raise tolerances to the measured distances — the honest minimal
+    /// repair while everything fits under the kernel cap. Covers the whole
+    /// defect the bad curve causes: the edge's distance to its surfaces
+    /// *and* each vertex's distance to the curve's ends (a curve written
+    /// against the wrong support misses both).
     Elevate {
         edge: EntityId<Edge>,
         new_tolerance: f64,
+        vertex_tolerances: Vec<(EntityId<Vertex>, f64)>,
     },
     /// Replace the curve outright: nothing under [`MAX_ALLOWED_TOLERANCE`]
     /// covers where it actually is.
@@ -1519,12 +1523,13 @@ fn plan_edge_surface_consistency(
             continue;
         }
         // Under the kernel cap, the minimal repair wins: record the measured
-        // distance as tolerance and change no geometry.
+        // distances as tolerance and change no geometry.
         if deviation <= MAX_ALLOWED_TOLERANCE {
             if !rescue_only {
                 plan.push(ConsistencyRepair::Elevate {
                     edge: edge_id,
                     new_tolerance: deviation,
+                    vertex_tolerances: plan_endpoint_raises(store, geo, edge),
                 });
             }
             continue;
@@ -1539,6 +1544,39 @@ fn plan_edge_surface_consistency(
         }
     }
     plan
+}
+
+/// Vertex tolerance raises covering each end's distance to the edge's own
+/// curve endpoints (`spec/08-tolerances.md` §7.1 invariant 2) — the other
+/// half of what a curve written against the wrong support breaks. Raises
+/// past [`MAX_ALLOWED_TOLERANCE`] are not proposed; the residual failure is
+/// `check_geometry`'s to report.
+fn plan_endpoint_raises(
+    store: &TopologyStore,
+    geo: &GeometryStore,
+    edge: &Edge,
+) -> Vec<(EntityId<Vertex>, f64)> {
+    let mut raises = Vec::new();
+    let Some(curve) = edge.curve.and_then(|id| geo.curve(id)) else {
+        return raises;
+    };
+    for (vertex_id, t) in [
+        (edge.start_vertex, edge.t_start),
+        (edge.end_vertex, edge.t_end),
+    ] {
+        let Some(vertex) = store.vertex(vertex_id) else {
+            continue;
+        };
+        let residual = (vertex.point - curve.point(t)).norm();
+        if residual.is_finite()
+            && residual > vertex.tolerance
+            && residual <= MAX_ALLOWED_TOLERANCE
+            && !raises.iter().any(|&(v, _)| v == vertex_id)
+        {
+            raises.push((vertex_id, residual));
+        }
+    }
+    raises
 }
 
 /// Derive a replacement curve for `edge_id` from the intersection of its two
@@ -1753,10 +1791,19 @@ fn report_consistency_plan(
             ConsistencyRepair::Elevate {
                 edge,
                 new_tolerance,
-            } => operations.push(HealOperation::ToleranceElevated {
-                entity: EntityRef::Edge(*edge),
-                new_tolerance: *new_tolerance,
-            }),
+                vertex_tolerances,
+            } => {
+                operations.push(HealOperation::ToleranceElevated {
+                    entity: EntityRef::Edge(*edge),
+                    new_tolerance: *new_tolerance,
+                });
+                for &(vertex, new_tolerance) in vertex_tolerances {
+                    operations.push(HealOperation::ToleranceElevated {
+                        entity: EntityRef::Vertex(vertex),
+                        new_tolerance,
+                    });
+                }
+            }
             ConsistencyRepair::Recompute(recompute) => {
                 operations.push(HealOperation::EdgeCurveRecomputed {
                     edge: recompute.edge,
@@ -1789,6 +1836,7 @@ fn apply_consistency_repairs(
             ConsistencyRepair::Elevate {
                 edge,
                 new_tolerance,
+                vertex_tolerances,
             } => {
                 let Some(e) = store.edges.get_mut(edge) else {
                     continue;
@@ -1800,6 +1848,7 @@ fn apply_consistency_repairs(
                         new_tolerance,
                     });
                 }
+                apply_vertex_raises(store, &vertex_tolerances, operations);
             }
             ConsistencyRepair::Recompute(recompute) => {
                 if store.edges.get(recompute.edge).is_none() {
@@ -1827,19 +1876,27 @@ fn apply_consistency_repairs(
                     deviation_before: recompute.deviation_before,
                     deviation_after: recompute.deviation_after,
                 });
-                for &(vertex_id, tolerance) in &recompute.vertex_tolerances {
-                    if let Some(vertex) = store.vertices.get_mut(vertex_id)
-                        && tolerance > vertex.tolerance
-                    {
-                        vertex.tolerance = tolerance;
-                        operations.push(HealOperation::ToleranceElevated {
-                            entity: EntityRef::Vertex(vertex_id),
-                            new_tolerance: tolerance,
-                        });
-                    }
-                }
+                apply_vertex_raises(store, &recompute.vertex_tolerances, operations);
                 refit_pcurves_of_edge(store, geo, &recompute, operations, notes);
             }
+        }
+    }
+}
+
+fn apply_vertex_raises(
+    store: &mut TopologyStore,
+    raises: &[(EntityId<Vertex>, f64)],
+    operations: &mut Vec<HealOperation>,
+) {
+    for &(vertex_id, tolerance) in raises {
+        if let Some(vertex) = store.vertices.get_mut(vertex_id)
+            && tolerance > vertex.tolerance
+        {
+            vertex.tolerance = tolerance;
+            operations.push(HealOperation::ToleranceElevated {
+                entity: EntityRef::Vertex(vertex_id),
+                new_tolerance: tolerance,
+            });
         }
     }
 }
@@ -3199,5 +3256,503 @@ mod tests {
             GeometryHealer::fix_gaps(f.body, &mut f.store, &f.geo, &HealOptions::default());
         assert!(result.is_empty());
         assert!(!result.healed(), "there was nothing wrong to heal");
+    }
+
+    // --- Phase 2 fixtures -------------------------------------------
+
+    /// The block edge whose vertices sit at `a` and `b` (either order).
+    fn find_block_edge(f: &BlockFixture, a: Point3, b: Point3) -> EntityId<Edge> {
+        body_edges(&f.store, f.body)
+            .into_iter()
+            .find(|&e| {
+                let edge = f.store.edge(e).expect("live edge");
+                let s = f.store.vertex(edge.start_vertex).expect("live vertex").point;
+                let t = f.store.vertex(edge.end_vertex).expect("live vertex").point;
+                ((s - a).norm() < 1e-9 && (t - b).norm() < 1e-9)
+                    || ((s - b).norm() < 1e-9 && (t - a).norm() < 1e-9)
+            })
+            .expect("block edge exists")
+    }
+
+    /// Split the block edge between `(0,0,0)` and `(1,0,0)` with a mid
+    /// vertex `eps` from the first corner — the sliver an exporter leaves
+    /// where a tiny feature collapsed. Both adjacent faces get the split, so
+    /// the body stays sewn and valid. Returns the sliver edge.
+    fn split_block_edge_with_sliver(f: &mut BlockFixture, eps: f64) -> EntityId<Edge> {
+        let target = find_block_edge(
+            f,
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(1.0, 0.0, 0.0),
+        );
+        let (va, vb, curve_id, t_start, t_end) = {
+            let e = f.store.edge(target).expect("live edge");
+            (
+                e.start_vertex,
+                e.end_vertex,
+                e.curve.expect("fixture edges carry curves"),
+                e.t_start,
+                e.t_end,
+            )
+        };
+        assert!(
+            (f.store.vertex(va).expect("live vertex").point - Point3::origin()).norm() < 1e-9,
+            "sewn_block authors this edge from the origin corner"
+        );
+
+        let m = f
+            .store
+            .create_vertex(Point3::new(eps, 0.0, 0.0), SYSTEM_RESOLUTION);
+        let sliver =
+            f.store
+                .create_edge_with_curve(va, m, SYSTEM_RESOLUTION, curve_id, t_start, eps);
+        let long = f
+            .store
+            .create_edge_with_curve(m, vb, SYSTEM_RESOLUTION, curve_id, eps, t_end);
+
+        // Replace each fin of the split edge with two fins over the halves.
+        let old_fins: Vec<EntityId<Fin>> = f.store.fins_of_edge(target).to_vec();
+        for old_fin in old_fins {
+            let (loop_id, sense) = {
+                let fin = f.store.fin(old_fin).expect("live fin");
+                (fin.loop_ref, fin.sense)
+            };
+            let halves = if sense == FinSense::Forward {
+                [(sliver, FinSense::Forward), (long, FinSense::Forward)]
+            } else {
+                [(long, FinSense::Reversed), (sliver, FinSense::Reversed)]
+            };
+            let new_fins: Vec<EntityId<Fin>> = halves
+                .iter()
+                .map(|&(edge, sense)| {
+                    let fin = f.store.fins.insert(Fin {
+                        edge,
+                        loop_ref: loop_id,
+                        sense,
+                        next: None,
+                        prev: None,
+                        mate: None,
+                        pcurve: None,
+                    });
+                    f.store
+                        .edges
+                        .get_mut(edge)
+                        .expect("live edge")
+                        .fins
+                        .push(fin);
+                    fin
+                })
+                .collect();
+            let lp = f.store.loops.get_mut(loop_id).expect("live loop");
+            let at = lp
+                .fins
+                .iter()
+                .position(|&x| x == old_fin)
+                .expect("fin sits in its loop");
+            lp.fins.splice(at..=at, new_fins);
+            f.store.fins.remove(old_fin);
+            let fins = f.store.loops.get(loop_id).expect("live loop").fins.clone();
+            let n = fins.len();
+            for (i, &fin_id) in fins.iter().enumerate() {
+                let fin = f.store.fins.get_mut(fin_id).expect("live fin");
+                fin.next = Some(fins[(i + 1) % n]);
+                fin.prev = Some(fins[(i + n - 1) % n]);
+            }
+        }
+        for e in [sliver, long] {
+            let fins = f.store.edges.get(e).expect("live edge").fins.clone();
+            assert_eq!(fins.len(), 2, "both faces traverse each half");
+            f.store.fins.get_mut(fins[0]).expect("live fin").mate = Some(fins[1]);
+            f.store.fins.get_mut(fins[1]).expect("live fin").mate = Some(fins[0]);
+        }
+        f.store.edges.remove(target);
+        for v in [va, vb] {
+            f.store
+                .vertices
+                .get_mut(v)
+                .expect("live vertex")
+                .edges
+                .retain(|&e| e != target);
+        }
+        sliver
+    }
+
+    /// Replace the `(0,0,0)`–`(1,0,0)` edge's curve with a parallel line
+    /// displaced by `offset` — an exporter that wrote the edge's geometry
+    /// against the wrong support. Returns the edge.
+    fn displace_block_edge(f: &mut BlockFixture, offset: Vector3) -> EntityId<Edge> {
+        let target = find_block_edge(
+            f,
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(1.0, 0.0, 0.0),
+        );
+        let bad = f.geo.add_curve(
+            Curve3::line(Point3::origin() + offset, Vector3::x()).expect("unit direction"),
+        );
+        let e = f.store.edges.get_mut(target).expect("live edge");
+        e.curve = Some(bad);
+        e.t_start = 0.0;
+        e.t_end = 1.0;
+        target
+    }
+
+    // --- Sliver collapse ---------------------------------------------
+
+    #[test]
+    fn a_sliver_edge_is_collapsed_through_kev() {
+        let mut f = sewn_block(&[]);
+        let sliver = split_block_edge_with_sliver(&mut f, 1e-6);
+        assert_eq!(
+            f.store.check(f.body),
+            vec![],
+            "the split fixture must be valid before healing"
+        );
+        assert_eq!(f.store.vertices.len(), 9);
+        assert_eq!(f.store.edges.len(), 13);
+
+        let result =
+            GeometryHealer::heal(f.body, &mut f.store, &mut f.geo, &HealOptions::default());
+        assert!(
+            result.operations.iter().any(
+                |op| matches!(op, HealOperation::EdgeCollapsed { edge, .. } if *edge == sliver)
+            ),
+            "the sliver must be collapsed: {:?}",
+            result.operations
+        );
+        assert_eq!(f.store.check(f.body), vec![]);
+        assert_eq!(f.store.vertices.len(), 8, "the mid vertex is gone");
+        assert_eq!(f.store.edges.len(), 12, "the sliver edge is gone");
+        let failures = f.store.check_geometry(&f.geo, f.body);
+        assert!(
+            failures.is_empty(),
+            "the collapse must be covered by tolerance: {failures:#?}"
+        );
+        assert!((signed_volume(&f) - 1.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn report_only_plans_a_sliver_collapse_without_touching() {
+        let mut f = sewn_block(&[]);
+        let sliver = split_block_edge_with_sliver(&mut f, 1e-6);
+        let result = GeometryHealer::heal(
+            f.body,
+            &mut f.store,
+            &mut f.geo,
+            &HealOptions {
+                strategy: HealStrategy::ReportOnly,
+                max_gap: None,
+            },
+        );
+        assert!(
+            result.operations.iter().any(
+                |op| matches!(op, HealOperation::EdgeCollapsed { edge, .. } if *edge == sliver)
+            ),
+            "the collapse must still be reported: {:?}",
+            result.operations
+        );
+        assert_eq!(f.store.vertices.len(), 9, "nothing may move");
+        assert_eq!(f.store.edges.len(), 13);
+    }
+
+    /// The refusal half: a short edge that is longer than the tolerance is a
+    /// real feature, not a sliver, and indiscriminate collapsing is exactly
+    /// what healing must never do.
+    #[test]
+    fn a_short_but_honest_edge_is_not_collapsed() {
+        let mut f = sewn_block(&[]);
+        split_block_edge_with_sliver(&mut f, 0.2);
+        let result =
+            GeometryHealer::heal(f.body, &mut f.store, &mut f.geo, &HealOptions::default());
+        assert!(
+            result
+                .operations
+                .iter()
+                .all(|op| !matches!(op, HealOperation::EdgeCollapsed { .. })),
+            "0.2 mm on a 1 mm block is a feature: {:?}",
+            result.operations
+        );
+        assert_eq!(f.store.vertices.len(), 9);
+        assert_eq!(f.store.edges.len(), 13);
+    }
+
+    // --- Edge/surface consistency --------------------------------------
+
+    #[test]
+    fn an_edge_curve_past_the_tolerance_cap_is_recomputed_from_ssi() {
+        let mut f = sewn_block(&[]);
+        let target = displace_block_edge(&mut f, Vector3::new(0.0, 0.0, -0.05));
+        assert!(
+            f.store
+                .check_geometry(&f.geo, f.body)
+                .iter()
+                .any(|x| matches!(x, CheckFailure::EdgeOffSurface { .. })),
+            "the displaced curve must fail the geometric check first"
+        );
+
+        let result =
+            GeometryHealer::heal(f.body, &mut f.store, &mut f.geo, &HealOptions::default());
+        assert!(
+            result.operations.iter().any(|op| matches!(
+                op,
+                HealOperation::EdgeCurveRecomputed { edge, .. } if *edge == target
+            )),
+            "the curve must be recomputed: {:?}",
+            result.operations
+        );
+        assert_eq!(f.store.check_geometry(&f.geo, f.body), vec![]);
+        // The replacement runs along the true corner line, trimmed to the
+        // authored vertices.
+        let e = f.store.edge(target).expect("live edge");
+        let curve = f.geo.curve(e.curve.expect("edge keeps a curve")).unwrap();
+        assert!((curve.point(e.t_start) - Point3::origin()).norm() < 1e-9);
+        assert!((curve.point(e.t_end) - Point3::new(1.0, 0.0, 0.0)).norm() < 1e-9);
+        assert!((signed_volume(&f) - 1.0).abs() < 1e-9);
+    }
+
+    /// Under the kernel cap the minimal repair wins, and it is split between
+    /// two owners: `heal` leaves the band entirely to the reader's tolerance
+    /// recording, while the standalone pass records it itself.
+    #[test]
+    fn a_deviation_under_the_cap_is_elevated_not_recomputed() {
+        let mut f = sewn_block(&[]);
+        displace_block_edge(&mut f, Vector3::new(0.0, 0.0, -1e-4));
+        let result =
+            GeometryHealer::heal(f.body, &mut f.store, &mut f.geo, &HealOptions::default());
+        assert!(
+            result.operations.is_empty(),
+            "heal leaves the sub-cap band to record_edge_tolerances: {:?}",
+            result.operations
+        );
+
+        let mut f = sewn_block(&[]);
+        let target = displace_block_edge(&mut f, Vector3::new(0.0, 0.0, -1e-4));
+        let curve_before = f.store.edge(target).unwrap().curve;
+        let result = GeometryHealer::fix_edge_surface_consistency(
+            f.body,
+            &mut f.store,
+            &mut f.geo,
+            &HealOptions::default(),
+        );
+        assert!(
+            result.operations.iter().any(|op| matches!(
+                op,
+                HealOperation::ToleranceElevated { entity: EntityRef::Edge(e), .. } if *e == target
+            )),
+            "the standalone pass records the measured distance: {:?}",
+            result.operations
+        );
+        assert!(
+            result
+                .operations
+                .iter()
+                .all(|op| !matches!(op, HealOperation::EdgeCurveRecomputed { .. })),
+            "an honest tolerance beats replacing authored geometry"
+        );
+        assert_eq!(
+            f.store.edge(target).unwrap().curve,
+            curve_before,
+            "the authored curve must survive"
+        );
+        assert!(result.healed(), "remaining: {:?}", result.remaining);
+    }
+
+    #[test]
+    fn past_the_cap_with_no_second_surface_is_refused_with_a_note() {
+        let mut f = sewn_block(&[]);
+        // Displaced off both adjacent planes, so the deviation survives
+        // whichever surface remains measurable.
+        let target = displace_block_edge(&mut f, Vector3::new(0.0, -0.05, -0.05));
+        let face = f.store.fin_face(f.store.fins_of_edge(target)[0]);
+        f.store.faces.get_mut(face).expect("live face").surface = None;
+
+        let result =
+            GeometryHealer::heal(f.body, &mut f.store, &mut f.geo, &HealOptions::default());
+        assert!(
+            result
+                .operations
+                .iter()
+                .all(|op| !matches!(op, HealOperation::EdgeCurveRecomputed { .. })),
+            "one surface cannot make an intersection: {:?}",
+            result.operations
+        );
+        assert!(
+            result
+                .notes
+                .iter()
+                .any(|n| n.contains("no honest replacement curve")),
+            "the refusal must be recorded: {:?}",
+            result.notes
+        );
+    }
+
+    /// The circle-arc machinery of the recompute planner: a quarter arc
+    /// where a cylinder meets a plane, authored floating above the plane.
+    /// The intersection is a full circle, and three of its four readings
+    /// (far arc, either winding; near arc, wrong winding) share the edge's
+    /// endpoints — only the branch-match test tells them apart.
+    #[test]
+    fn recompute_picks_the_matching_arc_of_a_circular_intersection() {
+        use std::f64::consts::{FRAC_1_SQRT_2, FRAC_PI_2};
+
+        let mut store = TopologyStore::new();
+        let mut geo = GeometryStore::new();
+        let body = store.create_body(BodyType::Solid);
+        let shell = store.create_shell(body, true, ShellOrientation::Outward);
+
+        let plane = geo.add_surface(Surface3::plane(Point3::origin(), Vector3::z()).unwrap());
+        let cylinder =
+            geo.add_surface(Surface3::cylinder(Point3::origin(), Vector3::z(), 1.0).unwrap());
+        let face_a = store.create_face(shell, FaceSense::Positive);
+        store.faces.get_mut(face_a).expect("live face").surface = Some(plane);
+        let face_b = store.create_face(shell, FaceSense::Positive);
+        store.faces.get_mut(face_b).expect("live face").surface = Some(cylinder);
+
+        let delta = 0.05;
+        let a = store.create_vertex(Point3::new(1.0, 0.0, 0.0), SYSTEM_RESOLUTION);
+        let b = store.create_vertex(Point3::new(0.0, 1.0, 0.0), SYSTEM_RESOLUTION);
+        // A quarter turn floating `delta` above the plane (still exactly on
+        // the cylinder wall).
+        let bad = geo.add_curve(
+            Curve3::circle(Point3::new(0.0, 0.0, delta), Vector3::z(), 1.0).unwrap(),
+        );
+        let edge = store.create_edge_with_curve(a, b, SYSTEM_RESOLUTION, bad, 0.0, FRAC_PI_2);
+        store.create_loop(face_a, LoopType::Outer, &[(edge, FinSense::Forward)]);
+        store.create_loop(face_b, LoopType::Outer, &[(edge, FinSense::Reversed)]);
+
+        let mut notes = Vec::new();
+        let recompute = plan_curve_recompute(&store, &geo, edge, delta, &mut notes)
+            .expect("a plane-cylinder edge must be recomputable");
+        assert!(
+            recompute.deviation_after < 1e-9,
+            "the replacement lies on both surfaces: {:.3e}",
+            recompute.deviation_after
+        );
+        assert!(
+            (recompute.curve.point(recompute.t_start) - Point3::new(1.0, 0.0, 0.0)).norm() < 1e-9
+        );
+        assert!(
+            (recompute.curve.point(recompute.t_end) - Point3::new(0.0, 1.0, 0.0)).norm() < 1e-9
+        );
+        let mid = recompute
+            .curve
+            .point((recompute.t_start + recompute.t_end) / 2.0);
+        let expected = Point3::new(FRAC_1_SQRT_2, FRAC_1_SQRT_2, 0.0);
+        assert!(
+            (mid - expected).norm() < 1e-9,
+            "the near arc with the authored winding must win, got mid {mid}"
+        );
+    }
+
+    // --- Pcurve recompute ----------------------------------------------
+
+    #[test]
+    fn a_stale_pcurve_is_refit() {
+        use opensolid_brep::attach_body_pcurves;
+        use opensolid_core::{Point2, Vector2};
+
+        let mut f = sewn_block(&[]);
+        attach_body_pcurves(&mut f.store, &mut f.geo, f.body);
+        assert_eq!(f.store.check_geometry(&f.geo, f.body), vec![]);
+
+        let fin = fins_of_face(&f.store, f.store.faces_of_body(f.body)[0])[0];
+        let rogue = f
+            .geo
+            .add_pcurve(Curve2::line(Point2::new(7.0, 7.0), Vector2::x()).unwrap());
+        f.store.fins.get_mut(fin).expect("live fin").pcurve = Some(rogue);
+        assert!(
+            f.store
+                .check_geometry(&f.geo, f.body)
+                .iter()
+                .any(|x| matches!(x, CheckFailure::PcurveDeviation { .. })),
+            "the rogue pcurve must fail the geometric check first"
+        );
+
+        let result = GeometryHealer::fix_pcurves(
+            f.body,
+            &mut f.store,
+            &mut f.geo,
+            &HealOptions::default(),
+        );
+        assert!(
+            result.operations.iter().any(|op| matches!(
+                op,
+                HealOperation::PcurveRecomputed { fin: fixed, .. } if *fixed == fin
+            )),
+            "the refit must be reported: {:?}",
+            result.operations
+        );
+        assert!(
+            result.healed(),
+            "before: {:?}, after: {:?}",
+            result.failures_before,
+            result.remaining
+        );
+    }
+
+    #[test]
+    fn report_only_plans_a_pcurve_refit_without_touching() {
+        use opensolid_brep::attach_body_pcurves;
+        use opensolid_core::{Point2, Vector2};
+
+        let mut f = sewn_block(&[]);
+        attach_body_pcurves(&mut f.store, &mut f.geo, f.body);
+        let fin = fins_of_face(&f.store, f.store.faces_of_body(f.body)[0])[0];
+        let rogue = f
+            .geo
+            .add_pcurve(Curve2::line(Point2::new(7.0, 7.0), Vector2::x()).unwrap());
+        f.store.fins.get_mut(fin).expect("live fin").pcurve = Some(rogue);
+
+        let result = GeometryHealer::fix_pcurves(
+            f.body,
+            &mut f.store,
+            &mut f.geo,
+            &HealOptions {
+                strategy: HealStrategy::ReportOnly,
+                max_gap: None,
+            },
+        );
+        assert!(
+            result
+                .operations
+                .iter()
+                .any(|op| matches!(op, HealOperation::PcurveRecomputed { .. })),
+            "the refit must still be planned: {:?}",
+            result.operations
+        );
+        assert_eq!(
+            f.store.fin(fin).expect("live fin").pcurve,
+            Some(rogue),
+            "ReportOnly must leave the rogue pcurve in place"
+        );
+        assert_eq!(result.remaining, result.failures_before);
+    }
+
+    #[test]
+    fn recomputing_an_edge_refits_the_pcurves_riding_it() {
+        use opensolid_brep::attach_body_pcurves;
+
+        let mut f = sewn_block(&[]);
+        attach_body_pcurves(&mut f.store, &mut f.geo, f.body);
+        let target = displace_block_edge(&mut f, Vector3::new(0.0, 0.0, -0.05));
+
+        let result =
+            GeometryHealer::heal(f.body, &mut f.store, &mut f.geo, &HealOptions::default());
+        assert!(result.operations.iter().any(|op| matches!(
+            op,
+            HealOperation::EdgeCurveRecomputed { edge, .. } if *edge == target
+        )));
+        assert_eq!(
+            result
+                .operations
+                .iter()
+                .filter(|op| matches!(
+                    op,
+                    HealOperation::PcurveRecomputed { edge, .. } if *edge == target
+                ))
+                .count(),
+            2,
+            "both fins riding the recomputed edge refit their pcurves: {:?}",
+            result.operations
+        );
+        assert_eq!(f.store.check_geometry(&f.geo, f.body), vec![]);
     }
 }
