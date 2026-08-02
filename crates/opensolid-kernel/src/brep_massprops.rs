@@ -804,6 +804,48 @@ fn is_collapsed_bridge(surface: &Surface3, a: Point2, b: Point2) -> bool {
     })
 }
 
+/// A two-corner route closing a wide gap through a collapsed row *near* the
+/// gap's endpoints: `from → p1 → (collapsed row) → p2 → to`, with both legs
+/// small by the same [`GAP_TOL_REL`] standard a direct gap is held to.
+///
+/// This is the tolerant-body counterpart of [`is_collapsed_bridge`]. A trim
+/// refit against a surface that has strayed under its vertices — a STEP
+/// sphere kept on the exact path within a raised edge tolerance (of-0een) —
+/// ends where the *vertex* projects, a hair short of the pole. The 2π seam
+/// jump then runs just off the pole row, tracing a small circle
+/// `is_collapsed_bridge` rightly refuses. But the face genuinely closes
+/// through the pole: the loop steps up onto the collapsed row, crosses it for
+/// free, and steps back down. Both steps are real boundary of the sliver the
+/// refit left uncovered, so the caller integrates them rather than ignoring
+/// them.
+///
+/// Candidate rows are the parameter-domain boundaries — a sphere's pole rows,
+/// a NURBS patch's collapsed edge rows. An unbounded direction (a plane, a
+/// cylinder or cone wall) puts the candidate at infinity and the leg test
+/// fails it; a bounded row that does not collapse (a torus rim, a cylinder
+/// cap circle) fails [`is_collapsed_bridge`], so a genuinely open loop —
+/// `an_open_parameter_loop_is_rejected`'s shortened seam — still refuses.
+fn collapsed_row_detour(
+    surface: &Surface3,
+    from: Point2,
+    to: Point2,
+    leg_tol: f64,
+) -> Option<(Point2, Point2)> {
+    let (u_lo, u_hi) = surface.domain_u();
+    let (v_lo, v_hi) = surface.domain_v();
+    let candidates = [
+        (Point2::new(from.x, v_lo), Point2::new(to.x, v_lo)),
+        (Point2::new(from.x, v_hi), Point2::new(to.x, v_hi)),
+        (Point2::new(u_lo, from.y), Point2::new(u_lo, to.y)),
+        (Point2::new(u_hi, from.y), Point2::new(u_hi, to.y)),
+    ];
+    candidates.into_iter().find(|&(p1, p2)| {
+        (p1 - from).norm() <= leg_tol
+            && (to - p2).norm() <= leg_tol
+            && is_collapsed_bridge(surface, p1, p2)
+    })
+}
+
 /// Signed moments of the region one face covers, contributed with its own
 /// face normal (see the module docs on why no sense factor appears).
 fn face_moments(
@@ -854,11 +896,28 @@ fn face_moments(
                 continue;
             }
             if jump.norm() > GAP_TOL_REL * extent && !is_collapsed_bridge(surface, from, to) {
-                return Err(BrepMassPropertiesError::OpenParameterLoop {
-                    face: face_id,
-                    gap: jump.norm(),
-                    at: from,
-                });
+                // A wide gap that does not lie on a collapsed row may still
+                // close through one a small step away (see
+                // [`collapsed_row_detour`]); its legs are real boundary and
+                // are integrated like any small bridge.
+                let Some((p1, p2)) =
+                    collapsed_row_detour(surface, from, to, GAP_TOL_REL * extent)
+                else {
+                    return Err(BrepMassPropertiesError::OpenParameterLoop {
+                        face: face_id,
+                        gap: jump.norm(),
+                        at: from,
+                    });
+                };
+                for (a, b) in [(from, p1), (p1, p2), (p2, to)] {
+                    let dir = b - a;
+                    if dir.norm() == 0.0 {
+                        continue;
+                    }
+                    let leg = Curve2::Line { origin: a, dir };
+                    contour_integral(surface, u0, &leg, (0.0, 1.0), 1.0, &mut acc);
+                }
+                continue;
             }
             let bridge = Curve2::Line {
                 origin: from,
@@ -1387,6 +1446,76 @@ mod tests {
             .expect_err("an empty range on a line bounds nothing");
         assert!(
             matches!(failure, BrepMassPropertiesError::EmptyEdgeRange { .. }),
+            "unexpected failure: {failure}"
+        );
+    }
+
+    /// A sphere whose surface has strayed *under* its vertices — the of-0een
+    /// STEP import shape. The exact path keeps such a body when the stray's
+    /// off-surface component sits inside the raised edge tolerance, but the
+    /// seam pcurves are then refit against the strayed surface and end where
+    /// the pole vertices *project* — a hair off the collapsed row — so the 2π
+    /// seam jump used to be refused as an open loop. The loop genuinely
+    /// closes through the pole ([`collapsed_row_detour`]), and a translated
+    /// sphere's volume is unchanged, so the measurement must come back right.
+    #[test]
+    fn a_sphere_strayed_under_its_vertices_still_measures() {
+        let mut scene = Scene::new();
+        let r = 7.9204;
+        let body = primitives::sphere(&mut scene.store, &mut scene.geo, r).unwrap();
+        let face = scene.store.faces_of_body(body)[0];
+        let surface_id = scene
+            .store
+            .face(face)
+            .and_then(|f| f.surface)
+            .expect("sphere face has a surface");
+        // The of-0een failing displacement: dominated by the component
+        // perpendicular to the seam plane, so both pole vertices project
+        // well off the collapsed row.
+        let center = Point3::new(
+            0.0457 * 0.1869,
+            0.0457 * -0.9784,
+            0.0457 * -0.0880,
+        );
+        let strayed = Surface3::sphere(center, Vector3::z(), r).unwrap();
+        *scene.geo.surfaces.get_mut(surface_id).expect("live surface") = strayed;
+        // What `finish_exact_body` does on import: refit and store every
+        // fin's pcurve against the (now strayed) surface, seam uses a
+        // period apart.
+        opensolid_brep::attach_body_pcurves(&mut scene.store, &mut scene.geo, body);
+
+        let mp = scene.measure(body);
+        assert_rel(
+            mp.volume,
+            4.0 / 3.0 * PI * r * r * r,
+            1e-3,
+            "strayed sphere volume",
+        );
+        assert_rel(
+            mp.surface_area,
+            4.0 * PI * r * r,
+            1e-3,
+            "strayed sphere area",
+        );
+    }
+
+    /// The pole detour must not resurrect a genuinely open loop: a seam
+    /// stopping far short of the pole leaves a step onto the collapsed row
+    /// that no tolerance covers, and the measurement must still refuse.
+    #[test]
+    fn a_seam_stopping_short_of_the_pole_is_still_rejected() {
+        let mut scene = Scene::new();
+        let body = primitives::sphere(&mut scene.store, &mut scene.geo, 5.0).unwrap();
+        let edge_id = scene
+            .store
+            .edges_of_face(scene.store.faces_of_body(body)[0])[0];
+        // The meridian now ends at latitude 1.0, ~0.57 rad shy of the pole.
+        scene.store.edges.get_mut(edge_id).expect("live edge").t_end = 1.0;
+
+        let failure = brep_mass_properties(&scene.store, &scene.geo, body)
+            .expect_err("a seam stopping short of the pole bounds nothing well-defined");
+        assert!(
+            matches!(failure, BrepMassPropertiesError::OpenParameterLoop { .. }),
             "unexpected failure: {failure}"
         );
     }
