@@ -11957,6 +11957,377 @@ mod tests {
         );
     }
 
+    /// [`tilted_bore_rings`] with the rim's angular stations supplied
+    /// explicitly (of-stjd), so a stress case can move the seam, cluster or
+    /// thin its samples, or make the far rim oblique too. `far_v` maps a
+    /// station to the far rim's height; the near rim always traces
+    /// `r·tan(theta)·cos u`, so every near-rim sample still sits exactly in
+    /// the plate's plane by construction — the property the whole of-aoml
+    /// failure mode rests on.
+    fn tilted_bore_rings_at(
+        theta: f64,
+        radius: f64,
+        us_near: &[f64],
+        us_far: &[f64],
+        far_v: impl Fn(f64) -> f64,
+    ) -> ChartRings {
+        let axis = Vector3::new(theta.sin(), 0.0, theta.cos());
+        let chart = Chart::Cylinder {
+            origin: Point3::origin(),
+            axis,
+            e_u: Vector3::new(theta.cos(), 0.0, -theta.sin()),
+            e_v: Vector3::new(0.0, 1.0, 0.0),
+            radius,
+        };
+        let rim_v = radius * theta.tan();
+        let mut uv: Vec<(f64, f64)> = Vec::with_capacity(us_near.len() + us_far.len());
+        for &u in us_near {
+            uv.push((u, rim_v * u.cos()));
+        }
+        for &u in us_far.iter().rev() {
+            uv.push((u, far_v(u)));
+        }
+        let p = uv.iter().map(|&q| chart_point(&chart, q)).collect();
+        (chart, vec![uv], vec![p])
+    }
+
+    /// `n` equally spaced angular stations starting at `phase`.
+    fn stations(n: usize, phase: f64) -> Vec<f64> {
+        (0..n).map(|i| phase + TWO_PI * i as f64 / n as f64).collect()
+    }
+
+    /// The of-stjd battery's shared verdict: triangulate the wall and check
+    /// every invariant the of-aoml fix promises, whatever the rim's tilt or
+    /// sampling. `cut_zs` are the plate planes (z = const) that cut the
+    /// rims; a triangle with all three corners in one of them is exactly the
+    /// flat flap whose facet normal opposes the plate's and cancels the rim
+    /// pseudonormals. Returns all violations rather than panicking, so a
+    /// sweep can report every failing configuration at once.
+    fn lens_battery_verdict(
+        label: &str,
+        (chart, rings_uv, rings_p): &ChartRings,
+        pitch: f64,
+        radius: f64,
+        axis: &Vector3,
+        cut_zs: &[f64],
+    ) -> Vec<String> {
+        let mut violations = Vec::new();
+        let (tris, uv, points) = match triangulate_trimmed_region(chart, pitch, rings_uv, rings_p)
+        {
+            Ok(out) => out,
+            Err(e) => return vec![format!("{label}: triangulation refused: {e}")],
+        };
+        let plate_band = 1e-9;
+        for &z in cut_zs {
+            let flat: Vec<[usize; 3]> = tris
+                .iter()
+                .copied()
+                .filter(|t| t.iter().all(|&i| (points[i].z - z).abs() <= plate_band))
+                .collect();
+            if !flat.is_empty() {
+                violations.push(format!(
+                    "{label}: {} triangles lie flat in the z = {z} plate plane, e.g. {:?}",
+                    flat.len(),
+                    &flat[..flat.len().min(4)]
+                ));
+            }
+        }
+        for (i, p) in points.iter().enumerate() {
+            let off = (p.coords - axis * p.coords.dot(axis)).norm();
+            if (off - radius).abs() >= 1e-9 {
+                violations.push(format!(
+                    "{label}: vertex {i} sits {off} from the axis, not on the r = {radius} wall"
+                ));
+                break;
+            }
+        }
+        let area: f64 = tris
+            .iter()
+            .map(|t| 0.5 * orient2d(uv[t[0]], uv[t[1]], uv[t[2]]))
+            .sum();
+        let ring: Vec<CoverPoint> = rings_uv[0].iter().map(|&q| (q, Point3::origin())).collect();
+        let expected = shoelace(&ring);
+        if (area - expected).abs() > 1e-9 * expected.abs() {
+            violations.push(format!(
+                "{label}: triangulated uv area {area} vs the rings' {expected}"
+            ));
+        }
+        if !edges_are_manifold(&tris) {
+            violations.push(format!("{label}: an edge is shared by more than two triangles"));
+        }
+        violations
+    }
+
+    /// of-stjd battery: the of-aoml fix must hold across tilts and rim
+    /// samplings, not just nist_ctc_02's (2°, 25/9). Steeper tilts make the
+    /// lens deeper than the band's upper bound (the lattice's quarter-cell
+    /// clearance) — legitimate only if a lattice point then lands inside and
+    /// gives the lens a corner some other way. Coarser rims make the chords
+    /// longer, finer ones make the lenses shallower and more numerous.
+    #[test]
+    fn tilted_rim_lens_battery_tilt_and_sampling_sweep() {
+        let mut violations = Vec::new();
+        for &deg in &[0.5f64, 1.0, 2.0, 5.0] {
+            for &(near, far) in &[(25usize, 9usize), (12, 5), (8, 8), (60, 24)] {
+                let theta = deg.to_radians();
+                let rings =
+                    tilted_bore_rings_at(theta, 25.0, &stations(near, 0.0), &stations(far, 0.0), |_| 40.0);
+                let axis = Vector3::new(theta.sin(), 0.0, theta.cos());
+                violations.extend(lens_battery_verdict(
+                    &format!("tilt {deg}°, rim {near}/{far}"),
+                    &rings,
+                    TWO_PI / 32.0,
+                    25.0,
+                    &axis,
+                    &[0.0],
+                ));
+            }
+        }
+        assert!(violations.is_empty(), "{}", violations.join("\n"));
+    }
+
+    /// of-8oit: the band's upper bound (the lattice's quarter-cell
+    /// clearance) is what tells a lens chord from an honest cross-region
+    /// one, and past ~8° of tilt it stops working — the lens is deeper than
+    /// a quarter cell, so its chord midpoint falls outside the band and is
+    /// never split, while the staggered lattice's points do not land inside
+    /// the thin curved strip either. The flat flaps of of-aoml survive at
+    /// every sampling tried, and end-to-end the failure is *silent*: the
+    /// shell closes, the rim pseudonormals come out garbage rather than
+    /// exactly zero so `MeshSdf::new` accepts, and the field flips sign in
+    /// the bore void (see `lens_closure.rs`). Un-ignore when of-8oit lands.
+    #[test]
+    #[ignore = "of-8oit: deep lenses (tilt >= 10°) fall outside the split band"]
+    fn steeply_tilted_rim_gains_corners() {
+        let mut violations = Vec::new();
+        for &deg in &[10.0f64, 20.0, 45.0] {
+            for &(near, far) in &[(25usize, 9usize), (12, 5), (8, 8), (60, 24)] {
+                let theta = deg.to_radians();
+                let rings = tilted_bore_rings_at(
+                    theta,
+                    25.0,
+                    &stations(near, 0.0),
+                    &stations(far, 0.0),
+                    |_| 40.0,
+                );
+                let axis = Vector3::new(theta.sin(), 0.0, theta.cos());
+                violations.extend(lens_battery_verdict(
+                    &format!("tilt {deg}°, rim {near}/{far}"),
+                    &rings,
+                    TWO_PI / 32.0,
+                    25.0,
+                    &axis,
+                    &[0.0],
+                ));
+            }
+        }
+        // The through-bore shape fails the same way at these tilts.
+        let theta = 10.0_f64.to_radians();
+        let rim_v = 25.0 * theta.tan();
+        let far = 40.0 / theta.cos();
+        let rings = tilted_bore_rings_at(theta, 25.0, &stations(25, 0.0), &stations(25, 0.0), |u| {
+            far + rim_v * u.cos()
+        });
+        let axis = Vector3::new(theta.sin(), 0.0, theta.cos());
+        violations.extend(lens_battery_verdict(
+            "through-bore tilt 10°",
+            &rings,
+            TWO_PI / 32.0,
+            25.0,
+            &axis,
+            &[0.0, 40.0],
+        ));
+        assert!(violations.is_empty(), "{}", violations.join("\n"));
+    }
+
+    /// of-stjd battery: a barely-tilted bore. The flap triangles a shallow
+    /// lens realizes are exactly as flat as a deep lens's — every rim sample
+    /// is in the plate's plane whatever the amplitude — so the cancellation
+    /// is just as total; only the lens gets thinner. Below the split pass's
+    /// own floor (`lens_min2`, 1e-4 of a cell) the chord is skipped by
+    /// design, so this probes whether the floor is low enough that no
+    /// physically-plausible tilt slips under it.
+    #[test]
+    fn barely_tilted_rim_still_gains_corners() {
+        let mut violations = Vec::new();
+        for &deg in &[0.2f64, 0.05, 0.01, 0.002, 0.0005, 0.0001] {
+            let theta = deg.to_radians();
+            let rings =
+                tilted_bore_rings_at(theta, 25.0, &stations(25, 0.0), &stations(9, 0.0), |_| 40.0);
+            let axis = Vector3::new(theta.sin(), 0.0, theta.cos());
+            violations.extend(lens_battery_verdict(
+                &format!("tilt {deg}°"),
+                &rings,
+                TWO_PI / 32.0,
+                25.0,
+                &axis,
+                &[0.0],
+            ));
+        }
+        assert!(violations.is_empty(), "{}", violations.join("\n"));
+    }
+
+    /// of-stjd battery: the seam straddles the valley. The original test's
+    /// stations start at the cosine's crest, so the lens sits mid-domain;
+    /// starting them at the valley splits the lens across the two seam
+    /// columns of the unrolled rectangle, where chords end on the seam
+    /// constraint edges' own vertices. Also a half-period phase, where the
+    /// lens leans on one seam column only.
+    #[test]
+    fn seam_straddling_valley_gains_corners() {
+        let mut violations = Vec::new();
+        for &phase in &[PI, PI / 2.0, PI / 4.0] {
+            let theta = 2.0_f64.to_radians();
+            let rings = tilted_bore_rings_at(
+                theta,
+                25.0,
+                &stations(25, phase),
+                &stations(9, phase),
+                |_| 40.0,
+            );
+            let axis = Vector3::new(theta.sin(), 0.0, theta.cos());
+            violations.extend(lens_battery_verdict(
+                &format!("phase {phase}"),
+                &rings,
+                TWO_PI / 32.0,
+                25.0,
+                &axis,
+                &[0.0],
+            ));
+        }
+        assert!(violations.is_empty(), "{}", violations.join("\n"));
+    }
+
+    /// of-stjd battery: non-uniform rim sampling, the shape a
+    /// curvature-adaptive discretizer actually emits. Dense on the crest and
+    /// sparse across the valley leaves one long chord spanning the whole
+    /// lens; the reverse leaves many short ones. Uniform stations are the
+    /// easy case and the only one nist_ctc_02 happens to exercise.
+    #[test]
+    fn nonuniformly_sampled_rim_gains_corners() {
+        let theta = 2.0_f64.to_radians();
+        let axis = Vector3::new(theta.sin(), 0.0, theta.cos());
+        let mut sparse_valley: Vec<f64> = Vec::new();
+        for i in 0..20 {
+            // 20 stations across the crest half [-π/2, π/2)...
+            sparse_valley.push(-PI / 2.0 + PI * i as f64 / 20.0);
+        }
+        for i in 0..4 {
+            // ...and 4 across the valley half [π/2, 3π/2).
+            sparse_valley.push(PI / 2.0 + PI * i as f64 / 4.0);
+        }
+        let dense_valley: Vec<f64> = sparse_valley.iter().map(|u| u + PI).collect();
+        let mut violations = Vec::new();
+        for (label, us) in [("sparse valley", &sparse_valley), ("dense valley", &dense_valley)] {
+            let rings = tilted_bore_rings_at(theta, 25.0, us, &stations(9, 0.0), |_| 40.0);
+            violations.extend(lens_battery_verdict(
+                label,
+                &rings,
+                TWO_PI / 32.0,
+                25.0,
+                &axis,
+                &[0.0],
+            ));
+        }
+        assert!(violations.is_empty(), "{}", violations.join("\n"));
+    }
+
+    /// of-stjd battery: a through-bore. nist_ctc_02's plate has parallel
+    /// faces, so a tilted bore through it has BOTH rims tracing the same
+    /// cosine, one plate-thickness apart — the far rim of the original test
+    /// (a constant-`v` circle, i.e. a blind hole's bottom) is actually the
+    /// artificial case. Flaps can form against either plate face.
+    #[test]
+    fn through_bore_gains_corners_at_both_rims() {
+        let mut violations = Vec::new();
+        for &deg in &[2.0f64, 5.0] {
+            let theta = deg.to_radians();
+            let rim_v = 25.0 * theta.tan();
+            let h = 40.0;
+            let far = h / theta.cos();
+            let rings = tilted_bore_rings_at(
+                theta,
+                25.0,
+                &stations(25, 0.0),
+                &stations(25, 0.0),
+                |u| far + rim_v * u.cos(),
+            );
+            let axis = Vector3::new(theta.sin(), 0.0, theta.cos());
+            violations.extend(lens_battery_verdict(
+                &format!("through-bore tilt {deg}°"),
+                &rings,
+                TWO_PI / 32.0,
+                25.0,
+                &axis,
+                &[0.0, h],
+            ));
+        }
+        assert!(violations.is_empty(), "{}", violations.join("\n"));
+    }
+
+    /// of-stjd battery: a countersink — a cone whose axis is tilted off the
+    /// plate it opens onto. Its rim in the cone's own chart is not even a
+    /// cosine (`v = r·cos u·sin θ / (cos θ − tan α·cos u·sin θ)`), but every
+    /// rim sample still sits exactly in the plate's plane, so the flap
+    /// mechanism is identical; the lens-split pass is chart-agnostic and
+    /// must catch it here too.
+    #[test]
+    fn tilted_countersink_rim_gains_corners() {
+        let theta = 5.0_f64.to_radians();
+        let half_angle = 15.0_f64.to_radians();
+        let (radius, depth) = (25.0, 40.0);
+        let axis = Vector3::new(theta.sin(), 0.0, theta.cos());
+        let chart = Chart::Cone {
+            origin: Point3::origin(),
+            axis,
+            e_u: Vector3::new(theta.cos(), 0.0, -theta.sin()),
+            e_v: Vector3::new(0.0, 1.0, 0.0),
+            half_angle,
+            radius,
+        };
+        let rim_v = |u: f64| {
+            radius * u.cos() * theta.sin()
+                / (theta.cos() - half_angle.tan() * u.cos() * theta.sin())
+        };
+        let mut uv: Vec<(f64, f64)> = Vec::new();
+        for &u in &stations(25, 0.0) {
+            uv.push((u, rim_v(u)));
+        }
+        for &u in stations(9, 0.0).iter().rev() {
+            uv.push((u, depth));
+        }
+        let p: Vec<Point3> = uv.iter().map(|&q| chart_point(&chart, q)).collect();
+        let (tris, _, points) =
+            triangulate_trimmed_region(&chart, TWO_PI / 32.0, &[uv.clone()], &[p.clone()])
+                .expect("the countersink wall's rings bound a triangulable region");
+        let plate_band = 1e-9;
+        for (i, p) in p.iter().take(25).enumerate() {
+            assert!(p.z.abs() <= plate_band, "rim sample {i} is off the plate");
+        }
+        let flat: Vec<[usize; 3]> = tris
+            .iter()
+            .copied()
+            .filter(|t| t.iter().all(|&i| points[i].z.abs() <= plate_band))
+            .collect();
+        assert!(
+            flat.is_empty(),
+            "{} countersink triangles lie flat in the plate's plane: {:?}",
+            flat.len(),
+            &flat[..flat.len().min(8)]
+        );
+        // Every vertex on the cone wall: local radius r + v_axial·tan α.
+        for (i, p) in points.iter().enumerate() {
+            let v_ax = p.coords.dot(&axis);
+            let off = (p.coords - axis * v_ax).norm();
+            let rho = radius + v_ax * half_angle.tan();
+            assert!(
+                (off - rho).abs() < 1e-9,
+                "vertex {i} sits {off} from the axis, not on the ρ = {rho} wall"
+            );
+        }
+        assert!(edges_are_manifold(&tris));
+    }
+
     /// of-2ql regression: sphere minus coaxial through-cylinder (napkin
     /// ring). The wall and band boundary polylines are sampled on the same
     /// angular pitch as the refinement lattice, so seed-chord diagonals pass
