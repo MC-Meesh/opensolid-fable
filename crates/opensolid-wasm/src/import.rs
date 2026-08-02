@@ -43,6 +43,7 @@ use opensolid_kernel::io::step::read::{
 };
 
 use crate::bounded::BoundedShape;
+use crate::error::WireError;
 use crate::exact::{ExactRep, ImportedBody, ImportedFile};
 
 /// Default angular sampling of the imported-body tessellation: 32 segments
@@ -157,7 +158,8 @@ pub fn tessellation_options(circle_segments: Option<f64>) -> TessellationOptions
 /// product name is perfectly valid STEP and is not valid UTF-8.
 ///
 /// # Errors
-/// A human-readable message when the file is not syntactically valid Part 21.
+/// A structured JSON error string (see `crate::error`, code
+/// `step_parse_error`) when the file is not syntactically valid Part 21.
 /// Semantic problems never fail the call: they arrive as per-solid outcomes
 /// and diagnostics, which is the entire point of the report.
 pub fn import_step(bytes: &[u8], circle_segments: Option<f64>) -> Result<StepImport, String> {
@@ -169,7 +171,7 @@ pub fn import_step(bytes: &[u8], circle_segments: Option<f64>) -> Result<StepImp
     let mut store = TopologyStore::new();
     let mut geo = GeometryStore::new();
     let report = read_step_bytes(bytes, &mut store, &mut geo, &options)
-        .map_err(|e| format!("STEP import failed: {e}"))?;
+        .map_err(|e| WireError::from(&e).context("STEP import failed").json())?;
 
     let is_assembly = report.is_assembly();
     let file = Rc::new(ImportedFile { store, geo });
@@ -757,7 +759,8 @@ END-ISO-10303-21;
         let Err(err) = import_step(b"not a STEP file at all", None) else {
             panic!("a file that is not Part 21 must not import");
         };
-        assert!(err.starts_with("STEP import failed:"), "{err}");
+        assert!(err.starts_with("{\"code\":\"step_parse_error\""), "{err}");
+        assert!(err.contains("STEP import failed:"), "{err}");
     }
 
     /// STEP is Latin-1, so bytes that are not valid UTF-8 are a legal file

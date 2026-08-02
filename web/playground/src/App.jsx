@@ -18,6 +18,7 @@ import ReferencePanel from './components/ReferencePanel.jsx';
 import FeaturePanel from './components/FeaturePanel.jsx';
 import MassPropertiesPanel from './components/MassPropertiesPanel.jsx';
 import { DEFAULT_SCRIPT } from './lib/defaultScript.js';
+import { wasmErrorMessage } from './lib/wasmError.js';
 import { freeNodes, nodeLabel, runTracedScript, scriptHeader, serializeTree } from './lib/sceneTree.js';
 import { buildBinaryStl } from './lib/stl.js';
 import { pickCandidates, pickNodeAt } from './lib/picking.js';
@@ -347,7 +348,7 @@ export default function App() {
     try {
       data = shape.meshAdaptive(acc);
     } catch (err) {
-      setError(`Meshing failed: ${String(err)}`);
+      setError(`Meshing failed: ${wasmErrorMessage(err)}`);
       return;
     }
     const elapsedMs = performance.now() - started;
@@ -402,7 +403,7 @@ export default function App() {
     try {
       traced = runTracedScript(scriptRef.current, api.WasmShape, api.WasmProfile2D, api.WasmPath3D, api.WasmOpenPath2D);
     } catch (err) {
-      setError(String(err?.stack || err));
+      setError(err?.stack ? String(err.stack) : wasmErrorMessage(err));
       return;
     }
     // The displayed mesh is rebuilt, so hovered/picked face triangles are
@@ -1017,7 +1018,7 @@ export default function App() {
     try {
       traced = runTracedScript(serializeTree(pruned), api.WasmShape, api.WasmProfile2D, api.WasmPath3D, api.WasmOpenPath2D);
     } catch (err) {
-      setError(`Recomputing without hidden features failed: ${String(err)}`);
+      setError(`Recomputing without hidden features failed: ${wasmErrorMessage(err)}`);
       displayRef.current = { mode: 'full' };
       remesh({ generation });
       return;
@@ -1179,7 +1180,7 @@ export default function App() {
     try {
       ops = profileToOps(profile);
     } catch (err) {
-      setError(String(err));
+      setError(wasmErrorMessage(err));
       return;
     }
     const path = pathTo(root, editingSketch.nodeId);
@@ -1226,7 +1227,7 @@ export default function App() {
       // this arg existed simply ignores it and exports in millimetres.
       text = shape.exportStep(MESH_ACCURACY, documentUnit);
     } catch (err) {
-      setError(String(err));
+      setError(wasmErrorMessage(err));
       return;
     }
     downloadBlob(new Blob([text], { type: 'application/step' }), 'model.step');
@@ -1242,7 +1243,7 @@ export default function App() {
       try {
         ops = profileToOps(profile);
       } catch (err) {
-        setError(String(err));
+        setError(wasmErrorMessage(err));
         return;
       }
       const { min, max } = opsBounds(ops);
@@ -1335,7 +1336,7 @@ export default function App() {
       setSweepError(null);
     } catch (err) {
       setPreviewMesh(null);
-      setSweepError(String(err));
+      setSweepError(wasmErrorMessage(err));
     } finally {
       shape?.free?.();
     }
@@ -1424,7 +1425,7 @@ export default function App() {
       setFeatureError(null);
     } catch (err) {
       setPreviewMesh(null);
-      setFeatureError(String(err));
+      setFeatureError(wasmErrorMessage(err));
     } finally {
       shape?.free?.();
     }
@@ -1491,7 +1492,7 @@ export default function App() {
         edge: fillet.edge,
       });
     } catch (err) {
-      setFilletError(String(err));
+      setFilletError(wasmErrorMessage(err));
       return;
     }
     setFillet(null);
@@ -1528,7 +1529,7 @@ export default function App() {
       setFilletError(null);
     } catch (err) {
       setPreviewMesh(null);
-      setFilletError(String(err));
+      setFilletError(wasmErrorMessage(err));
     } finally {
       shape?.free?.();
     }
@@ -1778,7 +1779,7 @@ export default function App() {
     try {
       return parseMeasure(shape.measure(MESH_ACCURACY));
     } catch (err) {
-      setError(String(err));
+      setError(wasmErrorMessage(err));
       return null;
     }
   }, []);

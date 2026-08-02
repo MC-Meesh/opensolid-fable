@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react';
 import { buildReference } from '../lib/referenceGeometry.js';
+import { wasmErrorMessage } from '../lib/wasmError.js';
 
 /**
  * Reference-geometry creation panel (of-fsl.14): pick a datum type + method,
@@ -190,7 +191,7 @@ export default function ReferencePanel({ open, refGeom = [], onAdd, onClose }) {
       onAdd(k, geom);
       setError(null);
     } catch (err) {
-      setError(String(err.message ?? err));
+      setError(wasmErrorMessage(err));
     }
   };
 

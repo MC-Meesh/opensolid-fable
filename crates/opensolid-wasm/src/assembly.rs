@@ -22,11 +22,12 @@ use wasm_bindgen::prelude::*;
 
 use opensolid_core::types::{Point3, Transform3, Vector3};
 use opensolid_kernel::assembly::{
-    Assembly, Feature, FeatureRef, Instance, Mate, Part, SolveStatus,
+    Assembly, Feature, FeatureRef, Instance, Mate, MateError, Part, SolveStatus,
 };
 use opensolid_kernel::mass_properties;
 
 use crate::bounded::BoundedShape;
+use crate::error::{WireError, wire};
 use crate::{WasmShape, json_escape, json_num};
 
 /// A placed, solvable multi-part assembly.
@@ -56,9 +57,15 @@ impl Default for WasmAssembly {
 }
 
 /// Read a JS-supplied `[x, y, z]` triple.
-fn vec3(v: &[f64], what: &str) -> Result<Vector3, String> {
+///
+/// Helpers below this one return [`WireError`], not serialized JSON, so a
+/// caller can still attach context (which mate side, which argument) before
+/// the boundary flattens the error to its wire form.
+fn vec3(v: &[f64], what: &str) -> Result<Vector3, WireError> {
     if v.len() != 3 || v.iter().any(|c| !c.is_finite()) {
-        return Err(format!("{what} must be [x, y, z] with finite components"));
+        return Err(WireError::invalid_argument(format!(
+            "{what} must be [x, y, z] with finite components"
+        )));
     }
     Ok(Vector3::new(v[0], v[1], v[2]))
 }
@@ -66,11 +73,13 @@ fn vec3(v: &[f64], what: &str) -> Result<Vector3, String> {
 /// Build the rigid placement from a translation and an axis–angle rotation.
 /// A zero axis with a zero angle is the identity rotation; a zero axis with a
 /// non-zero angle is rejected (the rotation is unspecified).
-fn placement(translation: &[f64], axis: &[f64], angle_deg: f64) -> Result<Transform3, String> {
+fn placement(translation: &[f64], axis: &[f64], angle_deg: f64) -> Result<Transform3, WireError> {
     let t = vec3(translation, "translation")?;
     let a = vec3(axis, "rotation axis")?;
     if !angle_deg.is_finite() {
-        return Err("rotation angle must be a finite number of degrees".to_string());
+        return Err(WireError::invalid_argument(
+            "rotation angle must be a finite number of degrees",
+        ));
     }
     let angle = angle_deg.to_radians();
     let rot = if angle == 0.0 {
@@ -78,7 +87,9 @@ fn placement(translation: &[f64], axis: &[f64], angle_deg: f64) -> Result<Transf
     } else {
         let n = a.norm();
         if n < 1e-12 {
-            return Err("rotation axis must be non-zero when the angle is non-zero".to_string());
+            return Err(WireError::invalid_argument(
+                "rotation axis must be non-zero when the angle is non-zero",
+            ));
         }
         UnitQuaternion::from_scaled_axis(a / n * angle)
     };
@@ -87,15 +98,19 @@ fn placement(translation: &[f64], axis: &[f64], angle_deg: f64) -> Result<Transf
 
 /// Parse one mate feature from its wire form: a `kind` string plus a point
 /// and (for planes and axes) a direction, all in the instance's local frame.
-fn feature(kind: &str, point: &[f64], direction: &[f64]) -> Result<Feature, String> {
+fn feature(kind: &str, point: &[f64], direction: &[f64]) -> Result<Feature, WireError> {
     let p: Point3 = vec3(point, "feature point")?.into();
     match kind {
-        "plane" => Feature::plane(p, vec3(direction, "plane normal")?).map_err(|e| e.to_string()),
-        "axis" => Feature::axis(p, vec3(direction, "axis direction")?).map_err(|e| e.to_string()),
+        "plane" => {
+            Feature::plane(p, vec3(direction, "plane normal")?).map_err(|e| WireError::from(&e))
+        }
+        "axis" => {
+            Feature::axis(p, vec3(direction, "axis direction")?).map_err(|e| WireError::from(&e))
+        }
         "point" => Ok(Feature::point(p)),
-        other => Err(format!(
+        other => Err(WireError::invalid_argument(format!(
             "unknown feature kind '{other}'; use plane, axis, or point"
-        )),
+        ))),
     }
 }
 
@@ -161,11 +176,12 @@ impl WasmAssembly {
         density: f64,
         name: &str,
     ) -> Result<usize, String> {
-        let transform = placement(&translation, &axis, angle_deg)?;
+        let transform = placement(&translation, &axis, angle_deg).map_err(|e| e.json())?;
         if !(density.is_finite() && density >= 0.0) {
-            return Err(format!(
+            return Err(WireError::invalid_argument(format!(
                 "density must be a non-negative finite number, got {density}"
-            ));
+            ))
+            .json());
         }
         let (part, mass_error) = self.part_for(shape);
         let index = self.inner.insert(
@@ -206,34 +222,39 @@ impl WasmAssembly {
         let count = self.inner.len();
         for (label, i) in [("a", a_instance), ("b", b_instance)] {
             if i >= count {
-                return Err(format!(
+                return Err(WireError::invalid_argument(format!(
                     "mate side {label} references instance {i}, but the assembly has {count} \
                      instance(s)"
-                ));
+                ))
+                .json());
             }
         }
         let a = FeatureRef::new(
             a_instance,
-            feature(a_feature, &a_point, &a_direction).map_err(|e| format!("side a: {e}"))?,
+            feature(a_feature, &a_point, &a_direction).map_err(|e| e.context("side a").json())?,
         );
         let b = FeatureRef::new(
             b_instance,
-            feature(b_feature, &b_point, &b_direction).map_err(|e| format!("side b: {e}"))?,
+            feature(b_feature, &b_point, &b_direction).map_err(|e| e.context("side b").json())?,
         );
         let mate = match kind {
-            "coincident" => Mate::coincident(a, b).map_err(|e| e.to_string())?,
-            "concentric" => Mate::concentric(a, b).map_err(|e| e.to_string())?,
+            "coincident" => Mate::coincident(a, b).map_err(wire)?,
+            "concentric" => Mate::concentric(a, b).map_err(wire)?,
             "distance" => {
-                let v = value.ok_or("distance mate requires a value")?;
+                let v = value.ok_or_else(|| wire(MateError::MissingValue))?;
                 if !v.is_finite() {
-                    return Err(format!("distance value must be finite, got {v}"));
+                    return Err(WireError::invalid_argument(format!(
+                        "distance value must be finite, got {v}"
+                    ))
+                    .json());
                 }
-                Mate::distance(a, b, v).map_err(|e| e.to_string())?
+                Mate::distance(a, b, v).map_err(wire)?
             }
             other => {
-                return Err(format!(
+                return Err(WireError::invalid_argument(format!(
                     "unknown mate kind '{other}'; use coincident, concentric, or distance"
-                ));
+                ))
+                .json());
             }
         };
         Ok(self.inner.add_mate(mate))
@@ -391,7 +412,11 @@ impl WasmAssembly {
             .iter()
             .zip(&self.sources)
             .map(|(inst, src)| src.transform(&inst.transform));
-        let first = placed.next().ok_or("assembly has no instances")?;
+        let first = placed.next().ok_or_else(|| {
+            WireError::new("empty_assembly", "argument", "assembly has no instances")
+                .with_hint("Add at least one instance before requesting the assembled shape.")
+                .json()
+        })?;
         Ok(WasmShape::sdf_only(
             placed.fold(first, |acc, next| acc.union(&next)),
         ))
