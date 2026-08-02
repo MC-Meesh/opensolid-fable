@@ -61,17 +61,17 @@
 //!
 //! # Findings (first sweep, 2026-08-01)
 //!
-//! Spheres fail this campaign both ways, so they are held out of the
-//! must-degrade gate and pinned by their own `#[ignore]`d tests:
+//! Spheres failed this campaign both ways on the first sweep, so they are
+//! held out of the must-degrade gate and pinned by their own tests:
 //!
-//! - **of-wtu0** — a *refused* sphere vanishes: its face is bounded only
-//!   by the seam, the CDT refuses the ring ("does not bound a triangulable
-//!   region"), and the periodic grid arm samples the displaced surface
-//!   while the seam-ring polyline stays on the authored curve — 32 open
-//!   edges, `SolidOutcome::Failed`. Every other family in the corpus
-//!   closes under the identical damage because its faces are ring-anchored
-//!   (ear-clip, CDT, rim-anchored quadric grids).
-//!   [`a_refused_sphere_must_degrade_not_vanish`] pins it.
+//! - **of-wtu0** (fixed) — a *refused* sphere vanished: its face is
+//!   bounded only by the seam, the CDT refuses the ring ("does not bound a
+//!   triangulable region"), and the grid arm classified the seam boundary
+//!   from samples projected onto the *displaced* surface — near-pole
+//!   scatter read as a partial skewed trim, so a partial grid with 32 open
+//!   edges, `SolidOutcome::Failed`. The grid arm now detects a seam-only
+//!   boundary topologically and wraps the full period.
+//!   [`a_refused_sphere_must_degrade_not_vanish`] pins the fix.
 //! - **of-0een** — a sphere *kept* on the exact path (stray inside the
 //!   tolerance the reader may raise) imports as a B-Rep that
 //!   `brep_mass_properties` then refuses: `OpenParameterLoop` with a gap
@@ -205,10 +205,11 @@ fn writer_sphere(rng: &mut Rng) -> Case {
 /// amplitudes below (≤ 0.08 mm) stay under 1% of any dimension and the
 /// ground-truth volume survives the bend within the volume gates.
 ///
-/// `include_sphere` is false for the must-degrade gate: a refused sphere
-/// vanishes today (of-wtu0), so the gate would fail on every run until
-/// that bead lands; [`a_refused_sphere_must_degrade_not_vanish`] pins the
-/// gap instead.
+/// `include_sphere` is false for the must-degrade gate: a sphere *kept* on
+/// the exact path is unmeasurable today (of-0een), so the gate would fail
+/// whenever the random displacement stays inside the reader's allowance.
+/// The refused-sphere degrade itself is covered by
+/// [`a_refused_sphere_must_degrade_not_vanish`].
 fn writer_primitive(rng: &mut Rng, include_sphere: bool) -> Case {
     let mut store = TopologyStore::new();
     let mut geo = GeometryStore::new();
@@ -752,8 +753,9 @@ fn a_refused_solid_degrades_to_mesh_not_failed() {
     for index in 0..CASES {
         let case = match rng.pick(3) {
             0 => wedge(&mut rng),
-            // No spheres here: a refused sphere vanishes today (of-wtu0),
-            // pinned by `a_refused_sphere_must_degrade_not_vanish` below.
+            // No spheres here: a sphere the exact path *keeps* is
+            // unmeasurable (of-0een). The refused-sphere degrade is
+            // covered by `a_refused_sphere_must_degrade_not_vanish` below.
             _ => writer_primitive(&mut rng, false),
         };
         let amplitude = rng.range(2.0, 8.0) * MAX_ALLOWED_TOLERANCE;
@@ -964,14 +966,15 @@ fn survey() {
 }
 
 /// Pins of-wtu0: a sphere whose surface record is displaced past
-/// [`MAX_ALLOWED_TOLERANCE`] is correctly refused by the exact path, and
-/// then vanishes — the periodic grid arm samples the displaced surface
-/// while the seam ring stays on the authored curve, leaving 32 open edges
-/// the weld cannot bridge. The rings are consistent (the curve agrees with
-/// its vertices), so a closable shell exists and the contract says
-/// degrade, not lose. Un-ignore when of-wtu0 lands.
+/// [`MAX_ALLOWED_TOLERANCE`] is correctly refused by the exact path and
+/// must then degrade to a closed mesh, not vanish. It used to vanish: the
+/// quadric grid arm classified the face's `u` span from boundary samples
+/// projected onto the *displaced* surface, whose near-pole scatter turned
+/// the seam-only boundary into a "partial skewed trim" — a partial grid
+/// with 32 open edges no weld could bridge. The reader now detects a
+/// seam-only boundary topologically (every edge traversed net-zero) and
+/// grids the full period with wrap.
 #[test]
-#[ignore = "of-wtu0: refused sphere vanishes — grid rows tear off the seam ring"]
 fn a_refused_sphere_must_degrade_not_vanish() {
     let mut rng = Rng::new(0x0f_37b0_51ef_0001);
     let mut refused = 0;

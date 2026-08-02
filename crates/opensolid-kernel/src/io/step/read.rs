@@ -4355,12 +4355,26 @@ impl FallbackMesher<'_> {
         // A skewed trim grids as its bounding rectangle: an approximation the
         // face's own rim contradicts, but the honest alternative is no
         // triangles at all, and the caller has already tried the CDT.
-        let (u_lo, u_hi, wrap_u) = match quadric_u_span(&samples, period, u_anchor, v_lo, v_hi) {
-            Some(QuadricUSpan::Full { u_anchor }) => (u_anchor, u_anchor + period, true),
-            None => (u_anchor, u_anchor + period, true),
-            Some(
-                QuadricUSpan::PartialRect { u_lo, u_hi } | QuadricUSpan::PartialSkew { u_lo, u_hi },
-            ) => (u_lo, u_hi, false),
+        // A boundary that walks every edge as often forward as reversed
+        // bounds no region — it is the seam apparatus of a face covering its
+        // surface's whole period (a sphere's meridian traversed up then down,
+        // a torus's a b a⁻¹ b⁻¹ polygon). Grid the full period outright:
+        // classifying such a face by its projected samples instead misreads
+        // it whenever the surface record has strayed from the authored seam
+        // (of-wtu0) — near a pole the projection swings `u` arbitrarily, the
+        // seam scatters into a "partial skewed trim", and the partial grid's
+        // open columns are a hole no weld can close.
+        let (u_lo, u_hi, wrap_u) = if self.seam_only_boundary(bounds, face_ref)? {
+            (u_anchor, u_anchor + period, true)
+        } else {
+            match quadric_u_span(&samples, period, u_anchor, v_lo, v_hi) {
+                Some(QuadricUSpan::Full { u_anchor }) => (u_anchor, u_anchor + period, true),
+                None => (u_anchor, u_anchor + period, true),
+                Some(
+                    QuadricUSpan::PartialRect { u_lo, u_hi }
+                    | QuadricUSpan::PartialSkew { u_lo, u_hi },
+                ) => (u_lo, u_hi, false),
+            }
         };
         grid_quadric(
             mesh,
@@ -4378,6 +4392,44 @@ impl FallbackMesher<'_> {
             self.options,
         );
         Ok(())
+    }
+
+    /// Whether the face's bounds traverse every `EDGE_CURVE` as many times
+    /// forward as reversed (net fin sense zero, `VERTEX_LOOP`s aside). Such
+    /// a boundary encloses the entire surface rather than cutting a region
+    /// out of it — on a periodic surface it is the seam of a face covering
+    /// the full period, so the grid must wrap.
+    fn seam_only_boundary(&self, bounds: &[u64], face_ref: u64) -> MapResult<bool> {
+        let mut net: HashMap<u64, i64> = HashMap::new();
+        let mut any = false;
+        for &bound_ref in bounds {
+            let inst = instance(self.file, bound_ref, face_ref)?;
+            let rec = inst
+                .entity
+                .part("FACE_OUTER_BOUND")
+                .or_else(|| inst.entity.part("FACE_BOUND"))
+                .ok_or_else(|| {
+                    invalid(
+                        bound_ref,
+                        format!("expected FACE_BOUND, found {}", type_names(inst)),
+                    )
+                })?;
+            let loop_ref = ref_attr(rec, 1, bound_ref)?;
+            let bound_orientation = bool_attr(rec, 2, bound_ref)?;
+            let loop_inst = instance(self.file, loop_ref, bound_ref)?;
+            if loop_inst.entity.part("VERTEX_LOOP").is_some() {
+                continue;
+            }
+            let loop_rec = typed_record(self.file, loop_ref, "EDGE_LOOP", bound_ref)?;
+            for oe_ref in ref_list(loop_rec, 1, loop_ref)? {
+                let oe = typed_record(self.file, oe_ref, "ORIENTED_EDGE", loop_ref)?;
+                let edge_ref = ref_attr(oe, 3, oe_ref)?;
+                let forward = bool_attr(oe, 4, oe_ref)? == bound_orientation;
+                *net.entry(edge_ref).or_insert(0) += if forward { 1 } else { -1 };
+                any = true;
+            }
+        }
+        Ok(any && net.values().all(|&n| n == 0))
     }
 
     /// A face bound as one closed 3D polygon (no repeated closing point),
