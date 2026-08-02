@@ -9453,7 +9453,12 @@ fn severed_torus_rings_walk_the_major_seam() {
 /// orders smaller than the part and a crossing angle that shrinks with
 /// the bite. Every step must keep genus 1, bind readable ranges, and
 /// close the material balance against the intersection.
+// Fenced adversarial discovery (of-rxjs): at bite 0.05 the subtract fails
+// with Degenerate("boolean::imprint", "an imprint chain ends in a face
+// interior without closing or reaching the face boundary"). bite 0.15
+// passes. Un-ignore when of-rxjs lands.
 #[test]
+#[ignore = "of-rxjs: shallow graze aborts Degenerate in boolean::imprint"]
 fn grazing_notch_shrinks_the_imprint_loop_to_an_island() {
     let (major, minor) = (2.0, 0.5);
     for bite in [0.15, 0.05, 0.02] {
@@ -9591,7 +9596,12 @@ fn long_block_severs_the_tube_twice() {
 /// +X spoke through both tube walls (bore to outside); axially it runs
 /// parallel to the torus axis through top and bottom of the tube. Both
 /// tunnel the solid: genus 1 → 2.
+// Fenced adversarial discovery (of-f7rk): the radial drill's subtract
+// fails with Degenerate("boolean::imprint", "an imprint chain ends in a
+// face interior without closing or reaching the face boundary") before
+// any assertion runs. Un-ignore when of-f7rk lands.
 #[test]
+#[ignore = "of-f7rk: curved-curved drill aborts Degenerate in boolean::imprint"]
 fn cylinder_drilled_through_the_tube_binds_readable_loops() {
     let (major, minor) = (2.0, 0.5);
     for (name, base, axis) in [

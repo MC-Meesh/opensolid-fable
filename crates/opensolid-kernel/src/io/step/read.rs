@@ -186,7 +186,8 @@ use opensolid_brep::{
     Body, BodyType, Curve2, Curve3, CurveEval, CurveProject, Edge, Face, FaceSense, Fin, FinSense,
     GeometryStore, KnotVector, Loop, LoopType, MAX_ALLOWED_TOLERANCE, NurbsCurve, NurbsCurve2,
     NurbsError, NurbsSurface, QuadricUSpan, SYSTEM_RESOLUTION, Shell, ShellOrientation, Surface3,
-    SurfaceEval, SurfaceProject, TessellationOptions, TopologyStore, Vertex, attach_body_pcurves,
+    SurfaceEval,
+    SurfaceProject, TessellationOptions, TopologyStore, Vertex, attach_body_pcurves,
     quadric_u_span, triangulate_bounded_face,
 };
 use opensolid_core::error::CoreError;
