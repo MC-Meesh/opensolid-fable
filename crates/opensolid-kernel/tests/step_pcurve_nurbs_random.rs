@@ -47,13 +47,14 @@
 //! softened. `OPENSOLID_CAMPAIGN_SEED=<hex>` remixes every suite seed.
 //!
 //! Bugs filed from this suite (first run, 2026-08-01):
-//! - of-yic4: `NurbsCurve{,2}::reversed` panics when the floating-point
-//!   knot reflection `t0 + t1 − k` collapses two distinct knots (the
-//!   reflected vector fails `KnotVector::new` behind an `expect`).
+//! - of-yic4 (fixed — `KnotVector::reversed` now repairs the collapse):
+//!   `NurbsCurve{,2}::reversed` panicked when the floating-point
+//!   knot reflection `t0 + t1 − k` collapsed two distinct knots (the
+//!   reflected vector failed `KnotVector::new` behind an `expect`).
 //!   Reachable from a crafted STEP file through a `same_sense = .F.`
 //!   freeform edge — `collect_authored_pcurves` reverses the authored 2D
 //!   trim (of-50u) and `trim_curve` the authored 3D basis — so the reader
-//!   aborts instead of diagnosing. See
+//!   aborted instead of diagnosing. See
 //!   [`reversing_a_hostile_knot_vector_must_not_panic`] and
 //!   [`hostile_authored_pcurve_knots_on_a_reversed_edge_must_not_panic_the_reader`].
 //! - of-xsr7: `fit_pcurve` on a *closed* NURBS patch, fitting a curve that
@@ -956,12 +957,12 @@ fn degenerate_authored_pcurves_degrade_without_panic() {
 /// Knot vectors valid at degree 1 whose floating-point reflection
 /// `t0 + t1 − k` collapses the two distinct interior knots onto one f64
 /// (or onto the domain end). `NurbsCurve2::reversed` — and its 3D twin —
-/// rebuilds the reflected vector through `KnotVector::new` behind an
-/// `expect`, so a collapse is an abort, not an error.
+/// used to rebuild the reflected vector through `KnotVector::new` behind
+/// an `expect`, so a collapse was an abort, not an error; since of-yic4
+/// `KnotVector::reversed` repairs the collapse instead.
 ///
-/// First run: panicked `DegenerateEndSpan { index: 3, knot: 1e17 }`.
+/// First run (pre-fix): panicked `DegenerateEndSpan { index: 3, knot: 1e17 }`.
 #[test]
-#[ignore = "of-yic4: NurbsCurve2::reversed panics on a collapsing knot reflection"]
 fn reversing_a_hostile_knot_vector_must_not_panic() {
     let knots = KnotVector::new(1, vec![0.0, 0.0, 1.0, 1.0 + f64::EPSILON, 1e17, 1e17])
         .expect("distinct interior knots at multiplicity 1 are valid");
@@ -989,10 +990,9 @@ fn reversing_a_hostile_knot_vector_must_not_panic() {
 /// trim before the transplant gate ever sees it, so a crafted file aborts
 /// the reader.
 ///
-/// First run: the import call panicked inside `NurbsCurve2::reversed`
-/// (`curve2.rs:165`) before any diagnostic was produced.
+/// First run (pre-fix, of-yic4): the import call panicked inside
+/// `NurbsCurve2::reversed` before any diagnostic was produced.
 #[test]
-#[ignore = "of-yic4: hostile authored pcurve knots panic the STEP reader"]
 fn hostile_authored_pcurve_knots_on_a_reversed_edge_must_not_panic_the_reader() {
     let mut rng = Rng::new(0x50D5);
     let spec = SplitSpec::random(&mut rng);

@@ -149,20 +149,18 @@ impl NurbsCurve2 {
     }
 
     /// The same locus traced in the opposite direction, over the same
-    /// parameter domain: control points and weights reversed, knot `k`
-    /// reflected to `t0 + t1 − k`. Mirrors
+    /// parameter domain: control points and weights reversed, the knot
+    /// vector reflected by [`KnotVector::reversed`]. Mirrors
     /// [`NurbsCurve::reversed`](crate::nurbs::NurbsCurve::reversed), and
-    /// like it satisfies `reversed().point(t) == point(t0 + t1 − t)`.
+    /// like it satisfies `reversed().point(t) == point(t0 + t1 − t)` —
+    /// exactly when the reflection is exactly representable, and to the ULP
+    /// scale of the repair when rounding collapses reflected knots (see
+    /// [`KnotVector::reversed`]; this never panics).
     pub fn reversed(&self) -> NurbsCurve2 {
-        let (t0, t1) = self.knots.domain();
-        let sum = t0 + t1;
-        let knots: Vec<f64> = self.knots.knots().iter().rev().map(|&k| sum - k).collect();
-        let degree = self.degree();
         NurbsCurve2 {
             control_points: self.control_points.iter().rev().copied().collect(),
             weights: self.weights.iter().rev().copied().collect(),
-            knots: KnotVector::new(degree, knots)
-                .expect("reflecting a valid knot vector keeps it valid"),
+            knots: self.knots.reversed(),
         }
     }
 
@@ -294,6 +292,32 @@ mod tests {
                 "reversed tangent must oppose the original at t={t}"
             );
         }
+    }
+
+    #[test]
+    fn reversed_repairs_a_collapsing_knot_reflection() {
+        // Valid knots whose reflection `t0 + t1 − k` rounds both interior
+        // knots onto the domain end `1e17` — the naive reflection is not a
+        // valid knot vector, and `reversed` once aborted on it (of-yic4).
+        // `KnotVector::reversed` repairs the collapse; this pins the 2D
+        // curve to the same contract as the 3D one.
+        let knots = KnotVector::new(1, vec![0.0, 0.0, 1.0, 1.0 + f64::EPSILON, 1e17, 1e17])
+            .expect("distinct interior knots at multiplicity 1 are valid");
+        let curve = NurbsCurve2::bspline(
+            vec![
+                Point2::new(0.0, 0.0),
+                Point2::new(0.3, 0.4),
+                Point2::new(0.7, 0.6),
+                Point2::new(1.0, 1.0),
+            ],
+            knots,
+        )
+        .expect("valid curve");
+        let back = curve.reversed();
+        let (t0, t1) = curve.domain();
+        assert_eq!(back.domain(), (t0, t1));
+        assert!((back.point(t0) - curve.point(t1)).norm() < TIGHT);
+        assert!((back.point(t1) - curve.point(t0)).norm() < TIGHT);
     }
 
     #[test]

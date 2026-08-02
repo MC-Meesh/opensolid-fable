@@ -233,6 +233,79 @@ impl KnotVector {
         self.knots.iter().filter(|&&k| k == u).count()
     }
 
+    /// The knot vector of the reversed curve: order reversed, each knot `k`
+    /// reflected to `t0 + t1 − k`. Total — never panics.
+    ///
+    /// Reflection is order-reversing only in real arithmetic. In floating
+    /// point the rounded images of two distinct knots can collapse onto one
+    /// f64 (or onto a domain end) when the domain magnitude dwarfs their
+    /// spacing — `1e17 − 1` and `1e17 − (1 + ε)` both round to `1e17` — and
+    /// the naive reflection is then not a valid knot vector (of-yic4). Every
+    /// invariant [`KnotVector::new`] enforces is a property of the
+    /// equal/strictly-increasing *pattern* of the knots (plus finiteness),
+    /// and reflection rounds monotonically, so a collapse only ever merges
+    /// neighbours: it is repaired here by walking down from the domain end
+    /// and re-separating merged neighbours one ULP apart, which restores the
+    /// original pattern exactly while keeping the domain anchored. The
+    /// result is bit-identical to the naive reflection whenever that
+    /// reflection is valid, and within a few ULPs of it otherwise.
+    pub fn reversed(&self) -> KnotVector {
+        let (t0, t1) = self.domain();
+        let sum = t0 + t1;
+        // `t0 + t1` can overflow even though the true image `t0 + t1 − k` of
+        // every in-domain knot is finite; regrouping as `t0 + (t1 − k)`
+        // stays finite in exactly those cases (the two addends cannot both
+        // be large once `t0 + t1` overflows). Padding knots outside the
+        // domain can still overflow under either form, so clamp: the clamp
+        // keeps the map weakly monotone and the repair below works in
+        // finite space.
+        let reflect = |k: f64| {
+            let r = if sum.is_finite() {
+                sum - k
+            } else {
+                t0 + (t1 - k)
+            };
+            r.clamp(f64::MIN, f64::MAX)
+        };
+        let reflected: Vec<f64> = self.knots.iter().rev().map(|&k| reflect(k)).collect();
+        if let Ok(valid) = KnotVector::new(self.degree, reflected.clone()) {
+            return valid;
+        }
+        // Monotone rounding means the reflection is still non-decreasing —
+        // only strictness can be lost. Restore the original pattern top
+        // down: knots the original kept distinct move one ULP below their
+        // upper neighbour; runs it kept equal follow their upper member.
+        let mut knots = reflected;
+        let n = knots.len();
+        for i in (0..n - 1).rev() {
+            if self.knots[n - 2 - i] < self.knots[n - 1 - i] {
+                if knots[i] >= knots[i + 1] {
+                    knots[i] = knots[i + 1].next_down();
+                }
+            } else {
+                knots[i] = knots[i + 1];
+            }
+        }
+        // The pattern now matches the original's, whose validity is a
+        // pattern property, so this fails only if a nudge ran off the low
+        // end of f64 (values pinned at `f64::MIN` by the clamp above). No
+        // reflection is representable there at all; keep only the pattern,
+        // with the distinct values at 0, 1, 2, …
+        KnotVector::new(self.degree, knots).unwrap_or_else(|_| {
+            let mut fallback = Vec::with_capacity(n);
+            let mut value = 0.0;
+            for j in 0..n {
+                let i = n - 1 - j;
+                if j > 0 && self.knots[i] < self.knots[i + 1] {
+                    value += 1.0;
+                }
+                fallback.push(value);
+            }
+            KnotVector::new(self.degree, fallback)
+                .expect("integer knots with a valid pattern form a valid knot vector")
+        })
+    }
+
     /// Index of the knot span containing `u` (FindSpan, A2.1): the unique
     /// `i` with `knots[i] <= u < knots[i + 1]`, except at the domain end
     /// where the last non-empty span is returned. `u` is assumed within the
@@ -486,30 +559,25 @@ impl NurbsCurve {
     /// The same locus traced in the opposite direction, over the same
     /// parameter domain.
     ///
-    /// Control points and weights are reversed, and knot `k` is reflected
-    /// to `t0 + t1 − k` (then re-reversed so the vector is non-decreasing
-    /// again). The reflection is an affine change of parameter, so
-    /// `reversed().point(t) == point(t0 + t1 − t)` exactly up to the
-    /// floating-point cost of the reflection itself; multiplicities — and
-    /// hence the clamping — are carried along with the knots they belong
-    /// to.
+    /// Control points and weights are reversed, and the knot vector is
+    /// reflected by [`KnotVector::reversed`]. The reflection is an affine
+    /// change of parameter, so `reversed().point(t) == point(t0 + t1 − t)`
+    /// exactly up to the floating-point cost of the reflection itself;
+    /// multiplicities — and hence the clamping — are carried along with the
+    /// knots they belong to. When rounding collapses reflected knots the
+    /// reflection is repaired rather than trusted (see
+    /// [`KnotVector::reversed`]), so this never panics, at the cost of the
+    /// identity above degrading to the ULP scale of the repair.
     ///
     /// The reflected interior knots are new float values: `t0 + t1 − k` is
     /// generally not the decimal one would write down for the mirrored
     /// position, so query [`KnotVector::multiplicity`] with a value read
     /// back out of `knot_vector().knots()`, never with a literal.
     pub fn reversed(&self) -> NurbsCurve {
-        let (t0, t1) = self.knots.domain();
-        let sum = t0 + t1;
-        let knots: Vec<f64> = self.knots.knots().iter().rev().map(|&k| sum - k).collect();
-        let degree = self.degree();
         NurbsCurve {
             control_points: self.control_points.iter().rev().copied().collect(),
             weights: self.weights.iter().rev().copied().collect(),
-            // Reflecting a valid knot vector yields a valid knot vector of
-            // the same degree and length, so this cannot fail.
-            knots: KnotVector::new(degree, knots)
-                .expect("reflecting a valid knot vector keeps it valid"),
+            knots: self.knots.reversed(),
         }
     }
 
@@ -1312,6 +1380,97 @@ mod tests {
             .map(|&k| t0 + t1 - k)
             .collect();
         assert_eq!(back.knot_vector().knots(), expected.as_slice());
+    }
+
+    #[test]
+    fn reversed_repairs_a_collapsing_knot_reflection() {
+        // Valid at degree 1 (two distinct interior knots, multiplicity 1
+        // each), but the reflection `t0 + t1 − k` rounds both interior
+        // knots and the upper end knot onto the same f64 `1e17` — the
+        // naive reflection is not a valid knot vector (of-yic4).
+        let hostile = KnotVector::new(1, vec![0.0, 0.0, 1.0, 1.0 + f64::EPSILON, 1e17, 1e17])
+            .expect("distinct interior knots at multiplicity 1 are valid");
+        let back = hostile.reversed();
+        // The repair anchors the domain end, so the domain survives, and
+        // the strict/equal pattern of the original is restored: two
+        // distinct interior knots strictly inside (0, 1e17).
+        assert_eq!(back.domain(), hostile.domain());
+        let k = back.knots();
+        assert_eq!(k.len(), 6);
+        assert_eq!((k[0], k[1]), (0.0, 0.0));
+        assert_eq!((k[4], k[5]), (1e17, 1e17));
+        assert!(k[1] < k[2] && k[2] < k[3] && k[3] < k[4], "knots {k:?}");
+        // And the curve-level reversal built on it must not abort either.
+        let curve = NurbsCurve::bspline(
+            vec![
+                Point3::new(0.0, 0.0, 0.0),
+                Point3::new(0.3, 0.4, 0.1),
+                Point3::new(0.7, 0.6, 0.2),
+                Point3::new(1.0, 1.0, 0.3),
+            ],
+            hostile,
+        )
+        .expect("valid curve");
+        let reversed = curve.reversed();
+        assert_eq!(
+            reversed.knot_vector().domain(),
+            curve.knot_vector().domain()
+        );
+        let (t0, t1) = curve.knot_vector().domain();
+        assert!((reversed.point(t0) - curve.point(t1)).norm() < TIGHT);
+        assert!((reversed.point(t1) - curve.point(t0)).norm() < TIGHT);
+    }
+
+    #[test]
+    fn reversed_survives_an_overflowing_domain_sum() {
+        // `t0 + t1` overflows to infinity, but every true reflected image
+        // is finite; the regrouped `t0 + (t1 − k)` form must be used and
+        // the reflection must come out exact.
+        let huge = KnotVector::new(1, vec![1e308, 1e308, 1.2e308, 1.5e308, 1.5e308])
+            .expect("finite huge knots are valid");
+        let back = huge.reversed();
+        assert_eq!(back.domain(), huge.domain());
+        let mirrored_interior = 1e308 + (1.5e308 - 1.2e308);
+        assert_eq!(
+            back.knots(),
+            [1e308, 1e308, mirrored_interior, 1.5e308, 1.5e308].as_slice()
+        );
+    }
+
+    #[test]
+    fn reversed_falls_back_when_no_reflection_is_representable() {
+        // Padding knots near `f64::MAX` over a domain anchored at
+        // `−f64::MAX`: their reflections overflow below `f64::MIN`, the
+        // clamp pins them there, and the repair has no room to separate
+        // them. The pattern-only fallback must kick in — same degree, same
+        // control count, same multiplicity pattern, all knots finite.
+        let saturated = KnotVector::new(
+            2,
+            vec![
+                f64::MIN,
+                f64::MIN,
+                f64::MIN,
+                0.0,
+                1.0,
+                2.0,
+                f64::MAX / 2.0,
+                f64::MAX,
+            ],
+        )
+        .expect("finite saturated knots are valid");
+        let back = saturated.reversed();
+        assert!(
+            back.knots().iter().all(|k| k.is_finite()),
+            "{:?}",
+            back.knots()
+        );
+        assert_eq!(back.degree(), 2);
+        assert_eq!(back.control_count(), saturated.control_count());
+        // Multiplicities mirror: the triple run moves to the top end.
+        let k = back.knots();
+        assert!(k[0] < k[1] && k[1] < k[2] && k[2] < k[3] && k[3] < k[4] && k[4] < k[5]);
+        assert_eq!(k[6], k[5]);
+        assert_eq!(k[7], k[5]);
     }
 
     #[test]
