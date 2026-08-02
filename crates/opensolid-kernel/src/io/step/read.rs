@@ -9353,19 +9353,18 @@ REPRESENTATION_CONTEXT('2D SPACE','') );
     /// the day. The corpus gates in `tests/` measure the other half, that
     /// each file ends up with a solid at all.
     ///
-    /// `bspline_patch_prism` clears the whole contract — it meshes, closes,
-    /// and becomes a `MeshSdf`, which is what `SolidOutcome::Mesh` requires.
-    /// nist_ctc_02 clears the meshing half only, and of-aoml is the other:
-    /// tilted bores through its plate leave flat triangles in the plate's own
-    /// plane, facing the other way, and the rim vertices between them have no
-    /// pseudonormal for `MeshSdf::new` to take. That is a real defect and it
-    /// keeps that one file out of the SDF; it is also a far smaller one than
-    /// what this test was written for, and pinning the closure here is what
-    /// stops it regressing while of-aoml is open.
+    /// Both files clear the whole contract — mesh, close, and become a
+    /// `MeshSdf`, which is what `SolidOutcome::Mesh` requires. nist_ctc_02
+    /// used to clear the meshing half only: tilted bores through its plate
+    /// left flat triangles in the plate's own plane, facing the other way,
+    /// and the rim vertices between them had no pseudonormal for
+    /// `MeshSdf::new` to take. The of-aoml lens split fixed that, and the
+    /// `sdf_too` flag pins it (flipped by of-stjd; its bores are ~2° — the
+    /// steeper tilts the split still misses are of-8oit).
     #[test]
     fn corpus_solids_that_only_the_fallback_can_reach_still_close() {
         for (name, sdf_too) in [
-            ("nist/nist_ctc_02_asme1_rc.stp", false),
+            ("nist/nist_ctc_02_asme1_rc.stp", true),
             ("occ/nurbs/bspline_patch_prism.stp", true),
         ] {
             let path = format!("{}/tests/data/step/{name}", env!("CARGO_MANIFEST_DIR"));
