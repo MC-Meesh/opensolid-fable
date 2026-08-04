@@ -729,15 +729,14 @@ fn a_pastcap_bulged_arc_on_an_unsewn_file_is_rescued_by_ssi_recompute() {
 /// (`spec/06-step-io.md` §4) does not say "…but only if the topology is also
 /// broken".
 ///
-/// Today it cannot: the reader consults the healer only when the
-/// topology-only `TopologyStore::check` fails, so a sewn file goes straight
-/// to `record_edge_tolerances`, which sees the past-cap deviation and drops
-/// the whole solid to the mesh fallback. The rescue pass — built for exactly
-/// this defect — is unreachable. Adding *more* damage (unsewing the same
-/// file) makes the import strictly better, which is the inconsistency in one
-/// sentence; the sibling test above proves the unsewn half.
+/// A sewn file passes the topology-only `TopologyStore::check`, so the full
+/// healer never runs; the past-cap deviation surfaces only when
+/// `record_edge_tolerances` measures the finished body. The reader then
+/// consults the rescue recompute standalone
+/// (`GeometryHealer::rescue_edge_curves`) before abandoning the exact path —
+/// otherwise adding *more* damage (unsewing the same file) would make the
+/// import strictly better; the sibling test above proves the unsewn half.
 #[test]
-#[ignore = "of-du3v: phase-2 rescue is unreachable on topologically-sewn files"]
 fn a_pastcap_bulged_arc_on_a_sewn_file_must_still_import_exactly() {
     let mut rng = Rng::new(0x_9A7E_D001);
     for case in 0..6 {

@@ -542,6 +542,52 @@ impl GeometryHealer {
         result
     }
 
+    /// The phase-2 rescue alone: recompute the curves of edges whose
+    /// deviation exceeds [`MAX_ALLOWED_TOLERANCE`] — the ones no tolerance
+    /// elevation can save — leaving sub-cap edges to the caller's tolerance
+    /// accounting (`record_edge_tolerances` on the import path).
+    ///
+    /// This exists for the reader's exact path on a *topologically-sewn*
+    /// file (of-du3v): [`heal`](Self::heal) only runs when the topology-only
+    /// check fails, so a sewn file with a past-cap geometric defect never
+    /// reached the rescue pass at all. The reader calls this when the
+    /// tolerance measurement reports a past-cap edge, before abandoning the
+    /// exact path for the mesh fallback.
+    ///
+    /// Respects the strategy the same way [`heal`](Self::heal) does: only
+    /// strategies that run the geometry-consistency passes plan anything
+    /// (`Minimal` trusts authored geometry and plans nothing), and only ones
+    /// that apply mutate the body (`ReportOnly` reports the plan).
+    pub fn rescue_edge_curves(
+        body: EntityId<Body>,
+        store: &mut TopologyStore,
+        geo: &mut GeometryStore,
+        options: &HealOptions,
+    ) -> HealResult {
+        let mut result = HealResult {
+            failures_before: store.check_geometry(geo, body),
+            ..HealResult::default()
+        };
+        if store.body(body).is_none() || !options.strategy.fixes_geometry() {
+            result.remaining = result.failures_before.clone();
+            return result;
+        }
+        Self::fix_edge_surface_consistency_into(
+            body,
+            store,
+            geo,
+            true,
+            options.strategy.applies(),
+            &mut result,
+        );
+        result.remaining = if options.strategy.applies() {
+            store.check_geometry(geo, body)
+        } else {
+            result.failures_before.clone()
+        };
+        result
+    }
+
     /// Refit every pcurve that no longer tracks its edge's curve
     /// (`spec/06-step-io.md` §6). Fins with no pcurve at all are left for
     /// [`opensolid_brep::attach_body_pcurves`].

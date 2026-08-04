@@ -5586,10 +5586,13 @@ fn choose_outer_bounds(
 /// `Err` names the worst edge whose gap exceeds [`MAX_ALLOWED_TOLERANCE`].
 /// There is no honest tolerance to give such an edge: the kernel's cap is a
 /// cap, and writing the measured value would only move the complaint to
-/// `check`'s per-entity range test. So the solid does not import exactly at
-/// all and falls back to tessellation, which represents the same shape
-/// without claiming anything about where its edges are. That refusal is what
-/// makes the tolerance a bound rather than a decoration.
+/// `check`'s per-entity range test. [`map_solid`] answers an `Err` by
+/// consulting the healer's rescue recompute once — a past-cap edge on a
+/// topologically-sewn body is otherwise unreachable by healing (of-du3v) —
+/// and only when that too leaves a past-cap edge does the solid fall back to
+/// tessellation, which represents the same shape without claiming anything
+/// about where its edges are. That refusal is what makes the tolerance a
+/// bound rather than a decoration.
 fn record_edge_tolerances(
     store: &mut TopologyStore,
     geo: &GeometryStore,
@@ -5734,50 +5737,90 @@ fn map_solid(
                 // Only once the topology is settled — healing decides which
                 // faces an edge ends up bounding — is there anything to
                 // measure the edges against.
-                match record_edge_tolerances(store, geo, body) {
-                    Ok(raised) => {
-                        if closure_trims > 0 {
+                let mut rescue_spent = false;
+                loop {
+                    match record_edge_tolerances(store, geo, body) {
+                        Ok(raised) => {
+                            if closure_trims > 0 {
+                                diagnostics.push(Diagnostic {
+                                    entity: Some(msb_id),
+                                    severity: Severity::Info,
+                                    message: format!(
+                                        "{closure_trims} edge(s) miss their vertex points by \
+                                         more than decimal round-off, within the {closure:.3e} \
+                                         mm closure this solid is held to"
+                                    ),
+                                });
+                            }
+                            if raised > 0 {
+                                diagnostics.push(Diagnostic {
+                                    entity: Some(msb_id),
+                                    severity: Severity::Info,
+                                    message: format!(
+                                        "{raised} edge tolerance(s) raised to the measured \
+                                         distance from their faces' surfaces"
+                                    ),
+                                });
+                            }
+                            *heal_operations += finish_exact_body(
+                                store,
+                                geo,
+                                body,
+                                options,
+                                &carryover,
+                                msb_id,
+                                diagnostics,
+                            );
+                            return SolidOutcome::BRep(body);
+                        }
+                        Err((edge, deviation)) => {
+                            // A past-cap edge is exactly what the rescue
+                            // recompute exists for, but on a topologically-
+                            // sewn file the heal above never ran — the
+                            // topology-only check passed (of-du3v). Consult
+                            // the rescue pass once before abandoning the
+                            // exact path; anything it repairs is re-measured
+                            // by another round of `record_edge_tolerances`.
+                            if !rescue_spent && options.heal.strategy != HealStrategy::Off {
+                                rescue_spent = true;
+                                let result = GeometryHealer::rescue_edge_curves(
+                                    body,
+                                    store,
+                                    geo,
+                                    &options.heal,
+                                );
+                                *heal_operations += result.operations.len();
+                                for op in &result.operations {
+                                    diagnostics.push(Diagnostic {
+                                        entity: Some(msb_id),
+                                        severity: Severity::Info,
+                                        message: format!("healed: {op}"),
+                                    });
+                                }
+                                for note in &result.notes {
+                                    diagnostics.push(Diagnostic {
+                                        entity: Some(msb_id),
+                                        severity: Severity::Info,
+                                        message: format!("heal: {note}"),
+                                    });
+                                }
+                                if !result.is_empty() {
+                                    continue;
+                                }
+                            }
                             diagnostics.push(Diagnostic {
                                 entity: Some(msb_id),
-                                severity: Severity::Info,
+                                severity: Severity::Warning,
                                 message: format!(
-                                    "{closure_trims} edge(s) miss their vertex points by more \
-                                     than decimal round-off, within the {closure:.3e} mm \
-                                     closure this solid is held to"
+                                    "mapped body failed validation: edge {edge:?} strays \
+                                     {deviation} from the surface of a face it bounds, more \
+                                     than the kernel's maximum tolerance \
+                                     ({MAX_ALLOWED_TOLERANCE})"
                                 ),
                             });
+                            break;
                         }
-                        if raised > 0 {
-                            diagnostics.push(Diagnostic {
-                                entity: Some(msb_id),
-                                severity: Severity::Info,
-                                message: format!(
-                                    "{raised} edge tolerance(s) raised to the measured \
-                                     distance from their faces' surfaces"
-                                ),
-                            });
-                        }
-                        *heal_operations += finish_exact_body(
-                            store,
-                            geo,
-                            body,
-                            options,
-                            &carryover,
-                            msb_id,
-                            diagnostics,
-                        );
-                        return SolidOutcome::BRep(body);
                     }
-                    Err((edge, deviation)) => diagnostics.push(Diagnostic {
-                        entity: Some(msb_id),
-                        severity: Severity::Warning,
-                        message: format!(
-                            "mapped body failed validation: edge {edge:?} strays \
-                             {deviation} from the surface of a face it bounds, more \
-                             than the kernel's maximum tolerance \
-                             ({MAX_ALLOWED_TOLERANCE})"
-                        ),
-                    }),
                 }
             }
             for failure in &failures {
