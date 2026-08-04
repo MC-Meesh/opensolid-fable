@@ -8143,16 +8143,23 @@ fn refine_curved_region(
     // absorb-the-flap attempt in of-05ac converged, but took 32 passes and
     // 310 s on this one file).
     //
-    // The band is what tells a lens chord from an honest one, and it is the
-    // lattice's own clearance. A chord that cuts ACROSS the region — a bore
-    // wall's near-rim-to-far-rim diagonal, a fan across a cap — has its
-    // midpoint a quarter-cell or more from the boundary, which is exactly
-    // where lattice points are allowed to be, so its triangles already carry
-    // interior corners; only a chord whose midpoint falls inside that
-    // clearance bounds a lens the lattice could not reach. The lower bound is
-    // the sphere pass's, and for the same reason: a vertex that welds into a
-    // boundary edge would split it on one face only and T-junction the
-    // assembled mesh.
+    // Two discriminators tell a lens chord from an honest one, and a chord
+    // that passes either is split. The BAND is the lattice's own clearance:
+    // a chord whose midpoint falls inside it bounds a strip the lattice was
+    // forbidden to reach, so nothing else can give it a corner. It is not
+    // sufficient (of-8oit): a bore tilted past ~8° has rim amplitude
+    // r·tan(theta), the lens outgrows the quarter-cell band, and its chord
+    // midpoint sits where lattice points are *allowed* — but on the thin
+    // curved strip the staggered lattice still never *lands*, so the flat
+    // flaps survive. The second discriminator catches those directly: a
+    // chord one of whose flanking triangles has all three corners on the
+    // chord's own ring. Such a triangle is realized from rim samples alone
+    // — the exact flap whose facet cancels the plate's — and an honest
+    // cross-region chord never shows one, because its neighbourhood was
+    // reachable by the lattice and carries interior corners. The lower
+    // bound applies to both and is the sphere pass's, for the same reason:
+    // a vertex that welds into a boundary edge would split it on one face
+    // only and T-junction the assembled mesh.
     //
     // Runs last so nothing undoes it — `insert_on_edge` legalizes locally,
     // and a later global sweep could flip a fresh interior edge back into a
@@ -8210,9 +8217,25 @@ fn refine_curved_region(
                         near2 = near2.min(point_seg_dist2(ps, ba, bb));
                     }
                 }
-                if !(lens_min2..=margin2).contains(&near2) {
+                if near2 < lens_min2 {
                     k += 1;
                     continue;
+                }
+                if near2 > margin2 {
+                    // Deep lens (of-8oit): out of band, so split only on the
+                    // all-rim-triangle signature.
+                    let ring_a = ring_of(a);
+                    let apex_on_ring =
+                        |x: usize| x < n_boundary && ring_of(x) == ring_a;
+                    let c = mesh.tris[t][(k + 2) % 3];
+                    let flanked_by_flap = apex_on_ring(c)
+                        || mesh
+                            .edge_index(n, a, b)
+                            .is_some_and(|j| apex_on_ring(mesh.tris[n][(j + 2) % 3]));
+                    if !flanked_by_flap {
+                        k += 1;
+                        continue;
+                    }
                 }
                 // `insert_on_edge` needs both incident triangles proper and
                 // the quad across the edge unfolded — the same two guards the
@@ -12096,18 +12119,15 @@ mod tests {
         assert!(violations.is_empty(), "{}", violations.join("\n"));
     }
 
-    /// of-8oit: the band's upper bound (the lattice's quarter-cell
-    /// clearance) is what tells a lens chord from an honest cross-region
-    /// one, and past ~8° of tilt it stops working — the lens is deeper than
-    /// a quarter cell, so its chord midpoint falls outside the band and is
-    /// never split, while the staggered lattice's points do not land inside
-    /// the thin curved strip either. The flat flaps of of-aoml survive at
-    /// every sampling tried, and end-to-end the failure is *silent*: the
-    /// shell closes, the rim pseudonormals come out garbage rather than
-    /// exactly zero so `MeshSdf::new` accepts, and the field flips sign in
-    /// the bore void (see `lens_closure.rs`). Un-ignore when of-8oit lands.
+    /// of-8oit: past ~8° of tilt the band's upper bound (the lattice's
+    /// quarter-cell clearance) stops discriminating — the lens is deeper
+    /// than a quarter cell, so its chord midpoint falls outside the band,
+    /// while the staggered lattice's points do not land inside the thin
+    /// curved strip either, and the flat flaps of of-aoml survive. Deep
+    /// lenses are now caught by their all-rim-triangle signature: a chord
+    /// flanked by a triangle all three of whose corners sit on the chord's
+    /// own ring is split wherever its midpoint falls.
     #[test]
-    #[ignore = "of-8oit: deep lenses (tilt >= 10°) fall outside the split band"]
     fn steeply_tilted_rim_gains_corners() {
         let mut violations = Vec::new();
         for &deg in &[10.0f64, 20.0, 45.0] {

@@ -152,18 +152,16 @@ fn tilted_through_bore_plate_closes_and_has_pseudonormals() {
     }
 }
 
-/// of-8oit: at steep tilts the wall still carries flat flap triangles
-/// (see the boolean.rs battery — the lens outgrows the split band's
-/// quarter-cell upper bound), and end-to-end the failure is *silent*: the
-/// shell closes and `MeshSdf::new` accepts it, because at these
-/// proportions the rim pseudonormals come out as garbage directions
-/// rather than exact zeros — nist_ctc_02's loud refusal was the lucky
-/// case. The accepted field then reports bore-void points near the rim as
-/// **inside the solid** (measured: 4/96 probes at 20°, 14/96 at 45°).
-/// This asserts the desired behavior — every bore-void sample strictly
-/// outside — and is ignored until of-8oit lands.
+/// of-8oit: at steep tilts the lens outgrows the split band's quarter-cell
+/// upper bound, and before the all-rim-triangle discriminator the wall
+/// kept flat flap triangles whose failure was *silent*: the shell closed
+/// and `MeshSdf::new` accepted it, because at these proportions the rim
+/// pseudonormals come out as garbage directions rather than exact zeros —
+/// nist_ctc_02's loud refusal was the lucky case. The accepted field then
+/// reported bore-void points near the rim as **inside the solid**
+/// (measured: 4/96 probes at 20°, 14/96 at 45°). This holds the fix to
+/// the end-to-end standard: every bore-void sample strictly outside.
 #[test]
-#[ignore = "of-8oit: flat flaps at tilt >= 20° flip SDF signs in the bore void"]
 fn steep_tilt_sdf_keeps_its_signs() {
     use opensolid_kernel::frep::primitives::Sdf;
     let mut wrong = Vec::new();
