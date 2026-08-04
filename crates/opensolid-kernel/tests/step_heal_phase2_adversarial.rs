@@ -1043,13 +1043,11 @@ fn corrupted_pcurves_are_refit_across_seam_uses() {
 /// campaigns holds at once: exact import, geometric check, honest tolerance,
 /// positive volume within the merge budget, and a tessellatable result.
 ///
-/// Ignored on of-8jqc: whenever the random flip set reaches a majority of
-/// the six faces (case 4 of this seed does), the heal comes back inside-out
-/// — see [`unsew_plus_majority_sense_flips_must_not_heal_to_an_inside_out_body`]
-/// for the minimal deterministic pin and the mechanism. Re-enable with the
-/// bead.
+/// Whenever the random flip set reaches a majority of the six faces (case 4
+/// of this seed does), the heal used to come back inside-out (of-8jqc) — see
+/// [`unsew_plus_majority_sense_flips_must_not_heal_to_an_inside_out_body`]
+/// for the minimal deterministic pin and the mechanism.
 #[test]
-#[ignore = "of-8jqc: majority sense flips on an unsewn file heal to a certified inside-out body"]
 fn combined_phase1_and_phase2_damage_heals_in_one_import() {
     let mut rng = Rng::new(0x_C0B1_9ED6);
     for case in 0..10 {
@@ -1209,24 +1207,26 @@ fn combined_api_damage_heals_in_one_pass() {
 
 /// The minimal pin for of-8jqc: an **unsewn** file with a **majority** of
 /// its `ADVANCED_FACE` sense flags flipped must not heal to an inside-out
-/// body — yet today it does, certified clean.
+/// body — which it used to do, certified clean.
 ///
-/// Neither defect alone misbehaves: flips on a sewn file never reach the
+/// Neither defect alone misbehaved: flips on a sewn file never reach the
 /// healer (the topology check passes) and `reconcile_face_senses` repairs
 /// the flags against the authoritative loop winding; an unsewn file with
 /// honest flags sews and measures correctly. Together, the unsewn topology
-/// brings `heal()` in, and its shell-reversal pass measures the enclosed
-/// volume *through the lying flags* (`tessellate_face` reads them), sees a
-/// negative flag-weighted sum, and reverses the whole shell — inverting the
+/// brought `heal()` in, and its shell-reversal pass measured the enclosed
+/// volume *through the lying flags* (`tessellate_face` reads them), saw a
+/// negative flag-weighted sum, and reversed the whole shell — inverting the
 /// loop windings that were never wrong. `reconcile_face_senses` then
-/// corrects every flag to match the inside-out windings, and the result
-/// passes `check()` and `check_with_geometry()` while enclosing negative
-/// volume. `brep_mass_properties` is the first thing that refuses.
+/// corrected every flag to match the inside-out windings, and the result
+/// passed `check()` and `check_with_geometry()` while enclosing negative
+/// volume; `brep_mass_properties` was the first thing that refused. The fix
+/// re-measures the volume sign in `finish_exact_body`, after the flags are
+/// reconciled against the windings (`fix_shell_volume_signs`), where the
+/// wrong mid-heal reversal is caught and undone.
 ///
 /// Deterministic: fixed block, fixed jitter, the first four (of six) face
 /// flags flipped.
 #[test]
-#[ignore = "of-8jqc: shell reversal trusts sense flags that reconcile_face_senses overrules"]
 fn unsew_plus_majority_sense_flips_must_not_heal_to_an_inside_out_body() {
     let mut rng = Rng::new(0x_1D51_DE00);
     let mut store = TopologyStore::new();

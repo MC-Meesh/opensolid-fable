@@ -195,7 +195,9 @@ use opensolid_core::mesh::TriangleMesh;
 use opensolid_core::types::Point2;
 use opensolid_core::{EntityId, Point3, Vector3};
 
-use super::heal::{GeometryHealer, HealOptions, HealStrategy, reconcile_face_senses};
+use super::heal::{
+    GeometryHealer, HealOptions, HealStrategy, fix_shell_volume_signs, reconcile_face_senses,
+};
 use super::product::{PlacedSolid, resolve_instances};
 use super::{EntityRecord, Instance, SimpleRecord, StepError, StepFile, Value};
 use crate::convert::MeshSdf;
@@ -5156,8 +5158,11 @@ fn map_file(
 
 /// Last step of an exact import: derive the 2D trim geometry the file's
 /// `PCURVE`s could not supply directly (see [`validate_associated_geometry`]),
-/// settle which bound of each face is the outer one, then make each face's
-/// surface sense agree with that bound's winding.
+/// settle which bound of each face is the outer one, make each face's
+/// surface sense agree with that bound's winding, and finally reverse any
+/// shell whose winding-corroborated enclosed volume has the wrong sign
+/// ([`fix_shell_volume_signs`] — only here is that measurement trustworthy,
+/// of-8jqc).
 ///
 /// This runs on the finished body, after validation and any healing, rather
 /// than face by face during mapping. Healing welds duplicate edges and
@@ -5227,7 +5232,29 @@ fn finish_exact_body(
             message: format!("healed: {op}"),
         });
     }
-    corrections.len()
+
+    // Volume sign last: with the flags just reconciled (and pcurves attached,
+    // so the windings corroborate them), the enclosed-volume measurement is
+    // finally winding-authoritative — this is where an inside-out shell is
+    // caught, whether the file authored it that way or the healer's own
+    // early reversal pass was misled into it by lying flags (of-8jqc).
+    let mut notes = Vec::new();
+    let reversals = fix_shell_volume_signs(body, store, geo, options.heal.strategy, &mut notes);
+    for op in &reversals {
+        diagnostics.push(Diagnostic {
+            entity: Some(msb_id),
+            severity: Severity::Info,
+            message: format!("healed: {op}"),
+        });
+    }
+    for note in notes {
+        diagnostics.push(Diagnostic {
+            entity: Some(msb_id),
+            severity: Severity::Info,
+            message: format!("heal: {note}"),
+        });
+    }
+    corrections.len() + reversals.len()
 }
 
 /// What one solid's mapping collected for [`finish_exact_body`]: questions

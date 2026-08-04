@@ -83,7 +83,7 @@ fn displace_sphere_anchor(text: &str, delta: [f64; 3]) -> String {
 /// What the import did with a strayed writer sphere.
 enum Strayed {
     /// Kept on the exact path; the imported body and its stores.
-    Exact(TopologyStore, GeometryStore, EntityId<Body>),
+    Exact(Box<TopologyStore>, GeometryStore, EntityId<Body>),
     /// The reader degraded away from the exact path (its right, not a bug).
     Degraded(String),
 }
@@ -105,7 +105,7 @@ fn import_strayed_sphere(radius: f64, amplitude: f64, dir: [f64; 3]) -> Strayed 
         .expect("valid Part 21");
     assert_eq!(report.solids.len(), 1, "r = {radius}: one solid");
     match &report.solids[0].outcome {
-        SolidOutcome::BRep(imported) => Strayed::Exact(store, geo, *imported),
+        SolidOutcome::BRep(imported) => Strayed::Exact(Box::new(store), geo, *imported),
         other => Strayed::Degraded(format!("{other:?}")),
     }
 }

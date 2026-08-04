@@ -2197,6 +2197,17 @@ fn plan_face_flips(
 /// keeps [`HealStrategy::ReportOnly`] honest — it reports the same reversal
 /// an `Auto` run would apply, without touching the body.
 ///
+/// The flag the tessellator winds each face by is the *less* authoritative of
+/// a face's two orientation records: [`reconcile_face_senses`] later corrects
+/// it against the outer loop's winding, never the other way round. So
+/// wherever that winding is readable, the contribution is signed by the
+/// winding-derived sense instead — the sum then measures the body as it will
+/// stand once the flags are reconciled, and a file whose flags lie cannot
+/// talk this pass into reversing loop windings that were never wrong
+/// (of-8jqc). A face whose winding is unreadable (no pcurves — the import
+/// path attaches them only after healing) falls back to its flag, which is
+/// all there is to read.
+///
 /// Only structurally closed shells are measured: an open shell encloses no
 /// volume, so the sum's sign would be an artefact of where the hole is.
 fn plan_shell_reversals(
@@ -2234,11 +2245,17 @@ fn plan_shell_reversals(
                     a.dot(&b.cross(&c)) / 6.0
                 })
                 .sum();
-            let signed = if flips.contains(&face) {
+            let mut signed = if flips.contains(&face) {
                 -contribution
             } else {
                 contribution
             };
+            // Winding-vs-flag disagreement is invariant under a flip (both
+            // records negate together), so this composes with the virtual
+            // flip above to give exactly the post-flip, post-reconcile sign.
+            if winding_contradicts_sense_flag(store, geo, face) {
+                signed = -signed;
+            }
             total += signed;
             magnitude += signed.abs();
         }
@@ -2353,6 +2370,72 @@ pub fn reconcile_face_senses(
     corrections
         .into_iter()
         .map(|(face, sense)| HealOperation::FaceSenseCorrected { face, sense })
+        .collect()
+}
+
+/// Whether `face`'s readable outer-loop winding contradicts its sense flag —
+/// the disagreement [`reconcile_face_senses`] repairs, read without repairing
+/// it. `false` wherever the winding is unreadable: nothing is concluded from
+/// a winding that was not measured.
+fn winding_contradicts_sense_flag(
+    store: &TopologyStore,
+    geo: &GeometryStore,
+    face_id: EntityId<Face>,
+) -> bool {
+    let Some(face) = store.face(face_id) else {
+        return false;
+    };
+    let (Some(surface), Some(outer)) = (face.surface.and_then(|id| geo.surface(id)), face.outer_loop)
+    else {
+        return false;
+    };
+    let Some(twice_signed_area) = store.loop_winding(geo, surface, outer) else {
+        return false;
+    };
+    (twice_signed_area > 0.0) != (face.sense == FaceSense::Positive)
+}
+
+/// Reverse any shell left enclosing a signed volume of the wrong sign for its
+/// [`ShellOrientation`], and report what was reversed.
+///
+/// This is [`plan_shell_reversals`] run where its measurement is finally
+/// trustworthy: after the reader has attached pcurves and
+/// [`reconcile_face_senses`] has settled every readable flag against its
+/// loop's winding. The same pass inside [`GeometryHealer::heal`] runs before
+/// either — on the import path no fin has a pcurve yet, so it can only read
+/// the authored flags, and a file whose flags lie in the majority talks it
+/// into reversing correctly-wound shells (of-8jqc). Measured here instead,
+/// the winding-authoritative sum catches both that mid-heal wrong turn and
+/// the file that really is inside out — including the sewn, self-consistent
+/// one that never brings the healer in at all, which no combinatorial check
+/// can see.
+///
+/// Obeys the same [`HealStrategy`] conventions as [`reconcile_face_senses`]:
+/// planned (and reported) under [`HealStrategy::ReportOnly`], applied only
+/// when the strategy mutates. Applying reverses each shell through
+/// [`flip_face`], which flips flag and winding together, so the reversed
+/// shell needs no second reconciliation.
+pub fn fix_shell_volume_signs(
+    body: EntityId<Body>,
+    store: &mut TopologyStore,
+    geo: &GeometryStore,
+    strategy: HealStrategy,
+    notes: &mut Vec<String>,
+) -> Vec<HealOperation> {
+    if !strategy.orients() {
+        return Vec::new();
+    }
+    let reversals = plan_shell_reversals(store, geo, body, &[], notes);
+    if strategy.applies() {
+        for &(shell, _) in &reversals {
+            for face in store.faces_of_shell(shell).to_vec() {
+                flip_face(store, face);
+            }
+        }
+    }
+    reversals
+        .into_iter()
+        .map(|(shell, faces)| HealOperation::ShellReversed { shell, faces })
         .collect()
 }
 
