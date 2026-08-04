@@ -2591,6 +2591,12 @@ fn trim_tol(a: Point3, b: Point3, closure: f64) -> f64 {
 /// not a possible arc but a guaranteed-unclosable loop; the *callers* make
 /// that exception (of-00pu), this bound stays closure-free.
 ///
+/// The bound is also not the whole answer inside itself: an edge whose two
+/// vertices the rest of some loop already joins ([`loop_anchored_edges`])
+/// is no seam at any gap — the loop's chain says the pair is two real
+/// points — so `trim_curve` reads it literally however far under this
+/// bound its chord sits (of-a5me).
+///
 /// What decides seam identity end-to-end is whether the kernel itself will
 /// call the two vertices one point, which is heal's vertex merge at
 /// [`HEAL_GAP_REL`](super::heal::HEAL_GAP_REL) × the body's vertex
@@ -2702,6 +2708,87 @@ fn sole_loop_edges(file: &StepFile) -> HashSet<u64> {
         }
     }
     edges
+}
+
+/// The `EDGE_CURVE` ids whose two distinct endpoint `VERTEX_POINT`s are
+/// joined by the *other* edges of some `EDGE_LOOP` the edge appears in.
+///
+/// This is the loop context that settles the two-vertex full-circle
+/// question [`trim_curve`] cannot judge locally (of-a5me). A loop chains
+/// head to tail; the one place a well-formed loop's chain may fail to
+/// close *as entities* is a seam, where two distinct `VERTEX_POINT`s spell
+/// one point. So a genuine OCC two-vertex seam never has the rest of its
+/// loop connecting its two vertices — the pair reads as one point or the
+/// loop does not close — while a genuinely short arc always does: its
+/// endpoints each anchor the walls that carry the rest of the boundary.
+/// For these edges the seam reading is structurally refuted whatever the
+/// vertex gap measures, and refuting it matters because under a covering
+/// declared closure the full-circle rewrite otherwise imports
+/// checker-clean at wildly wrong volume. A seam walked twice by one loop
+/// contributes nothing against itself: only *other* edges refute.
+/// Resolution failures are skipped, not errors: whatever is wrong will be
+/// reported by the real mapping.
+fn loop_anchored_edges(file: &StepFile) -> HashSet<u64> {
+    let mut anchored = HashSet::new();
+    for inst in &file.data {
+        let Some(rec) = inst.entity.part("EDGE_LOOP") else {
+            continue;
+        };
+        let Ok(oriented) = ref_list(rec, 1, inst.id) else {
+            continue;
+        };
+        // The loop's member edges, deduplicated (a seam appears twice), with
+        // their endpoint vertex refs.
+        let mut members: Vec<(u64, u64, u64)> = Vec::new();
+        for &oe_ref in &oriented {
+            let Some(oe) = file
+                .get(oe_ref)
+                .and_then(|i| i.entity.part("ORIENTED_EDGE"))
+            else {
+                continue;
+            };
+            let Ok(edge_ref) = ref_attr(oe, 3, oe_ref) else {
+                continue;
+            };
+            if members.iter().any(|&(e, _, _)| e == edge_ref) {
+                continue;
+            }
+            let Some(edge) = file
+                .get(edge_ref)
+                .and_then(|i| i.entity.part("EDGE_CURVE"))
+            else {
+                continue;
+            };
+            let (Ok(start_ref), Ok(end_ref)) =
+                (ref_attr(edge, 1, edge_ref), ref_attr(edge, 2, edge_ref))
+            else {
+                continue;
+            };
+            members.push((edge_ref, start_ref, end_ref));
+        }
+        for (k, &(edge_ref, start_ref, end_ref)) in members.iter().enumerate() {
+            if start_ref == end_ref || anchored.contains(&edge_ref) {
+                continue;
+            }
+            // Flood the other members' vertex graph from one endpoint.
+            let mut reached = HashSet::from([start_ref]);
+            let mut grew = true;
+            while grew && !reached.contains(&end_ref) {
+                grew = false;
+                for (j, &(_, s, e)) in members.iter().enumerate() {
+                    if j != k && reached.contains(&s) != reached.contains(&e) {
+                        reached.insert(s);
+                        reached.insert(e);
+                        grew = true;
+                    }
+                }
+            }
+            if reached.contains(&end_ref) {
+                anchored.insert(edge_ref);
+            }
+        }
+    }
+    anchored
 }
 
 // ---------------------------------------------------------------------
@@ -2962,7 +3049,10 @@ fn minimax_point(points: &[Point3]) -> Point3 {
 /// Trim an analytic curve to an edge's vertices: orient it along the edge
 /// (STEP `same_sense` false means the edge opposes the curve direction)
 /// and recover the parameter range, always with `t_start < t_end`.
-/// `seam_tol` is the solid's seam-identity bound ([`solid_seam_tol`]).
+/// `seam_tol` is the solid's seam-identity bound ([`solid_seam_tol`]);
+/// `anchored` says the rest of some loop joins the edge's two vertices
+/// ([`loop_anchored_edges`]), which refutes the two-vertex seam reading
+/// outright (of-a5me).
 #[allow(clippy::too_many_arguments)]
 fn trim_curve(
     curve: &Curve3,
@@ -2970,6 +3060,7 @@ fn trim_curve(
     start: Point3,
     end: Point3,
     closed: bool,
+    anchored: bool,
     closure: f64,
     seam_tol: f64,
     entity: u64,
@@ -3047,7 +3138,16 @@ fn trim_curve(
             // read literally; whether its endpoints then hold together is the
             // loop's problem, judged by the heal merge this bound mirrors —
             // itself floored by the closure (`HealOptions::gap_floor`).
-            if closed || (end - start).norm() <= seam_tol {
+            //
+            // Even inside the bound the question is not always ambiguous:
+            // when the rest of some loop already joins the two vertices
+            // (`anchored`, [`loop_anchored_edges`]) they are two real points
+            // of that loop's chain — a seam pair chains through nothing —
+            // and the arc reads literally at any chord (of-a5me). Without
+            // the gate a sub-bound arc under a covering declared closure
+            // was rewritten into a full circle that imported checker-clean
+            // at ~750,000x the authored volume.
+            if closed || (!anchored && (end - start).norm() <= seam_tol) {
                 (t0, t0 + TAU)
             } else {
                 let sweep = (conic_angle(conic, &end).expect("conic") - t0).rem_euclid(TAU);
@@ -3189,6 +3289,10 @@ struct SolidBuilder<'a> {
     /// Edges standing alone in some `EDGE_LOOP` ([`sole_loop_edges`]): the
     /// declared closure widens the seam test for these, and only these.
     seam_edges: &'a HashSet<u64>,
+    /// Edges whose two vertices the rest of some loop joins
+    /// ([`loop_anchored_edges`]): the two-vertex seam reading is refuted
+    /// for these outright (of-a5me).
+    anchored_edges: &'a HashSet<u64>,
     /// `VERTEX_POINT` #id → reconciled position ([`reconcile_vertices`]),
     /// read in place of the authored point. Empty on the first attempt.
     adjusted: &'a HashMap<u64, Point3>,
@@ -3623,7 +3727,11 @@ impl SolidBuilder<'_> {
         // An edge that is the whole of some loop can only close that loop by
         // returning to its own start, so for it — and only it — the declared
         // closure vouches for the two-vertex seam spelling (of-00pu). Every
-        // other edge keeps the heal-scale bound (of-5rnp).
+        // other edge keeps the heal-scale bound (of-5rnp). An edge whose two
+        // vertices the rest of some loop joins is refused the seam reading
+        // altogether (of-a5me); on a self-contradictory file that claims
+        // both, refusal wins — an honest degrade over a possible silent
+        // rewrite.
         let seam_tol = if self.seam_edges.contains(&edge_ref) {
             self.seam_tol.max(self.closure)
         } else {
@@ -3635,6 +3743,7 @@ impl SolidBuilder<'_> {
             start,
             end,
             closed,
+            self.anchored_edges.contains(&edge_ref),
             self.closure,
             seam_tol,
             edge_ref,
@@ -4143,6 +4252,10 @@ struct FallbackMesher<'a> {
     /// Edges standing alone in some `EDGE_LOOP` ([`sole_loop_edges`]),
     /// shared with the exact path so both trim the seam spelling alike.
     seam_edges: &'a HashSet<u64>,
+    /// Edges whose two vertices the rest of some loop joins
+    /// ([`loop_anchored_edges`]), shared with the exact path for the same
+    /// reason (of-a5me).
+    anchored_edges: &'a HashSet<u64>,
     diagnostics: &'a mut Vec<Diagnostic>,
     /// `EDGE_CURVE` #id → its polyline from start vertex to end vertex.
     /// Shared between adjacent faces so junctions weld watertight.
@@ -4953,7 +5066,8 @@ impl FallbackMesher<'_> {
     ) -> MapResult<Vec<Point3>> {
         match raw {
             RawCurve::Analytic(curve) => {
-                // Same sole-loop widening as the exact path's `map_edge`.
+                // Same sole-loop widening and anchored refusal as the exact
+                // path's `map_edge`.
                 let seam_tol = if self.seam_edges.contains(&edge_ref) {
                     self.seam_tol.max(self.closure)
                 } else {
@@ -4965,6 +5079,7 @@ impl FallbackMesher<'_> {
                     start,
                     end,
                     closed,
+                    self.anchored_edges.contains(&edge_ref),
                     self.closure,
                     seam_tol,
                     edge_ref,
@@ -5948,6 +6063,7 @@ fn map_solid(
         .collect();
     let seam_tol = solid_seam_tol(file, &shell_roots, scale);
     let seam_edges = sole_loop_edges(file);
+    let anchored_edges = loop_anchored_edges(file);
 
     // Exact path first. A refusal gets one retry after vertex
     // reconciliation ([`reconcile_vertices`]): the sweep runs only off a
@@ -5967,6 +6083,7 @@ fn map_solid(
             closure,
             seam_tol,
             seam_edges: &seam_edges,
+            anchored_edges: &anchored_edges,
             adjusted: &adjusted,
             closure_trims: 0,
             created: Created::default(),
@@ -6196,6 +6313,7 @@ fn map_solid(
         closure,
         seam_tol,
         seam_edges: &seam_edges,
+        anchored_edges: &anchored_edges,
         adjusted: &adjusted,
         diagnostics,
         polylines: HashMap::new(),
@@ -8161,6 +8279,7 @@ mod tests {
             Point3::new(1.0, 0.0, 0.0),
             Point3::new(0.0, 1.0, 0.0),
             false,
+            false,
             0.0,
             2.0e-5,
             1,
@@ -8180,6 +8299,7 @@ mod tests {
             false,
             Point3::new(1.0, 0.0, 0.0),
             Point3::new(0.0, 1.0, 0.0),
+            false,
             false,
             0.0,
             2.0e-5,
@@ -8203,6 +8323,7 @@ mod tests {
             Point3::origin(),
             Point3::new(1.0, 0.0, 0.0),
             false,
+            false,
             0.0,
             2.0e-5,
             1,
@@ -8216,7 +8337,7 @@ mod tests {
     fn closed_edge_spans_the_full_circle() {
         let circle = Curve3::circle(Point3::origin(), Vector3::z(), 2.0).unwrap();
         let vertex = Point3::new(0.0, 2.0, 0.0);
-        let trimmed = trim_curve(&circle, true, vertex, vertex, true, 0.0, 4.0e-5, 1).unwrap();
+        let trimmed = trim_curve(&circle, true, vertex, vertex, true, false, 0.0, 4.0e-5, 1).unwrap();
         assert!((trimmed.t_end - trimmed.t_start - TAU).abs() < 1e-12);
         assert!((trimmed.curve.point(trimmed.t_start) - vertex).norm() < 1e-12);
     }
@@ -8231,7 +8352,7 @@ mod tests {
         // only in the last bits of the y component.
         let start = Point3::new(20.0, -7.347880794884e-16, 10.0);
         let end = Point3::new(20.0, 0.0, 10.0);
-        let trimmed = trim_curve(&circle, true, start, end, false, 0.0, 1.2e-4, 1).unwrap();
+        let trimmed = trim_curve(&circle, true, start, end, false, false, 0.0, 1.2e-4, 1).unwrap();
         assert!((trimmed.t_end - trimmed.t_start - TAU).abs() < 1e-12);
         // Halfway round is the far side of the circle, not the seam.
         let mid = trimmed.curve.point((trimmed.t_start + trimmed.t_end) / 2.0);
@@ -8253,7 +8374,7 @@ mod tests {
         let end = Point3::new(r * sweep.cos(), r * sweep.sin(), 0.0);
         // The seam bound heal-scale derivation gives the of-5rnp sector
         // (vertex bbox diagonal ~3.4 mm).
-        let trimmed = trim_curve(&circle, true, start, end, false, 9.0e-3, 3.4e-5, 1).unwrap();
+        let trimmed = trim_curve(&circle, true, start, end, false, false, 9.0e-3, 3.4e-5, 1).unwrap();
         assert!(
             (trimmed.t_end - trimmed.t_start - sweep).abs() < 1e-9,
             "expected the literal {sweep:.3e} sweep, got {:.3e}",
@@ -8275,7 +8396,7 @@ mod tests {
         let end = Point3::new(r * phi.cos(), r * phi.sin(), 0.0);
         assert!((end - start).norm() > trim_tol(start, end, 0.0));
         // The bound a ~8 mm body derives; the 5e-5 gap sits inside it.
-        let trimmed = trim_curve(&circle, true, start, end, false, 1.0e-3, 8.0e-5, 1).unwrap();
+        let trimmed = trim_curve(&circle, true, start, end, false, false, 1.0e-3, 8.0e-5, 1).unwrap();
         assert!(
             (trimmed.t_end - trimmed.t_start - TAU).abs() < 1e-12,
             "expected a full period, got {:.3e}",
@@ -8293,13 +8414,70 @@ mod tests {
         assert_eq!(sole_loop_edges(&file), HashSet::from([17, 18]));
     }
 
+    /// The same sub-bound gap with loop context refuting the seam: when the
+    /// rest of some loop joins the edge's two vertices (`anchored`,
+    /// [`loop_anchored_edges`]) they are two real points of that loop's
+    /// chain, and the arc reads literally however short its chord (of-a5me).
+    #[test]
+    fn an_anchored_gap_within_the_bound_reads_literally() {
+        let r = 5.0;
+        let circle = Curve3::circle(Point3::origin(), Vector3::z(), r).unwrap();
+        let gap = 5.0e-5f64;
+        let phi = gap / r;
+        let start = Point3::new(r, 0.0, 0.0);
+        let end = Point3::new(r * phi.cos(), r * phi.sin(), 0.0);
+        // Identical call to `a_seam_gap_within_the_heal_scale_bound_still_
+        // collapses` above, except the edge is anchored.
+        let trimmed =
+            trim_curve(&circle, true, start, end, false, true, 1.0e-3, 8.0e-5, 1).unwrap();
+        assert!(
+            (trimmed.t_end - trimmed.t_start - phi).abs() < 1e-9,
+            "expected the literal {phi:.3e} sweep, got {:.3e}",
+            trimmed.t_end - trimmed.t_start
+        );
+    }
+
+    /// [`loop_anchored_edges`] marks exactly the edges whose two vertices
+    /// the rest of some loop joins — every edge of a triangle loop — and
+    /// never a two-vertex seam, whose duplicate vertex nothing else in the
+    /// loop reaches (of-a5me). The cylinder fixture's wall loop anchors
+    /// nothing either: its cap circles close on a single vertex and
+    /// contribute no connection.
+    #[test]
+    fn loop_anchored_edges_marks_edges_whose_loop_joins_their_vertices() {
+        let file = super::super::parse(&cylinder_step(5.0, 8.0)).expect("fixture parses");
+        assert!(loop_anchored_edges(&file).is_empty());
+
+        // A triangle loop (#40) and, sharing the file, an OCC-style
+        // two-vertex seam loop (#41): circle #24 runs #7 → #8 where #8 is
+        // the seam's duplicate vertex, reached by no other edge.
+        let file = parse_fixture(
+            "#21 = EDGE_CURVE('', #4, #5, #99, .T.);
+             #22 = EDGE_CURVE('', #5, #6, #99, .T.);
+             #23 = EDGE_CURVE('', #6, #4, #99, .T.);
+             #31 = ORIENTED_EDGE('', *, *, #21, .T.);
+             #32 = ORIENTED_EDGE('', *, *, #22, .T.);
+             #33 = ORIENTED_EDGE('', *, *, #23, .T.);
+             #40 = EDGE_LOOP('', (#31, #32, #33));
+             #24 = EDGE_CURVE('', #7, #8, #99, .T.);
+             #25 = EDGE_CURVE('', #7, #9, #99, .T.);
+             #26 = EDGE_CURVE('', #9, #9, #99, .T.);
+             #34 = ORIENTED_EDGE('', *, *, #24, .T.);
+             #35 = ORIENTED_EDGE('', *, *, #25, .T.);
+             #36 = ORIENTED_EDGE('', *, *, #26, .F.);
+             #37 = ORIENTED_EDGE('', *, *, #25, .F.);
+             #41 = EDGE_LOOP('', (#34, #35, #36, #37));",
+        );
+        assert_eq!(loop_anchored_edges(&file), HashSet::from([21, 22, 23]));
+    }
+
     /// The same coincidence on a line is not a closed edge — a line has no
     /// period to come back through — so it stays an error.
     #[test]
     fn coincident_vertices_on_a_line_are_still_refused() {
         let line = Curve3::line(Point3::origin(), Vector3::x()).unwrap();
         let vertex = Point3::new(3.0, 0.0, 0.0);
-        let err = trim_curve(&line, true, vertex, vertex, false, 0.0, 2.0e-5, 7).unwrap_err();
+        let err = trim_curve(&line, true, vertex, vertex, false, false, 0.0, 2.0e-5, 7).unwrap_err();
         assert!(
             matches!(err, MapError::Invalid { entity: 7, .. }),
             "{err:?}"
@@ -8314,6 +8492,7 @@ mod tests {
             true,
             Point3::new(5.0, 0.0, 0.0),
             Point3::new(0.0, 1.0, 0.0),
+            false,
             false,
             0.0,
             2.0e-5,
@@ -8341,6 +8520,7 @@ mod tests {
             Point3::new(1.0 + 2e-7, 0.0, 0.0),
             Point3::new(0.0, 1.0, 3e-7),
             false,
+            false,
             0.0,
             2.0e-5,
             1,
@@ -8363,6 +8543,7 @@ mod tests {
             true,
             Point3::new(1.0, 0.0, 0.0),
             Point3::new(0.0, 1.0, 0.0),
+            false,
             false,
             0.0,
             2.0e-5,
@@ -8387,6 +8568,7 @@ mod tests {
             Point3::new(5.0e4 + 0.02, 0.0, 0.0),
             Point3::new(0.0, 5.0e4, 0.0),
             false,
+            false,
             0.0,
             MAX_ALLOWED_TOLERANCE,
             7,
@@ -8402,6 +8584,7 @@ mod tests {
             true,
             Point3::new(5.0e4 + 0.002, 0.0, 0.0),
             Point3::new(0.0, 5.0e4, 0.0),
+            false,
             false,
             0.0,
             MAX_ALLOWED_TOLERANCE,
@@ -9076,12 +9259,12 @@ mod tests {
         let curve = bspline_arc();
         let (t0, t1) = curve.domain();
         let (start, end) = (curve.point(t0), curve.point(t1));
-        let trimmed = trim_curve(&curve, true, start, end, false, 0.0, 2.0e-5, 1).unwrap();
+        let trimmed = trim_curve(&curve, true, start, end, false, false, 0.0, 2.0e-5, 1).unwrap();
         assert!((trimmed.t_start - t0).abs() < 1e-9);
         assert!((trimmed.t_end - t1).abs() < 1e-9);
         // An interior vertex trims to an interior parameter, not the end.
         let mid = curve.point(1.25);
-        let partial = trim_curve(&curve, true, start, mid, false, 0.0, 2.0e-5, 1).unwrap();
+        let partial = trim_curve(&curve, true, start, mid, false, false, 0.0, 2.0e-5, 1).unwrap();
         assert!((partial.t_end - 1.25).abs() < 1e-6, "got {}", partial.t_end);
     }
 
@@ -9091,7 +9274,7 @@ mod tests {
         let (t0, t1) = curve.domain();
         // The edge runs against the curve: end vertex first.
         let (start, end) = (curve.point(t1), curve.point(t0));
-        let trimmed = trim_curve(&curve, false, start, end, false, 0.0, 2.0e-5, 1).unwrap();
+        let trimmed = trim_curve(&curve, false, start, end, false, false, 0.0, 2.0e-5, 1).unwrap();
         assert!(trimmed.t_start < trimmed.t_end, "normalized trim direction");
         assert!(matches!(trimmed.curve, Curve3::Nurbs(_)), "stays exact");
         // The reversed curve interpolates the edge's vertices in order.
@@ -9118,7 +9301,7 @@ mod tests {
             .unwrap(),
         );
         let vertex = curve.point(0.0);
-        let trimmed = trim_curve(&curve, true, vertex, vertex, true, 0.0, 2.0e-5, 1).unwrap();
+        let trimmed = trim_curve(&curve, true, vertex, vertex, true, false, 0.0, 2.0e-5, 1).unwrap();
         assert_eq!((trimmed.t_start, trimmed.t_end), (0.0, 3.0));
     }
 
@@ -9131,6 +9314,7 @@ mod tests {
             true,
             start,
             Point3::new(0.0, 9.0, 9.0),
+            false,
             false,
             0.0,
             2.0e-5,
@@ -9170,6 +9354,7 @@ mod tests {
             Point3::origin(),
             Point3::origin(),
             true,
+            false,
             0.0,
             2.0e-5,
             7,
@@ -10334,6 +10519,7 @@ REPRESENTATION_CONTEXT('2D SPACE','') );
                 let closure = resolve_closure(&file, inst.id, &mut diagnostics);
                 let seam_tol = solid_seam_tol(&file, &[shell_ref], scale);
                 let seam_edges = sole_loop_edges(&file);
+                let anchored_edges = loop_anchored_edges(&file);
                 let adjusted = HashMap::new();
                 let mut mesher = FallbackMesher {
                     file: &file,
@@ -10343,6 +10529,7 @@ REPRESENTATION_CONTEXT('2D SPACE','') );
                     closure,
                     seam_tol,
                     seam_edges: &seam_edges,
+                    anchored_edges: &anchored_edges,
                     adjusted: &adjusted,
                     diagnostics: &mut diagnostics,
                     polylines: HashMap::new(),
@@ -10485,6 +10672,7 @@ REPRESENTATION_CONTEXT('2D SPACE','') );
                 let closure = resolve_closure(&file, inst.id, &mut diagnostics);
                 let seam_tol = solid_seam_tol(&file, &[shell_ref], scale);
                 let seam_edges = sole_loop_edges(&file);
+                let anchored_edges = loop_anchored_edges(&file);
                 let adjusted = HashMap::new();
                 let mut mesher = FallbackMesher {
                     file: &file,
@@ -10494,6 +10682,7 @@ REPRESENTATION_CONTEXT('2D SPACE','') );
                     closure,
                     seam_tol,
                     seam_edges: &seam_edges,
+                    anchored_edges: &anchored_edges,
                     adjusted: &adjusted,
                     diagnostics: &mut diagnostics,
                     polylines: HashMap::new(),

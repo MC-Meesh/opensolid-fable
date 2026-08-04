@@ -12,8 +12,10 @@
 //!
 //! - **Arcs just above the bound must read literally** — exact, checker
 //!   clean, correct volume, across randomized radii, heights and chords.
-//! - **The collapse cliff must sit at the bound**, flip once, and never
-//!   pass through a silently-wrong volume on the way.
+//! - **Loop context outranks the bound** (of-a5me): an arc whose endpoints
+//!   the rest of its loop joins is no seam at any chord, and reads
+//!   literally on both sides of the bound. The bound decides only where no
+//!   loop context refutes the seam — the true two-vertex spelling.
 //! - **A declared closure must not move the cliff in either direction** —
 //!   neither a loose closure widening it (of-5rnp's bug) nor a tight
 //!   closure narrowing it.
@@ -41,12 +43,14 @@
 //!   neither, and now is both. Repros (kept as regression tests):
 //!   [`translating_the_of_5rnp_sector_must_not_resurrect_the_collapse`],
 //!   [`translating_a_clean_short_arc_sector_must_not_cost_its_exact_import`].
-//! - **of-a5me** (P3): inside the bound the ambiguity window is not merely
-//!   a degraded import — with a covering closure a genuine sub-bound arc
-//!   (chord 4.2e-5 under a 6e-5 bound, closure 1e-3) imports checker-clean
-//!   at 235.62 mm³ vs authored 3.15e-4 mm³ (~750,000×). Loop context (the
-//!   arc's endpoints each anchor a radial wall) disambiguates what the
-//!   local trim decision cannot. Repro:
+//! - **of-a5me** (P3, fixed): inside the bound the ambiguity window was not
+//!   merely a degraded import — with a covering closure a genuine sub-bound
+//!   arc (chord 4.2e-5 under a 6e-5 bound, closure 1e-3) imported
+//!   checker-clean at 235.62 mm³ vs authored 3.15e-4 mm³ (~750,000×). Loop
+//!   context (the arc's endpoints each anchor a radial wall, so the rest of
+//!   the loop joins them — `loop_anchored_edges`) now refutes the seam
+//!   reading and the arc reads literally at any chord. Repro (kept as the
+//!   regression test):
 //!   [`a_sub_bound_arc_under_a_covering_closure_must_not_be_silently_rewritten`].
 
 use opensolid_brep::{GeometryStore, TopologyStore};
@@ -459,52 +463,32 @@ fn a_chord_just_above_the_bound_reads_literally() {
 // (2) The collapse cliff sits at the bound and is never silently wrong
 // =====================================================================
 
-/// Scan chords across the bound (no declaration). Both arcs see the one
-/// vertex-bbox-diagonal bound — placement and z height no longer split them
-/// into a mixed zone — so below it both collapse and above it both read
-/// literally. The literal side must import exactly at the authored volume;
-/// below the bound the import must be honest — `verify_trim` refuses the
-/// collapsed circle's chord-sized end miss, so no exact body may appear.
-/// Acceptance must flip exactly once, at the bound.
+/// Scan chords across the bound (no declaration). Since of-a5me the seam
+/// bound no longer decides these arcs at all: each arc's endpoints anchor
+/// a radial wall, so the rest of every loop it bounds joins them — loop
+/// context that structurally refutes the two-vertex seam reading — and the
+/// arc reads literally on *both* sides of the bound, exact and checker
+/// clean at the authored volume. (Until of-a5me the sub-bound side
+/// collapsed and was refused by `verify_trim`; the bound still decides
+/// seam identity where no loop context refutes it, which
+/// [`a_tight_closure_must_not_narrow_the_seam_bound`]'s two-vertex seam
+/// keeps proving.)
 #[test]
-fn the_collapse_cliff_sits_at_the_seam_bound() {
+fn an_anchored_arc_reads_literally_on_both_sides_of_the_bound() {
     let (r, h) = (5.0, 3.0);
     let bound = seam_bound(r, h);
-    let mut seen_exact = false;
-    for (zone, chord) in [
-        ("collapse", 0.5 * bound),
-        ("collapse", 0.999 * bound),
-        ("literal", 1.001 * bound),
-        ("literal", 1.05 * bound),
-        ("literal", 2.0 * bound),
-    ] {
+    for factor in [0.5, 0.999, 1.001, 1.05, 2.0] {
+        let chord = factor * bound;
         let sweep = sweep_for_chord(r, chord);
         let repro = format!(
-            "sector(r = {r}, h = {h}), chord {chord:.6e} ({zone}; bound \
-             {bound:.6e}), no declaration"
+            "sector(r = {r}, h = {h}), chord {chord:.6e} = {factor}x the bound \
+             {bound:.6e}, no declaration"
         );
         let text = offset_cylinder_sector(0.0, r, h, sweep, None);
-        let expected = sector_volume(r, h, sweep);
-        let exact = exact_checked_volume(&text, &repro);
-        if let Some(volume) = exact {
-            assert_within(volume, expected, 1.0e-6, &repro);
-        }
-        let literal = zone == "literal";
-        assert_eq!(
-            exact.is_some(),
-            literal,
-            "{repro}: expected {}",
-            if literal {
-                "a literal exact import"
-            } else {
-                "an honest refusal of the collapsed arc"
-            }
-        );
-        assert!(
-            !seen_exact || exact.is_some(),
-            "{repro}: acceptance must flip exactly once, monotonically"
-        );
-        seen_exact = exact.is_some();
+        let volume = exact_checked_volume(&text, &repro).unwrap_or_else(|| {
+            panic!("{repro}: an anchored arc must read literally at any chord")
+        });
+        assert_within(volume, sector_volume(r, h, sweep), 1.0e-6, &repro);
     }
 }
 
@@ -562,20 +546,20 @@ fn a_tight_closure_must_not_narrow_the_seam_bound() {
     assert_within(volume, PI * r * r * h, 1.0e-4, &repro);
 }
 
-/// Inside the bound the collapse is the designed reading — but it must
-/// never *certify* a wrong volume. With a covering closure, `verify_trim`
-/// accepts the collapsed circle's chord-sized end miss and the fabricated
-/// body imports checker-clean at full-circle volume.
+/// Inside the bound a collapse must never *certify* a wrong volume. With a
+/// covering closure, `verify_trim` accepted the collapsed circle's
+/// chord-sized end miss and the fabricated body imported checker-clean at
+/// full-circle volume.
 ///
-/// FOUND FAILING, filed as **of-a5me** (P3): sector r = 5, h = 3, chord
-/// 4.2e-5 under the 6e-5 bound, closure 1e-3 → exact, checker clean,
+/// FOUND FAILING, filed and fixed as **of-a5me** (P3): sector r = 5, h = 3,
+/// chord 4.2e-5 under the 6e-5 bound, closure 1e-3 → exact, checker clean,
 /// 235.6198 mm³ vs authored 3.15e-4 mm³ (~750,000×). The heal-gap ambiguity
-/// window the of-5rnp fix accepts by design, made an explicit tracked
-/// decision: loop context (each arc endpoint anchors a radial wall chain)
-/// disambiguates what the local trim decision cannot. Not softened;
-/// un-ignore when of-a5me lands (as a fix or an explicit wontfix pin).
+/// window the of-5rnp fix accepted by design, closed by loop context: each
+/// arc endpoint anchors a radial wall chain, so the rest of the loop joins
+/// the pair (`loop_anchored_edges`) and the seam reading is refuted — the
+/// arc now reads literally and imports exactly at the authored volume.
+/// Kept as the regression test.
 #[test]
-#[ignore = "of-a5me: a sub-bound arc under a covering closure imports checker-clean at full-circle volume"]
 fn a_sub_bound_arc_under_a_covering_closure_must_not_be_silently_rewritten() {
     let (r, h, chord, closure) = (5.0, 3.0, 4.2e-5, 1.0e-3);
     let sweep = sweep_for_chord(r, chord);
