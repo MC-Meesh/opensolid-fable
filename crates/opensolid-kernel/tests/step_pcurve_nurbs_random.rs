@@ -57,11 +57,14 @@
 //!   aborted instead of diagnosing. See
 //!   [`reversing_a_hostile_knot_vector_must_not_panic`] and
 //!   [`hostile_authored_pcurve_knots_on_a_reversed_edge_must_not_panic_the_reader`].
-//! - of-xsr7: `fit_pcurve` on a *closed* NURBS patch, fitting a curve that
-//!   crosses the patch's join mid-span, interpolates unwrapped samples
-//!   that straddle the knot rectangle; the patch clamps outside its
-//!   domain, so the fitted `Curve2::Nurbs` misses the invariant at its own
-//!   fit parameters by up to a diameter (3.2 measured at radius 1.66). See
+//! - of-xsr7 (fixed — a closed patch now wraps out-of-rectangle parameters
+//!   by whole domain extents instead of clamping, so straddling samples
+//!   evaluate on the far side of the join they meant): `fit_pcurve` on a
+//!   *closed* NURBS patch, fitting a curve that crosses the patch's join
+//!   mid-span, interpolates unwrapped samples that straddle the knot
+//!   rectangle; the patch used to clamp outside its domain, so the fitted
+//!   `Curve2::Nurbs` missed the invariant at its own fit parameters by up
+//!   to a diameter (3.2 measured at radius 1.66). See
 //!   [`seam_crossing_trim_on_a_closed_freeform_tube_holds_the_invariant`].
 
 use std::fmt::Write as _;
@@ -1064,16 +1067,15 @@ fn closed_tube(radius: f64, height: f64) -> NurbsSurface {
 /// A trim that crosses the closed patch's join mid-span: `fit_pcurve` must
 /// still produce a pcurve that holds the invariant at the parameters it
 /// claims. The samples unwrap past the knot rectangle and
-/// `recenter_on_knot_rectangle` recentres the straddling run; a clamped
-/// patch evaluates a parameter outside its rectangle to the rectangle's
-/// edge, so any overhang the recentre leaves is arc-length error the fit
-/// silently claims as exact.
+/// `recenter_on_knot_rectangle` recentres the straddling run; the overhang
+/// the recentre leaves is real trim geometry, and a *closed* patch wraps an
+/// out-of-rectangle parameter by whole domain extents (of-xsr7), so the fit
+/// traces the far side of the join rather than folding onto it.
 ///
-/// First run: every seed failed, worst deviation 3.229 at radius 1.662
-/// (seed 0x50D6) — about 1.9 radii of arc claimed exactly and traced
-/// wrongly.
+/// First run (pre-fix): every seed failed, worst deviation 3.229 at radius
+/// 1.662 (seed 0x50D6) — about 1.9 radii of arc claimed exactly and traced
+/// wrongly, because the patch then *clamped* outside its rectangle.
 #[test]
-#[ignore = "of-xsr7: seam-crossing fit on a closed NURBS patch breaks the invariant"]
 fn seam_crossing_trim_on_a_closed_freeform_tube_holds_the_invariant() {
     for case in 0..12u64 {
         let mut rng = Rng::new(0x50D6 + case);

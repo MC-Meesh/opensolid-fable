@@ -658,21 +658,123 @@ pub fn fit_pcurve(
     }
     // A smooth curve on a freeform surface: interpolate the samples with a
     // cubic instead of chording them, cutting the between-sample error from
-    // second order in the spacing to fourth. A `Curve3::Polyline` stays on
-    // the polyline, which is not a downgrade — the curve itself is piecewise
+    // second order in the spacing to fourth, and densify the samples
+    // wherever the interpolant still misses the curve between them (see
+    // `fit_nurbs_pcurve_refined`). A `Curve3::Polyline` stays on the
+    // polyline, which is not a downgrade — the curve itself is piecewise
     // linear, so the chords are the geometry.
     if !matches!(curve, Curve3::Polyline { .. })
-        && let Some(nurbs) = fit_nurbs_pcurve(&params, &points)
+        && let Some(nurbs) = fit_nurbs_pcurve_refined(surface, curve, &params, &points)
     {
         return Ok(nurbs);
     }
     Curve2::polyline(params, points)
 }
 
+/// Relative tolerance for the freeform fit's *between-sample* deviation,
+/// measured in 3D against the sampled span's own extent (see
+/// [`fit_nurbs_pcurve_refined`]).
+///
+/// Deliberately looser than [`FIT_TOL_REL`]: that one asks whether samples
+/// *are* a line or circle exactly, this one bounds how far an interpolant
+/// is allowed to wander between samples it passes through exactly — a fit
+/// quality, not a classification. It only has to be tight enough that no
+/// consumer's own allowance (the geometric check's, a campaign's 1e-6) can
+/// see the gap.
+const FIT_REFINE_TOL_REL: f64 = 1e-7;
+
+/// Ceiling on freeform fit samples after refinement, so densifying a
+/// pathological pairing terminates. Reaching it leaves a fit coarser than
+/// [`FIT_REFINE_TOL_REL`] somewhere between samples — the same honest claim
+/// an unrefined fit made, since a fitted [`Curve2::Nurbs`] only ever
+/// promises exactness *at* its fit parameters.
+const FIT_REFINE_MAX_SAMPLES: usize = 257;
+
 /// Degree of the interpolating fit below. Cubic is the conventional choice
 /// (Piegl & Tiller §9.2.1): high enough for fourth-order error, low enough
 /// that the interpolant cannot oscillate past what the samples support.
 const FIT_NURBS_DEGREE: usize = 3;
+
+/// [`fit_nurbs_pcurve`], plus adaptive densification: wherever the
+/// interpolant misses the curve *between* two samples by more than
+/// [`FIT_REFINE_TOL_REL`] of the sampled span's 3D extent, a new projected
+/// sample is inserted at the interval's midpoint and the fit is redone.
+///
+/// The uniform [`FIT_SAMPLES`] are enough only where the preimage is
+/// smooth. It is not smooth everywhere: the parameter-space image of a
+/// NURBS curve on a NURBS patch loses continuity at the curve's own
+/// interior knots and wherever the trim crosses one of the surface's knot
+/// lines, and a cubic interpolant converges only second-order across such
+/// a kink — measured at ~1e-3 of a radius for a phase-rotated circle on a
+/// closed tube (of-xsr7), against fourth-order everywhere else. The kinks
+/// are where the deviation concentrates, so refinement is local: each pass
+/// splits only the failing intervals, and a handful of passes buys at the
+/// kinks what the smooth spans already had.
+///
+/// New samples continue their left neighbour's branch (the same rule
+/// [`sample_parameter_space`] applies), so a run that straddles a closed
+/// patch's join stays on the branch the recentre chose. `None` exactly when
+/// [`fit_nurbs_pcurve`] fails, in which case the caller falls back to the
+/// polyline through the *original* samples.
+fn fit_nurbs_pcurve_refined(
+    surface: &Surface3,
+    curve: &Curve3,
+    params: &[f64],
+    points: &[Point2],
+) -> Option<Curve2> {
+    let mut params = params.to_vec();
+    let mut points = points.to_vec();
+    let periods = (surface.wrap_period_u(), surface.wrap_period_v());
+
+    // The sampled image's own 3D extent, for the relative tolerance. The
+    // *image's*, not the curve's: a caller may fit the projection of a
+    // curve that does not lie on the surface, and the curve-to-surface gap
+    // is then no fit error of ours.
+    let first = surface.point(points[0].x, points[0].y);
+    let extent = points
+        .iter()
+        .fold(0.0f64, |acc, p| {
+            acc.max((surface.point(p.x, p.y) - first).norm())
+        });
+    let tol = FIT_REFINE_TOL_REL * extent;
+
+    let mut fitted = fit_nurbs_pcurve(&params, &points)?;
+    while points.len() < FIT_REFINE_MAX_SAMPLES {
+        let mut split = false;
+        // Backwards, so an insertion never moves an interval still to visit.
+        for i in (1..points.len()).rev() {
+            if points.len() >= FIT_REFINE_MAX_SAMPLES {
+                break;
+            }
+            let mid = 0.5 * (params[i - 1] + params[i]);
+            // A parameter interval too narrow to have a midpoint of its own
+            // cannot be split further, whatever the deviation.
+            if !(mid > params[i - 1] && mid < params[i]) {
+                continue;
+            }
+            // Measured against the projected truth — what the sample at
+            // `mid` *would* be — for the same off-surface reason as the
+            // tolerance above.
+            let sample = guide_sample(surface, curve, mid, points[i - 1], periods);
+            let uv = fitted.point(mid);
+            let deviation =
+                (surface.point(uv.x, uv.y) - surface.point(sample.x, sample.y)).norm();
+            // NaN-safe: a non-finite deviation fails the comparison and the
+            // interval is left alone rather than split forever.
+            if deviation.partial_cmp(&tol) != Some(std::cmp::Ordering::Greater) {
+                continue;
+            }
+            params.insert(i, mid);
+            points.insert(i, sample);
+            split = true;
+        }
+        if !split {
+            break;
+        }
+        fitted = fit_nurbs_pcurve(&params, &points)?;
+    }
+    Some(fitted)
+}
 
 /// Interpolate the sampled parameter-space points with a B-spline that
 /// passes through every sample at that sample's own parameter — global
@@ -899,11 +1001,14 @@ fn sample_parameter_space(
 ///
 /// For a periodic parameterization that costs nothing, because evaluation is
 /// periodic too — a cylinder's `u = 7` is its `u = 7 − 2π` and both are the
-/// same point. A clamped patch has no such luxury: outside its knot
-/// rectangle it does not extrapolate but *clamps*, so a `u` a period low
-/// evaluates to the domain edge and the pcurve reads as a curve that folds
-/// onto the seam. Hence the shift, and hence it applies only where
-/// evaluation is bounded.
+/// same point. A **closed** patch now enjoys the same luxury: evaluation
+/// wraps an out-of-rectangle parameter by whole domain extents rather than
+/// clamping (see `NurbsSurface::clamp_params`, of-xsr7), so the shift is no
+/// longer what stands between a low-trailing walk and a pcurve that folds
+/// onto the seam. It is kept because the pcurve's *coordinates* still have
+/// consumers — the STEP writer spells them into authored trims, and region
+/// panelling measures them against the domain — and those read best with the
+/// run on, or minimally beside, the rectangle rather than a period away.
 ///
 /// A run already on the rectangle is left exactly where it is — including
 /// one lying *on* either end of the cut, which is what a seam edge is and
@@ -912,7 +1017,9 @@ fn sample_parameter_space(
 /// dragged in by its nearest sample, so a run that genuinely straddles the
 /// join — which a face boundary should not do without a seam edge, but which
 /// nothing here can rule out — ends up minimally outside on both sides
-/// instead of wholly outside on one.
+/// instead of wholly outside on one. The overhang that remains is real trim
+/// geometry, not error: wrap-around evaluation takes it to the far side of
+/// the join, exactly as the fitted samples meant it to (of-xsr7).
 fn recenter_on_knot_rectangle(
     surface: &Surface3,
     points: &mut [Point2],

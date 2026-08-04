@@ -12,7 +12,13 @@
 //! evaluation projects back through the weight component.
 //!
 //! Evaluation outside the knot domains clamps both parameters (clamped
-//! surfaces do not extrapolate).
+//! surfaces do not extrapolate) — except along a direction the patch
+//! **closes** in ([`NurbsSurface::closure_u`]), where an out-of-domain
+//! parameter wraps by whole domain extents instead. The two ends of a
+//! closed direction are the same locus, so the wrapped parameter names a
+//! real point of the surface exactly, the way a cylinder's `u = θ + 2π`
+//! does; clamping there would silently substitute the join for everything
+//! beyond it (of-xsr7).
 
 use crate::nurbs::curve::{KnotVector, NurbsError, binomial, is_finite};
 use crate::surface::SurfaceEval;
@@ -32,6 +38,14 @@ pub struct NurbsSurface {
     weights: Vec<f64>,
     knots_u: KnotVector,
     knots_v: KnotVector,
+    /// Cached [`Self::closure_u`] / [`Self::closure_v`]: detection scans the
+    /// whole control grid, and evaluation consults closure on every call to
+    /// decide between wrapping and clamping (see [`Self::clamp_params`]), so
+    /// it is computed once at construction rather than per query. A function
+    /// of the other fields — kept in sync by the constructors and
+    /// [`Self::map_control_points`], the only places they change.
+    closure_u: Option<f64>,
+    closure_v: Option<f64>,
 }
 
 impl NurbsSurface {
@@ -86,12 +100,17 @@ impl NurbsSurface {
         if let Some(index) = flat_points.iter().position(|p| !is_finite(*p)) {
             return Err(NurbsError::NonFiniteControlPoint { index });
         }
-        Ok(Self {
+        let mut surface = Self {
             control_points: flat_points,
             weights: flat_weights,
             knots_u,
             knots_v,
-        })
+            closure_u: None,
+            closure_v: None,
+        };
+        surface.closure_u = surface.detect_closure_u();
+        surface.closure_v = surface.detect_closure_v();
+        Ok(surface)
     }
 
     /// Non-rational (all weights 1) B-spline surface.
@@ -159,14 +178,30 @@ impl NurbsSurface {
     /// *and* weights) make the two ends equal exactly, whatever the basis.
     /// A patch that is not clamped in `u` does not interpolate them and is
     /// left alone.
+    ///
+    /// Closure also changes what an out-of-domain parameter means to
+    /// evaluation: a closed direction **wraps** by whole domain extents
+    /// where an open one clamps — see the module header and
+    /// [`Self::clamp_params`].
     pub fn closure_u(&self) -> Option<f64> {
-        let (rows, cols) = self.grid_size();
-        self.closure(&self.knots_u, rows, cols, |k, j| (k * (rows - 1), j))
+        self.closure_u
     }
 
     /// The `v`-domain extent if the patch closes on itself in `v`; see
     /// [`Self::closure_u`].
     pub fn closure_v(&self) -> Option<f64> {
+        self.closure_v
+    }
+
+    /// Structural closure detection in `u` — the scan behind the cached
+    /// [`Self::closure_u`].
+    fn detect_closure_u(&self) -> Option<f64> {
+        let (rows, cols) = self.grid_size();
+        self.closure(&self.knots_u, rows, cols, |k, j| (k * (rows - 1), j))
+    }
+
+    /// Structural closure detection in `v`; see [`Self::detect_closure_u`].
+    fn detect_closure_v(&self) -> Option<f64> {
         let (rows, cols) = self.grid_size();
         self.closure(&self.knots_v, cols, rows, |k, i| (i, k * (cols - 1)))
     }
@@ -227,6 +262,11 @@ impl NurbsSurface {
         for p in &mut self.control_points {
             *p = f(*p);
         }
+        // An affine map preserves coincident boundary rows, but detection is
+        // toleranced against the (now rescaled) control hull — recompute
+        // rather than assume the cached answer survived.
+        self.closure_u = self.detect_closure_u();
+        self.closure_v = self.detect_closure_v();
     }
 
     /// Axis-aligned box of the control hull.
@@ -489,11 +529,23 @@ impl NurbsSurface {
         Vector4::new(w * p.x, w * p.y, w * p.z, w)
     }
 
-    /// Clamp `(u, v)` to the knot domains.
+    /// Take `(u, v)` into the knot domains: **wrap** along a closed
+    /// direction, **clamp** along an open one.
+    ///
+    /// A closed direction's two domain ends are the same locus, so a
+    /// parameter past either end names a real point of the surface — the one
+    /// a whole-extent translation lands on — exactly the way a periodic
+    /// analytic surface's does. Clamping it instead would substitute the
+    /// join for everything beyond it, which is how a seam-crossing fitted
+    /// pcurve came to miss the parameterization invariant by up to a
+    /// diameter (of-xsr7). In-domain parameters (including the ends
+    /// themselves) pass through untouched either way, so nothing changes for
+    /// a caller that already stays on the knot rectangle.
     fn clamp_params(&self, u: f64, v: f64) -> (f64, f64) {
-        let (u0, u1) = self.knots_u.domain();
-        let (v0, v1) = self.knots_v.domain();
-        (u.clamp(u0, u1), v.clamp(v0, v1))
+        (
+            wrap_or_clamp(u, self.knots_u.domain(), self.closure_u),
+            wrap_or_clamp(v, self.knots_v.domain(), self.closure_v),
+        )
     }
 
     /// All partial derivatives `∂^{k+l} S / ∂u^k ∂v^l` for
@@ -557,6 +609,23 @@ impl NurbsSurface {
 /// Mirrors the `boolean::POLE_REL_EPS` the sphere and cone charts apply to
 /// their own radii.
 const POLE_REL_EPS: f64 = 1e-9;
+
+/// One parameter of [`NurbsSurface::clamp_params`]: wrapped into `[lo, hi)`
+/// by whole `closure` extents when the direction closes and `t` lies
+/// outside, clamped to `[lo, hi]` otherwise. `rem_euclid` keeps the wrap
+/// exact for the common whole-period offsets and lands in `[0, closure)`,
+/// so the final clamp is only float-noise insurance. A non-finite `t` skips
+/// the wrap (there is no meaningful representative) and behaves as it
+/// always has under `f64::clamp`.
+fn wrap_or_clamp(t: f64, (lo, hi): (f64, f64), closure: Option<f64>) -> f64 {
+    if let Some(extent) = closure
+        && t.is_finite()
+        && (t < lo || t > hi)
+    {
+        return (lo + (t - lo).rem_euclid(extent)).clamp(lo, hi);
+    }
+    t.clamp(lo, hi)
+}
 
 /// The direction that steps from `t` *into* the domain `(lo, hi)`: `+1` at
 /// the lower boundary, `-1` at the upper. Ties go to `+1`, which only
@@ -780,6 +849,33 @@ mod tests {
         assert_eq!(cylinder_patch().closure_v(), None);
         let flat = bilinear_patch();
         assert_eq!((flat.closure_u(), flat.closure_v()), (None, None));
+    }
+
+    /// Along a closed direction an out-of-domain parameter wraps by whole
+    /// domain extents instead of clamping: the ends are one locus, so the
+    /// wrapped parameter names a real surface point — which is what lets a
+    /// seam-crossing fitted pcurve hold the parameterization invariant
+    /// while its samples straddle the knot rectangle (of-xsr7).
+    #[test]
+    fn a_closed_direction_wraps_instead_of_clamping() {
+        let surface = cylinder_patch();
+        for &(outside, inside) in &[
+            (1.3, 0.3),   // one extent high
+            (-0.25, 0.75), // one extent low
+            (2.6, 0.6),   // two extents high
+        ] {
+            for v in [0.0, 0.5, 1.0] {
+                let gap = (surface.point(outside, v) - surface.point(inside, v)).norm();
+                assert!(gap < TIGHT, "u={outside} should wrap to {inside}, off by {gap}");
+                // Derivatives wrap with it: same basis evaluation, not the
+                // frozen one-sided values the old clamp answered with.
+                let du_gap = (surface.du(outside, v) - surface.du(inside, v)).norm();
+                assert!(du_gap < TIGHT, "du at u={outside} vs {inside}: off by {du_gap}");
+            }
+        }
+        // The open v direction still clamps.
+        let clamped = (surface.point(0.3, 1.7) - surface.point(0.3, 1.0)).norm();
+        assert!(clamped < TIGHT, "open v must clamp, off by {clamped}");
     }
 
     /// Equal control point *positions* do not close a rational patch: the
