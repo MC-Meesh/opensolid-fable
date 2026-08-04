@@ -1773,26 +1773,23 @@ mod corpus {
                 );
             }
         }
-        // 2026-08-02: 33 of 34, measured with of-8ulj, of-kwn, of-aoml and
-        // of-05ac all on main. of-8ulj returned bspline_patch_prism to the
-        // exact path; of-kwn cleared the five nist_ctc_05 edges whose
-        // ~1e-5 in misses were slop the file's own declared 3.67e-3 in
-        // closure covers; and nist_ctc_02 — off the exact path for good on
-        // 0.0386 mm of authored gap, rightly refused — now arrives as a
-        // fallback mesh instead of a loss: of-05ac closes the fallback over
-        // its trimmed faces (spec/06-step-io.md §4) and of-aoml gives its
-        // tilted-bore rim lenses corners of their own, so `MeshSdf::new` has
-        // pseudonormals to take at the rims. One file still fails:
-        // - nist_ctc_05 (of-5cn5): one CIRCLE edge (#4444) whose end
-        //   VERTEX_POINT sits 7.2e-4 in off the circle's *plane* — 0.0182 mm,
-        //   nearly twice MAX_ALLOWED_TOLERANCE, so no tolerance the reader
-        //   could derive would let the kernel carry it, and no consistent
-        //   shell survives it for the fallback either. Snapping the vertex is
-        //   no answer: its CARTESIAN_POINT #374 is the last control point of
-        //   B_SPLINE_CURVE #375 and the other three edges meeting there
-        //   interpolate it exactly, so a snap only moves the 18 um onto edges
-        //   that currently have none. 34 needs that 18 um vertex.
-        const FLOOR: usize = 33;
+        // 2026-08-04: 34 of 34 — the whole corpus. The last file in was
+        // nist_ctc_05 (of-5cn5): one CIRCLE edge (#4444) whose end
+        // VERTEX_POINT sits 7.2e-4 in off the circle's *plane* — 0.0182 mm,
+        // nearly twice MAX_ALLOWED_TOLERANCE, so no tolerance the reader
+        // could derive would let the kernel carry it, and no consistent
+        // shell survived it for the fallback either. Snapping the vertex was
+        // no answer: its CARTESIAN_POINT #374 is the last control point of
+        // B_SPLINE_CURVE #375 and the other three edges meeting there
+        // interpolate it exactly, so a snap only moves the 18 um onto edges
+        // that carried none. What admits it is vertex reconciliation
+        // (read.rs `reconcile_vertices`): the miss is connectivity slop
+        // inside the file's own declared 3.67e-3 in closure, so the reader
+        // moves the vertex to the minimax point among its four edges'
+        // curves and every edge carries ~9 um as ordinary vertex tolerance,
+        // under the kernel limit. The file imports on the exact path,
+        // geometrically clean (see the floor below).
+        const FLOOR: usize = 34;
         assert!(
             passed.len() >= FLOOR,
             "corpus pass count regressed below {FLOOR}: only {passed:?} pass"
@@ -1867,16 +1864,19 @@ mod corpus {
                 );
             }
         }
-        // 2026-08-01: 32 files clear this, up from a measured 31 on of-bb6's
-        // main — every corpus file that imports as a B-Rep at all is also
-        // geometrically clean, so this list and the pass-rate list above are
-        // the same 32 files. The one this bead adds is bspline_patch_prism:
-        // its four extrusion walls were patches one `VECTOR` long and did not
+        // 2026-08-04: 33 files clear this — every corpus file that imports
+        // as a B-Rep at all is also geometrically clean. of-5cn5 added
+        // nist_ctc_05: its reconciled vertex (see the pass-rate floor above)
+        // carries the split miss as its own tolerance, so the geometry gates
+        // hold for it like any other authored slop. (nist_ctc_02 stays a
+        // fallback mesh, vacuous here, so the two counts differ by one.)
+        // Before that, 2026-08-01: 32, up from a measured 31 on of-bb6's
+        // main — the one that bead added was bspline_patch_prism: its four
+        // extrusion walls were patches one `VECTOR` long and did not
         // contain their own faces, which showed up here as 12 EdgeOffSurface
         // (to 20 mm) and 8 PcurveDeviation. Sizing the patch to the face it
-        // carries takes all 20 to zero. Nothing that was clean before stopped
-        // being clean.
-        const FLOOR: usize = 32;
+        // carries took all 20 to zero.
+        const FLOOR: usize = 33;
         assert!(
             clean.len() >= FLOOR,
             "geometrically clean corpus count regressed below {FLOOR}: only {clean:?} pass"

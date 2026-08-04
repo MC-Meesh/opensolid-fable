@@ -20,9 +20,12 @@
 //!   declaration is converted out of the file's own unit (nist_ctc_05
 //!   declares thousandths of an inch); a conversion bug moves the cliff by
 //!   25.4× in one direction only.
-//! - **The kernel limit still binds.** A declaration past
-//!   [`MAX_ALLOWED_TOLERANCE`] is clamped, so slop between the limit and a
-//!   looser declaration must refuse even though the file blesses it.
+//! - **The kernel limit binds on what is carried.** A declaration past
+//!   [`MAX_ALLOWED_TOLERANCE`] is clamped for tolerance elevation, so slop
+//!   between the limit and a looser declaration never imports *unmoved*.
+//!   Since of-5cn5 it may import *reconciled* — the vertex split across the
+//!   edges meeting it, every residual under the limit, the move reported as
+//!   a heal — while slop no split can land under the limit still refuses.
 //! - **Declaring a closure must never break a body that imported without
 //!   one.** The floor only ever widens acceptance of vertex misses — until
 //!   of-5rnp it also widened [`trim_curve`]'s "two distinct seam vertices
@@ -727,19 +730,38 @@ fn an_inch_authored_file_agrees_with_its_millimetre_twin() {
 // (5) The kernel limit binds through any declaration
 // =====================================================================
 
-/// A declaration looser than [`MAX_ALLOWED_TOLERANCE`] is clamped: slop the
-/// file blesses but the kernel cannot carry must refuse, while slop inside
-/// the limit imports under the same declaration. nist_ctc_01 declares
-/// 5.08e-2 mm — twice the limit — so the clamp is a corpus-real path, and a
-/// clamp that only fired in the diagnostic would let a vertex through that
-/// `check` rejects.
+/// A declaration looser than [`MAX_ALLOWED_TOLERANCE`] is clamped for what
+/// any single entity may *carry* — but since of-5cn5 the band between the
+/// limit and the declaration is no longer an automatic refusal: vertex
+/// reconciliation (read.rs `reconcile_vertices`) may split such a miss
+/// across the edges meeting there, provided every reconciled residual
+/// lands under the limit. nist_ctc_05 lives in exactly this band (18 µm of
+/// miss under a 93 µm declaration). What binds through any declaration is
+/// the limit on carried tolerance:
+/// - slop inside the limit imports unmoved, as the clamp always allowed;
+/// - slop between the limit and twice the limit imports *reconciled* — the
+///   vertex moves, the report says so, and the checker stays clean;
+/// - slop whose curves disagree by more than twice the limit still
+///   refuses, however loose the declaration: no split can land every
+///   residual under the limit.
+///
+/// The exception is the radial push, where the circle and the seam line
+/// agree on one point: reconciliation takes their unanimous word within
+/// the declaration and the vertex snaps to it, carrying nothing at all.
 #[test]
 fn a_declaration_past_the_kernel_limit_is_clamped_in_effect() {
     let (r, h) = (5.0, 8.0);
+    let reconciled = |report: &StepImport| {
+        report
+            .diagnostics
+            .iter()
+            .any(|d| d.message.starts_with("healed: vertex"))
+    };
     for declared in [2.54e-2, 1.0e3] {
         for slop in SLOPS {
             let inside = MAX_ALLOWED_TOLERANCE * 0.9;
-            let beyond = MAX_ALLOWED_TOLERANCE * 1.2;
+            let split = MAX_ALLOWED_TOLERANCE * 1.2;
+            let beyond = MAX_ALLOWED_TOLERANCE * 2.2;
             let ok_repro =
                 format!("{slop:?} slop {inside:.3e} under declaration {declared:.3e} (clamped)");
             let text = cylinder_with_a_loose_seam_vertex(
@@ -754,7 +776,28 @@ fn a_declaration_past_the_kernel_limit_is_clamped_in_effect() {
                 "{ok_repro}: slop inside the kernel limit must import"
             );
 
-            let bad_repro =
+            let split_repro =
+                format!("{slop:?} slop {split:.3e} under declaration {declared:.3e} (clamped)");
+            let text = cylinder_with_a_loose_seam_vertex(
+                r,
+                h,
+                slop.apply(r, h, split),
+                Unit::Mm,
+                Some(declared),
+            );
+            assert!(
+                exact_checked_volume(&text, &split_repro).is_some(),
+                "{split_repro}: slop the split lands under the limit must import"
+            );
+            let (_, _, report) = import(&text, &split_repro);
+            assert!(
+                reconciled(&report),
+                "{split_repro}: an import past the carriable limit must say \
+                 the vertex was reconciled: {:#?}",
+                report.diagnostics
+            );
+
+            let beyond_repro =
                 format!("{slop:?} slop {beyond:.3e} under declaration {declared:.3e} (clamped)");
             let text = cylinder_with_a_loose_seam_vertex(
                 r,
@@ -763,7 +806,17 @@ fn a_declaration_past_the_kernel_limit_is_clamped_in_effect() {
                 Unit::Mm,
                 Some(declared),
             );
-            assert_refused(&text, &bad_repro);
+            match slop {
+                Slop::OffPlane | Slop::Tangential => assert_refused(&text, &beyond_repro),
+                Slop::Radial => {
+                    assert!(
+                        exact_checked_volume(&text, &beyond_repro).is_some()
+                            && reconciled(&import(&text, &beyond_repro).2),
+                        "{beyond_repro}: curves unanimous within the declaration \
+                         must snap, not refuse"
+                    );
+                }
+            }
         }
     }
 }

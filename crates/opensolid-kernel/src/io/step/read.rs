@@ -186,8 +186,7 @@ use opensolid_brep::{
     Body, BodyType, Curve2, Curve3, CurveEval, CurveProject, Edge, Face, FaceSense, Fin, FinSense,
     GeometryStore, KnotVector, Loop, LoopType, MAX_ALLOWED_TOLERANCE, NurbsCurve, NurbsCurve2,
     NurbsError, NurbsSurface, QuadricUSpan, SYSTEM_RESOLUTION, Shell, ShellOrientation, Surface3,
-    SurfaceEval,
-    SurfaceProject, TessellationOptions, TopologyStore, Vertex, attach_body_pcurves,
+    SurfaceEval, SurfaceProject, TessellationOptions, TopologyStore, Vertex, attach_body_pcurves,
     quadric_u_span, triangulate_bounded_face,
 };
 use opensolid_core::error::CoreError;
@@ -773,16 +772,7 @@ fn representation_context(file: &StepFile, item: u64) -> Option<u64> {
 /// the whole declaration. Several uncertainties in one context all apply,
 /// so the widest wins.
 fn resolve_closure(file: &StepFile, msb_id: u64, diagnostics: &mut Vec<Diagnostic>) -> f64 {
-    let declared = representation_context(file, msb_id)
-        .and_then(|ctx_id| file.get(ctx_id))
-        .and_then(|ctx| ctx.entity.part("GLOBAL_UNCERTAINTY_ASSIGNED_CONTEXT"))
-        .and_then(|rec| rec.attributes.first().and_then(Value::as_list))
-        .map(|list| {
-            list.iter()
-                .filter_map(|v| uncertainty_in_mm(file, v.as_ref_id()?))
-                .fold(0.0f64, f64::max)
-        })
-        .unwrap_or(0.0);
+    let declared = declared_closure(file, msb_id);
     if declared > MAX_ALLOWED_TOLERANCE {
         diagnostics.push(Diagnostic {
             entity: Some(msb_id),
@@ -795,6 +785,24 @@ fn resolve_closure(file: &StepFile, msb_id: u64, diagnostics: &mut Vec<Diagnosti
         return MAX_ALLOWED_TOLERANCE;
     }
     declared
+}
+
+/// The raw declared closure in millimetres, unclamped — the file's own
+/// assertion, before [`resolve_closure`] holds it to the kernel limit.
+/// Vertex reconciliation ([`reconcile_vertices`]) bounds by this: whether a
+/// miss is authored slop is the declaration's question, while what any one
+/// entity may then carry is the limit's.
+fn declared_closure(file: &StepFile, msb_id: u64) -> f64 {
+    representation_context(file, msb_id)
+        .and_then(|ctx_id| file.get(ctx_id))
+        .and_then(|ctx| ctx.entity.part("GLOBAL_UNCERTAINTY_ASSIGNED_CONTEXT"))
+        .and_then(|rec| rec.attributes.first().and_then(Value::as_list))
+        .map(|list| {
+            list.iter()
+                .filter_map(|v| uncertainty_in_mm(file, v.as_ref_id()?))
+                .fold(0.0f64, f64::max)
+        })
+        .unwrap_or(0.0)
 }
 
 /// One `UNCERTAINTY_MEASURE_WITH_UNIT(value, unit, name, description)` in
@@ -2696,6 +2704,261 @@ fn sole_loop_edges(file: &StepFile) -> HashSet<u64> {
     edges
 }
 
+// ---------------------------------------------------------------------
+// Vertex reconciliation (of-5cn5)
+// ---------------------------------------------------------------------
+
+/// One vertex [`reconcile_vertices`] moved, with the measurements the move
+/// was decided by, for the caller's diagnostics.
+struct ReconciledVertex {
+    /// The `VERTEX_POINT` #id.
+    vertex: u64,
+    /// Where the vertex now reads from, in millimetres.
+    point: Point3,
+    /// Greatest distance from the authored point to an incident edge curve.
+    was: f64,
+    /// Greatest distance from the reconciled point to an incident edge curve.
+    now: f64,
+    /// How far the vertex moved.
+    moved: f64,
+}
+
+/// Relocate vertices the file parks farther off an incident edge's curve
+/// than any tolerance the kernel can carry, splitting the miss between
+/// every edge meeting there.
+///
+/// A vertex past [`MAX_ALLOWED_TOLERANCE`] fails [`verify_trim`] however
+/// the trim bound is derived, and the mesh fallback shares the refusal, so
+/// the solid is lost outright. nist_ctc_05's #2783 is the shape of it: the
+/// end vertex of `CIRCLE` edge #4444 sits 18 µm off the circle's *plane* —
+/// 1.8× the kernel limit — while the three B-spline edges meeting at the
+/// same vertex interpolate it exactly (of-5cn5). No single entity can
+/// absorb such a miss: snapping the vertex onto the circle puts the whole
+/// 18 µm onto three edges that today carry none, and refitting the circle
+/// moves it onto the adjacent faces' surfaces instead, where the edge
+/// tolerance measurement ([`record_edge_tolerances`]) hits the same limit.
+/// What works is reading the miss as what it is — connectivity slop within
+/// the closure the file *declares* — and splitting it: move the vertex to
+/// the point minimizing its greatest distance to any incident edge curve,
+/// so each edge carries an equal share as ordinary vertex tolerance. For
+/// #2783 that is the midpoint between the authored point and the circle,
+/// and 18 µm past-limit becomes 9 µm on every edge, under it.
+///
+/// The bounds keep the pass honest; a vertex failing any of them stays
+/// where the file put it, for [`verify_trim`] to refuse as before:
+/// - only a miss too large to carry unmoved qualifies — round-off slop
+///   keeps its authored position (and its authored-tolerance bookkeeping);
+/// - the miss, and the move, must sit within the *unclamped* declared
+///   closure ([`declared_closure`]) — the file's own statement of how far
+///   its asserted connectivities may sit apart. A file declaring nothing
+///   gets nothing moved, slop past the declaration is refused exactly as
+///   the of-7aja cliff pins (`step_closure_adversarial.rs`), and a cluster
+///   of curves agreeing on some distant point — a genuinely wrong file,
+///   not an imprecise one — cannot teleport the vertex there;
+/// - every incident curve must be measurable (resolve, and admit a
+///   nearest point) and the reconciled residuals must all land within
+///   what a vertex can carry, or the move fixes nothing.
+///
+/// Together the first two make this a no-op wherever the declaration is
+/// within the kernel limit: there the closure floor already admits every
+/// miss the file vouches for, and anything past it stays refused. The pass
+/// lives exactly in the band the clamp cuts off — authored slop between
+/// [`MAX_ALLOWED_TOLERANCE`] and a looser declaration, which no single
+/// entity may carry but a split can.
+///
+/// Callers run this only after the exact path has already failed once, so
+/// a well-formed solid never pays for the sweep.
+fn reconcile_vertices(
+    file: &StepFile,
+    shell_roots: &[u64],
+    scale: f64,
+    angle_scale: f64,
+    declared: f64,
+    closure: f64,
+) -> Vec<ReconciledVertex> {
+    let mut moves = Vec::new();
+    if declared <= 0.0 {
+        return moves;
+    }
+    // Gather each vertex's incident edges from everything reachable from
+    // the shells — the same walk as [`solid_seam_tol`], stopping at
+    // `EDGE_CURVE`s (nothing beneath one places a vertex).
+    let mut stack: Vec<u64> = shell_roots.to_vec();
+    let mut visited: HashSet<u64> = stack.iter().copied().collect();
+    let mut incident: HashMap<u64, Vec<(u64, u64)>> = HashMap::new();
+    while let Some(id) = stack.pop() {
+        let Some(inst) = file.get(id) else { continue };
+        if let Some(rec) = inst.entity.part("EDGE_CURVE") {
+            if let (Ok(start_ref), Ok(end_ref), Ok(geometry_ref)) = (
+                ref_attr(rec, 1, id),
+                ref_attr(rec, 2, id),
+                ref_attr(rec, 3, id),
+            ) {
+                incident
+                    .entry(start_ref)
+                    .or_default()
+                    .push((id, geometry_ref));
+                // A closed edge names its one vertex twice; count it once.
+                if end_ref != start_ref {
+                    incident
+                        .entry(end_ref)
+                        .or_default()
+                        .push((id, geometry_ref));
+                }
+            }
+            continue;
+        }
+        let records = match &inst.entity {
+            EntityRecord::Simple(rec) => std::slice::from_ref(rec),
+            EntityRecord::Complex(recs) => recs.as_slice(),
+        };
+        for rec in records {
+            let mut values: Vec<&Value> = rec.attributes.iter().collect();
+            while let Some(value) = values.pop() {
+                match value {
+                    Value::Ref(target) => {
+                        if visited.insert(*target) {
+                            stack.push(*target);
+                        }
+                    }
+                    Value::List(items) => values.extend(items),
+                    Value::Typed { value, .. } => values.push(value),
+                    _ => {}
+                }
+            }
+        }
+    }
+    // Deterministic order, so diagnostics read the same on every import.
+    let mut vertices: Vec<u64> = incident.keys().copied().collect();
+    vertices.sort_unstable();
+    for vertex_ref in vertices {
+        let Ok(rec) = typed_record(file, vertex_ref, "VERTEX_POINT", vertex_ref) else {
+            continue;
+        };
+        let Ok(point_ref) = ref_attr(rec, 1, vertex_ref) else {
+            continue;
+        };
+        let Ok(authored) = resolve_point(file, point_ref, vertex_ref, scale) else {
+            continue;
+        };
+        // What verify_trim will accept a residual of, at this vertex.
+        let carriable = trim_tol(authored, authored, closure).min(MAX_ALLOWED_TOLERANCE);
+        // Every incident curve must resolve and admit a foot, or the vertex
+        // stays put: a move cannot be shown safe against a curve it cannot
+        // measure. (An unresolvable curve dooms its edge regardless.)
+        let mut curves = Vec::new();
+        let mut feet = Vec::new();
+        let mut sound = true;
+        for &(edge_ref, geometry_ref) in &incident[&vertex_ref] {
+            let curve = resolve_curve(file, geometry_ref, edge_ref, scale, angle_scale)
+                .ok()
+                .and_then(|raw| raw.exact_curve());
+            let Some(foot) = curve.as_ref().and_then(|c| curve_foot(c, &authored)) else {
+                sound = false;
+                break;
+            };
+            curves.push(curve.expect("footed curve resolved"));
+            feet.push(foot);
+        }
+        if !sound || curves.is_empty() {
+            continue;
+        }
+        let was = feet
+            .iter()
+            .map(|q| (q - authored).norm())
+            .fold(0.0, f64::max);
+        // Carriable unmoved, or never asserted connected at all: stay put.
+        if was <= carriable || was > declared {
+            continue;
+        }
+        let center = minimax_point(&feet);
+        let moved = (center - authored).norm();
+        // Re-measure from the reconciled position against the curves
+        // themselves — a foot moves as the query point does.
+        let mut now = 0.0f64;
+        for curve in &curves {
+            let Some(foot) = curve_foot(curve, &center) else {
+                now = f64::INFINITY;
+                break;
+            };
+            now = now.max((foot - center).norm());
+        }
+        if moved > declared || now > carriable {
+            continue;
+        }
+        moves.push(ReconciledVertex {
+            vertex: vertex_ref,
+            point: center,
+            was,
+            now,
+            moved,
+        });
+    }
+    moves
+}
+
+/// The nearest point on `curve` to `p` — exact for lines and circles, to
+/// the projector's accuracy for B-splines. An ellipse's angle-parameter
+/// point is on the curve but not always nearest, which only overestimates
+/// its distance and makes [`reconcile_vertices`] more conservative. `None`
+/// where no foot is defined (`p` on a circle's axis) or the curve has no
+/// closed form worth inverting (polylines, which the reader never builds).
+fn curve_foot(curve: &Curve3, p: &Point3) -> Option<Point3> {
+    match curve {
+        Curve3::Line { origin, dir } => Some(origin + dir * (p - origin).dot(dir)),
+        Curve3::Nurbs(nurbs) => Some(nurbs.project_point(p).point),
+        Curve3::Polyline { .. } => None,
+        Curve3::Circle {
+            center,
+            axis,
+            radius,
+        } => {
+            // Drop onto the plane, then out to the radius. On the axis
+            // every direction ties and there is no foot to trust —
+            // `conic_angle`'s `atan2(0, 0)` would pick one arbitrarily.
+            let r = p - center;
+            let in_plane = r - axis * r.dot(axis);
+            let len = in_plane.norm();
+            (len > SYSTEM_RESOLUTION).then(|| center + in_plane * (*radius / len))
+        }
+        ellipse @ Curve3::Ellipse { center, axis, .. } => {
+            let r = p - center;
+            if (r - axis * r.dot(axis)).norm() <= SYSTEM_RESOLUTION {
+                return None;
+            }
+            Some(ellipse.point(conic_angle(ellipse, p)?))
+        }
+    }
+}
+
+/// How many Bădoiu–Clarkson rounds [`minimax_point`] runs: the center is
+/// then within `1/MINIMAX_ROUNDS` of the optimal radius, far tighter than
+/// the margins [`reconcile_vertices`] decides by — and it re-measures the
+/// result against the curves before trusting it anyway.
+const MINIMAX_ROUNDS: usize = 1024;
+
+/// The point minimizing the greatest distance to any of `points`: the
+/// center of their smallest enclosing ball, by the Bădoiu–Clarkson
+/// core-set iteration — start at the centroid, step toward the farthest
+/// point by 1/(k+1).
+fn minimax_point(points: &[Point3]) -> Point3 {
+    let mut center =
+        Point3::from(points.iter().map(|p| p.coords).sum::<Vector3>() / points.len() as f64);
+    for k in 1..=MINIMAX_ROUNDS {
+        let mut far = center;
+        let mut best = -1.0;
+        for p in points {
+            let d = (p - center).norm_squared();
+            if d > best {
+                best = d;
+                far = *p;
+            }
+        }
+        center += (far - center) / (k as f64 + 1.0);
+    }
+    center
+}
+
 /// Trim an analytic curve to an edge's vertices: orient it along the edge
 /// (STEP `same_sense` false means the edge opposes the curve direction)
 /// and recover the parameter range, always with `t_start < t_end`.
@@ -2926,6 +3189,9 @@ struct SolidBuilder<'a> {
     /// Edges standing alone in some `EDGE_LOOP` ([`sole_loop_edges`]): the
     /// declared closure widens the seam test for these, and only these.
     seam_edges: &'a HashSet<u64>,
+    /// `VERTEX_POINT` #id → reconciled position ([`reconcile_vertices`]),
+    /// read in place of the authored point. Empty on the first attempt.
+    adjusted: &'a HashMap<u64, Point3>,
     /// How many edges needed that floor — trims whose vertex miss is inside
     /// the declared closure but outside what [`TRIM_TOL_REL`] alone allows.
     /// Reported once per solid rather than per edge.
@@ -3513,6 +3779,9 @@ impl SolidBuilder<'_> {
             vertex_ref,
             self.scale,
         )?;
+        // A reconciled vertex ([`reconcile_vertices`]) reads from its
+        // repaired position; everything else takes the file's word.
+        let point = self.adjusted.get(&vertex_ref).copied().unwrap_or(point);
         let vertex = self.store.create_vertex(point, SYSTEM_RESOLUTION);
         self.created.vertices.push(vertex);
         self.vertices.insert(vertex_ref, vertex);
@@ -3866,6 +4135,11 @@ struct FallbackMesher<'a> {
     /// The solid's seam-identity bound ([`solid_seam_tol`]), shared with the
     /// exact path for the same reason as `closure`.
     seam_tol: f64,
+    /// `VERTEX_POINT` #id → reconciled position ([`reconcile_vertices`]),
+    /// shared with the exact path for the same reason as `closure`: the
+    /// fallback trims by the same vertices, so a vertex only the
+    /// reconciliation makes carriable must read the same on both paths.
+    adjusted: &'a HashMap<u64, Point3>,
     /// Edges standing alone in some `EDGE_LOOP` ([`sole_loop_edges`]),
     /// shared with the exact path so both trim the seam spelling alike.
     seam_edges: &'a HashSet<u64>,
@@ -4637,6 +4911,11 @@ impl FallbackMesher<'_> {
         let closed = start_ref == end_ref;
 
         let vertex_point = |vertex_ref: u64| -> MapResult<Point3> {
+            // Reconciled vertices read from their repaired position, as on
+            // the exact path (`map_vertex`).
+            if let Some(&point) = self.adjusted.get(&vertex_ref) {
+                return Ok(point);
+            }
             let vrec = typed_record(self.file, vertex_ref, "VERTEX_POINT", edge_ref)?;
             resolve_point(
                 self.file,
@@ -5664,177 +5943,220 @@ fn map_solid(
     };
 
     let closure = resolve_closure(file, msb_id, diagnostics);
-    let seam_tol = {
-        let mut shell_roots = vec![shell_ref];
-        shell_roots.extend(voids.iter().map(|&(void_ref, _)| void_ref));
-        solid_seam_tol(file, &shell_roots, scale)
-    };
+    let shell_roots: Vec<u64> = std::iter::once(shell_ref)
+        .chain(voids.iter().map(|&(void_ref, _)| void_ref))
+        .collect();
+    let seam_tol = solid_seam_tol(file, &shell_roots, scale);
     let seam_edges = sole_loop_edges(file);
 
-    // Exact path first.
-    let mut builder = SolidBuilder {
-        file,
-        store,
-        geo,
-        scale,
-        angle_scale,
-        closure,
-        seam_tol,
-        seam_edges: &seam_edges,
-        closure_trims: 0,
-        created: Created::default(),
-        multi_bound_faces: Vec::new(),
-        vertices: HashMap::new(),
-        edges: HashMap::new(),
-        seams: Vec::new(),
-        authored_pcurves: HashMap::new(),
-        face_surface_refs: HashMap::new(),
-    };
-    let built = builder.build(msb_id, shell_ref, &voids);
-    let created = builder.created;
-    let carryover = MappingCarryover {
-        multi_bound_faces: builder.multi_bound_faces,
-        authored_pcurves: builder.authored_pcurves,
-        face_surface_refs: builder.face_surface_refs,
-    };
-    let closure_trims = builder.closure_trims;
-    match built {
-        Ok(body) => {
-            let mut failures = store.check(body);
-            // Import heals, it does not reject (`spec/06-step-io.md` §4): a
-            // body whose only defects are an unsewn shell, a vertex gap or a
-            // flipped face is repaired and re-validated before the exact path
-            // is abandoned for the tessellated one.
-            if !failures.is_empty() && options.heal.strategy != HealStrategy::Off {
-                // The declared closure floors heal's vertex-merge gap, the
-                // same way it floors `trim_tol`: the file's own statement of
-                // its connectivity slop outranks the derived round-off gap
-                // (of-00pu). Sliver collapse is deliberately not floored —
-                // see `HealOptions::gap_floor`.
-                let heal_options = HealOptions {
-                    gap_floor: options.heal.gap_floor.max(closure),
-                    ..options.heal.clone()
-                };
-                let result = GeometryHealer::heal(body, store, geo, &heal_options);
-                *heal_operations += result.operations.len();
-                for op in &result.operations {
-                    diagnostics.push(Diagnostic {
-                        entity: Some(msb_id),
-                        severity: Severity::Info,
-                        message: format!("healed: {op}"),
-                    });
+    // Exact path first. A refusal gets one retry after vertex
+    // reconciliation ([`reconcile_vertices`]): the sweep runs only off a
+    // failure, so a solid whose vertices all sit where its curves say never
+    // pays for it, and whatever it repairs is shared with the mesh fallback
+    // below — which trims by the same vertices and would refuse them the
+    // same way.
+    let mut adjusted: HashMap<u64, Point3> = HashMap::new();
+    let mut reconciled = false;
+    loop {
+        let mut builder = SolidBuilder {
+            file,
+            store,
+            geo,
+            scale,
+            angle_scale,
+            closure,
+            seam_tol,
+            seam_edges: &seam_edges,
+            adjusted: &adjusted,
+            closure_trims: 0,
+            created: Created::default(),
+            multi_bound_faces: Vec::new(),
+            vertices: HashMap::new(),
+            edges: HashMap::new(),
+            seams: Vec::new(),
+            authored_pcurves: HashMap::new(),
+            face_surface_refs: HashMap::new(),
+        };
+        let built = builder.build(msb_id, shell_ref, &voids);
+        let created = builder.created;
+        let carryover = MappingCarryover {
+            multi_bound_faces: builder.multi_bound_faces,
+            authored_pcurves: builder.authored_pcurves,
+            face_surface_refs: builder.face_surface_refs,
+        };
+        let closure_trims = builder.closure_trims;
+        match built {
+            Ok(body) => {
+                let mut failures = store.check(body);
+                // Import heals, it does not reject (`spec/06-step-io.md` §4): a
+                // body whose only defects are an unsewn shell, a vertex gap or a
+                // flipped face is repaired and re-validated before the exact path
+                // is abandoned for the tessellated one.
+                if !failures.is_empty() && options.heal.strategy != HealStrategy::Off {
+                    // The declared closure floors heal's vertex-merge gap, the
+                    // same way it floors `trim_tol`: the file's own statement of
+                    // its connectivity slop outranks the derived round-off gap
+                    // (of-00pu). Sliver collapse is deliberately not floored —
+                    // see `HealOptions::gap_floor`.
+                    let heal_options = HealOptions {
+                        gap_floor: options.heal.gap_floor.max(closure),
+                        ..options.heal.clone()
+                    };
+                    let result = GeometryHealer::heal(body, store, geo, &heal_options);
+                    *heal_operations += result.operations.len();
+                    for op in &result.operations {
+                        diagnostics.push(Diagnostic {
+                            entity: Some(msb_id),
+                            severity: Severity::Info,
+                            message: format!("healed: {op}"),
+                        });
+                    }
+                    for note in &result.notes {
+                        diagnostics.push(Diagnostic {
+                            entity: Some(msb_id),
+                            severity: Severity::Info,
+                            message: format!("heal: {note}"),
+                        });
+                    }
+                    failures = result.remaining;
                 }
-                for note in &result.notes {
-                    diagnostics.push(Diagnostic {
-                        entity: Some(msb_id),
-                        severity: Severity::Info,
-                        message: format!("heal: {note}"),
-                    });
-                }
-                failures = result.remaining;
-            }
-            if failures.is_empty() {
-                // Only once the topology is settled — healing decides which
-                // faces an edge ends up bounding — is there anything to
-                // measure the edges against.
-                let mut rescue_spent = false;
-                loop {
-                    match record_edge_tolerances(store, geo, body) {
-                        Ok(raised) => {
-                            if closure_trims > 0 {
-                                diagnostics.push(Diagnostic {
-                                    entity: Some(msb_id),
-                                    severity: Severity::Info,
-                                    message: format!(
-                                        "{closure_trims} edge(s) miss their vertex points by \
-                                         more than decimal round-off, within the {closure:.3e} \
-                                         mm closure this solid is held to"
-                                    ),
-                                });
-                            }
-                            if raised > 0 {
-                                diagnostics.push(Diagnostic {
-                                    entity: Some(msb_id),
-                                    severity: Severity::Info,
-                                    message: format!(
-                                        "{raised} edge tolerance(s) raised to the measured \
-                                         distance from their faces' surfaces"
-                                    ),
-                                });
-                            }
-                            *heal_operations += finish_exact_body(
-                                store,
-                                geo,
-                                body,
-                                options,
-                                &carryover,
-                                msb_id,
-                                diagnostics,
-                            );
-                            return SolidOutcome::BRep(body);
-                        }
-                        Err((edge, deviation)) => {
-                            // A past-cap edge is exactly what the rescue
-                            // recompute exists for, but on a topologically-
-                            // sewn file the heal above never ran — the
-                            // topology-only check passed (of-du3v). Consult
-                            // the rescue pass once before abandoning the
-                            // exact path; anything it repairs is re-measured
-                            // by another round of `record_edge_tolerances`.
-                            if !rescue_spent && options.heal.strategy != HealStrategy::Off {
-                                rescue_spent = true;
-                                let result = GeometryHealer::rescue_edge_curves(
-                                    body,
+                if failures.is_empty() {
+                    // Only once the topology is settled — healing decides which
+                    // faces an edge ends up bounding — is there anything to
+                    // measure the edges against.
+                    let mut rescue_spent = false;
+                    loop {
+                        match record_edge_tolerances(store, geo, body) {
+                            Ok(raised) => {
+                                if closure_trims > 0 {
+                                    diagnostics.push(Diagnostic {
+                                        entity: Some(msb_id),
+                                        severity: Severity::Info,
+                                        message: format!(
+                                            "{closure_trims} edge(s) miss their vertex points \
+                                             by more than decimal round-off, within the \
+                                             {closure:.3e} mm closure this solid is held to"
+                                        ),
+                                    });
+                                }
+                                if raised > 0 {
+                                    diagnostics.push(Diagnostic {
+                                        entity: Some(msb_id),
+                                        severity: Severity::Info,
+                                        message: format!(
+                                            "{raised} edge tolerance(s) raised to the measured \
+                                             distance from their faces' surfaces"
+                                        ),
+                                    });
+                                }
+                                *heal_operations += finish_exact_body(
                                     store,
                                     geo,
-                                    &options.heal,
+                                    body,
+                                    options,
+                                    &carryover,
+                                    msb_id,
+                                    diagnostics,
                                 );
-                                *heal_operations += result.operations.len();
-                                for op in &result.operations {
-                                    diagnostics.push(Diagnostic {
-                                        entity: Some(msb_id),
-                                        severity: Severity::Info,
-                                        message: format!("healed: {op}"),
-                                    });
-                                }
-                                for note in &result.notes {
-                                    diagnostics.push(Diagnostic {
-                                        entity: Some(msb_id),
-                                        severity: Severity::Info,
-                                        message: format!("heal: {note}"),
-                                    });
-                                }
-                                if !result.is_empty() {
-                                    continue;
-                                }
+                                return SolidOutcome::BRep(body);
                             }
-                            diagnostics.push(Diagnostic {
-                                entity: Some(msb_id),
-                                severity: Severity::Warning,
-                                message: format!(
-                                    "mapped body failed validation: edge {edge:?} strays \
-                                     {deviation} from the surface of a face it bounds, more \
-                                     than the kernel's maximum tolerance \
-                                     ({MAX_ALLOWED_TOLERANCE})"
-                                ),
-                            });
-                            break;
+                            Err((edge, deviation)) => {
+                                // A past-cap edge is exactly what the rescue
+                                // recompute exists for, but on a topologically-
+                                // sewn file the heal above never ran — the
+                                // topology-only check passed (of-du3v). Consult
+                                // the rescue pass once before abandoning the
+                                // exact path; anything it repairs is re-measured
+                                // by another round of `record_edge_tolerances`.
+                                if !rescue_spent && options.heal.strategy != HealStrategy::Off {
+                                    rescue_spent = true;
+                                    let result = GeometryHealer::rescue_edge_curves(
+                                        body,
+                                        store,
+                                        geo,
+                                        &options.heal,
+                                    );
+                                    *heal_operations += result.operations.len();
+                                    for op in &result.operations {
+                                        diagnostics.push(Diagnostic {
+                                            entity: Some(msb_id),
+                                            severity: Severity::Info,
+                                            message: format!("healed: {op}"),
+                                        });
+                                    }
+                                    for note in &result.notes {
+                                        diagnostics.push(Diagnostic {
+                                            entity: Some(msb_id),
+                                            severity: Severity::Info,
+                                            message: format!("heal: {note}"),
+                                        });
+                                    }
+                                    if !result.is_empty() {
+                                        continue;
+                                    }
+                                }
+                                diagnostics.push(Diagnostic {
+                                    entity: Some(msb_id),
+                                    severity: Severity::Warning,
+                                    message: format!(
+                                        "mapped body failed validation: edge {edge:?} strays \
+                                         {deviation} from the surface of a face it bounds, \
+                                         more than the kernel's maximum tolerance \
+                                         ({MAX_ALLOWED_TOLERANCE})"
+                                    ),
+                                });
+                                break;
+                            }
                         }
                     }
                 }
+                for failure in &failures {
+                    diagnostics.push(Diagnostic {
+                        entity: Some(msb_id),
+                        severity: Severity::Warning,
+                        message: format!("mapped body failed validation: {failure}"),
+                    });
+                }
+                rollback(store, geo, &created);
+                break;
             }
-            for failure in &failures {
-                diagnostics.push(Diagnostic {
-                    entity: Some(msb_id),
-                    severity: Severity::Warning,
-                    message: format!("mapped body failed validation: {failure}"),
-                });
+            Err(e) => {
+                rollback(store, geo, &created);
+                if !reconciled {
+                    reconciled = true;
+                    let moves = reconcile_vertices(
+                        file,
+                        &shell_roots,
+                        scale,
+                        angle_scale,
+                        declared_closure(file, msb_id),
+                        closure,
+                    );
+                    if !moves.is_empty() {
+                        for m in &moves {
+                            diagnostics.push(Diagnostic {
+                                entity: Some(m.vertex),
+                                severity: Severity::Info,
+                                message: format!(
+                                    "healed: vertex #{} sat {:.3e} mm off an incident \
+                                     edge's curve, more than a vertex can carry; moved \
+                                     {:.3e} mm within the declared closure so every \
+                                     incident curve is within {:.3e} mm",
+                                    m.vertex, m.was, m.moved, m.now
+                                ),
+                            });
+                        }
+                        *heal_operations += moves.len();
+                        adjusted = moves.into_iter().map(|m| (m.vertex, m.point)).collect();
+                        // The first attempt's refusal is not reported: either
+                        // the retry clears it, or the retry's own refusal —
+                        // measured on the reconciled vertices — supersedes it.
+                        continue;
+                    }
+                }
+                diagnostics.push(e.diagnostic());
+                break;
             }
-            rollback(store, geo, &created);
-        }
-        Err(e) => {
-            diagnostics.push(e.diagnostic());
-            rollback(store, geo, &created);
         }
     }
 
@@ -5852,6 +6174,7 @@ fn map_solid(
         closure,
         seam_tol,
         seam_edges: &seam_edges,
+        adjusted: &adjusted,
         diagnostics,
         polylines: HashMap::new(),
     };
@@ -8339,6 +8662,240 @@ mod tests {
         }
     }
 
+    // ---- vertex reconciliation (of-5cn5) ----
+
+    /// A vertex 1.5× the kernel limit off two of its three edges — too far
+    /// for any tolerance to carry, so of-kwn's closure floor cannot admit
+    /// it. What can is splitting the miss: the fixture declares a closure
+    /// and the reader moves the vertex to the minimax point of its edges'
+    /// nearest points, leaving each edge half the miss as ordinary vertex
+    /// tolerance. nist_ctc_05's #2783 in miniature (of-5cn5).
+    #[test]
+    fn a_vertex_past_the_kernel_limit_is_reconciled_within_the_closure() {
+        let off = 1.5 * MAX_ALLOWED_TOLERANCE;
+        let (store, geo, report) = import(&block_with_a_loose_vertex(off, Some(5.0e-2)));
+        no_error_diagnostics(&report);
+        let body = brep_body(&report.solids[0].outcome);
+        assert_eq!(store.check_with_geometry(&geo, body), Vec::new());
+
+        // The repair says what it did, and counts as a heal operation.
+        assert!(
+            report.diagnostics.iter().any(|d| {
+                d.severity == Severity::Info
+                    && d.message.starts_with("healed: vertex #9 sat")
+                    && d.message.contains("within the declared closure")
+            }),
+            "the reconciliation must say what it moved: {:?}",
+            report.diagnostics
+        );
+
+        // The vertex moved halfway toward the corner its two missed edges
+        // still run from, so every edge now carries half the miss — under
+        // the limit — and the vertex's tolerance covers it.
+        let vertex = store
+            .faces_of_body(body)
+            .into_iter()
+            .flat_map(|f| store.edges_of_face(f))
+            .flat_map(|e| {
+                let edge = store.edge(e).expect("live edge");
+                [edge.start_vertex, edge.end_vertex]
+            })
+            .find(|&v| store.vertex(v).expect("live vertex").tolerance > SYSTEM_RESOLUTION)
+            .expect("the reconciled vertex carries its split miss");
+        let vertex = store.vertex(vertex).expect("live vertex");
+        assert!(
+            (vertex.point - Point3::new(-1.0 + off / 2.0, -1.0, -1.0)).norm() < 1e-4,
+            "expected the minimax midpoint, got {:?}",
+            vertex.point
+        );
+        assert!(
+            (vertex.tolerance - off / 2.0).abs() < 1e-4,
+            "expected half the miss as tolerance, got {}",
+            vertex.tolerance
+        );
+    }
+
+    /// Without a declaration there is no authored slop to split — the file
+    /// asserts its printed decimals, and a vertex this far off them is a
+    /// defect, not imprecision. The refusal stands.
+    #[test]
+    fn a_vertex_past_the_limit_stays_refused_without_a_declaration() {
+        let off = 1.5 * MAX_ALLOWED_TOLERANCE;
+        let (_, _, report) = import(&block_with_a_loose_vertex(off, None));
+        assert!(
+            matches!(report.solids[0].outcome, SolidOutcome::Failed),
+            "got {:?}",
+            report.solids[0].outcome
+        );
+        assert!(
+            !report
+                .diagnostics
+                .iter()
+                .any(|d| d.message.starts_with("healed: vertex")),
+            "nothing may move without a declaration: {:?}",
+            report.diagnostics
+        );
+    }
+
+    /// A miss too wide for even an equal split to land under the kernel
+    /// limit is beyond repair, however wide the declaration: the reconciled
+    /// residuals would still be more than a vertex can carry.
+    #[test]
+    fn a_miss_too_wide_to_split_is_still_refused() {
+        let off = 5.0 * MAX_ALLOWED_TOLERANCE;
+        let (_, _, report) = import(&block_with_a_loose_vertex(off, Some(9.0e-2)));
+        assert!(
+            matches!(report.solids[0].outcome, SolidOutcome::Failed),
+            "got {:?}",
+            report.solids[0].outcome
+        );
+        assert!(
+            !report
+                .diagnostics
+                .iter()
+                .any(|d| d.message.starts_with("healed: vertex")),
+            "an unrepairable vertex must stay where the file put it: {:?}",
+            report.diagnostics
+        );
+    }
+
+    /// [`reconcile_vertices`] itself, on the fixture: one move, to the
+    /// midpoint, measured honestly — and none when the miss is round-off
+    /// slop a vertex can already carry.
+    #[test]
+    fn reconcile_vertices_splits_the_miss_at_the_minimax_point() {
+        let off = 1.5 * MAX_ALLOWED_TOLERANCE;
+        let src = block_with_a_loose_vertex(off, Some(5.0e-2));
+        let file = super::super::parse::parse(&src).expect("fixture parses");
+        let (msb_id, shell_ref) = file
+            .data
+            .iter()
+            .find_map(|inst| {
+                let rec = inst.entity.part("MANIFOLD_SOLID_BREP")?;
+                Some((inst.id, ref_attr(rec, 1, inst.id).ok()?))
+            })
+            .expect("fixture holds a solid");
+        let reconcile = |file: &StepFile| {
+            let closure = resolve_closure(file, msb_id, &mut Vec::new());
+            reconcile_vertices(
+                file,
+                &[shell_ref],
+                1.0,
+                1.0,
+                declared_closure(file, msb_id),
+                closure,
+            )
+        };
+        let moves = reconcile(&file);
+        let [m] = &moves[..] else {
+            panic!("expected exactly one move, got {}", moves.len());
+        };
+        assert_eq!(m.vertex, 9);
+        assert!((m.point - Point3::new(-1.0 + off / 2.0, -1.0, -1.0)).norm() < 1e-4);
+        assert!((m.was - off).abs() < 1e-12, "got {}", m.was);
+        assert!((m.now - off / 2.0).abs() < 1e-4, "got {}", m.now);
+        assert!((m.moved - off / 2.0).abs() < 1e-4, "got {}", m.moved);
+
+        // Round-off slop stays put: the closure floor already carries it.
+        let src = block_with_a_loose_vertex(LOOSE_VERTEX_OFFSET, Some(1.0e-4));
+        let file = super::super::parse::parse(&src).expect("fixture parses");
+        assert!(
+            reconcile(&file).is_empty(),
+            "a carriable miss must not be moved"
+        );
+
+        // A miss past the file's own declaration is not authored slop the
+        // split may believe, however carriable the halves would be: 1.8e-2
+        // splits to 9e-3 — under the kernel limit — but the file only
+        // vouches for 1.5e-2 (of-7aja's cliff, held to the *unclamped*
+        // declaration).
+        let src = block_with_a_loose_vertex(1.8e-2, Some(1.5e-2));
+        let file = super::super::parse::parse(&src).expect("fixture parses");
+        assert!(
+            reconcile(&file).is_empty(),
+            "a miss beyond the declaration must not be moved"
+        );
+        let src = block_with_a_loose_vertex(1.4e-2, Some(1.5e-2));
+        let file = super::super::parse::parse(&src).expect("fixture parses");
+        assert_eq!(
+            reconcile(&file).len(),
+            1,
+            "the same split inside the declaration goes through"
+        );
+    }
+
+    /// [`curve_foot`] finds the nearest point exactly where a closed form
+    /// exists, lands on the curve everywhere else, and declines the cases
+    /// with nothing to invert.
+    #[test]
+    fn curve_foot_lands_on_each_curve_kind() {
+        let p = Point3::new(2.0, 3.0, 5.0);
+
+        let line = Curve3::Line {
+            origin: Point3::new(0.0, 0.0, 5.0),
+            dir: Vector3::x(),
+        };
+        let foot = curve_foot(&line, &p).expect("a line always has a foot");
+        assert!((foot - Point3::new(2.0, 0.0, 5.0)).norm() < 1e-12);
+
+        // Off-plane and off-radius at once: the foot drops onto the plane
+        // and out to the radius — the #2783 geometry.
+        let circle = Curve3::Circle {
+            center: Point3::origin(),
+            axis: Vector3::z(),
+            radius: 2.0,
+        };
+        let q = Point3::new(1.0, 1.0, 0.5);
+        let foot = curve_foot(&circle, &q).expect("off-axis point has a foot");
+        let s = 2.0 / 2.0f64.sqrt();
+        assert!((foot - Point3::new(s, s, 0.0)).norm() < 1e-12);
+        // On the axis every direction ties, and there is no foot to trust.
+        assert!(curve_foot(&circle, &Point3::new(0.0, 0.0, 1.0)).is_none());
+
+        let ellipse = Curve3::Ellipse {
+            center: Point3::origin(),
+            axis: Vector3::z(),
+            major_dir: Vector3::x(),
+            major_radius: 3.0,
+            minor_radius: 1.0,
+        };
+        let foot = curve_foot(&ellipse, &Point3::new(0.0, 2.0, 0.0)).expect("foot");
+        assert!((foot - Point3::new(0.0, 1.0, 0.0)).norm() < 1e-12);
+
+        // A B-spline foot comes from the projector: a control-polygon
+        // endpoint is interpolated exactly, so its foot is itself.
+        let spline = bspline_arc();
+        let foot = curve_foot(&spline, &Point3::new(4.0, 0.0, 0.0)).expect("foot");
+        assert!((foot - Point3::new(4.0, 0.0, 0.0)).norm() < 1e-9);
+
+        let polyline = Curve3::Polyline {
+            points: vec![Point3::origin(), Point3::new(1.0, 0.0, 0.0)],
+            closed: false,
+        };
+        assert!(curve_foot(&polyline, &p).is_none());
+    }
+
+    /// [`minimax_point`] centers the smallest enclosing ball: the midpoint
+    /// of two points, unmoved by interior points, and exact enough for the
+    /// margins the reconciliation decides by.
+    #[test]
+    fn minimax_point_centers_the_smallest_enclosing_ball() {
+        let a = Point3::new(-1.0, -1.0, -1.0);
+        let b = Point3::new(-1.0 + 0.018, -1.0, -1.0);
+        // Repeats model several exact edges footing the same corner.
+        let center = minimax_point(&[b, a, a, a]);
+        let mid = Point3::new(-1.0 + 0.009, -1.0, -1.0);
+        assert!((center - mid).norm() < 1e-5, "got {center:?}");
+
+        // A point already inside the ball changes nothing.
+        let inside = Point3::new(-1.0 + 0.004, -1.0, -1.0);
+        let center = minimax_point(&[a, b, inside]);
+        assert!((center - mid).norm() < 1e-5, "got {center:?}");
+
+        let single = minimax_point(&[a]);
+        assert!((single - a).norm() < 1e-12);
+    }
+
     // ---- edge tolerances (of-bb6) ----
 
     /// A 2 mm block whose bottom face's `PLANE` is tilted by `slope` about
@@ -9755,6 +10312,7 @@ REPRESENTATION_CONTEXT('2D SPACE','') );
                 let closure = resolve_closure(&file, inst.id, &mut diagnostics);
                 let seam_tol = solid_seam_tol(&file, &[shell_ref], scale);
                 let seam_edges = sole_loop_edges(&file);
+                let adjusted = HashMap::new();
                 let mut mesher = FallbackMesher {
                     file: &file,
                     options: &options,
@@ -9763,6 +10321,7 @@ REPRESENTATION_CONTEXT('2D SPACE','') );
                     closure,
                     seam_tol,
                     seam_edges: &seam_edges,
+                    adjusted: &adjusted,
                     diagnostics: &mut diagnostics,
                     polylines: HashMap::new(),
                 };
@@ -9904,6 +10463,7 @@ REPRESENTATION_CONTEXT('2D SPACE','') );
                 let closure = resolve_closure(&file, inst.id, &mut diagnostics);
                 let seam_tol = solid_seam_tol(&file, &[shell_ref], scale);
                 let seam_edges = sole_loop_edges(&file);
+                let adjusted = HashMap::new();
                 let mut mesher = FallbackMesher {
                     file: &file,
                     options: &options,
@@ -9912,6 +10472,7 @@ REPRESENTATION_CONTEXT('2D SPACE','') );
                     closure,
                     seam_tol,
                     seam_edges: &seam_edges,
+                    adjusted: &adjusted,
                     diagnostics: &mut diagnostics,
                     polylines: HashMap::new(),
                 };

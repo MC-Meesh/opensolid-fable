@@ -90,16 +90,14 @@ const ANGULAR_STEP: f64 = std::f64::consts::TAU / 192.0;
 /// Every entry names the bug that explains it; the test asserts this set
 /// *equals* the observed one.
 const KNOWN_IMPORT_FAILURES: &[(&str, &str)] = &[
-    // of-5cn5: one CIRCLE edge (#4444) whose end VERTEX_POINT sits 7.2e-4 in
-    // off the circle's *plane* — 0.0182 mm, nearly twice
+    // Empty since of-5cn5: the whole corpus imports. nist_ctc_05 was the
+    // last entry — one CIRCLE edge (#4444) whose end VERTEX_POINT sat
+    // 7.2e-4 in off the circle's *plane*, 0.0182 mm, nearly twice
     // MAX_ALLOWED_TOLERANCE, so no trim tolerance the reader could derive
-    // lets the kernel carry it. of-kwn cleared the five edges underneath it,
-    // whose ~1e-5 in misses are inside the 3.669e-3 in closure this file
-    // declares; this one is a different kind of defect, and it holds off the
-    // mesh fallback too — a vertex this far off its own curve leaves no
-    // consistent shell to close (measured on the of-05ac branch, which
-    // carries the fallback and still lists this file here).
-    ("nist/nist_ctc_05_asme1_rd.stp", "of-5cn5"),
+    // let the kernel carry it *unmoved*. Vertex reconciliation (read.rs
+    // `reconcile_vertices`) splits the miss among the four edges meeting
+    // there instead, inside the closure the file declares, and the file
+    // imports on the exact path.
 ];
 
 /// Corpus files with at least one solid that imports, but only through the
@@ -147,6 +145,13 @@ const SEAM_DELTAS: &[(&str, isize, isize)] = &[
     // entry now (of-05ac) and so counts nothing to compare; the entry comes
     // back with the file.
     ("nist/nist_ctc_03_asme1_rc.stp", 20, 5),
+    // In since of-5cn5 put the file on the exact path. It declares 209
+    // faces, 514 edges and 333 vertices, but plane face #6532 shares none
+    // of its four edges with any other face — an orphan patch both kernels
+    // drop, leaving the 208 faces, 510 edges and 329 vertices we import.
+    // OCC agrees exactly on faces and vertices and seams its closed faces
+    // up to 531 edges.
+    ("nist/nist_ctc_05_asme1_rd.stp", 21, 0),
     ("nist/nist_ctc_04_asme1_rd.stp", 66, 0),
     ("nist/nist_ftc_06_asme1_rd.stp", 71, 23),
     ("nist/nist_ftc_07_asme1_rd.stp", 47, 12),
