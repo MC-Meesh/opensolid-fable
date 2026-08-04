@@ -9622,18 +9622,28 @@ fn long_block_severs_the_tube_twice() {
 /// A cylinder drilled through the tube: a CURVED tool, so the entry and
 /// exit loops come from the curved-curved marcher rather than a plane
 /// section, and each loop wraps the cylinder chart's periodic direction
-/// while sitting contractible on the torus chart — the two hosts must
-/// re-merge the seam-cut fragments into the same ring (of-43n) before
-/// [`ring_polyline`] can re-spell it. Radially the drill runs along the
-/// +X spoke through both tube walls (bore to outside); axially it runs
-/// parallel to the torus axis through top and bottom of the tube. Both
-/// tunnel the solid: genus 1 → 2.
-// Fenced adversarial discovery (of-f7rk): the radial drill's subtract
-// fails with Degenerate("boolean::imprint", "an imprint chain ends in a
-// face interior without closing or reaching the face boundary") before
-// any assertion runs. Un-ignore when of-f7rk lands.
+/// while sitting contractible on the torus chart. Radially the drill
+/// runs along the +X spoke through both tube walls (bore to outside);
+/// axially it runs parallel to the torus axis through top and bottom of
+/// the tube. Both tunnel the solid: genus 1 → 2.
+///
+/// Discovered fenced by of-f7rk: the radial drill's subtract died with
+/// Degenerate("boolean::imprint") because `march_boxed`'s seed dedup
+/// starved the fourth seam-quartered cover fragment of every loop —
+/// cured upstream by of-rxjs. What the cure revealed is that NEITHER
+/// drill binds a whole looping curve: both drills sit on the +X spoke,
+/// so every entry/exit loop straddles the torus chart's u-seam (the
+/// radial exit loop the v-seam too) and its fragments bind as OPEN
+/// marched arcs meeting at seam-crossing vertices — the same spelling
+/// as the bite-0.02 island of
+/// [`grazing_notch_shrinks_the_imprint_loop_to_an_island`]. Loop
+/// closure itself is carried by the genus and the material balance; the
+/// probe below accepts either spelling so it keeps matching if of-43n
+/// style re-merging ever binds these loops whole. Each cut loop yields
+/// at least two arcs, each arc shared by a bore-wall and a tube-wall
+/// face, so two loops put at least 8 open marched arc uses on the body
+/// (the radial drill binds 14, its exit loop being quartered).
 #[test]
-#[ignore = "of-f7rk: curved-curved drill aborts Degenerate in boolean::imprint"]
 fn cylinder_drilled_through_the_tube_binds_readable_loops() {
     let (major, minor) = (2.0, 0.5);
     for (name, base, axis) in [
@@ -9658,10 +9668,25 @@ fn cylinder_drilled_through_the_tube_binds_readable_loops() {
             "{context}: a through-drilled tube must be genus 2"
         );
         let (looping, _) = looping_imprint_edge_ranges(&diff, &context);
+        let mut marched_arcs = 0;
+        for face in diff.store.faces_of_body(diff.body) {
+            for edge_id in diff.store.edges_of_face(face) {
+                let edge = diff.store.edge(edge_id).expect("live edge");
+                let curve_id = edge.curve.expect("every output edge binds a curve");
+                let curve = diff.geo.curve(curve_id).expect("live curve");
+                let (lo, hi) = curve.domain();
+                if matches!(curve, Curve3::Polyline { .. })
+                    && (curve.point(hi) - curve.point(lo)).norm() > 1e-9
+                {
+                    marched_arcs += 1;
+                }
+            }
+        }
         assert!(
-            looping >= 2,
-            "{context}: expected both drill loops bound to looping \
-             imprints, found {looping}"
+            looping >= 2 || marched_arcs >= 8,
+            "{context}: the two drill loops are bound in neither spelling — \
+             {looping} looping edge use(s), {marched_arcs} open marched arc \
+             use(s) — the curved-curved marcher's loops are not on the body"
         );
         assert_edge_ranges_readable(&diff, &context);
         let inter = scene
