@@ -56,6 +56,41 @@
 //!   gap is floored by the closure (`HealOptions::gap_floor`) without
 //!   flooring sliver collapse. The repro
 //!   [`a_declared_closure_admits_a_slopped_two_vertex_seam`] now passes.
+//!
+//! # of-5xtv: attacking vertex reconciliation (pairs of-5cn5)
+//!
+//! Sections (8)–(10) attack the of-5cn5 mechanism itself — the band between
+//! [`MAX_ALLOWED_TOLERANCE`] and a looser declaration, where a vertex no
+//! single entity can carry is moved to the minimax point of its incident
+//! curves' nearest points and the miss split across the edges meeting
+//! there. The cylinder fixture's seam vertex carries valence **two** (the
+//! circle and the seam line), the pyramid fixture's apex valence **six** —
+//! either side of nist_ctc_05's four. Attacked: the band's epsilon edges at
+//! 1× and 2× the kernel limit, the cliff at the *unclamped* declaration,
+//! inch authoring, translation invariance (of-85rt), the two-vertex seam
+//! spelling (of-00pu) reconciled and seamed in one import, declarations
+//! that lie by decades, and a randomized band fuzz.
+//!
+//! - **of-3jgq** (P2, OPEN): the minimax point is computed as the center of
+//!   the smallest ball enclosing the incident curves' *feet*, which is not
+//!   the point minimizing the greatest curve distance when the curves are
+//!   concurrent at shallow mutual angles. A hexagonal-pyramid apex slopped
+//!   *along its axis* by 1.35× the limit — six slant lines all passing
+//!   exactly through the authored apex, unanimity the mechanism's own
+//!   contract says to believe — reconciles only to 1.27× the limit
+//!   (reduction factor cos²α) and is refused, where the true minimax point
+//!   carries **zero** residual. The repro is
+//!   [`an_axially_slopped_apex_of_concurrent_edges_must_import`],
+//!   `#[ignore]`d until the bead lands.
+//! - **of-yluq** (P2, OPEN): not the split itself, but the same
+//!   declared-closure family — a *carriable* miss (0.8× the limit under the
+//!   closure floor, no reconciliation) at the sharp valence-six apex
+//!   imports as an exact `SolidOutcome::BRep` whose adjacent side faces
+//!   genuinely cross near the apex: `check()` (topology-only, all the
+//!   import runs) passes, `check_with_geometry` reports `SelfIntersection`.
+//!   The import certifies a body the geometric checker refuses. The repro
+//!   is [`a_high_valence_apex_with_carriable_slop_imports_unmoved`],
+//!   `#[ignore]`d until the bead lands.
 
 use opensolid_brep::MAX_ALLOWED_TOLERANCE;
 use opensolid_brep::{GeometryStore, TopologyStore};
@@ -252,16 +287,38 @@ fn cylinder_with_a_loose_seam_vertex(
     unit: Unit,
     closure_mm: Option<f64>,
 ) -> String {
+    cylinder_with_a_loose_seam_vertex_at([0.0; 3], r, h, vertex_mm, unit, closure_mm)
+}
+
+/// The same cylinder translated so its axis passes through `origin_mm` —
+/// `vertex_mm` stays in the untranslated frame and is offset along with
+/// everything else. Reconciliation must be translation-invariant the same
+/// way the seam bound is (of-85rt): a band verdict that changes when the
+/// part moves is measuring placement, not geometry.
+fn cylinder_with_a_loose_seam_vertex_at(
+    origin_mm: [f64; 3],
+    r: f64,
+    h: f64,
+    vertex_mm: [f64; 3],
+    unit: Unit,
+    closure_mm: Option<f64>,
+) -> String {
     let s = unit.in_mm();
-    let (lo, hi) = (-h / 2.0 / s, h / 2.0 / s);
+    let (ox, oy, oz) = (origin_mm[0] / s, origin_mm[1] / s, origin_mm[2] / s);
+    let (lo, hi) = (oz - h / 2.0 / s, oz + h / 2.0 / s);
     let rr = r / s;
-    let (vx, vy, vz) = (vertex_mm[0] / s, vertex_mm[1] / s, vertex_mm[2] / s);
+    let xr = ox + rr;
+    let (vx, vy, vz) = (
+        ox + vertex_mm[0] / s,
+        oy + vertex_mm[1] / s,
+        oz + vertex_mm[2] / s,
+    );
     let body = format!(
         "\
-#1 = CARTESIAN_POINT('', (0., 0., {lo:.12}));
-#2 = CARTESIAN_POINT('', (0., 0., {hi:.12}));
-#3 = CARTESIAN_POINT('', ({rr:.12}, 0., {lo:.12}));
-#4 = CARTESIAN_POINT('', ({rr:.12}, 0., {hi:.12}));
+#1 = CARTESIAN_POINT('', ({ox:.12}, {oy:.12}, {lo:.12}));
+#2 = CARTESIAN_POINT('', ({ox:.12}, {oy:.12}, {hi:.12}));
+#3 = CARTESIAN_POINT('', ({xr:.12}, {oy:.12}, {lo:.12}));
+#4 = CARTESIAN_POINT('', ({xr:.12}, {oy:.12}, {hi:.12}));
 #5 = DIRECTION('', (0., 0., 1.));
 #6 = DIRECTION('', (1., 0., 0.));
 #7 = DIRECTION('', (0., 0., -1.));
@@ -406,6 +463,169 @@ fn cylinder_sector(r: f64, h: f64, sweep: f64, closure_mm: Option<f64>) -> Strin
         tail = context_tail(84, Unit::Mm, closure_mm),
     );
     wrap(&body)
+}
+
+/// An `n`-gonal right pyramid: base a regular n-gon of circumradius `r` in
+/// the `z = 0` plane, apex *authored* at `apex_mm` while every slant `LINE`
+/// runs through the **true** apex `(0, 0, h)` — so the apex vertex is off
+/// each of its `n` incident slant edges by exactly the perturbation's
+/// perpendicular component, and nothing else in the file moves. The apex is
+/// the high-valence vertex the of-5cn5 discussion needs: nist_ctc_05's
+/// carries four incident edges, this one carries `n`. The slant half-angle
+/// α (from the axis) is `asin(r / √(r² + h²))`: a tall pyramid makes the
+/// slant lines nearly concurrent-parallel, which is where the feet-ball
+/// minimax degrades (of-3jgq).
+fn ngon_pyramid(n: usize, r: f64, h: f64, apex_mm: [f64; 3], closure_mm: Option<f64>) -> String {
+    use std::fmt::Write as _;
+    assert!(n >= 3, "a pyramid needs at least a triangular base");
+    let apex = [0.0, 0.0, h];
+    let sub = |a: [f64; 3], b: [f64; 3]| [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+    let cross = |a: [f64; 3], b: [f64; 3]| {
+        [
+            a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0],
+        ]
+    };
+    let unit3 = |v: [f64; 3]| {
+        let n = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+        [v[0] / n, v[1] / n, v[2] / n]
+    };
+    let p3 = |v: [f64; 3]| format!("({:.12}, {:.12}, {:.12})", v[0], v[1], v[2]);
+    let base: Vec<[f64; 3]> = (0..n)
+        .map(|i| {
+            let t = 2.0 * PI * (i as f64) / (n as f64);
+            [r * t.cos(), r * t.sin(), 0.0]
+        })
+        .collect();
+    let mut b = String::new();
+    // Base plane: outward normal -z.
+    writeln!(b, "#1 = CARTESIAN_POINT('', (0., 0., 0.));").unwrap();
+    writeln!(b, "#2 = DIRECTION('', (0., 0., -1.));").unwrap();
+    writeln!(b, "#3 = DIRECTION('', (1., 0., 0.));").unwrap();
+    writeln!(b, "#4 = AXIS2_PLACEMENT_3D('', #1, #2, #3);").unwrap();
+    writeln!(b, "#5 = PLANE('', #4);").unwrap();
+    writeln!(b, "#9 = CARTESIAN_POINT('', {});", p3(apex_mm)).unwrap();
+    writeln!(b, "#8 = VERTEX_POINT('', #9);").unwrap();
+    for i in 0..n {
+        let j = (i + 1) % n;
+        writeln!(b, "#{} = CARTESIAN_POINT('', {});", 100 + i, p3(base[i])).unwrap();
+        writeln!(b, "#{} = VERTEX_POINT('', #{});", 200 + i, 100 + i).unwrap();
+        // Slant line through the base corner toward the TRUE apex.
+        let slant = unit3(sub(apex, base[i]));
+        writeln!(b, "#{} = DIRECTION('', {});", 300 + i, p3(slant)).unwrap();
+        writeln!(b, "#{} = VECTOR('', #{}, 1.);", 400 + i, 300 + i).unwrap();
+        writeln!(b, "#{} = LINE('', #{}, #{});", 500 + i, 100 + i, 400 + i).unwrap();
+        // Base edge line b_i -> b_j.
+        let along = unit3(sub(base[j], base[i]));
+        writeln!(b, "#{} = DIRECTION('', {});", 600 + i, p3(along)).unwrap();
+        writeln!(b, "#{} = VECTOR('', #{}, 1.);", 700 + i, 600 + i).unwrap();
+        writeln!(b, "#{} = LINE('', #{}, #{});", 800 + i, 100 + i, 700 + i).unwrap();
+        writeln!(
+            b,
+            "#{} = EDGE_CURVE('', #{}, #8, #{}, .T.);",
+            900 + i,
+            200 + i,
+            500 + i
+        )
+        .unwrap();
+        writeln!(
+            b,
+            "#{} = EDGE_CURVE('', #{}, #{}, #{}, .T.);",
+            1000 + i,
+            200 + i,
+            200 + j,
+            800 + i
+        )
+        .unwrap();
+        // Side face: plane through b_i, b_j and the true apex, outward
+        // normal (b_j - b_i) x (apex - b_i); loop b_i -> b_j -> apex is
+        // counter-clockwise around it.
+        let normal = unit3(cross(sub(base[j], base[i]), sub(apex, base[i])));
+        writeln!(b, "#{} = DIRECTION('', {});", 1100 + i, p3(normal)).unwrap();
+        writeln!(
+            b,
+            "#{} = AXIS2_PLACEMENT_3D('', #{}, #{}, #{});",
+            1200 + i,
+            100 + i,
+            1100 + i,
+            600 + i
+        )
+        .unwrap();
+        writeln!(b, "#{} = PLANE('', #{});", 1300 + i, 1200 + i).unwrap();
+        writeln!(
+            b,
+            "#{} = ORIENTED_EDGE('', *, *, #{}, .T.);",
+            1400 + i,
+            1000 + i
+        )
+        .unwrap();
+        writeln!(
+            b,
+            "#{} = ORIENTED_EDGE('', *, *, #{}, .T.);",
+            1500 + i,
+            900 + j
+        )
+        .unwrap();
+        writeln!(
+            b,
+            "#{} = ORIENTED_EDGE('', *, *, #{}, .F.);",
+            1600 + i,
+            900 + i
+        )
+        .unwrap();
+        writeln!(
+            b,
+            "#{} = EDGE_LOOP('', (#{}, #{}, #{}));",
+            1700 + i,
+            1400 + i,
+            1500 + i,
+            1600 + i
+        )
+        .unwrap();
+        writeln!(
+            b,
+            "#{} = FACE_OUTER_BOUND('', #{}, .T.);",
+            1800 + i,
+            1700 + i
+        )
+        .unwrap();
+        writeln!(
+            b,
+            "#{} = ADVANCED_FACE('', (#{}), #{}, .T.);",
+            1900 + i,
+            1800 + i,
+            1300 + i
+        )
+        .unwrap();
+    }
+    // Base face: every base edge reversed, walked backwards, so the loop
+    // runs clockwise seen from +z — counter-clockwise around the -z normal.
+    for i in 0..n {
+        writeln!(
+            b,
+            "#{} = ORIENTED_EDGE('', *, *, #{}, .F.);",
+            2000 + i,
+            1000 + (n - 1 - i)
+        )
+        .unwrap();
+    }
+    let base_loop = (0..n)
+        .map(|i| format!("#{}", 2000 + i))
+        .collect::<Vec<_>>()
+        .join(", ");
+    writeln!(b, "#2100 = EDGE_LOOP('', ({base_loop}));").unwrap();
+    writeln!(b, "#2101 = FACE_OUTER_BOUND('', #2100, .T.);").unwrap();
+    writeln!(b, "#2102 = ADVANCED_FACE('', (#2101), #5, .T.);").unwrap();
+    let shell = (0..n)
+        .map(|i| format!("#{}", 1900 + i))
+        .chain(std::iter::once("#2102".to_string()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    writeln!(b, "#2103 = CLOSED_SHELL('', ({shell}));").unwrap();
+    writeln!(b, "#2104 = MANIFOLD_SOLID_BREP('pyramid', #2103);").unwrap();
+    write!(b, "{}", context_tail(2104, Unit::Mm, closure_mm)).unwrap();
+    wrap(&b)
 }
 
 // ---------------------------------------------------------------------
@@ -1040,4 +1260,445 @@ fn a_seam_gap_beyond_the_declared_closure_is_never_silently_misread() {
             assert_within(volume, PI * r * r * h, 1.0e-4, &repro);
         }
     }
+}
+
+// =====================================================================
+// (8) The reconciliation band's edges (of-5xtv, pairs of-5cn5)
+// =====================================================================
+
+/// Did vertex reconciliation run? Its diagnostic is the only one spelled
+/// "within the declared closure", distinguishing it from `GeometryHealer`'s
+/// own "healed: …" operations.
+fn reconciled(report: &StepImport) -> bool {
+    report
+        .diagnostics
+        .iter()
+        .any(|d| d.message.starts_with("healed: vertex") && d.message.contains("declared closure"))
+}
+
+/// What a band draw is expected to do end-to-end.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Band {
+    /// Imports with the miss carried unmoved — reconciliation must not run.
+    CarriedUnmoved,
+    /// Imports only because the vertex moved — the diagnostic must say so.
+    Reconciled,
+    /// No split lands every residual under the limit — refusal stands.
+    Refused,
+}
+
+/// Import a cylinder fixture and hold it to a [`Band`] verdict: acceptance,
+/// checker cleanliness, measured volume *and* the reconciliation
+/// diagnostic must all agree with the analytic expectation.
+fn assert_band(text: &str, expect: Band, r: f64, h: f64, repro: &str) {
+    match expect {
+        Band::Refused => assert_refused(text, repro),
+        _ => {
+            let volume = exact_checked_volume(text, repro)
+                .unwrap_or_else(|| panic!("{repro}: expected {expect:?} to import exactly"));
+            assert_within(volume, PI * r * r * h, 1.0e-4, repro);
+            let (_, _, report) = import(text, repro);
+            assert_eq!(
+                reconciled(&report),
+                expect == Band::Reconciled,
+                "{repro}: expected {expect:?}, diagnostics {:#?}",
+                report.diagnostics
+            );
+        }
+    }
+}
+
+/// The seam vertex carries valence **two** — the circle and the seam line,
+/// the fewest incident edges a manifold vertex can have — and the off-plane
+/// push misses the circle by the whole amount while staying on the line, so
+/// the minimax split halves the miss between the two. The band's inner edge
+/// therefore sits at the kernel limit (below it the vertex carries the miss
+/// unmoved) and its outer edge at exactly **twice** the limit (above it no
+/// split lands both residuals under the limit). Off-by-epsilon draws on
+/// either side of both edges, under a clamped declaration.
+#[test]
+fn the_reconciliation_band_edges_sit_at_the_limit_and_its_double() {
+    let (r, h) = (5.0, 8.0);
+    let declared = 2.54e-2;
+    for (factor, expect) in [
+        (0.98, Band::CarriedUnmoved),
+        (1.02, Band::Reconciled),
+        (1.96, Band::Reconciled),
+        (2.04, Band::Refused),
+    ] {
+        let amount = factor * MAX_ALLOWED_TOLERANCE;
+        let repro =
+            format!("OffPlane slop at {factor}x the kernel limit under declaration {declared:.3e}");
+        let text = cylinder_with_a_loose_seam_vertex(
+            r,
+            h,
+            Slop::OffPlane.apply(r, h, amount),
+            Unit::Mm,
+            Some(declared),
+        );
+        assert_band(&text, expect, r, h, &repro);
+    }
+}
+
+/// Inside the band the of-7aja cliff moves to the *unclamped* declaration:
+/// a miss at 0.99× a 1.4e-2 mm declaration splits to 6.93e-3 — comfortably
+/// carriable — and imports reconciled, while 1.01× refuses even though its
+/// halves would carry just as well. The acceptance must flip exactly once,
+/// at 1.0×, and every accepted case must be a reconciliation (the whole
+/// scan sits above the kernel limit, nothing here imports unmoved).
+#[test]
+fn the_reconciliation_cliff_sits_at_the_unclamped_declaration() {
+    let (r, h) = (5.0, 8.0);
+    let declared = 1.4e-2;
+    let mut last_accepted = true;
+    for factor in [0.90, 0.95, 0.99, 1.01, 1.05, 1.20] {
+        let amount = factor * declared;
+        let expect = if factor < 1.0 {
+            Band::Reconciled
+        } else {
+            Band::Refused
+        };
+        let repro = format!(
+            "OffPlane slop at {factor}x the unclamped declaration {declared:.3e} (band cliff)"
+        );
+        let text = cylinder_with_a_loose_seam_vertex(
+            r,
+            h,
+            Slop::OffPlane.apply(r, h, amount),
+            Unit::Mm,
+            Some(declared),
+        );
+        assert_band(&text, expect, r, h, &repro);
+        let accepted = expect != Band::Refused;
+        assert!(
+            last_accepted || !accepted,
+            "{repro}: acceptance must flip exactly once, monotonically"
+        );
+        last_accepted = accepted;
+    }
+}
+
+/// The band survives inch authoring: coordinates and declaration divided by
+/// 25.4 and declared through the `CONVERSION_BASED_UNIT` chain must land on
+/// the same side of both band edges as the millimetre original. A unit bug
+/// in `declared_closure` (fetched separately from `resolve_closure` since
+/// of-5cn5) moves the band 25.4× in one direction.
+#[test]
+fn the_reconciliation_band_survives_inch_authoring() {
+    let (r, h) = (5.0, 8.0);
+    let declared = 2.54e-2;
+    for (amount, expect) in [
+        (1.4 * MAX_ALLOWED_TOLERANCE, Band::Reconciled),
+        (2.2 * MAX_ALLOWED_TOLERANCE, Band::Refused),
+    ] {
+        for unit in [Unit::Mm, Unit::Inch] {
+            let repro =
+                format!("OffPlane slop {amount:.3e} under declaration {declared:.3e} in {unit:?}");
+            let text = cylinder_with_a_loose_seam_vertex(
+                r,
+                h,
+                Slop::OffPlane.apply(r, h, amount),
+                unit,
+                Some(declared),
+            );
+            assert_band(&text, expect, r, h, &repro);
+        }
+    }
+}
+
+/// The band verdict must not move when the part does (of-85rt): the same
+/// slop on a cylinder translated hundreds of millimetres from the origin
+/// must reconcile — or refuse — exactly as at the origin, with the same
+/// volume. The minimax arithmetic runs on absolute coordinates, and the
+/// carriable bound leans on [`trim_tol`]'s origin-distance term; either
+/// drifting under translation would make the verdict about placement.
+#[test]
+fn the_reconciliation_band_is_translation_invariant() {
+    let (r, h) = (5.0, 8.0);
+    let declared = 2.54e-2;
+    let origin = [700.0, -400.0, 250.0];
+    for (amount, expect) in [
+        (1.4 * MAX_ALLOWED_TOLERANCE, Band::Reconciled),
+        (2.04 * MAX_ALLOWED_TOLERANCE, Band::Refused),
+    ] {
+        let repro = format!(
+            "OffPlane slop {amount:.3e} under declaration {declared:.3e} at origin {origin:?}"
+        );
+        let text = cylinder_with_a_loose_seam_vertex_at(
+            origin,
+            r,
+            h,
+            Slop::OffPlane.apply(r, h, amount),
+            Unit::Mm,
+            Some(declared),
+        );
+        assert_band(&text, expect, r, h, &repro);
+    }
+}
+
+/// Reconciliation and the of-00pu seam spelling in one import: the closed
+/// bottom circle written with two distinct seam vertices, one of which
+/// also sits past the kernel limit off the circle's plane. The vertex must
+/// first reconcile (halving the miss with the seam line) and the seam must
+/// still read as a seam afterwards — a full cylinder, never a sliver arc
+/// or a refusal. Order matters here: the seam test and heal's merge run on
+/// the *reconciled* position.
+#[test]
+fn a_reconciled_vertex_still_reads_the_two_vertex_seam() {
+    let (r, h) = (5.0, 8.0);
+    let declared = 2.54e-2;
+    let amount = 1.2 * MAX_ALLOWED_TOLERANCE;
+    let gap = 5.0e-4;
+    let repro = format!(
+        "two-vertex seam {gap:.1e} apart, seam vertex OffPlane by {amount:.3e}, \
+         declaration {declared:.3e}"
+    );
+    let text = with_a_two_vertex_seam(
+        &cylinder_with_a_loose_seam_vertex(
+            r,
+            h,
+            Slop::OffPlane.apply(r, h, amount),
+            Unit::Mm,
+            Some(declared),
+        ),
+        r,
+        h,
+        gap,
+    );
+    let volume = exact_checked_volume(&text, &repro)
+        .unwrap_or_else(|| panic!("{repro}: the reconciled seam must import exactly"));
+    assert_within(volume, PI * r * r * h, 1.0e-4, &repro);
+    assert!(
+        reconciled(&import(&text, &repro).2),
+        "{repro}: the past-limit seam vertex must have been reconciled"
+    );
+}
+
+/// A declaration that lies by decades — 1000 mm on an 8 mm part. The
+/// clamp note fires, and inside the band the mechanism behaves exactly as
+/// under an honest loose declaration: curves unanimous on one point snap to
+/// it even 50× past the kernel limit (the file's geometry is consistent,
+/// only its vertex is parked wrong — and the reader says what it did),
+/// while the same magnitude of *disagreement* between the circle and the
+/// seam line stays refused, because no split can land 0.25 mm residuals
+/// under the limit. A lying declaration widens what may move, never what
+/// any entity may carry.
+#[test]
+fn a_lying_declaration_rescues_only_unanimous_curves_and_says_so() {
+    let (r, h) = (5.0, 8.0);
+    let declared = 1.0e3;
+    let amount = 0.5;
+
+    let repro = format!("Radial slop {amount} under lying declaration {declared:.1e}");
+    let text = cylinder_with_a_loose_seam_vertex(
+        r,
+        h,
+        Slop::Radial.apply(r, h, amount),
+        Unit::Mm,
+        Some(declared),
+    );
+    let volume = exact_checked_volume(&text, &repro)
+        .unwrap_or_else(|| panic!("{repro}: unanimous curves within the declaration must snap"));
+    assert_within(volume, PI * r * r * h, 1.0e-6, &repro);
+    let (_, _, report) = import(&text, &repro);
+    assert!(
+        reconciled(&report),
+        "{repro}: a 0.5 mm snap must be reported: {:#?}",
+        report.diagnostics
+    );
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("exceeds the kernel limit")),
+        "{repro}: the clamped declaration must be noted: {:#?}",
+        report.diagnostics
+    );
+
+    let repro = format!("OffPlane slop {amount} under lying declaration {declared:.1e}");
+    let text = cylinder_with_a_loose_seam_vertex(
+        r,
+        h,
+        Slop::OffPlane.apply(r, h, amount),
+        Unit::Mm,
+        Some(declared),
+    );
+    assert_refused(&text, &repro);
+}
+
+/// Randomized sweep of the whole band, all three slop shapes, honest and
+/// lying declarations: draws sit ≥ 4% clear of both band edges so the
+/// analytic verdict is unambiguous, and every import is checker-clean,
+/// measured, and reports reconciliation exactly when the draw is past the
+/// limit. Radial slop snaps at any band magnitude (the circle and the seam
+/// line agree on the seam point); off-plane and tangential split and so die
+/// past twice the limit.
+#[test]
+fn reconciliation_band_fuzz_agrees_with_the_analytic_contract() {
+    let mut rng = Rng::new(0x_0F5C_5A01);
+    for case in 0..18 {
+        let (r, h) = random_cylinder(&mut rng);
+        let declared = [2.54e-2, 9.3e-2, 1.0e3][rng.pick(3)];
+        let slop = SLOPS[rng.pick(SLOPS.len())];
+        let class = rng.pick(3);
+        let amount = MAX_ALLOWED_TOLERANCE
+            * match class {
+                0 => rng.range(0.3, 0.9),
+                1 => rng.range(1.1, 1.9),
+                _ => rng.range(2.1, 2.5),
+            };
+        let expect = match (slop, class) {
+            (_, 0) => Band::CarriedUnmoved,
+            (Slop::Radial, _) => Band::Reconciled,
+            (_, 1) => Band::Reconciled,
+            _ => Band::Refused,
+        };
+        let repro = format!(
+            "case {case}: cylinder(r = {r:.6}, h = {h:.6}), {slop:?} slop {amount:.6e} \
+             under declaration {declared:.3e}, expecting {expect:?}"
+        );
+        let text = cylinder_with_a_loose_seam_vertex(
+            r,
+            h,
+            slop.apply(r, h, amount),
+            Unit::Mm,
+            Some(declared),
+        );
+        assert_band(&text, expect, r, h, &repro);
+    }
+}
+
+// =====================================================================
+// (9) High-valence vertices: the hexagonal pyramid apex
+// =====================================================================
+
+/// The clean pyramid must import exactly and measure the closed-form
+/// volume — the baseline that proves the fixture, not the mechanism, before
+/// the apex is attacked. Valence six everywhere below rests on this.
+#[test]
+fn a_clean_hexagonal_pyramid_imports_exactly() {
+    let (n, r, h) = (6, 3.0f64, 12.0f64);
+    let repro = format!("clean {n}-gon pyramid(r = {r}, h = {h})");
+    let volume = exact_checked_volume(&ngon_pyramid(n, r, h, [0.0, 0.0, h], None), &repro)
+        .unwrap_or_else(|| panic!("{repro}: the clean pyramid must import exactly"));
+    let base_area = (n as f64) / 2.0 * r * r * (2.0 * PI / (n as f64)).sin();
+    assert_within(volume, base_area * h / 3.0, 1.0e-6, &repro);
+}
+
+/// Six slant edges meet the apex — more than nist_ctc_05's four. Slopped
+/// *perpendicular* to the axis by 1.2× the limit, the feet spread across
+/// all six lines and the minimax center lands near the true apex: the
+/// residual collapses to ~0.07× the limit and the pyramid imports
+/// reconciled, checker-clean, at the authored volume. High valence per se
+/// is not the mechanism's weakness.
+#[test]
+fn a_high_valence_apex_reconciles_perpendicular_slop() {
+    let (n, r, h) = (6, 3.0f64, 12.0f64);
+    let amount = 1.2 * MAX_ALLOWED_TOLERANCE;
+    let declared = 0.1;
+    let repro = format!(
+        "{n}-gon pyramid(r = {r}, h = {h}), apex slopped {amount:.3e} along +x, \
+         declaration {declared}"
+    );
+    let text = ngon_pyramid(n, r, h, [amount, 0.0, h], Some(declared));
+    let volume = exact_checked_volume(&text, &repro)
+        .unwrap_or_else(|| panic!("{repro}: a splittable high-valence miss must import"));
+    let base_area = (n as f64) / 2.0 * r * r * (2.0 * PI / (n as f64)).sin();
+    assert_within(volume, base_area * h / 3.0, 1.0e-4, &repro);
+    assert!(
+        reconciled(&import(&text, &repro).2),
+        "{repro}: the apex move must be reported"
+    );
+}
+
+/// The same apex slopped **along the axis** by 1.35× the limit. All six
+/// slant lines pass exactly through the authored apex `(0, 0, h)` — the
+/// curves are unanimous on one point inside the declaration, the textbook
+/// case of-5cn5's contract says to believe ("a cluster of curves agreeing
+/// on some distant point… snaps within the declaration"), and the true
+/// minimax point carries **zero** residual. But the implementation centers
+/// the ball of the *feet*, which for concurrent lines at slant half-angle
+/// α reduces the miss only by cos²α: here 1.35× becomes 1.27× the limit,
+/// still past carriable, and the solid is refused outright — a file the
+/// declared closure covers, lost to an approximation error in the split.
+///
+/// FOUND FAILING, filed as **of-3jgq**: `reconcile_vertices` must find (or
+/// verify against) the true minimax over curve distances, not the feet
+/// ball; a fixed-point re-foot iteration converges to the intersection
+/// here. Refusal today is honest (Failed + Error diagnostic), so this is a
+/// missed rescue, not corruption.
+#[test]
+#[ignore = "of-3jgq: feet-ball minimax refuses a unanimously-agreed apex (cos^2 alpha reduction)"]
+fn an_axially_slopped_apex_of_concurrent_edges_must_import() {
+    let (n, r, h) = (6, 3.0f64, 12.0f64);
+    // Slant half-angle: sin α = r / √(r² + h²) ≈ 0.2425. Axial slop δ
+    // misses every slant line by δ·sin α; aim the miss at 1.35× the limit.
+    let sin_a = r / (r * r + h * h).sqrt();
+    let delta = 1.35 * MAX_ALLOWED_TOLERANCE / sin_a;
+    let declared = 0.1;
+    let repro = format!(
+        "{n}-gon pyramid(r = {r}, h = {h}), apex slopped {delta:.4e} along +z \
+         (1.35x the limit off each slant line), declaration {declared}"
+    );
+    let text = ngon_pyramid(n, r, h, [0.0, 0.0, h + delta], Some(declared));
+    let volume = exact_checked_volume(&text, &repro).unwrap_or_else(|| {
+        panic!(
+            "{repro}: six curves unanimous on the authored apex, inside the \
+             declaration, must reconcile there and import"
+        )
+    });
+    let base_area = (n as f64) / 2.0 * r * r * (2.0 * PI / (n as f64)).sin();
+    assert_within(volume, base_area * h / 3.0, 1.0e-4, &repro);
+}
+
+/// The refusal the feet-ball approximation produces today must at least be
+/// honest — Failed with an Error diagnostic naming the vertex miss, never
+/// a silently-degraded or wrong-volume body. Pins the *current* behavior
+/// of the of-3jgq geometry so a fix over there flips exactly one test.
+#[test]
+fn an_axially_slopped_apex_is_at_least_refused_honestly() {
+    let (n, r, h) = (6, 3.0f64, 12.0f64);
+    let sin_a = r / (r * r + h * h).sqrt();
+    let delta = 1.35 * MAX_ALLOWED_TOLERANCE / sin_a;
+    let repro = format!(
+        "{n}-gon pyramid(r = {r}, h = {h}), apex slopped {delta:.4e} along +z, \
+         declaration 0.1 (of-3jgq geometry, current behavior)"
+    );
+    let text = ngon_pyramid(n, r, h, [0.0, 0.0, h + delta], Some(0.1));
+    assert_refused(&text, &repro);
+}
+
+/// A carriable miss at valence six stays where the file put it: slop under
+/// the limit imports unmoved, reconciliation reporting nothing — and the
+/// certified body must satisfy the geometric checker, as every carried
+/// miss on the low-valence fixtures does.
+///
+/// FOUND FAILING, filed as **of-yluq**: the import returns
+/// `SolidOutcome::BRep`, but the six side-face trims all end at the
+/// perturbed apex while their planes pass through the true one — adjacent
+/// faces cross near the apex and `check_with_geometry` reports
+/// `SelfIntersection`. The import pipeline only runs the topology-level
+/// `check()`, which cannot see it, so it certifies what the geometric
+/// checker refuses. No reconciliation is involved (the vertex never
+/// moves); the closure floor alone carries the miss into a sharp-vertex
+/// configuration where the trims genuinely intersect.
+#[test]
+#[ignore = "of-yluq: closure-floor carry at a sharp valence-6 apex certifies a self-intersecting body"]
+fn a_high_valence_apex_with_carriable_slop_imports_unmoved() {
+    let (n, r, h) = (6, 3.0f64, 12.0f64);
+    let amount = 0.8 * MAX_ALLOWED_TOLERANCE;
+    let declared = 0.1;
+    let repro = format!(
+        "{n}-gon pyramid(r = {r}, h = {h}), apex slopped {amount:.3e} along +x, \
+         declaration {declared} (carriable unmoved)"
+    );
+    let text = ngon_pyramid(n, r, h, [amount, 0.0, h], Some(declared));
+    let volume = exact_checked_volume(&text, &repro)
+        .unwrap_or_else(|| panic!("{repro}: a carriable miss must import"));
+    let base_area = (n as f64) / 2.0 * r * r * (2.0 * PI / (n as f64)).sin();
+    assert_within(volume, base_area * h / 3.0, 1.0e-4, &repro);
+    assert!(
+        !reconciled(&import(&text, &repro).2),
+        "{repro}: nothing may move when the vertex can carry the miss"
+    );
 }
