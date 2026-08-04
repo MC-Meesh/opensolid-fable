@@ -234,6 +234,21 @@ pub struct HealOptions {
     /// tolerance. Values are clamped to [`MAX_ALLOWED_TOLERANCE`]: healing may
     /// not create a body the kernel would reject for tolerance alone.
     pub max_gap: Option<f64>,
+    /// Floor for the gap-closure tolerance (vertex merging and edge
+    /// welding), in millimetres. The STEP reader sets it to the solid's
+    /// declared closure (`GLOBAL_UNCERTAINTY_ASSIGNED_CONTEXT`) — the file's
+    /// own statement of how far apart entities at asserted connectivities
+    /// may sit — so a gap the file vouches for is closed even when the
+    /// derived round-off gap would refuse it (of-00pu).
+    ///
+    /// It deliberately does **not** floor sliver collapse
+    /// ([`GeometryHealer::fix_degenerate_edges`]): the declaration states
+    /// connectivity slop between *distinct* entities, not minimum feature
+    /// size, and collapsing every edge shorter than it would destroy real
+    /// sub-closure features (the of-5rnp lesson). Clamped to
+    /// [`MAX_ALLOWED_TOLERANCE`] like `max_gap`; `0.0` (the default) is a
+    /// no-op.
+    pub gap_floor: f64,
 }
 
 /// One repair the healer applied (or, under
@@ -407,7 +422,8 @@ impl GeometryHealer {
         if strategy.closes_gaps() {
             let max_gap = resolve_max_gap(store, body, options.max_gap, &mut result.notes);
             Self::collapse_degenerate_edges_into(body, store, geo, options, max_gap, &mut result);
-            Self::fix_gaps_into(body, store, geo, options, max_gap, &mut result);
+            let merge_gap = floor_merge_gap(max_gap, options.gap_floor, &mut result.notes);
+            Self::fix_gaps_into(body, store, geo, options, merge_gap, &mut result);
         }
         if strategy.fixes_geometry() {
             // Rescue only: from the import pipeline, an edge whose deviation
@@ -456,7 +472,8 @@ impl GeometryHealer {
             ..HealResult::default()
         };
         let max_gap = resolve_max_gap(store, body, options.max_gap, &mut result.notes);
-        Self::fix_gaps_into(body, store, geo, options, max_gap, &mut result);
+        let merge_gap = floor_merge_gap(max_gap, options.gap_floor, &mut result.notes);
+        Self::fix_gaps_into(body, store, geo, options, merge_gap, &mut result);
         result.remaining = if options.strategy.applies() {
             recover_genus(store, body);
             store.check(body)
@@ -762,6 +779,23 @@ fn resolve_max_gap(
         return MAX_ALLOWED_TOLERANCE;
     }
     raw.max(SYSTEM_RESOLUTION)
+}
+
+/// Apply [`HealOptions::gap_floor`] to the resolved gap for the gap-closure
+/// passes only. Clamped to [`MAX_ALLOWED_TOLERANCE`] for the same reason as
+/// `resolve_max_gap`; a non-finite or non-positive floor is a no-op.
+fn floor_merge_gap(max_gap: f64, gap_floor: f64, notes: &mut Vec<String>) -> f64 {
+    if !(gap_floor.is_finite() && gap_floor > max_gap) {
+        return max_gap;
+    }
+    let floored = gap_floor.min(MAX_ALLOWED_TOLERANCE);
+    if floored > max_gap {
+        notes.push(format!(
+            "vertex-merge gap raised from {max_gap:.3e} mm to the {floored:.3e} mm gap floor \
+             (declared closure)"
+        ));
+    }
+    floored.max(max_gap)
 }
 
 fn derived_max_gap(store: &TopologyStore, body: EntityId<Body>) -> f64 {
@@ -3133,7 +3167,7 @@ mod tests {
             &mut f.geo,
             &HealOptions {
                 strategy: HealStrategy::Minimal,
-                max_gap: None,
+                ..HealOptions::default()
             },
         );
         assert!(!result.healed(), "Minimal must not touch orientation");
@@ -3156,7 +3190,7 @@ mod tests {
             &mut f.geo,
             &HealOptions {
                 strategy: HealStrategy::ReportOnly,
-                max_gap: None,
+                ..HealOptions::default()
             },
         );
         assert_eq!(f.store.vertices.len(), vertices_before);
@@ -3212,7 +3246,7 @@ mod tests {
             &mut f.geo,
             &HealOptions {
                 strategy: HealStrategy::ReportOnly,
-                max_gap: None,
+                ..HealOptions::default()
             },
         );
         assert_eq!(
@@ -3242,7 +3276,7 @@ mod tests {
             &mut f.geo,
             &HealOptions {
                 strategy: HealStrategy::Off,
-                max_gap: None,
+                ..HealOptions::default()
             },
         );
         assert!(result.operations.is_empty());
@@ -3317,10 +3351,51 @@ mod tests {
             &HealOptions {
                 strategy: HealStrategy::Auto,
                 max_gap: Some(1.0),
+                ..HealOptions::default()
             },
         );
         assert!(
             result.notes.iter().any(|n| n.contains("clamped max_gap")),
+            "notes: {:?}",
+            result.notes
+        );
+    }
+
+    /// [`HealOptions::gap_floor`] (the STEP reader's declared closure)
+    /// raises the vertex-merge gap over the derived round-off gap: a jitter
+    /// far past [`HEAL_GAP_REL`] × the diagonal refuses to sew by default
+    /// but sews when the floor vouches for it.
+    #[test]
+    fn the_gap_floor_widens_vertex_merging() {
+        // Unit block: derived gap ≈ 1.7e-5; this jitter is 60× outside it.
+        let jitter = 1.0e-3;
+        let mut refused = unsewn_block(jitter, &[]);
+        let result = GeometryHealer::heal(
+            refused.body,
+            &mut refused.store,
+            &mut refused.geo,
+            &HealOptions::default(),
+        );
+        assert!(
+            !result.healed(),
+            "the jitter must exceed the derived gap for this pin to mean anything"
+        );
+
+        let mut floored = unsewn_block(jitter, &[]);
+        let result = GeometryHealer::heal(
+            floored.body,
+            &mut floored.store,
+            &mut floored.geo,
+            &HealOptions {
+                gap_floor: 4.0e-3,
+                ..HealOptions::default()
+            },
+        );
+        assert!(result.healed(), "remaining: {:?}", result.remaining);
+        assert_eq!(floored.store.vertices.len(), 8);
+        assert!((signed_volume(&floored) - 1.0).abs() < 1e-2);
+        assert!(
+            result.notes.iter().any(|n| n.contains("gap floor")),
             "notes: {:?}",
             result.notes
         );
@@ -3528,7 +3603,7 @@ mod tests {
             &mut f.geo,
             &HealOptions {
                 strategy: HealStrategy::ReportOnly,
-                max_gap: None,
+                ..HealOptions::default()
             },
         );
         assert!(
@@ -3796,7 +3871,7 @@ mod tests {
             &mut f.geo,
             &HealOptions {
                 strategy: HealStrategy::ReportOnly,
-                max_gap: None,
+                ..HealOptions::default()
             },
         );
         assert!(

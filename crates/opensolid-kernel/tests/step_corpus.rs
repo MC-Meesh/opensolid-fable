@@ -1554,6 +1554,7 @@ mod healing {
             heal: HealOptions {
                 strategy: HealStrategy::Auto,
                 max_gap: Some(1.0),
+                ..HealOptions::default()
             },
             ..StepReadOptions::default()
         };

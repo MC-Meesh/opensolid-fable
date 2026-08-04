@@ -2578,6 +2578,11 @@ fn trim_tol(a: Point3, b: Point3, closure: f64) -> f64 {
 /// rewrites any genuinely short arc under the declaration into a full
 /// circle — a silent, checker-clean volume corruption (of-5rnp).
 ///
+/// The one place the closure may widen this bound is an edge that stands
+/// alone in some `EDGE_LOOP` ([`sole_loop_edges`]), where a short read is
+/// not a possible arc but a guaranteed-unclosable loop; the *callers* make
+/// that exception (of-00pu), this bound stays closure-free.
+///
 /// What decides seam identity end-to-end is whether the kernel itself will
 /// call the two vertices one point, which is heal's vertex merge at
 /// [`HEAL_GAP_REL`](super::heal::HEAL_GAP_REL) × the body's vertex
@@ -2652,6 +2657,43 @@ fn solid_seam_tol(file: &StepFile, shell_roots: &[u64], scale: f64) -> f64 {
         .sum::<f64>()
         .sqrt();
     seam_tol(diagonal)
+}
+
+/// The `EDGE_CURVE` ids that stand alone as the single edge of some
+/// `EDGE_LOOP` in the file.
+///
+/// A one-edge loop can only be a valid bound if its edge returns to its own
+/// start — it is the structural spelling of a closed boundary, whatever the
+/// vertex records say. That makes it the discriminator the seam question
+/// needs: for these edges (and only these) the declared closure may widen
+/// the full-circle seam test, because reading the edge as anything short of
+/// a full period guarantees an unclosable loop, while a genuinely short arc
+/// — the of-5rnp corruption — always has loop-mates carrying the rest of
+/// its boundary and never appears here. Resolution failures are skipped,
+/// not errors: whatever is wrong will be reported by the real mapping.
+fn sole_loop_edges(file: &StepFile) -> HashSet<u64> {
+    let mut edges = HashSet::new();
+    for inst in &file.data {
+        let Some(rec) = inst.entity.part("EDGE_LOOP") else {
+            continue;
+        };
+        let Ok(oriented) = ref_list(rec, 1, inst.id) else {
+            continue;
+        };
+        let [oe_ref] = oriented[..] else {
+            continue;
+        };
+        let Some(oe) = file
+            .get(oe_ref)
+            .and_then(|i| i.entity.part("ORIENTED_EDGE"))
+        else {
+            continue;
+        };
+        if let Ok(edge_ref) = ref_attr(oe, 3, oe_ref) {
+            edges.insert(edge_ref);
+        }
+    }
+    edges
 }
 
 /// Trim an analytic curve to an edge's vertices: orient it along the edge
@@ -2736,9 +2778,12 @@ fn trim_curve(
             // declared closure's: a genuinely short arc — an ordinary boolean
             // sliver — has a chord well under the closures real files declare,
             // and reading its vertices as a seam rewrites it into a full
-            // circle (of-5rnp). Past the bound the arc is read literally;
-            // whether its endpoints then hold together is the loop's problem,
-            // judged by the same heal merge this bound mirrors.
+            // circle (of-5rnp). Callers widen the bound with the closure only
+            // for an edge standing alone in some loop ([`sole_loop_edges`]),
+            // which no short arc can be (of-00pu). Past the bound the arc is
+            // read literally; whether its endpoints then hold together is the
+            // loop's problem, judged by the heal merge this bound mirrors —
+            // itself floored by the closure (`HealOptions::gap_floor`).
             if closed || (end - start).norm() <= seam_tol {
                 (t0, t0 + TAU)
             } else {
@@ -2878,6 +2923,9 @@ struct SolidBuilder<'a> {
     closure: f64,
     /// The solid's seam-identity bound ([`solid_seam_tol`]), in millimetres.
     seam_tol: f64,
+    /// Edges standing alone in some `EDGE_LOOP` ([`sole_loop_edges`]): the
+    /// declared closure widens the seam test for these, and only these.
+    seam_edges: &'a HashSet<u64>,
     /// How many edges needed that floor — trims whose vertex miss is inside
     /// the declared closure but outside what [`TRIM_TOL_REL`] alone allows.
     /// Reported once per solid rather than per edge.
@@ -3306,6 +3354,15 @@ impl SolidBuilder<'_> {
                 ));
             }
         };
+        // An edge that is the whole of some loop can only close that loop by
+        // returning to its own start, so for it — and only it — the declared
+        // closure vouches for the two-vertex seam spelling (of-00pu). Every
+        // other edge keeps the heal-scale bound (of-5rnp).
+        let seam_tol = if self.seam_edges.contains(&edge_ref) {
+            self.seam_tol.max(self.closure)
+        } else {
+            self.seam_tol
+        };
         let trimmed = trim_curve(
             &curve,
             same_sense,
@@ -3313,7 +3370,7 @@ impl SolidBuilder<'_> {
             end,
             closed,
             self.closure,
-            self.seam_tol,
+            seam_tol,
             edge_ref,
         )?;
         if trimmed.start_residual.max(trimmed.end_residual) > trim_tol(start, end, 0.0) {
@@ -3809,6 +3866,9 @@ struct FallbackMesher<'a> {
     /// The solid's seam-identity bound ([`solid_seam_tol`]), shared with the
     /// exact path for the same reason as `closure`.
     seam_tol: f64,
+    /// Edges standing alone in some `EDGE_LOOP` ([`sole_loop_edges`]),
+    /// shared with the exact path so both trim the seam spelling alike.
+    seam_edges: &'a HashSet<u64>,
     diagnostics: &'a mut Vec<Diagnostic>,
     /// `EDGE_CURVE` #id → its polyline from start vertex to end vertex.
     /// Shared between adjacent faces so junctions weld watertight.
@@ -4614,6 +4674,12 @@ impl FallbackMesher<'_> {
     ) -> MapResult<Vec<Point3>> {
         match raw {
             RawCurve::Analytic(curve) => {
+                // Same sole-loop widening as the exact path's `map_edge`.
+                let seam_tol = if self.seam_edges.contains(&edge_ref) {
+                    self.seam_tol.max(self.closure)
+                } else {
+                    self.seam_tol
+                };
                 let trimmed = trim_curve(
                     &curve,
                     same_sense,
@@ -4621,7 +4687,7 @@ impl FallbackMesher<'_> {
                     end,
                     closed,
                     self.closure,
-                    self.seam_tol,
+                    seam_tol,
                     edge_ref,
                 )?;
                 let segments = match trimmed.curve {
@@ -5600,6 +5666,7 @@ fn map_solid(
         shell_roots.extend(voids.iter().map(|&(void_ref, _)| void_ref));
         solid_seam_tol(file, &shell_roots, scale)
     };
+    let seam_edges = sole_loop_edges(file);
 
     // Exact path first.
     let mut builder = SolidBuilder {
@@ -5610,6 +5677,7 @@ fn map_solid(
         angle_scale,
         closure,
         seam_tol,
+        seam_edges: &seam_edges,
         closure_trims: 0,
         created: Created::default(),
         multi_bound_faces: Vec::new(),
@@ -5635,7 +5703,16 @@ fn map_solid(
             // flipped face is repaired and re-validated before the exact path
             // is abandoned for the tessellated one.
             if !failures.is_empty() && options.heal.strategy != HealStrategy::Off {
-                let result = GeometryHealer::heal(body, store, geo, &options.heal);
+                // The declared closure floors heal's vertex-merge gap, the
+                // same way it floors `trim_tol`: the file's own statement of
+                // its connectivity slop outranks the derived round-off gap
+                // (of-00pu). Sliver collapse is deliberately not floored —
+                // see `HealOptions::gap_floor`.
+                let heal_options = HealOptions {
+                    gap_floor: options.heal.gap_floor.max(closure),
+                    ..options.heal.clone()
+                };
+                let result = GeometryHealer::heal(body, store, geo, &heal_options);
                 *heal_operations += result.operations.len();
                 for op in &result.operations {
                     diagnostics.push(Diagnostic {
@@ -5731,6 +5808,7 @@ fn map_solid(
         angle_scale,
         closure,
         seam_tol,
+        seam_edges: &seam_edges,
         diagnostics,
         polylines: HashMap::new(),
     };
@@ -7817,6 +7895,16 @@ mod tests {
         );
     }
 
+    /// [`sole_loop_edges`] marks exactly the edges standing alone in an
+    /// `EDGE_LOOP` — the cylinder's two cap circles — and never the wall's
+    /// shared edges, which is what keeps the closure-widened seam test away
+    /// from genuinely short arcs (of-00pu vs of-5rnp).
+    #[test]
+    fn sole_loop_edges_marks_only_single_edge_loops() {
+        let file = super::super::parse(&cylinder_step(5.0, 8.0)).expect("fixture parses");
+        assert_eq!(sole_loop_edges(&file), HashSet::from([17, 18]));
+    }
+
     /// The same coincidence on a line is not a closed edge — a line has no
     /// period to come back through — so it stays an error.
     #[test]
@@ -9623,6 +9711,7 @@ REPRESENTATION_CONTEXT('2D SPACE','') );
                 let shell_ref = ref_attr(rec, 1, inst.id).expect("solid names a shell");
                 let closure = resolve_closure(&file, inst.id, &mut diagnostics);
                 let seam_tol = solid_seam_tol(&file, &[shell_ref], scale);
+                let seam_edges = sole_loop_edges(&file);
                 let mut mesher = FallbackMesher {
                     file: &file,
                     options: &options,
@@ -9630,6 +9719,7 @@ REPRESENTATION_CONTEXT('2D SPACE','') );
                     angle_scale,
                     closure,
                     seam_tol,
+                    seam_edges: &seam_edges,
                     diagnostics: &mut diagnostics,
                     polylines: HashMap::new(),
                 };

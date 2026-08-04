@@ -447,7 +447,7 @@ fn export_random_block(rng: &mut Rng) -> Exported {
 
 fn read_options(strategy: HealStrategy, max_gap: Option<f64>) -> StepReadOptions {
     StepReadOptions {
-        heal: HealOptions { strategy, max_gap },
+        heal: HealOptions { strategy, max_gap, ..HealOptions::default() },
         ..StepReadOptions::default()
     }
 }

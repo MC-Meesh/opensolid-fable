@@ -477,7 +477,7 @@ const TRIM_TOL_REL: f64 = 1e-6;
 
 fn read_options(strategy: HealStrategy, max_gap: Option<f64>) -> StepReadOptions {
     StepReadOptions {
-        heal: HealOptions { strategy, max_gap },
+        heal: HealOptions { strategy, max_gap, ..HealOptions::default() },
         ..StepReadOptions::default()
     }
 }

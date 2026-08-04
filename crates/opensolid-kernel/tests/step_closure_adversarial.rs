@@ -43,12 +43,16 @@
 //!   fabricated body imported *checker-clean* at 1257× the authored volume —
 //!   silent corruption. The seam test no longer consults the closure; the
 //!   repro [`a_declared_closure_must_not_collapse_a_short_arc`] now passes.
-//! - **of-00pu** (P2): the OCC two-vertex full-circle seam spelling dies
-//!   whenever the seam gap exceeds heal's merge allowance (~1e-5 ×
-//!   diagonal): neither heal's vertex merge nor (since of-5rnp) the seam
-//!   test consults the declaration, so the loop fails vertex continuity.
-//!   Measured cliff between 5e-5 and 1e-4 on a ⌀10 mm cylinder declaring
-//!   1e-3. Repro: [`a_declared_closure_admits_a_slopped_two_vertex_seam`].
+//! - **of-00pu** (P2, FIXED): the OCC two-vertex full-circle seam spelling
+//!   died whenever the seam gap exceeded heal's merge allowance (~1e-5 ×
+//!   diagonal), because neither heal's vertex merge nor (since of-5rnp) the
+//!   seam test consulted the declaration. Both ends now do, each behind its
+//!   own guard: the seam test widens to the closure only for an edge that
+//!   stands alone in some `EDGE_LOOP` (a short read there is a
+//!   guaranteed-unclosable loop, never a real arc), and heal's vertex-merge
+//!   gap is floored by the closure (`HealOptions::gap_floor`) without
+//!   flooring sliver collapse. The repro
+//!   [`a_declared_closure_admits_a_slopped_two_vertex_seam`] now passes.
 
 use opensolid_brep::MAX_ALLOWED_TOLERANCE;
 use opensolid_brep::{GeometryStore, TopologyStore};
@@ -921,10 +925,11 @@ fn assert_seam_imports_as_a_full_cylinder(r: f64, h: f64, gap: f64, closure: f64
     }
 }
 
-/// The working region of the two-vertex seam spelling, pinned: a gap inside
-/// the *heal* vertex-merge allowance (~1e-5 × diagonal ≈ 1.3e-4 mm here)
-/// imports as a full cylinder. This is the boundary that actually decides
-/// the spelling end-to-end today — see of-00pu for the gap sweep.
+/// The always-working region of the two-vertex seam spelling, pinned: a gap
+/// inside the *heal* vertex-merge allowance (~1e-5 × diagonal ≈ 1.3e-4 mm
+/// here) imports as a full cylinder without leaning on the declaration.
+/// Since of-00pu the declared closure decides the boundary beyond this —
+/// [`a_declared_closure_admits_a_slopped_two_vertex_seam`].
 #[test]
 fn a_two_vertex_seam_within_the_heal_gap_imports() {
     let (r, h) = (5.0, 8.0);
@@ -937,28 +942,27 @@ fn a_two_vertex_seam_within_the_heal_gap_imports() {
     );
 }
 
-/// The aspirational half of the seam test: a full circle written with two
-/// *distinct* seam vertices that agree only to within the declared closure
-/// should read as a full circle and import exactly. This is OCC's spelling
-/// of a tangent seam, with the slop real files carry.
+/// A full circle written with two *distinct* seam vertices that agree only
+/// to within the declared closure reads as a full circle and imports
+/// exactly. This is OCC's spelling of a tangent seam, with the slop real
+/// files carry.
 ///
-/// FOUND FAILING, filed as **of-00pu**: the gap never survives end-to-end —
-/// heal's merge gap does not consult the declared closure (5e-4 > ~1.3e-4
-/// here), so the loop fails vertex continuity and the solid dies; measured
-/// cliff between 5e-5 and 1e-4, which is the heal gap and not the
-/// declaration. Since of-5rnp the seam test in [`trim_curve`] is held to
-/// the same heal-scale bound (the closure must not collapse genuinely short
-/// arcs), so a fix for of-00pu has to teach *both* ends about the
-/// declaration — or decide the spelling stays bounded by the heal gap. Not
-/// softened; un-ignore when of-00pu lands.
+/// Originally FOUND FAILING as **of-00pu** (gap 5e-4 > the ~1.3e-4 heal
+/// merge gap: the loop failed vertex continuity and the solid died). Fixed
+/// by teaching both ends about the declaration, each behind its own guard —
+/// the seam test widens to the closure only for a sole-loop edge, and
+/// heal's vertex-merge gap is floored by it (`HealOptions::gap_floor`) —
+/// so the acceptance boundary is now the declaration, not the heal gap.
 #[test]
-#[ignore = "of-00pu: neither heal's vertex merge nor the seam bound consults the declared closure"]
 fn a_declared_closure_admits_a_slopped_two_vertex_seam() {
     let (r, h) = (5.0, 8.0);
     let closure = 1.0e-3;
-    let gap = 5.0e-4;
-    let repro = format!("two-vertex seam {gap:.1e} apart under declared closure {closure:.1e}");
-    assert_seam_imports_as_a_full_cylinder(r, h, gap, closure, &repro);
+    // The whole gap range the of-00pu sweep measured as failing: past the
+    // heal-derived merge gap (~1.3e-4 here), up to just inside the closure.
+    for gap in [1.0e-4, 3.0e-4, 5.0e-4, 9.0e-4] {
+        let repro = format!("two-vertex seam {gap:.1e} apart under declared closure {closure:.1e}");
+        assert_seam_imports_as_a_full_cylinder(r, h, gap, closure, &repro);
+    }
 }
 
 /// The adversarial half: seam vertices *further apart than the declared
