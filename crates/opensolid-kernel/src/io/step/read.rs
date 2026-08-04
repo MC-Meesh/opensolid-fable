@@ -9808,4 +9808,124 @@ REPRESENTATION_CONTEXT('2D SPACE','') );
         assert_eq!(split_shared_edges(&mut mesh), 0);
         assert_eq!(mesh.indices.len(), before);
     }
+
+    /// A tangency pinches these two corpus solids — the cylinder's wall
+    /// touches the block's wall along a line — so their fallback meshes
+    /// carry a pinch locus where two sheets fold back to back (of-cnyf).
+    /// That used to lose the solid twice over: the welded mesh had
+    /// four-triangle edges the closed-manifold gate rejected (repaired
+    /// since of-05ac), and even a closed pinched mesh was then rejected by
+    /// `MeshSdf::new` because pseudonormals cancel on the fold.
+    ///
+    /// Today the exact path imports both files (of-zdx), so this drives the
+    /// fallback directly: a tangent part that falls off the exact path for
+    /// any other reason must degrade to a measured mesh, not vanish. The
+    /// whole contract is asserted — the mesh closes, its volume matches
+    /// OCC's (constants from `tests/data/step/reference/occ/tangent/*.json`)
+    /// within the tessellation's chordal deficit, it becomes a `MeshSdf`,
+    /// and the SDF signs correctly on both sides — including outside beyond
+    /// the tangent line, where the nearest-feature tie between the two
+    /// touching sheets used to flip the sign inward.
+    #[test]
+    fn pinched_tangent_solids_survive_the_mesh_fallback() {
+        // (file, OCC volume, an interior probe: the solid's OCC centroid).
+        for (name, occ_volume, inside) in [
+            (
+                "occ/tangent/cylinder_tangent_to_wall.stp",
+                34261.9467106,
+                Point3::new(0.924268962756, 0.0, 0.0),
+            ),
+            (
+                "occ/tangent/hole_tangent_to_wall.stp",
+                29738.0532894,
+                Point3::new(-1.06487313208, 0.0, 0.0),
+            ),
+        ] {
+            let path = format!("{}/tests/data/step/{name}", env!("CARGO_MANIFEST_DIR"));
+            let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+            let file = super::super::parse_bytes(&bytes).expect("vendored file parses");
+            let mut diagnostics = Vec::new();
+            let scale = resolve_length_scale(&file, &mut diagnostics);
+            let angle_scale = resolve_angle_scale(&file, &mut diagnostics);
+            let options = TessellationOptions::default();
+            let mut solids = 0;
+            for inst in &file.data {
+                let Some(rec) = inst
+                    .entity
+                    .part("BREP_WITH_VOIDS")
+                    .or_else(|| inst.entity.part("MANIFOLD_SOLID_BREP"))
+                else {
+                    continue;
+                };
+                let shell_ref = ref_attr(rec, 1, inst.id).expect("solid names a shell");
+                let closure = resolve_closure(&file, inst.id, &mut diagnostics);
+                let seam_tol = solid_seam_tol(&file, &[shell_ref], scale);
+                let seam_edges = sole_loop_edges(&file);
+                let mut mesher = FallbackMesher {
+                    file: &file,
+                    options: &options,
+                    scale,
+                    angle_scale,
+                    closure,
+                    seam_tol,
+                    seam_edges: &seam_edges,
+                    diagnostics: &mut diagnostics,
+                    polylines: HashMap::new(),
+                };
+                let mesh = mesher
+                    .mesh_solid(inst.id, shell_ref, &[])
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "{name}: solid #{} did not tessellate: {:?}",
+                            inst.id,
+                            diagnostics
+                                .iter()
+                                .filter(|d| d.severity == Severity::Error)
+                                .map(|d| &d.message)
+                                .collect::<Vec<_>>()
+                        )
+                    });
+                assert!(
+                    mesh.is_closed_manifold(),
+                    "{name}: solid #{} is not closed: {:?}",
+                    inst.id,
+                    mesh.manifold_defects().describe()
+                );
+                let volume: f64 = mesh
+                    .indices
+                    .iter()
+                    .map(|t| {
+                        let [a, b, c] = t.map(|k| mesh.positions[k].coords);
+                        a.dot(&b.cross(&c)) / 6.0
+                    })
+                    .sum();
+                assert!(
+                    (volume - occ_volume).abs() <= 0.01 * occ_volume,
+                    "{name}: fallback volume {volume} differs from OCC's \
+                     {occ_volume} by more than 1%"
+                );
+                let sdf = MeshSdf::new(&mesh).unwrap_or_else(|e| {
+                    panic!("{name}: solid #{} rejected as an SDF: {e}", inst.id)
+                });
+                use opensolid_frep::primitives::Sdf as _;
+                let at_centroid = sdf.eval(&inside);
+                assert!(
+                    at_centroid < -1.0,
+                    "{name}: OCC centroid {inside:?} must be well inside, got {at_centroid}"
+                );
+                // Beyond the tangency-side wall, on the pinch line's own
+                // axis: the query whose nearest features straddle the two
+                // touching sheets.
+                let bbox = mesh.bounding_box().expect("mesh is non-empty");
+                let far = Point3::new(bbox.max.x + 100.0, 0.0, 0.0);
+                let at_far = sdf.eval(&far);
+                assert!(
+                    at_far > 99.0,
+                    "{name}: {far:?} is 100 mm outside, got {at_far}"
+                );
+                solids += 1;
+            }
+            assert_eq!(solids, 1, "{name}: expected exactly one solid");
+        }
+    }
 }

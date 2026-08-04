@@ -233,6 +233,43 @@ impl<Id> Bvh<Id> {
         }
         best
     }
+
+    /// True if any item within `radius` of `query` satisfies `predicate`.
+    /// `distance` has the same exact-distance contract as [`nearest`];
+    /// `predicate` runs only for items whose distance is at most `radius`,
+    /// and the traversal short-circuits on the first `true`. Subtrees whose
+    /// box is farther than `radius` are pruned, so a radius near the true
+    /// nearest distance visits only the tied neighborhood.
+    pub fn any_within<F, P>(&self, query: &Point3, radius: f64, mut distance: F, mut predicate: P) -> bool
+    where
+        F: FnMut(&Point3, &Id) -> f64,
+        P: FnMut(&Id) -> bool,
+    {
+        if self.nodes.is_empty() {
+            return false;
+        }
+        let mut stack = vec![0usize];
+        while let Some(ni) = stack.pop() {
+            let node = &self.nodes[ni];
+            if box_distance(query, &node.bounds) > radius {
+                continue;
+            }
+            match node.kind {
+                NodeKind::Leaf { start, count } => {
+                    for (_, id) in &self.items[start..start + count] {
+                        if distance(query, id) <= radius && predicate(id) {
+                            return true;
+                        }
+                    }
+                }
+                NodeKind::Inner { left, right } => {
+                    stack.push(left);
+                    stack.push(right);
+                }
+            }
+        }
+        false
+    }
 }
 
 impl Bvh<usize> {

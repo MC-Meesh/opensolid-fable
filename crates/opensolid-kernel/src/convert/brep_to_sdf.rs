@@ -29,6 +29,31 @@
 //! anything else. A fast-winding-number fallback for imperfect (imported)
 //! meshes is a later hardening pass.
 //!
+//! # Pinched (self-touching) solids
+//!
+//! One family the constructor deliberately accepts: a **pinched** solid — a
+//! tangency squeezes the material to zero thickness, like a hole whose wall
+//! touches the block's wall along a line (of-cnyf). The mesh is a closed
+//! 2-manifold, but the surface *touches itself* along the pinch, and that
+//! breaks two things the embedded case takes for granted:
+//!
+//! - A pseudonormal can cancel to zero where two sheets fold back to back.
+//!   Not an error: the cancelled sum is kept as the zero vector, and the
+//!   sign rule reads a zero dot product as outside — the correct limit for
+//!   a material wedge of zero angle. (The configuration this trades away,
+//!   a zero-width interior slit with normals folded inward, is a
+//!   self-intersecting immersion — defective input to begin with.)
+//! - The nearest feature is ambiguous *on* the touch locus: features of
+//!   both sheets sit at exactly the same distance with opposite sign
+//!   verdicts, and which one the BVH returns is an accident. `query`
+//!   therefore consults every feature at the tied distance and signs
+//!   inside only if they are unanimous — outside wins a tie, because the
+//!   touch locus encloses no material. On an embedded manifold every tied
+//!   feature votes identically (Bærentzen's sign is correct for each), so
+//!   the rule is a strict generalization; the pass only runs at all for
+//!   triangles touching a suspected pinch vertex, so untouched meshes pay
+//!   nothing.
+//!
 //! # Limits
 //!
 //! - Input must be a closed, consistently oriented 2-manifold with outward
@@ -57,11 +82,19 @@ pub struct MeshSdf {
     triangles: Vec<[usize; 3]>,
     /// Unit outward normal per triangle.
     face_normals: Vec<Vector3>,
-    /// Unit angle-weighted pseudonormal per vertex.
+    /// Unit angle-weighted pseudonormal per vertex; zero where the sum
+    /// cancelled at a pinch fold (module docs).
     vertex_normals: Vec<Vector3>,
     /// Unit pseudonormal per undirected edge `(lo, hi)`: the (normalized)
-    /// sum of its two adjacent face normals.
+    /// sum of its two adjacent face normals; zero where the sum cancelled
+    /// at a pinch fold (module docs).
     edge_normals: HashMap<(usize, usize), Vector3>,
+    /// Per triangle: does it touch a vertex whose angle-weighted normal sum
+    /// nearly cancels? Those vertices sit where a pinched solid's sheets
+    /// touch, and only queries nearest such a triangle need the tie-break
+    /// pass in [`query`](Self::query) — everywhere else the nearest
+    /// feature's vote stands alone, at no extra cost.
+    tie_prone: Vec<bool>,
     bvh: Bvh<usize>,
 }
 
@@ -90,7 +123,11 @@ impl MeshSdf {
     /// consistently oriented manifold, or if it encloses non-positive
     /// signed volume (inverted orientation);
     /// [`CoreError::Degenerate`] if any triangle's area is negligible
-    /// relative to its edge lengths, or a pseudonormal cancels to zero.
+    /// relative to its edge lengths.
+    ///
+    /// A pseudonormal that cancels to zero is *not* an error: it marks a
+    /// pinch fold of a tangency-pinched solid, and queries resolving to it
+    /// sign as outside — the correct limit there (module docs).
     pub fn new(mesh: &TriangleMesh) -> CoreResult<Self> {
         if !mesh.is_closed_manifold() {
             return Err(CoreError::InvalidArgument {
@@ -131,6 +168,7 @@ impl MeshSdf {
         }
 
         let mut vertex_sums = vec![Vector3::zeros(); positions.len()];
+        let mut vertex_weights = vec![0.0f64; positions.len()];
         let mut edge_sums: HashMap<(usize, usize), Vector3> = HashMap::new();
         for (tri, normal) in triangles.iter().zip(&face_normals) {
             for k in 0..3 {
@@ -142,26 +180,42 @@ impl MeshSdf {
                 let v = (positions[tri[(k + 2) % 3]] - corner).normalize();
                 let angle = u.dot(&v).clamp(-1.0, 1.0).acos();
                 vertex_sums[tri[k]] += normal * angle;
+                vertex_weights[tri[k]] += angle;
             }
         }
-        let unit = |sum: Vector3, what: &str| -> CoreResult<Vector3> {
+        // A vertex where the sheets of a pinched solid touch collects
+        // near-opposite normals from both sheets, so its weighted sum
+        // nearly cancels — at a tangency the residual is quadratic in the
+        // facet angle, far below this threshold, while genuine sharp
+        // features (a cube corner sums to ~0.58 of its weight, a slender
+        // cone apex to ~the sine of its half-angle) stay well above it.
+        // A false positive costs only the tie-break pass, never the sign.
+        let vertex_suspect: Vec<bool> = vertex_sums
+            .iter()
+            .zip(&vertex_weights)
+            .map(|(sum, weight)| sum.norm() <= 0.1 * weight)
+            .collect();
+        let tie_prone = triangles
+            .iter()
+            .map(|tri| tri.iter().any(|&v| vertex_suspect[v]))
+            .collect();
+        // A sum that cancels marks a pinch fold: two sheets back to back at
+        // a tangency. Kept as zero, not rejected — the sign rule reads zero
+        // as outside, the correct limit at a zero-angle material wedge
+        // (module docs).
+        let unit = |sum: Vector3| -> Vector3 {
             let norm = sum.norm();
             if norm <= 1e-12 {
-                return Err(CoreError::Degenerate {
-                    context: "MeshSdf::new",
-                    reason: format!("{what} pseudonormal cancels to zero"),
-                });
+                Vector3::zeros()
+            } else {
+                sum / norm
             }
-            Ok(sum / norm)
         };
-        let vertex_normals = vertex_sums
-            .into_iter()
-            .map(|sum| unit(sum, "vertex"))
-            .collect::<CoreResult<Vec<_>>>()?;
+        let vertex_normals = vertex_sums.into_iter().map(unit).collect::<Vec<_>>();
         let edge_normals = edge_sums
             .into_iter()
-            .map(|(key, sum)| Ok((key, unit(sum, "edge")?)))
-            .collect::<CoreResult<HashMap<_, _>>>()?;
+            .map(|(key, sum)| (key, unit(sum)))
+            .collect::<HashMap<_, _>>();
 
         let bvh = Bvh::from_triangle_mesh(mesh);
         Ok(Self {
@@ -170,6 +224,7 @@ impl MeshSdf {
             face_normals,
             vertex_normals,
             edge_normals,
+            tie_prone,
             bvh,
         })
     }
@@ -197,17 +252,9 @@ impl MeshSdf {
         self.triangles[t].map(|i| self.positions[i])
     }
 
-    /// Signed distance, closest surface point, and the pseudonormal of the
-    /// closest feature.
-    fn query(&self, p: &Point3) -> (f64, Point3, Vector3) {
-        let (_, &t) = self
-            .bvh
-            .nearest(p, |q, &i| {
-                let [a, b, c] = self.triangle_points(i);
-                (closest_point_on_triangle(q, &a, &b, &c).0 - q).norm()
-            })
-            .expect("validated mesh is non-empty");
-
+    /// Closest point of triangle `t` to `p` and the pseudonormal of the
+    /// containing feature.
+    fn closest_feature(&self, p: &Point3, t: usize) -> (Point3, Vector3) {
         let [a, b, c] = self.triangle_points(t);
         let (closest, feature) = closest_point_on_triangle(p, &a, &b, &c);
         let tri = self.triangles[t];
@@ -219,13 +266,45 @@ impl MeshSdf {
                 self.edge_normals[&(i.min(j), i.max(j))]
             }
         };
-        let offset = p - closest;
-        let unsigned = offset.norm();
-        let signed = if offset.dot(&normal) < 0.0 {
-            -unsigned
-        } else {
-            unsigned
+        (closest, normal)
+    }
+
+    /// Signed distance, closest surface point, and the pseudonormal of the
+    /// closest feature.
+    fn query(&self, p: &Point3) -> (f64, Point3, Vector3) {
+        let distance = |q: &Point3, &i: &usize| {
+            let [a, b, c] = self.triangle_points(i);
+            (closest_point_on_triangle(q, &a, &b, &c).0 - q).norm()
         };
+        let (unsigned, &t) = self
+            .bvh
+            .nearest(p, distance)
+            .expect("validated mesh is non-empty");
+
+        let (closest, normal) = self.closest_feature(p, t);
+        let offset = p - closest;
+        // Strictly negative means inside; a zero dot — including against a
+        // cancelled (zero) pinch-fold pseudonormal — signs as outside.
+        let mut inside = offset.dot(&normal) < 0.0;
+        // A pinched solid's sheets touch, so features of *different* sheets
+        // can claim the query at the same distance with opposite verdicts,
+        // and which one `nearest` returned is a tie-break accident. Outside
+        // wins a tie: the touch locus encloses no material. On an embedded
+        // (untouching) manifold every tied feature votes the same way —
+        // Bærentzen's sign is correct for each of them individually — so
+        // consulting the ties changes nothing there (module docs), and it
+        // is skipped entirely unless the winner touches the pinch locus.
+        if inside && self.tie_prone[t] {
+            let radius = unsigned * (1.0 + 1e-9);
+            inside = !self.bvh.any_within(p, radius, distance, |&i| {
+                if i == t {
+                    return false;
+                }
+                let (closest, normal) = self.closest_feature(p, i);
+                (p - closest).dot(&normal) >= 0.0
+            });
+        }
+        let signed = if inside { -unsigned } else { unsigned };
         (signed, closest, normal)
     }
 }
@@ -544,5 +623,59 @@ mod tests {
         };
         // (Winding may or may not pass; accept either rejection reason.)
         assert!(MeshSdf::new(&flat).is_err());
+    }
+
+    /// A tangency pinches a solid to zero thickness, and its mesh carries
+    /// the scar: two sheets folded exactly back to back, whose pseudonormal
+    /// sums cancel to zero (of-cnyf). The degenerate limit of such a flap
+    /// is a "pillow" — two coincident triangles wound opposite ways. It is
+    /// closed and consistently oriented, encloses nothing, and every one of
+    /// its edge and vertex pseudonormals cancels exactly. The constructor
+    /// must accept it rather than reject the whole mesh, and queries
+    /// resolving to the flap must sign as outside — the correct limit for a
+    /// material wedge of zero angle.
+    #[test]
+    fn a_zero_thickness_pinch_flap_signs_outside_not_rejected() {
+        // A real tetrahedron carrying the volume, plus a detached
+        // zero-thickness pillow off to the side.
+        let mut mesh = TriangleMesh {
+            positions: vec![
+                Point3::origin(),
+                Point3::new(1.0, 0.0, 0.0),
+                Point3::new(0.0, 1.0, 0.0),
+                Point3::new(0.0, 0.0, 1.0),
+            ],
+            normals: vec![Vector3::z(); 4],
+            indices: vec![[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 3]],
+        };
+        let base = mesh.positions.len();
+        for p in [
+            Point3::new(10.0, 0.0, 0.0),
+            Point3::new(11.0, 0.0, 0.0),
+            Point3::new(10.0, 1.0, 0.0),
+        ] {
+            mesh.positions.push(p);
+            mesh.normals.push(Vector3::z());
+        }
+        mesh.indices.push([base, base + 1, base + 2]);
+        mesh.indices.push([base, base + 2, base + 1]);
+        assert!(mesh.is_closed_manifold(), "the pillow is edge-manifold");
+
+        let sdf = MeshSdf::new(&mesh).expect("cancelled pseudonormals are a pinch, not an error");
+        // The tetrahedron still signs both ways.
+        let inside = sdf.eval(&Point3::new(0.2, 0.2, 0.2));
+        assert!(inside < 0.0, "tetrahedron interior signs inside: {inside}");
+        assert!(sdf.eval(&Point3::new(-1.0, -1.0, -1.0)) > 0.0);
+        // Queries nearest the pillow — its face, edges, and vertices — all
+        // sign outside: a zero-thickness flap contains no material.
+        for probe in [
+            Point3::new(10.3, 0.2, 0.5),   // over the face
+            Point3::new(10.3, 0.2, -0.5),  // under it
+            Point3::new(10.5, -1.0, 0.0),  // nearest an edge
+            Point3::new(12.0, -1.0, 0.0),  // nearest a vertex
+        ] {
+            let d = sdf.eval(&probe);
+            assert!(d > 0.0, "near the flap at {probe:?} must be outside, got {d}");
+        }
     }
 }
