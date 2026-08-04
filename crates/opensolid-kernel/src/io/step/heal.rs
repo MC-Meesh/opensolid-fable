@@ -403,6 +403,14 @@ impl GeometryHealer {
     /// is no partial rollback here. Callers that need the original body back
     /// (the STEP reader does, to fall through to its mesh path) must snapshot
     /// or rebuild it themselves.
+    ///
+    /// From the STEP reader, the pcurve refit pass below never plans
+    /// anything: the reader attaches trim geometry only after healing
+    /// (`finish_exact_body` in `read.rs`), so every fin is bare when it
+    /// runs — and the reader debug-asserts that ordering at its call site.
+    /// Only callers whose fins already carry pcurves
+    /// ([`fix_pcurves`](Self::fix_pcurves), or `heal` on a finished body)
+    /// feed it work (of-gpmq).
     pub fn heal(
         body: EntityId<Body>,
         store: &mut TopologyStore,
@@ -439,6 +447,10 @@ impl GeometryHealer {
                 strategy.applies(),
                 &mut result,
             );
+            // Dead from the STEP reader — fins are bare until
+            // `finish_exact_body` attaches pcurves, past this whole call —
+            // live only for API callers whose fins already carry them
+            // (of-gpmq).
             Self::fix_pcurves_into(body, store, geo, strategy.applies(), &mut result);
         }
         if strategy.orients() {

@@ -5988,6 +5988,28 @@ fn map_solid(
         match built {
             Ok(body) => {
                 let mut failures = store.check(body);
+                // No fin carries a pcurve yet: trim geometry attaches only in
+                // `finish_exact_body`, after healing and tolerance measurement
+                // have settled the topology and the edge curves a trim must
+                // track. That ordering is load-bearing — it keeps the pcurve
+                // refit inside `GeometryHealer::heal` (and the refits that
+                // accompany a rescue recompute) deliberately dead on the import
+                // path, and routes authored trims through
+                // `transplant_authored_pcurves`' lockstep gate instead of the
+                // refit's weaker improves-the-departure test (of-gpmq).
+                debug_assert!(
+                    store.faces_of_body(body).into_iter().all(|face| {
+                        store.loops_of_face(face).into_iter().all(|loop_id| {
+                            store
+                                .fins_of_loop(loop_id)
+                                .iter()
+                                .all(|&fin| store.fin(fin).and_then(|f| f.pcurve).is_none())
+                        })
+                    }),
+                    "pcurves attached before healing: GeometryHealer::heal's pcurve \
+                     refit pass is specified dead on the import path — attach them \
+                     in finish_exact_body, or re-audit heal's pass order (of-gpmq)"
+                );
                 // Import heals, it does not reject (`spec/06-step-io.md` §4): a
                 // body whose only defects are an unsewn shell, a vertex gap or a
                 // flipped face is repaired and re-validated before the exact path

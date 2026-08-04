@@ -1204,6 +1204,74 @@ fn combined_api_damage_heals_in_one_pass() {
     assert_within(measured, 1.0, 1e-9, &repro);
 }
 
+/// Import-path deadness pin for `heal()`'s pcurve pass (of-gpmq): the reader
+/// attaches trim geometry only in `finish_exact_body`, *after* healing, so
+/// when an unsewn file brings the healer in, every fin is bare and the
+/// in-pass refit must plan nothing. A "refit pcurve" diagnostic here would
+/// mean pcurves were attached before healing — which would hand authored
+/// trims to the refit's improves-the-departure test instead of
+/// `transplant_authored_pcurves`' stricter lockstep gate, silently changing
+/// what a hostile file can smuggle in. The reader also debug-asserts the
+/// ordering at its `heal()` call site; this test pins the observable half.
+///
+/// The bare-fins premise and the attachment both get asserted, so the test
+/// cannot rot into vacuity: healing must actually have run (the file is
+/// unsewn), and the finished body's fins must all carry the pcurves that
+/// `finish_exact_body` attached afterwards.
+#[test]
+fn import_path_healing_refits_no_pcurves_because_fins_are_still_bare() {
+    let mut rng = Rng::new(0x_60D9_ADE5);
+    for case in 0..6 {
+        let export = export_random_block(&mut rng);
+        let amplitude = export.diagonal * TRIM_TOL_REL * rng.range(0.05, 0.25);
+        let (damaged, largest) = unsew(&export.text, &mut rng, amplitude);
+        let repro = format!(
+            "case {case}: {} unsewn with jitter {largest:.3e} \
+             (cargo test --test step_heal_phase2_adversarial import_path_healing)",
+            export.label
+        );
+
+        let mut store = TopologyStore::new();
+        let mut geo = GeometryStore::new();
+        let import = read_step(
+            &damaged,
+            &mut store,
+            &mut geo,
+            &read_options(HealStrategy::Auto, None),
+        )
+        .unwrap_or_else(|e| panic!("{repro}: the damaged file must still PARSE: {e:?}"));
+        let SolidOutcome::BRep(body) = import.solids[0].outcome else {
+            panic!("{repro}: an unsewn block must heal to an exact import");
+        };
+        assert!(
+            import
+                .diagnostics
+                .iter()
+                .any(|d| d.message.starts_with("healed:")),
+            "{repro}: the premise needs the healer to have RUN — an unsewn file \
+             must report heals; diagnostics: {:#?}",
+            import.diagnostics
+        );
+        assert!(
+            !import
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("refit pcurve")),
+            "{repro}: healing refit a pcurve on the import path — fins must be \
+             bare until finish_exact_body attaches trims AFTER healing \
+             (of-gpmq); diagnostics: {:#?}",
+            import.diagnostics
+        );
+        for fin in body_fins(&store, body) {
+            assert!(
+                store.fin(fin).is_some_and(|f| f.pcurve.is_some()),
+                "{repro}: fin {fin:?} has no pcurve — finish_exact_body must \
+                 attach trims after healing"
+            );
+        }
+    }
+}
+
 /// The minimal pin for of-8jqc: an **unsewn** file with a **majority** of
 /// its `ADVANCED_FACE` sense flags flipped must not heal to an inside-out
 /// body — which it used to do, certified clean.
