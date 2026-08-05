@@ -122,8 +122,10 @@ def extract_detail(stdout: str, test: str) -> str:
 
 
 def bd(args: list[str]) -> str:
+    # No --no-pager: bd 1.1.2 rejects the flag, and with stdout captured
+    # through a pipe no pager can engage anyway.
     proc = subprocess.run(
-        ["bd", *args, "--no-pager"], capture_output=True, text=True, cwd=REPO_ROOT
+        ["bd", *args], capture_output=True, text=True, cwd=REPO_ROOT
     )
     if proc.returncode != 0:
         raise RuntimeError(f"bd {' '.join(args)} failed: {proc.stderr[-500:]}")
@@ -182,6 +184,40 @@ def file_bead(
     return m.group(1) if m else out.strip()[:80]
 
 
+def spool_finding(
+    log_dir: pathlib.Path,
+    stamp: str,
+    seed_hex: str,
+    crate: str,
+    target: str,
+    test: str,
+    detail: str,
+    error: str,
+) -> pathlib.Path:
+    """Append a finding that could not be reconciled/filed to a local spool.
+
+    A bd outage must not lose the finding: the spool line carries everything
+    the witness needs to file (or dedupe) the bead by hand later.
+    """
+    log_dir.mkdir(parents=True, exist_ok=True)
+    spool = log_dir / f"spool-{stamp}-{seed_hex}.jsonl"
+    entry = {
+        "crate": crate,
+        "target": target,
+        "test": test,
+        "seed": seed_hex,
+        "repro": (
+            f"OPENSOLID_CAMPAIGN_SEED={seed_hex} "
+            f"cargo test -p {crate} --test {target} {test}"
+        ),
+        "detail": detail[-2000:],
+        "error": error[-500:],
+    }
+    with spool.open("a") as fh:
+        fh.write(json.dumps(entry) + "\n")
+    return spool
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     mode = ap.add_mutually_exclusive_group()
@@ -212,7 +248,14 @@ def main() -> int:
     stamp = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
     print(f"campaign seed {seed_hex} — {len(suites)} suites, repo {REPO_ROOT}")
 
-    report = {"seed": seed_hex, "started": stamp, "suites": [], "filed": [], "known": []}
+    report = {
+        "seed": seed_hex,
+        "started": stamp,
+        "suites": [],
+        "filed": [],
+        "known": [],
+        "spooled": [],
+    }
     driver_error = False
     for crate, target, takes_seed in suites:
         print(f"  running {target} ...", flush=True)
@@ -230,16 +273,34 @@ def main() -> int:
             f" {res['seconds']}s"
         )
         for f in real:
-            bead = known_open_bead(target, f["test"])
-            if bead:
-                report["known"].append({"test": f"{target}::{f['test']}", "bead": bead})
-                print(f"    KNOWN {f['test']} -> open bead {bead}, not filing")
-            else:
+            key = f"{target}::{f['test']}"
+            try:
+                bead = known_open_bead(target, f["test"])
+                if bead:
+                    report["known"].append({"test": key, "bead": bead})
+                    print(f"    KNOWN {f['test']} -> open bead {bead}, not filing")
+                    continue
                 ref = file_bead(
                     crate, target, f["test"], seed_hex, f["detail"], args.dry_run
                 )
-                report["filed"].append({"test": f"{target}::{f['test']}", "bead": ref})
+                report["filed"].append({"test": key, "bead": ref})
                 print(f"    NEW   {f['test']} -> {ref}")
+            except (RuntimeError, OSError) as exc:
+                # bd trouble is a driver problem (nonzero exit), but it must
+                # not lose the finding or abort the remaining suites.
+                driver_error = True
+                spool = spool_finding(
+                    args.log_dir,
+                    stamp,
+                    seed_hex,
+                    crate,
+                    target,
+                    f["test"],
+                    f["detail"],
+                    str(exc),
+                )
+                report["spooled"].append({"test": key, "error": str(exc)[-500:]})
+                print(f"    SPOOL {f['test']} -> {spool} (bd failed: {exc})")
 
     total = sum(s["seconds"] for s in report["suites"])
     report["total_seconds"] = round(total, 1)
@@ -248,7 +309,8 @@ def main() -> int:
     log.write_text(json.dumps(report, indent=2))
     print(
         f"campaign done: {total:.0f} total test-seconds,"
-        f" {len(report['filed'])} new, {len(report['known'])} known -> {log}"
+        f" {len(report['filed'])} new, {len(report['known'])} known,"
+        f" {len(report['spooled'])} spooled -> {log}"
     )
     return 1 if driver_error else 0
 
