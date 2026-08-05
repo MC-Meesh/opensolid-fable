@@ -4651,6 +4651,83 @@ fn nurbs_box_bored_by_analytic_bar() {
     assert_close(sum, 8.0 + 3.0, PLANAR_VOLUME_RTOL, context);
 }
 
+/// The blind spot of the of-l69 in-region seed filter (of-l9xg, campaign
+/// seed 0x961C9A6E940362B8 case 10): a NURBS block cornered by a small
+/// analytic block whose overlap is a shallow corner notch. Two of the six
+/// intersection segments — the tool's x-min wall across A's top cap, and
+/// its z-min wall across A's x-max cap — have a region of interest (the
+/// joint face-overlap box) spanning only the tool face's ~0.15 width,
+/// while the bilinear cap's per-span seed grid samples ~0.7 apart. Every
+/// refined seed of those branches landed *outside* the ROI ball, the
+/// of-l69 filter dropped them all, and the crossings were silently never
+/// traced. The surviving legs of the imprint loop then ended in the caps'
+/// interiors and `unite` died in `apply_chain` with `an imprint chain ends
+/// in a face interior without closing or reaching the face boundary`.
+/// Fixed by walking an out-of-region seed along its branch into the ROI
+/// ([`Marcher::slide_into_roi`]) instead of discarding it. Both tool
+/// flavors run: the analytic tool clips its planes to the ROI (the
+/// original failure), and the NURBS tool drives the same walk on a
+/// patch-patch pair.
+#[test]
+fn nurbs_block_corner_notch_with_roi_smaller_than_seed_grid() {
+    let a_max = [1.7668492151935102, 2.103294669747842, 2.2828069811016327];
+    let b_min = [0.922099342189132, 0.9928934680585276, 1.7577761473158906];
+    let b_max = [2.8846314846147694, 1.1436817747966748, 3.433082888920978];
+    let vol = |lo: &[f64; 3], hi: &[f64; 3]| (0..3).map(|k| hi[k] - lo[k]).product::<f64>();
+    let vol_a = vol(&[0.0; 3], &a_max);
+    let vol_b = vol(&b_min, &b_max);
+    let overlap: f64 = (0..3)
+        .map(|k| a_max[k].min(b_max[k]) - 0.0_f64.max(b_min[k]))
+        .product();
+    for nurbs_tool in [false, true] {
+        let context = format!(
+            "NURBS block corner-notched by {} block (of-l9xg)",
+            if nurbs_tool { "NURBS" } else { "analytic" }
+        );
+        let mut scene = Scene::new();
+        let a = scene.nurbs_block([0.0; 3], a_max);
+        let b = if nurbs_tool {
+            scene.nurbs_block(b_min, b_max)
+        } else {
+            scene.block(b_min, b_max)
+        };
+        let inside_a = box_inside_test([0.0; 3], a_max);
+        let inside_b = box_inside_test(b_min, b_max);
+        let tests: [Option<InsideTest>; 2] = [
+            Some(&inside_a),
+            if nurbs_tool { Some(&inside_b) } else { None },
+        ];
+        let run = |op, label: &str| {
+            boolean_with_inside_tests(op, &scene.store, &scene.geo, a, b, &tol(), tests)
+                .unwrap_or_else(|e| panic!("{context}: {label} failed: {e:?}"))
+        };
+        let united = run(BooleanOp::Unite, "unite");
+        let intersected = run(BooleanOp::Intersect, "intersect");
+        let subtracted = run(BooleanOp::Subtract, "subtract");
+        let vol_union = volume_checked(&united, 1, 0, &format!("{context}: union"));
+        let vol_inter = volume_checked(&intersected, 1, 0, &format!("{context}: intersection"));
+        let vol_diff = volume_checked(&subtracted, 1, 0, &format!("{context}: difference"));
+        assert_close(
+            vol_inter,
+            overlap,
+            PLANAR_VOLUME_RTOL,
+            &format!("{context}: intersection vs analytic overlap"),
+        );
+        assert_close(
+            vol_union + vol_inter,
+            vol_a + vol_b,
+            PLANAR_VOLUME_RTOL,
+            &format!("{context}: inclusion–exclusion identity"),
+        );
+        assert_close(
+            vol_diff,
+            vol_a - overlap,
+            PLANAR_VOLUME_RTOL,
+            &format!("{context}: difference identity"),
+        );
+    }
+}
+
 // =====================================================================
 // (14) NURBS promotion gate: the FREEFORM §9 stress campaign (of-37i.5)
 // =====================================================================

@@ -519,6 +519,48 @@ impl<A: MarchSurface, B: MarchSurface> Marcher<'_, A, B> {
         }
         Ok((out, StopReason::Stalled))
     }
+
+    /// Walk a refined seed along its own intersection branch until it lies
+    /// within `reach` of `center`, or `None` when the branch never enters
+    /// that ball. Tries the tangent direction pointing toward the center
+    /// first, then the other, so a curved branch that initially bends away
+    /// is still followed to its crossing.
+    ///
+    /// This exists for a seed grid coarser than the region of interest: a
+    /// low-degree patch's per-span grid can put EVERY refined seed of a
+    /// branch outside the ROI ball even though the branch crosses straight
+    /// through it (a bilinear face of a NURBS block against a small tool
+    /// face, of-l9xg). Discarding such seeds silently drops the crossing;
+    /// walking them in keeps one in-region seed per branch without touching
+    /// the grid. The walked-in state is a *marched* vertex: on the
+    /// intersection to `gap_tol` like every vertex `trace` emits.
+    ///
+    /// # Errors
+    /// Near-tangency along the branch, exactly as [`Marcher::trace`].
+    fn slide_into_roi(
+        &self,
+        seed: &(MarchState, Frames),
+        center: Point3,
+        reach: f64,
+    ) -> CoreResult<Option<(MarchState, Frames)>> {
+        let tangent = self.tangent(&seed.1)?;
+        let prefer = if tangent.dot(&(center - seed.1.pa)) >= 0.0 {
+            1.0
+        } else {
+            -1.0
+        };
+        for dir in [prefer, -prefer] {
+            let (path, _) = self.trace(seed, dir, &tangent)?;
+            let entered = path
+                .into_iter()
+                .find(|(_, p)| (p - center).norm() <= reach);
+            if let Some((state, _)) = entered {
+                let frames = self.frames(&state);
+                return Ok(Some((state, frames)));
+            }
+        }
+        Ok(None)
+    }
 }
 
 /// Intersect two NURBS surfaces by grid-seeded predictor-corrector
@@ -552,11 +594,11 @@ pub fn intersect_nurbs(
 /// finite — unbounded primitive directions are clipped by the callers).
 ///
 /// `roi` is the region of interest as a bounding sphere `(center, radius)`.
-/// When set, only seeds whose refined point lies inside it (padded to the
-/// same `reach` [`clipped_domains`] clips a partner to) start a trace. This
-/// is not an optimization: `a`'s natural parameter domain can extend well
-/// past the region where it actually meets `b` — a plane clipped to the
-/// ROI intersects a full-domain NURBS patch only across the ROI, so the
+/// When set, every trace starts from a seed inside it (padded to the same
+/// `reach` [`clipped_domains`] clips a partner to). This is not an
+/// optimization: `a`'s natural parameter domain can extend well past the
+/// region where it actually meets `b` — a plane clipped to the ROI
+/// intersects a full-domain NURBS patch only across the ROI, so the
 /// patch's grid seeds *outside* the ROI would each trace a fragment that
 /// dead-ends at the clipped partner's domain wall. Those fragments overlap
 /// (the tracer covers past the seed on the ROI side before stalling), and
@@ -564,9 +606,12 @@ pub fn intersect_nurbs(
 /// already-traced curve, not one beyond a fragment's stalled end. Two
 /// overlapping fragments of one curve then reach the boolean arrangement as
 /// duplicate imprints, which collapse a holed region into a zero-area loop
-/// (of-l69). Seeding only inside the ROI leaves one trace to cover the whole
-/// in-region crossing. Callers with no clipped partner (compact primitives,
-/// full-domain NURBS) pass `None`.
+/// (of-l69). A seed that refines outside the ball is therefore walked along
+/// its branch into it first ([`Marcher::slide_into_roi`]) and dropped only
+/// if the branch never enters — dropping it *unconditionally* loses the
+/// whole crossing whenever the seed grid is coarser than the ball and no
+/// seed refines inside (of-l9xg). Callers with no clipped partner (compact
+/// primitives, full-domain NURBS) pass `None`.
 fn march_boxed<A: MarchSurface, B: MarchSurface>(
     a: &A,
     b: &B,
@@ -675,16 +720,29 @@ fn march_boxed<A: MarchSurface, B: MarchSurface>(
     let mut curves: Vec<MarchedCurve> = Vec::new();
     let merge_dist = 2.0 * marcher.h0;
     for candidate in candidates {
-        let Some(seed) = marcher.refine_seed(candidate)? else {
+        let Some(mut seed) = marcher.refine_seed(candidate)? else {
             continue;
         };
-        // Skip seeds outside the region of interest: `a`'s grid can cover
-        // more of `a` than `b` reaches once clipped, and an out-of-region
-        // seed only re-traces a fragment of an in-region crossing (of-l69).
+        // A seed outside the region of interest must not trace from where
+        // it refined: `a`'s grid can cover more of `a` than `b` reaches
+        // once clipped, and fragments traced from out-of-region seeds
+        // overlap without being deduplicable (of-l69). But it must not be
+        // discarded either — when the seed grid is coarser than the ROI
+        // ball, every seed of a branch that crosses the ball refines
+        // outside it, and dropping them all silently loses the crossing
+        // (of-l9xg). Walk the seed along its branch into the ball instead:
+        // every surviving trace then starts in-region, and later seeds of
+        // the same branch walk onto the already-traced fragment's interior,
+        // where the on-existing-curve guard below retires them — which is
+        // exactly the dedup the of-l69 filter bought, without its blind
+        // spot.
         if let Some((center, reach)) = roi_reach
             && (seed.1.pa - center).norm() > reach
         {
-            continue;
+            match marcher.slide_into_roi(&seed, center, reach)? {
+                Some(slid) => seed = slid,
+                None => continue,
+            }
         }
         // Skip seeds landing on an already-traced curve. The march from any
         // seed on a branch covers the whole branch in both directions, so
