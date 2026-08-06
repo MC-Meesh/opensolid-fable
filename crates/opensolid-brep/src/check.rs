@@ -1192,12 +1192,14 @@ impl TopologyStore {
     /// faces' trimmed regions is a defect — interiors crossing, an edge
     /// stabbing through a face, or two faces laid over each other. So a
     /// point is reported when it lies on both faces (inside the trim, or
-    /// within tolerance of its boundary) and is further than that same
-    /// tolerance band from every edge and vertex the two faces have in
-    /// common. Adjacency is thereby excused by *measurement* against the
-    /// shared entity's own geometry rather than by skipping adjacent pairs
-    /// outright, so two faces that share an edge and *also* cross elsewhere
-    /// are still caught.
+    /// within measurement fuzz of its boundary — the entities' claimed
+    /// tolerances deliberately do not widen what counts as "on", see
+    /// [`is_clash`]) and is further than twice the faces' claimed tolerance
+    /// from every edge and vertex the two faces have in common. Adjacency
+    /// is thereby excused by *measurement* against the shared entity's own
+    /// geometry rather than by skipping adjacent pairs outright, so two
+    /// faces that share an edge and *also* cross elsewhere are still
+    /// caught.
     ///
     /// # Method and its limits
     ///
@@ -2035,13 +2037,27 @@ fn is_clash(a: &FacePatch, b: &FacePatch, p: &Point3, tol: &ToleranceContext) ->
         return false;
     }
     let scale = p.coords.iter().fold(1.0f64, |m, &c| m.max(c.abs()));
-    let slack = a.tolerance.max(b.tolerance).max(tol.linear) + PROJECTION_SLACK_REL * scale;
-    if !a.covers(p, slack) || !b.covers(p, slack) {
+    // Admission is numeric, not tolerance-scale: a point is on a face when
+    // it sits inside the trim, or within measurement fuzz of its boundary.
+    // The faces' claimed tolerances deliberately do not widen this band.
+    // They once did, and that read *proximity* as *intersection*: two faces
+    // converging to a shared sharp vertex pass within the vertex's own
+    // tolerance of each other out to a distance that grows as 1/sin of the
+    // convergence angle — past any fixed multiple of that tolerance — so a
+    // flawless hexagonal-pyramid apex whose vertex honestly carried a fat
+    // tolerance was reported self-intersecting (of-yluq). A clash must lie
+    // on both trimmed regions beyond numeric doubt; how far apart two
+    // near-missing faces are *allowed* to sit is the tolerance model's
+    // question, and it is not answered here.
+    let fuzz = tol.linear + PROJECTION_SLACK_REL * scale;
+    if !a.covers(p, fuzz) || !b.covers(p, fuzz) {
         return false;
     }
-    // Twice the band `covers` admits: a point let in only by sitting `slack`
-    // outside a face is at most that far past the shared edge that explains
-    // it, and excusing it has to be at least as generous as admitting it was.
+    // The excusal band, by contrast, is tolerance-scale: contact within the
+    // claimed tolerance of an entity the two faces share is exactly what
+    // adjacency under tolerance looks like. Twice it, so excusing a point
+    // stays more generous than admitting it was.
+    let slack = a.tolerance.max(b.tolerance).max(tol.linear) + PROJECTION_SLACK_REL * scale;
     shared_boundary_distance(a, b, p) > 2.0 * slack
 }
 
@@ -3930,6 +3946,88 @@ mod tests {
             assert_eq!(
                 store.check_self_intersection(&geo, body),
                 vec![CheckFailure::StaleBody(body)]
+            );
+        }
+
+        /// Two faces sharing one sharp vertex whose tolerance is fat — the
+        /// of-yluq configuration, hexagonal-pyramid side faces one apart
+        /// (planes at a ~14° mutual wedge angle through the shared apex).
+        /// The faces touch only at the vertex; everywhere else they *near*-
+        /// miss each other, within the vertex's tolerance out to ~4x that
+        /// tolerance from it. Proximity is not intersection: a checker that
+        /// widens its "on the face" band by the claimed tolerance reports a
+        /// clash here and thereby refuses a flawless body for carrying the
+        /// very tolerance its vertex honestly measured.
+        #[test]
+        fn a_fat_tolerance_at_a_shared_sharp_vertex_is_not_a_clash() {
+            let (mut store, mut geo, body, shell) = sheet();
+            let (r, h) = (3.0, 12.0);
+            let apex = p(0.0, 0.0, h);
+            let base = |deg: f64| {
+                p(
+                    r * deg.to_radians().cos(),
+                    r * deg.to_radians().sin(),
+                    0.0,
+                )
+            };
+            let v_apex = vertex(&mut store, apex);
+            // Faces 2 and 4 of the hexagonal pyramid: adjacent to a common
+            // neighbour, sharing only the apex.
+            for (b0, b1) in [(120.0, 180.0), (240.0, 300.0)] {
+                let (pa, pb) = (base(b0), base(b1));
+                let (va, vb) = (vertex(&mut store, pa), vertex(&mut store, pb));
+                let ab = segment(&mut store, &mut geo, (va, pa), (vb, pb));
+                let b_up = segment(&mut store, &mut geo, (vb, pb), (v_apex, apex));
+                let up_a = segment(&mut store, &mut geo, (v_apex, apex), (va, pa));
+                triangle(
+                    &mut store,
+                    &mut geo,
+                    shell,
+                    [pa, pb, apex],
+                    [
+                        (ab, FinSense::Forward),
+                        (b_up, FinSense::Forward),
+                        (up_a, FinSense::Forward),
+                    ],
+                );
+            }
+            store
+                .vertices
+                .get_mut(v_apex)
+                .expect("live vertex")
+                .tolerance = 8.0e-3;
+
+            assert_eq!(store.check_self_intersection(&geo, body), Vec::new());
+        }
+
+        /// The tightened admission band must not excuse a *genuine*
+        /// crossing just because the entities carry fat tolerances: the
+        /// crossing's points lie strictly inside both trims, far from
+        /// anything shared, and fat claims change neither fact.
+        #[test]
+        fn a_genuine_crossing_is_still_reported_under_fat_tolerances() {
+            let (mut store, mut geo, body, shell) = sheet();
+            let flat = free_triangle(
+                &mut store,
+                &mut geo,
+                shell,
+                [p(0.0, 0.0, 0.0), p(4.0, 0.0, 0.0), p(0.0, 4.0, 0.0)],
+            );
+            let blade = free_triangle(
+                &mut store,
+                &mut geo,
+                shell,
+                [p(1.0, 1.0, -1.0), p(3.0, 1.0, -1.0), p(1.0, 1.0, 2.0)],
+            );
+            let vertex_ids: Vec<_> = store.vertices.iter().map(|(id, _)| id).collect();
+            for id in vertex_ids {
+                store.vertices.get_mut(id).expect("live vertex").tolerance =
+                    MAX_ALLOWED_TOLERANCE;
+            }
+
+            assert_eq!(
+                clashes(&store.check_self_intersection(&geo, body)),
+                vec![(flat, blade)]
             );
         }
 

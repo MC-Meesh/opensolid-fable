@@ -183,11 +183,11 @@ use std::collections::{HashMap, HashSet};
 use opensolid_brep::curve::plane_basis;
 use opensolid_brep::triangulate::{ear_clip_rings, signed_area2};
 use opensolid_brep::{
-    Body, BodyType, Curve2, Curve3, CurveEval, CurveProject, Edge, Face, FaceSense, Fin, FinSense,
-    GeometryStore, KnotVector, Loop, LoopType, MAX_ALLOWED_TOLERANCE, NurbsCurve, NurbsCurve2,
-    NurbsError, NurbsSurface, QuadricUSpan, SYSTEM_RESOLUTION, Shell, ShellOrientation, Surface3,
-    SurfaceEval, SurfaceProject, TessellationOptions, TopologyStore, Vertex, attach_body_pcurves,
-    quadric_u_span, triangulate_bounded_face,
+    Body, BodyType, CheckFailure, Curve2, Curve3, CurveEval, CurveProject, Edge, Face, FaceSense,
+    Fin, FinSense, GeometryStore, KnotVector, Loop, LoopType, MAX_ALLOWED_TOLERANCE, NurbsCurve,
+    NurbsCurve2, NurbsError, NurbsSurface, QuadricUSpan, SYSTEM_RESOLUTION, Shell,
+    ShellOrientation, Surface3, SurfaceEval, SurfaceProject, TessellationOptions, TopologyStore,
+    Vertex, attach_body_pcurves, quadric_u_span, triangulate_bounded_face,
 };
 use opensolid_core::error::CoreError;
 use opensolid_core::mesh::TriangleMesh;
@@ -3367,6 +3367,11 @@ struct SolidBuilder<'a> {
     /// the declared closure but outside what [`TRIM_TOL_REL`] alone allows.
     /// Reported once per solid rather than per edge.
     closure_trims: usize,
+    /// The vertices those floor-leaning trims end at. A carried miss leaves
+    /// each incident trim footed on its own curve, so these are the only
+    /// places the carry can spell faces that genuinely cross — the set the
+    /// pre-certification clash check is scoped to (of-yluq).
+    carried_vertices: HashSet<EntityId<Vertex>>,
     created: Created,
     /// Faces with more than one real bound, so which one is the outer bound
     /// was an open question at mapping time. [`choose_outer_bounds`] settles
@@ -3815,7 +3820,8 @@ impl SolidBuilder<'_> {
             seam_tol,
             edge_ref,
         )?;
-        if trimmed.start_residual.max(trimmed.end_residual) > trim_tol(start, end, 0.0) {
+        let floor_tol = trim_tol(start, end, 0.0);
+        if trimmed.start_residual.max(trimmed.end_residual) > floor_tol {
             self.closure_trims += 1;
         }
 
@@ -3841,6 +3847,9 @@ impl SolidBuilder<'_> {
             (v_start, trimmed.start_residual),
             (v_end, trimmed.end_residual),
         ] {
+            if residual > floor_tol {
+                self.carried_vertices.insert(vertex);
+            }
             let vertex = self.store.vertices.get_mut(vertex).expect("just created");
             vertex.tolerance = vertex.tolerance.max(residual);
         }
@@ -6080,6 +6089,38 @@ fn record_edge_tolerances(
     Ok(raised)
 }
 
+/// Whether a reported clash is one the closure-floor carry (or a
+/// reconciliation) could have spelled: both faces end at a vertex whose
+/// trim miss leaned on the floor. The carry displaces exactly the trims
+/// footed at that vertex, so a crossing it creates is between faces meeting
+/// there — the of-yluq configuration. A clash between faces that share no
+/// carried vertex predates the carry (or is checker sampling noise on a
+/// tangency) and is not held against the exact path; demoting a
+/// documented-good body for it is the of-wisp-45j regression.
+fn clash_at_carried_vertex(
+    store: &TopologyStore,
+    failure: &CheckFailure,
+    carried: &HashSet<EntityId<Vertex>>,
+) -> bool {
+    let CheckFailure::SelfIntersection { face_a, face_b, .. } = failure else {
+        return true;
+    };
+    let vertices_of = |face: EntityId<Face>| {
+        let mut vertices = HashSet::new();
+        for edge_id in store.edges_of_face(face) {
+            if let Some(edge) = store.edge(edge_id) {
+                vertices.insert(edge.start_vertex);
+                vertices.insert(edge.end_vertex);
+            }
+        }
+        vertices
+    };
+    let in_a = vertices_of(*face_a);
+    vertices_of(*face_b)
+        .into_iter()
+        .any(|vertex| carried.contains(&vertex) && in_a.contains(&vertex))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn map_solid(
     file: &StepFile,
@@ -6153,6 +6194,7 @@ fn map_solid(
             anchored_edges: &anchored_edges,
             adjusted: &adjusted,
             closure_trims: 0,
+            carried_vertices: HashSet::new(),
             created: Created::default(),
             multi_bound_faces: Vec::new(),
             vertices: HashMap::new(),
@@ -6169,6 +6211,16 @@ fn map_solid(
             face_surface_refs: builder.face_surface_refs,
         };
         let closure_trims = builder.closure_trims;
+        // A reconciled vertex leaned on the declared closure the same way a
+        // floor-carried one did — its trims are footed on their own curves
+        // around the moved point — so the reconciled band gets the same
+        // pre-certification protection (of-3jgq lands on this gate).
+        let mut carried_vertices = builder.carried_vertices;
+        for vertex_ref in adjusted.keys() {
+            if let Some(&vertex) = builder.vertices.get(vertex_ref) {
+                carried_vertices.insert(vertex);
+            }
+        }
         match built {
             Ok(body) => {
                 let mut failures = store.check(body);
@@ -6254,6 +6306,54 @@ fn map_solid(
                                              distance from their faces' surfaces"
                                         ),
                                     });
+                                }
+                                // A vertex miss the closure floor carried (or
+                                // reconciliation split) leaves each incident
+                                // trim footed on its own curve, and at a sharp
+                                // high-valence vertex those feet can spell
+                                // faces that genuinely cross — a defect the
+                                // topology-level `check` above cannot see. So
+                                // exactly the solids that leaned on the floor
+                                // buy the pairwise face check before
+                                // certifying, and a clash *at a carried
+                                // vertex* — both faces ending at a vertex
+                                // whose miss the floor carried — abandons the
+                                // exact path for the mesh fallback. A clash
+                                // reported elsewhere on the body is outside
+                                // this gate's writ: the checker's sampling
+                                // has documented false positives on
+                                // real-world tangencies (nist_ctc_05 imports
+                                // exact and checker-noisy), and a defect the
+                                // carry could not have spelled is no reason
+                                // to demote what the carry imported. Run
+                                // before `finish_exact_body`, which attaches
+                                // pcurves the rollback below must never see
+                                // (they are not measured by this check
+                                // anyway).
+                                if !carried_vertices.is_empty() {
+                                    let carried_clashes: Vec<_> = store
+                                        .check_self_intersection(geo, body)
+                                        .into_iter()
+                                        .filter(|failure| {
+                                            clash_at_carried_vertex(
+                                                store,
+                                                failure,
+                                                &carried_vertices,
+                                            )
+                                        })
+                                        .collect();
+                                    if !carried_clashes.is_empty() {
+                                        for failure in &carried_clashes {
+                                            diagnostics.push(Diagnostic {
+                                                entity: Some(msb_id),
+                                                severity: Severity::Warning,
+                                                message: format!(
+                                                    "mapped body failed validation: {failure}"
+                                                ),
+                                            });
+                                        }
+                                        break;
+                                    }
                                 }
                                 *heal_operations += finish_exact_body(
                                     store,
@@ -6442,6 +6542,70 @@ mod tests {
             !report.has_errors(),
             "unexpected error diagnostics: {:?}",
             report.diagnostics
+        );
+    }
+
+    /// The pre-certification clash gate is scoped to the carry (of-yluq,
+    /// narrowed after the of-wisp-45j regression): a reported clash
+    /// disqualifies the exact path only when both faces end at a vertex
+    /// whose trim miss leaned on the closure floor. Checker sampling noise
+    /// elsewhere on the body — nist_ctc_05's tangencies — must not demote a
+    /// documented-good import.
+    #[test]
+    fn a_clash_counts_against_certification_only_at_a_carried_vertex() {
+        let mut store = TopologyStore::new();
+        let body = store.create_body(BodyType::Solid);
+        let shell = store.create_shell(body, false, ShellOrientation::Outward);
+        let at = |x: f64, y: f64| Point3::new(x, y, 0.0);
+        let mut vertex = |store: &mut TopologyStore, x: f64, y: f64| {
+            store.create_vertex(at(x, y), SYSTEM_RESOLUTION)
+        };
+        let apex = vertex(&mut store, 0.0, 0.0);
+        let mut triangle = |store: &mut TopologyStore, corners: [EntityId<Vertex>; 3]| {
+            let face = store.create_face(shell, FaceSense::Positive);
+            let edges: Vec<_> = (0..3)
+                .map(|i| {
+                    (
+                        store.create_edge(corners[i], corners[(i + 1) % 3], SYSTEM_RESOLUTION),
+                        FinSense::Forward,
+                    )
+                })
+                .collect();
+            store.create_loop(face, LoopType::Outer, &edges);
+            face
+        };
+        // Faces `a` and `b` share only the apex; face `c` touches neither.
+        let (a1, a2) = (vertex(&mut store, 1.0, 0.0), vertex(&mut store, 1.0, 1.0));
+        let (b1, b2) = (
+            vertex(&mut store, -1.0, 0.0),
+            vertex(&mut store, -1.0, -1.0),
+        );
+        let (c1, c2, c3) = (
+            vertex(&mut store, 5.0, 5.0),
+            vertex(&mut store, 6.0, 5.0),
+            vertex(&mut store, 5.0, 6.0),
+        );
+        let face_a = triangle(&mut store, [apex, a1, a2]);
+        let face_b = triangle(&mut store, [apex, b1, b2]);
+        let face_c = triangle(&mut store, [c1, c2, c3]);
+        let clash = |face_a, face_b| CheckFailure::SelfIntersection {
+            face_a,
+            face_b,
+            at: at(0.0, 0.0),
+        };
+
+        let carried_apex = HashSet::from([apex]);
+        assert!(
+            clash_at_carried_vertex(&store, &clash(face_a, face_b), &carried_apex),
+            "a clash between two faces meeting at the carried vertex is the carry's own"
+        );
+        assert!(
+            !clash_at_carried_vertex(&store, &clash(face_a, face_c), &carried_apex),
+            "a clash whose faces share no carried vertex is outside the gate's writ"
+        );
+        assert!(
+            !clash_at_carried_vertex(&store, &clash(face_a, face_b), &HashSet::from([a1])),
+            "a carried vertex only one face ends at cannot have spelled the crossing"
         );
     }
 

@@ -90,15 +90,26 @@
 //!   curves* — see [`a_lying_declaration_rescues_only_unanimous_curves_and_says_so`].
 //!   The repro is [`an_axially_slopped_apex_of_concurrent_edges_must_import`],
 //!   now passing.
-//! - **of-yluq** (P2, OPEN): not the split itself, but the same
+//! - **of-yluq** (P2, FIXED): not the split itself, but the same
 //!   declared-closure family — a *carriable* miss (0.8× the limit under the
 //!   closure floor, no reconciliation) at the sharp valence-six apex
-//!   imports as an exact `SolidOutcome::BRep` whose adjacent side faces
-//!   genuinely cross near the apex: `check()` (topology-only, all the
-//!   import runs) passes, `check_with_geometry` reports `SelfIntersection`.
-//!   The import certifies a body the geometric checker refuses. The repro
-//!   is [`a_high_valence_apex_with_carriable_slop_imports_unmoved`],
-//!   `#[ignore]`d until the bead lands.
+//!   imported as an exact `SolidOutcome::BRep` that `check_with_geometry`
+//!   then refused with `SelfIntersection`. The clash was not a genuine
+//!   crossing but a checker false positive: `is_clash` widened its "on the
+//!   face" band by the claimed tolerances, so faces converging to the
+//!   fat-tolerance apex near-missed each other past the fixed 2× excusal
+//!   ball (even the *clean* pyramid was refused once its apex vertex
+//!   carried 8e-3). `is_clash` now admits only within numeric fuzz, and
+//!   the import runs `check_self_intersection` before certifying any solid
+//!   that leaned on the closure floor, so a genuine clash *at a carried
+//!   vertex* — both faces ending at a vertex whose miss the floor carried,
+//!   the only crossing the carry can spell — degrades to mesh fallback
+//!   instead of being certified. Clashes reported elsewhere are excused:
+//!   holding checker sampling noise on real-world tangencies against the
+//!   exact path demoted all 208 faces of documented-good nist_ctc_05 (the
+//!   of-wisp-45j regression). The repro
+//!   [`a_high_valence_apex_with_carriable_slop_imports_unmoved`] now
+//!   passes.
 
 use opensolid_brep::MAX_ALLOWED_TOLERANCE;
 use opensolid_brep::{GeometryStore, TopologyStore};
@@ -1693,17 +1704,23 @@ fn an_axially_slopped_apex_of_concurrent_edges_must_import() {
 /// certified body must satisfy the geometric checker, as every carried
 /// miss on the low-valence fixtures does.
 ///
-/// FOUND FAILING, filed as **of-yluq**: the import returns
-/// `SolidOutcome::BRep`, but the six side-face trims all end at the
-/// perturbed apex while their planes pass through the true one — adjacent
-/// faces cross near the apex and `check_with_geometry` reports
-/// `SelfIntersection`. The import pipeline only runs the topology-level
-/// `check()`, which cannot see it, so it certifies what the geometric
-/// checker refuses. No reconciliation is involved (the vertex never
-/// moves); the closure floor alone carries the miss into a sharp-vertex
-/// configuration where the trims genuinely intersect.
+/// FOUND FAILING as **of-yluq**, since fixed. The reported
+/// `SelfIntersection` was not a genuine crossing — with the tolerance band
+/// deflated to measurement fuzz the trimmed regions never overlap — but
+/// `is_clash`'s admission band was widened by the claimed tolerances, so
+/// side faces one apart, converging to the shared apex at a ~14° wedge
+/// angle, *near*-missed each other within the apex vertex's carried
+/// tolerance out to ~4x that tolerance from it, past the fixed 2x excusal
+/// ball. Proximity read as intersection: the same checker refused even the
+/// clean pyramid once its apex vertex honestly carried 8e-3. `is_clash`
+/// now admits a point only within numeric fuzz of both trims (claimed
+/// tolerances keep widening only the shared-topology excusal), and the
+/// import runs `check_self_intersection` before certifying any solid that
+/// leaned on the closure floor, degrading to mesh fallback on a genuine
+/// clash at a carried vertex rather than certifying it (a clash the carry
+/// could not have spelled — no carried vertex on both faces — is excused,
+/// or nist_ctc_05 loses its 208 exact faces to checker noise).
 #[test]
-#[ignore = "of-yluq: closure-floor carry at a sharp valence-6 apex certifies a self-intersecting body"]
 fn a_high_valence_apex_with_carriable_slop_imports_unmoved() {
     let (n, r, h) = (6, 3.0f64, 12.0f64);
     let amount = 0.8 * MAX_ALLOWED_TOLERANCE;
