@@ -61,27 +61,35 @@
 //!
 //! Sections (8)–(10) attack the of-5cn5 mechanism itself — the band between
 //! [`MAX_ALLOWED_TOLERANCE`] and a looser declaration, where a vertex no
-//! single entity can carry is moved to the minimax point of its incident
-//! curves' nearest points and the miss split across the edges meeting
-//! there. The cylinder fixture's seam vertex carries valence **two** (the
-//! circle and the seam line), the pyramid fixture's apex valence **six** —
-//! either side of nist_ctc_05's four. Attacked: the band's epsilon edges at
-//! 1× and 2× the kernel limit, the cliff at the *unclamped* declaration,
-//! inch authoring, translation invariance (of-85rt), the two-vertex seam
+//! single entity can carry is moved to the point minimizing its greatest
+//! distance to any incident curve and the miss split across the edges
+//! meeting there. The cylinder fixture's seam vertex carries valence
+//! **two** (the circle and the seam line), the pyramid fixture's apex
+//! valence **six** — either side of nist_ctc_05's four. Attacked: the
+//! band's epsilon edges, the cliff at the *unclamped* declaration, inch
+//! authoring, translation invariance (of-85rt), the two-vertex seam
 //! spelling (of-00pu) reconciled and seamed in one import, declarations
 //! that lie by decades, and a randomized band fuzz.
 //!
-//! - **of-3jgq** (P2, OPEN): the minimax point is computed as the center of
-//!   the smallest ball enclosing the incident curves' *feet*, which is not
-//!   the point minimizing the greatest curve distance when the curves are
-//!   concurrent at shallow mutual angles. A hexagonal-pyramid apex slopped
-//!   *along its axis* by 1.35× the limit — six slant lines all passing
-//!   exactly through the authored apex, unanimity the mechanism's own
-//!   contract says to believe — reconciles only to 1.27× the limit
-//!   (reduction factor cos²α) and is refused, where the true minimax point
-//!   carries **zero** residual. The repro is
-//!   [`an_axially_slopped_apex_of_concurrent_edges_must_import`],
-//!   `#[ignore]`d until the bead lands.
+//! - **of-3jgq** (P2, FIXED): the minimax point used to be computed as the
+//!   center of the smallest ball enclosing the incident curves' *feet*,
+//!   which is not the point minimizing the greatest curve distance when the
+//!   curves are concurrent at shallow mutual angles. A hexagonal-pyramid
+//!   apex slopped *along its axis* by 1.35× the limit — six slant lines all
+//!   passing exactly through the authored apex, unanimity the mechanism's
+//!   own contract says to believe — reconciled only to 1.27× the limit
+//!   (reduction factor cos²α) and was refused, where the true minimax point
+//!   carries **zero** residual. Fixed by `minimax_curve_point` (read.rs):
+//!   re-foot iteration to the true minimax, keeping every prior bound. The
+//!   fix moved the band's *outer* edge for every fixture whose incident
+//!   curves are concurrent (the cylinder's seam line and circle intersect
+//!   at the seam point, so all three slop shapes qualify): a miss the
+//!   curves unanimously locate now snaps at any magnitude the declaration
+//!   covers, and the outer refusal edge is the declaration itself, not 2×
+//!   the limit. What still refuses is genuine *disagreement between the
+//!   curves* — see [`a_lying_declaration_rescues_only_unanimous_curves_and_says_so`].
+//!   The repro is [`an_axially_slopped_apex_of_concurrent_edges_must_import`],
+//!   now passing.
 //! - **of-yluq** (P2, OPEN): not the split itself, but the same
 //!   declared-closure family — a *carriable* miss (0.8× the limit under the
 //!   closure floor, no reconciliation) at the sharp valence-six apex
@@ -474,7 +482,7 @@ fn cylinder_sector(r: f64, h: f64, sweep: f64, closure_mm: Option<f64>) -> Strin
 /// carries four incident edges, this one carries `n`. The slant half-angle
 /// α (from the axis) is `asin(r / √(r² + h²))`: a tall pyramid makes the
 /// slant lines nearly concurrent-parallel, which is where the feet-ball
-/// minimax degrades (of-3jgq).
+/// minimax degraded before of-3jgq taught it to iterate.
 fn ngon_pyramid(n: usize, r: f64, h: f64, apex_mm: [f64; 3], closure_mm: Option<f64>) -> String {
     use std::fmt::Write as _;
     assert!(n >= 3, "a pyramid needs at least a triangular base");
@@ -953,21 +961,23 @@ fn an_inch_authored_file_agrees_with_its_millimetre_twin() {
 /// A declaration looser than [`MAX_ALLOWED_TOLERANCE`] is clamped for what
 /// any single entity may *carry* — but since of-5cn5 the band between the
 /// limit and the declaration is no longer an automatic refusal: vertex
-/// reconciliation (read.rs `reconcile_vertices`) may split such a miss
-/// across the edges meeting there, provided every reconciled residual
-/// lands under the limit. nist_ctc_05 lives in exactly this band (18 µm of
-/// miss under a 93 µm declaration). What binds through any declaration is
-/// the limit on carried tolerance:
+/// reconciliation (read.rs `reconcile_vertices`) moves such a miss to the
+/// point minimizing its greatest curve distance, provided every reconciled
+/// residual lands under the limit. nist_ctc_05 lives in exactly this band
+/// (18 µm of miss under a 93 µm declaration). What binds through any
+/// declaration is the limit on *carried* tolerance:
 /// - slop inside the limit imports unmoved, as the clamp always allowed;
-/// - slop between the limit and twice the limit imports *reconciled* — the
-///   vertex moves, the report says so, and the checker stays clean;
-/// - slop whose curves disagree by more than twice the limit still
-///   refuses, however loose the declaration: no split can land every
-///   residual under the limit.
-///
-/// The exception is the radial push, where the circle and the seam line
-/// agree on one point: reconciliation takes their unanimous word within
-/// the declaration and the vertex snaps to it, carrying nothing at all.
+/// - slop past the limit imports *reconciled* — the vertex moves, the
+///   report says so, and the checker stays clean — at any magnitude the
+///   declaration covers, because the seam line and each circle intersect
+///   at the seam point: the curves are unanimous on where the vertex
+///   belongs, whichever way it was pushed, and the snap carries nothing
+///   (of-3jgq; before it, only the radial push's coincident feet found
+///   that point, and off-plane / tangential slop died past 2× the limit);
+/// - what refuses through any declaration is *disagreement between the
+///   curves themselves*, where no point lands every residual under the
+///   limit — [`a_lying_declaration_rescues_only_unanimous_curves_and_says_so`]
+///   pins that with a seam line no vertex move can reconcile.
 #[test]
 fn a_declaration_past_the_kernel_limit_is_clamped_in_effect() {
     let (r, h) = (5.0, 8.0);
@@ -1026,17 +1036,12 @@ fn a_declaration_past_the_kernel_limit_is_clamped_in_effect() {
                 Unit::Mm,
                 Some(declared),
             );
-            match slop {
-                Slop::OffPlane | Slop::Tangential => assert_refused(&text, &beyond_repro),
-                Slop::Radial => {
-                    assert!(
-                        exact_checked_volume(&text, &beyond_repro).is_some()
-                            && reconciled(&import(&text, &beyond_repro).2),
-                        "{beyond_repro}: curves unanimous within the declaration \
-                         must snap, not refuse"
-                    );
-                }
-            }
+            assert!(
+                exact_checked_volume(&text, &beyond_repro).is_some()
+                    && reconciled(&import(&text, &beyond_repro).2),
+                "{beyond_repro}: curves unanimous within the declaration \
+                 must snap, not refuse"
+            );
         }
     }
 }
@@ -1310,21 +1315,24 @@ fn assert_band(text: &str, expect: Band, r: f64, h: f64, repro: &str) {
 
 /// The seam vertex carries valence **two** — the circle and the seam line,
 /// the fewest incident edges a manifold vertex can have — and the off-plane
-/// push misses the circle by the whole amount while staying on the line, so
-/// the minimax split halves the miss between the two. The band's inner edge
-/// therefore sits at the kernel limit (below it the vertex carries the miss
-/// unmoved) and its outer edge at exactly **twice** the limit (above it no
-/// split lands both residuals under the limit). Off-by-epsilon draws on
-/// either side of both edges, under a clamped declaration.
+/// push misses the circle by the whole amount while staying on the line.
+/// The two curves intersect at the seam point, so the true minimax target
+/// is that intersection and the snap carries nothing (of-3jgq): the band's
+/// inner edge sits at the kernel limit (below it the vertex carries the
+/// miss unmoved) and its outer edge at the **declaration** (past it the
+/// file never vouched for the miss — the of-7aja cliff). 2.04× the limit,
+/// the old feet-ball mechanism's outer edge, now reconciles like the rest
+/// of the band. Off-by-epsilon draws on either side of both edges, under a
+/// clamped declaration.
 #[test]
-fn the_reconciliation_band_edges_sit_at_the_limit_and_its_double() {
+fn the_reconciliation_band_edges_sit_at_the_limit_and_the_declaration() {
     let (r, h) = (5.0, 8.0);
     let declared = 2.54e-2;
     for (factor, expect) in [
         (0.98, Band::CarriedUnmoved),
         (1.02, Band::Reconciled),
-        (1.96, Band::Reconciled),
-        (2.04, Band::Refused),
+        (2.04, Band::Reconciled),
+        (2.60, Band::Refused),
     ] {
         let amount = factor * MAX_ALLOWED_TOLERANCE;
         let repro =
@@ -1382,14 +1390,15 @@ fn the_reconciliation_cliff_sits_at_the_unclamped_declaration() {
 /// 25.4 and declared through the `CONVERSION_BASED_UNIT` chain must land on
 /// the same side of both band edges as the millimetre original. A unit bug
 /// in `declared_closure` (fetched separately from `resolve_closure` since
-/// of-5cn5) moves the band 25.4× in one direction.
+/// of-5cn5) moves the band 25.4× in one direction. The refusal probe sits
+/// past the declaration — the band's outer edge since of-3jgq.
 #[test]
 fn the_reconciliation_band_survives_inch_authoring() {
     let (r, h) = (5.0, 8.0);
     let declared = 2.54e-2;
     for (amount, expect) in [
         (1.4 * MAX_ALLOWED_TOLERANCE, Band::Reconciled),
-        (2.2 * MAX_ALLOWED_TOLERANCE, Band::Refused),
+        (2.7 * MAX_ALLOWED_TOLERANCE, Band::Refused),
     ] {
         for unit in [Unit::Mm, Unit::Inch] {
             let repro =
@@ -1419,7 +1428,7 @@ fn the_reconciliation_band_is_translation_invariant() {
     let origin = [700.0, -400.0, 250.0];
     for (amount, expect) in [
         (1.4 * MAX_ALLOWED_TOLERANCE, Band::Reconciled),
-        (2.04 * MAX_ALLOWED_TOLERANCE, Band::Refused),
+        (2.7 * MAX_ALLOWED_TOLERANCE, Band::Refused),
     ] {
         let repro = format!(
             "OffPlane slop {amount:.3e} under declaration {declared:.3e} at origin {origin:?}"
@@ -1476,63 +1485,94 @@ fn a_reconciled_vertex_still_reads_the_two_vertex_seam() {
 
 /// A declaration that lies by decades — 1000 mm on an 8 mm part. The
 /// clamp note fires, and inside the band the mechanism behaves exactly as
-/// under an honest loose declaration: curves unanimous on one point snap to
-/// it even 50× past the kernel limit (the file's geometry is consistent,
-/// only its vertex is parked wrong — and the reader says what it did),
-/// while the same magnitude of *disagreement* between the circle and the
-/// seam line stays refused, because no split can land 0.25 mm residuals
-/// under the limit. A lying declaration widens what may move, never what
-/// any entity may carry.
+/// under an honest loose declaration: curves unanimous on one point snap
+/// the vertex to it even 50× past the kernel limit (the file's geometry is
+/// consistent, only its vertex is parked wrong — and the reader says what
+/// it did). Since of-3jgq that unanimity is the curves' *intersection*,
+/// not coincident feet, so the off-plane push — 0.5 mm along the seam line
+/// away from the circles — snaps home exactly like the radial one. What no
+/// declaration may launder is *disagreement between the curves themselves*:
+/// re-anchor the seam line 0.5 mm off the circles and no vertex position
+/// lands the residuals under the limit — 0.25 mm at best — so the body is
+/// refused however loose the declaration. A lying declaration widens what
+/// may move, never what any entity may carry.
 #[test]
 fn a_lying_declaration_rescues_only_unanimous_curves_and_says_so() {
     let (r, h) = (5.0, 8.0);
     let declared = 1.0e3;
     let amount = 0.5;
 
-    let repro = format!("Radial slop {amount} under lying declaration {declared:.1e}");
-    let text = cylinder_with_a_loose_seam_vertex(
-        r,
-        h,
-        Slop::Radial.apply(r, h, amount),
-        Unit::Mm,
-        Some(declared),
-    );
-    let volume = exact_checked_volume(&text, &repro)
-        .unwrap_or_else(|| panic!("{repro}: unanimous curves within the declaration must snap"));
-    assert_within(volume, PI * r * r * h, 1.0e-6, &repro);
-    let (_, _, report) = import(&text, &repro);
-    assert!(
-        reconciled(&report),
-        "{repro}: a 0.5 mm snap must be reported: {:#?}",
-        report.diagnostics
-    );
-    assert!(
-        report
-            .diagnostics
-            .iter()
-            .any(|d| d.message.contains("exceeds the kernel limit")),
-        "{repro}: the clamped declaration must be noted: {:#?}",
-        report.diagnostics
-    );
+    for slop in [Slop::Radial, Slop::OffPlane] {
+        let repro = format!("{slop:?} slop {amount} under lying declaration {declared:.1e}");
+        let text = cylinder_with_a_loose_seam_vertex(
+            r,
+            h,
+            slop.apply(r, h, amount),
+            Unit::Mm,
+            Some(declared),
+        );
+        let volume = exact_checked_volume(&text, &repro).unwrap_or_else(|| {
+            panic!("{repro}: unanimous curves within the declaration must snap")
+        });
+        assert_within(volume, PI * r * r * h, 1.0e-6, &repro);
+        let (_, _, report) = import(&text, &repro);
+        assert!(
+            reconciled(&report),
+            "{repro}: a 0.5 mm snap must be reported: {:#?}",
+            report.diagnostics
+        );
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("exceeds the kernel limit")),
+            "{repro}: the clamped declaration must be noted: {:#?}",
+            report.diagnostics
+        );
+    }
 
-    let repro = format!("OffPlane slop {amount} under lying declaration {declared:.1e}");
-    let text = cylinder_with_a_loose_seam_vertex(
+    // The seam LINE re-anchored radially: it now misses the circles (and
+    // the cylinder wall) by the whole amount, and the vertex — left exactly
+    // at the true seam point — cannot move anywhere that reconciles curves
+    // disagreeing with each other.
+    let clean = cylinder_with_a_loose_seam_vertex(
         r,
         h,
-        Slop::OffPlane.apply(r, h, amount),
+        [r, 0.0, -h / 2.0],
         Unit::Mm,
         Some(declared),
+    );
+    let anchored = format!(
+        "#3 = CARTESIAN_POINT('', ({:.12}, {:.12}, {:.12}));",
+        r,
+        0.0,
+        -h / 2.0
+    );
+    assert_eq!(clean.matches(&anchored).count(), 1, "the seam line anchor");
+    let text = clean.replace(
+        &anchored,
+        &format!(
+            "#3 = CARTESIAN_POINT('', ({:.12}, {:.12}, {:.12}));",
+            r + amount,
+            0.0,
+            -h / 2.0
+        ),
+    );
+    let repro = format!(
+        "seam line re-anchored {amount} mm off the circles under lying \
+         declaration {declared:.1e}"
     );
     assert_refused(&text, &repro);
 }
 
 /// Randomized sweep of the whole band, all three slop shapes, honest and
-/// lying declarations: draws sit ≥ 4% clear of both band edges so the
-/// analytic verdict is unambiguous, and every import is checker-clean,
-/// measured, and reports reconciliation exactly when the draw is past the
-/// limit. Radial slop snaps at any band magnitude (the circle and the seam
-/// line agree on the seam point); off-plane and tangential split and so die
-/// past twice the limit.
+/// lying declarations: draws sit ≥ 4% clear of the band's inner edge (and
+/// under every drawn declaration) so the analytic verdict is unambiguous,
+/// and every import is checker-clean, measured, and reports reconciliation
+/// exactly when the draw is past the limit. Since of-3jgq every slop shape
+/// snaps at any band magnitude the declaration covers: the circle and the
+/// seam line intersect at the seam point, and the true minimax finds their
+/// agreement wherever the *vertex* was pushed.
 #[test]
 fn reconciliation_band_fuzz_agrees_with_the_analytic_contract() {
     let mut rng = Rng::new(0x_0F5C_5A01);
@@ -1547,11 +1587,10 @@ fn reconciliation_band_fuzz_agrees_with_the_analytic_contract() {
                 1 => rng.range(1.1, 1.9),
                 _ => rng.range(2.1, 2.5),
             };
-        let expect = match (slop, class) {
-            (_, 0) => Band::CarriedUnmoved,
-            (Slop::Radial, _) => Band::Reconciled,
-            (_, 1) => Band::Reconciled,
-            _ => Band::Refused,
+        let expect = if class == 0 {
+            Band::CarriedUnmoved
+        } else {
+            Band::Reconciled
         };
         let repro = format!(
             "case {case}: cylinder(r = {r:.6}, h = {h:.6}), {slop:?} slop {amount:.6e} \
@@ -1616,19 +1655,17 @@ fn a_high_valence_apex_reconciles_perpendicular_slop() {
 /// curves are unanimous on one point inside the declaration, the textbook
 /// case of-5cn5's contract says to believe ("a cluster of curves agreeing
 /// on some distant point… snaps within the declaration"), and the true
-/// minimax point carries **zero** residual. But the implementation centers
-/// the ball of the *feet*, which for concurrent lines at slant half-angle
-/// α reduces the miss only by cos²α: here 1.35× becomes 1.27× the limit,
-/// still past carriable, and the solid is refused outright — a file the
-/// declared closure covers, lost to an approximation error in the split.
+/// minimax point carries **zero** residual.
 ///
-/// FOUND FAILING, filed as **of-3jgq**: `reconcile_vertices` must find (or
-/// verify against) the true minimax over curve distances, not the feet
-/// ball; a fixed-point re-foot iteration converges to the intersection
-/// here. Refusal today is honest (Failed + Error diagnostic), so this is a
-/// missed rescue, not corruption.
+/// FOUND FAILING, filed as **of-3jgq** (now FIXED): the implementation
+/// centered the ball of the *feet*, which for concurrent lines at slant
+/// half-angle α reduces the miss only by cos²α — here 1.35× became 1.27×
+/// the limit, still past carriable, and the solid was refused outright, a
+/// file the declared closure covers lost to an approximation error in the
+/// split. `minimax_curve_point` (read.rs) now iterates the re-foot
+/// contraction to the common point the curves agree on, and the pyramid
+/// imports at the authored volume.
 #[test]
-#[ignore = "of-3jgq: feet-ball minimax refuses a unanimously-agreed apex (cos^2 alpha reduction)"]
 fn an_axially_slopped_apex_of_concurrent_edges_must_import() {
     let (n, r, h) = (6, 3.0f64, 12.0f64);
     // Slant half-angle: sin α = r / √(r² + h²) ≈ 0.2425. Axial slop δ
@@ -1649,23 +1686,6 @@ fn an_axially_slopped_apex_of_concurrent_edges_must_import() {
     });
     let base_area = (n as f64) / 2.0 * r * r * (2.0 * PI / (n as f64)).sin();
     assert_within(volume, base_area * h / 3.0, 1.0e-4, &repro);
-}
-
-/// The refusal the feet-ball approximation produces today must at least be
-/// honest — Failed with an Error diagnostic naming the vertex miss, never
-/// a silently-degraded or wrong-volume body. Pins the *current* behavior
-/// of the of-3jgq geometry so a fix over there flips exactly one test.
-#[test]
-fn an_axially_slopped_apex_is_at_least_refused_honestly() {
-    let (n, r, h) = (6, 3.0f64, 12.0f64);
-    let sin_a = r / (r * r + h * h).sqrt();
-    let delta = 1.35 * MAX_ALLOWED_TOLERANCE / sin_a;
-    let repro = format!(
-        "{n}-gon pyramid(r = {r}, h = {h}), apex slopped {delta:.4e} along +z, \
-         declaration 0.1 (of-3jgq geometry, current behavior)"
-    );
-    let text = ngon_pyramid(n, r, h, [0.0, 0.0, h + delta], Some(0.1));
-    assert_refused(&text, &repro);
 }
 
 /// A carriable miss at valence six stays where the file put it: slop under

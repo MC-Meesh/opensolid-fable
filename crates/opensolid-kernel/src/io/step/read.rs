@@ -2826,10 +2826,16 @@ struct ReconciledVertex {
 /// tolerance measurement ([`record_edge_tolerances`]) hits the same limit.
 /// What works is reading the miss as what it is — connectivity slop within
 /// the closure the file *declares* — and splitting it: move the vertex to
-/// the point minimizing its greatest distance to any incident edge curve,
-/// so each edge carries an equal share as ordinary vertex tolerance. For
-/// #2783 that is the midpoint between the authored point and the circle,
-/// and 18 µm past-limit becomes 9 µm on every edge, under it.
+/// the point minimizing its greatest distance to any incident edge curve
+/// ([`minimax_curve_point`]), so each edge carries an equal share as
+/// ordinary vertex tolerance. For #2783 that is the midpoint between the
+/// authored point and the circle, and 18 µm past-limit becomes 9 µm on
+/// every edge, under it. Where the incident curves are *concurrent* — all
+/// passing through one common point inside the declaration, as every
+/// straight-edged corner or seam junction authors them — that point is the
+/// minimax target itself: the curves are unanimous on where the vertex
+/// belongs, the vertex snaps there, and the edges carry nothing at all
+/// (of-3jgq).
 ///
 /// The bounds keep the pass honest; a vertex failing any of them stays
 /// where the file put it, for [`verify_trim`] to refuse as before:
@@ -2958,19 +2964,14 @@ fn reconcile_vertices(
         if was <= carriable || was > declared {
             continue;
         }
-        let center = minimax_point(&feet);
-        let moved = (center - authored).norm();
-        // Re-measure from the reconciled position against the curves
-        // themselves — a foot moves as the query point does.
-        let mut now = 0.0f64;
-        for curve in &curves {
-            let Some(foot) = curve_foot(curve, &center) else {
-                now = f64::INFINITY;
-                break;
-            };
-            now = now.max((foot - center).norm());
-        }
-        if moved > declared || now > carriable {
+        // The documented target: the point minimizing the greatest distance
+        // to any incident curve, measured against the curves themselves and
+        // held within the declaration ([`minimax_curve_point`]).
+        let Some((center, now, moved)) = minimax_curve_point(&curves, &feet, authored, declared)
+        else {
+            continue;
+        };
+        if now > carriable {
             continue;
         }
         moves.push(ReconciledVertex {
@@ -3044,6 +3045,72 @@ fn minimax_point(points: &[Point3]) -> Point3 {
         center += (far - center) / (k as f64 + 1.0);
     }
     center
+}
+
+/// How many re-foot rounds [`minimax_curve_point`] may take. Each round
+/// contracts the miss toward concurrent curves' common point by cos²α at
+/// mutual half-angle α, so shallow crossings need many rounds (α ≥ ~1°
+/// converges fully within this budget); the loop exits early the moment
+/// the center stops moving, and a crossing too shallow to reach simply
+/// keeps the best center any round measured.
+const REFOOT_ROUNDS: usize = 1024;
+
+/// The point minimizing the greatest distance to any of `curves` — the
+/// reconciliation target [`reconcile_vertices`] documents — approached by
+/// alternating the feet-ball center ([`minimax_point`]) with re-projecting
+/// every foot from that center. A single round is of-5cn5's feet-ball
+/// approximation, exact when the feet already tell the whole story
+/// (nist_ctc_05's #2783, where the curves genuinely disagree and the split
+/// halves the miss between them); but when the incident curves are
+/// *concurrent* — all through one common point, the hexagonal-pyramid apex
+/// of of-3jgq — one round shortens the miss only by cos²α, while iterating
+/// the same contraction converges to the point the curves unanimously
+/// name. `feet` are the projections of `authored` onto `curves`, in order —
+/// the iteration's starting measurements.
+///
+/// Every candidate center is measured against the curves themselves, and
+/// the best-measured one within `declared` of `authored` wins — so the
+/// result is never worse than the single-round split, and a center that
+/// wanders past the file's declaration (or somewhere unmeasurable, like a
+/// circle's axis) loses to its better predecessors rather than poisoning
+/// the move. Returns that center with its residual and its move, or `None`
+/// when no round produced a measurable candidate within the declaration.
+fn minimax_curve_point(
+    curves: &[Curve3],
+    feet: &[Point3],
+    authored: Point3,
+    declared: f64,
+) -> Option<(Point3, f64, f64)> {
+    let mut feet = feet.to_vec();
+    let mut best: Option<(Point3, f64, f64)> = None;
+    let mut prev: Option<Point3> = None;
+    for _ in 0..REFOOT_ROUNDS {
+        let center = minimax_point(&feet);
+        let mut now = 0.0f64;
+        let mut sound = true;
+        for (foot, curve) in feet.iter_mut().zip(curves) {
+            let Some(q) = curve_foot(curve, &center) else {
+                sound = false;
+                break;
+            };
+            now = now.max((q - center).norm());
+            *foot = q;
+        }
+        if !sound {
+            break;
+        }
+        let moved = (center - authored).norm();
+        if moved <= declared && best.is_none_or(|(_, r, _)| now < r) {
+            best = Some((center, now, moved));
+        }
+        if now <= SYSTEM_RESOLUTION
+            || prev.is_some_and(|p| (center - p).norm() <= SYSTEM_RESOLUTION)
+        {
+            break;
+        }
+        prev = Some(center);
+    }
+    best
 }
 
 /// Trim an analytic curve to an edge's vertices: orient it along the edge
@@ -8795,6 +8862,32 @@ mod tests {
     /// miss the relative rule refuses and any real closure covers.
     const LOOSE_VERTEX_OFFSET: f64 = 1.0e-5;
 
+    /// The disagreeing-curves twin of [`block_with_a_loose_vertex`]: every
+    /// vertex stays where the plain fixture puts it, but the corner-0→4
+    /// `LINE` (the z-aligned edge curve) is re-anchored `off` mm along +x,
+    /// onto a `CARTESIAN_POINT` of its own. The two corner-0 vertices' other
+    /// lines still pass through them exactly, so at each end the incident
+    /// curves genuinely *disagree* by `off` — there is no point all of them
+    /// pass through, and the best any move can do is split the miss
+    /// (residual `off / 2`). This is the configuration the loose-vertex
+    /// fixture cannot author: its curves are concurrent at the corner, so
+    /// reconciliation snaps them clean at any covered magnitude (of-3jgq).
+    fn block_with_a_loose_edge_line(off: f64, closure: Option<f64>) -> String {
+        // `off = 0` in the vertex fixture parks the vertex exactly where the
+        // plain block puts it, so only the line below moves.
+        let src = block_with_a_loose_vertex(0.0, closure);
+        let anchored = "#51 = LINE('', #1, #50);\n";
+        assert_eq!(src.matches(anchored).count(), 1, "corner 0's z-line");
+        src.replace(
+            anchored,
+            &format!(
+                "#9001 = CARTESIAN_POINT('', ({:.9}, -1.000000, -1.000000));\n\
+                 #51 = LINE('', #9001, #50);\n",
+                -1.0 + off
+            ),
+        )
+    }
+
     /// With no declaration the round-off rule stands alone and refuses the
     /// vertex — and because the mesh fallback shares [`trim_curve`], the
     /// refusal costs the whole solid rather than degrading it. That is
@@ -8871,10 +8964,13 @@ mod tests {
 
     /// A vertex 1.5× the kernel limit off two of its three edges — too far
     /// for any tolerance to carry, so of-kwn's closure floor cannot admit
-    /// it. What can is splitting the miss: the fixture declares a closure
-    /// and the reader moves the vertex to the minimax point of its edges'
-    /// nearest points, leaving each edge half the miss as ordinary vertex
-    /// tolerance. nist_ctc_05's #2783 in miniature (of-5cn5).
+    /// it. What can is reconciliation: the fixture declares a closure and
+    /// the reader moves the vertex to the point minimizing its greatest
+    /// curve distance. All three corner lines pass through the true corner
+    /// (the +x line contains the displaced vertex *and* the corner), so the
+    /// curves are unanimous and the vertex snaps there, carrying nothing —
+    /// the concurrent-curve case of-3jgq taught [`minimax_curve_point`] to
+    /// find exactly.
     #[test]
     fn a_vertex_past_the_kernel_limit_is_reconciled_within_the_closure() {
         let off = 1.5 * MAX_ALLOWED_TOLERANCE;
@@ -8894,10 +8990,9 @@ mod tests {
             report.diagnostics
         );
 
-        // The vertex moved halfway toward the corner its two missed edges
-        // still run from, so every edge now carries half the miss — under
-        // the limit — and the vertex's tolerance covers it.
-        let vertex = store
+        // The vertex snapped to the corner every incident line runs
+        // through, so no vertex carries any tolerance beyond round-off.
+        let vertices: Vec<_> = store
             .faces_of_body(body)
             .into_iter()
             .flat_map(|f| store.edges_of_face(f))
@@ -8905,19 +9000,22 @@ mod tests {
                 let edge = store.edge(e).expect("live edge");
                 [edge.start_vertex, edge.end_vertex]
             })
-            .find(|&v| store.vertex(v).expect("live vertex").tolerance > SYSTEM_RESOLUTION)
-            .expect("the reconciled vertex carries its split miss");
-        let vertex = store.vertex(vertex).expect("live vertex");
+            .collect();
         assert!(
-            (vertex.point - Point3::new(-1.0 + off / 2.0, -1.0, -1.0)).norm() < 1e-4,
-            "expected the minimax midpoint, got {:?}",
-            vertex.point
+            vertices.iter().any(|&v| {
+                (store.vertex(v).expect("live vertex").point - Point3::new(-1.0, -1.0, -1.0))
+                    .norm()
+                    < 1e-6
+            }),
+            "the vertex must sit at the corner its curves agree on"
         );
-        assert!(
-            (vertex.tolerance - off / 2.0).abs() < 1e-4,
-            "expected half the miss as tolerance, got {}",
-            vertex.tolerance
-        );
+        for &v in &vertices {
+            let tolerance = store.vertex(v).expect("live vertex").tolerance;
+            assert!(
+                tolerance < 1e-6,
+                "a unanimously-agreed vertex carries nothing, got {tolerance}"
+            );
+        }
     }
 
     /// Without a declaration there is no authored slop to split — the file
@@ -8942,13 +9040,38 @@ mod tests {
         );
     }
 
-    /// A miss too wide for even an equal split to land under the kernel
-    /// limit is beyond repair, however wide the declaration: the reconciled
-    /// residuals would still be more than a vertex can carry.
+    /// Even 5× the kernel limit snaps when the incident curves are
+    /// unanimous and the declaration covers it (of-3jgq): the three corner
+    /// lines all pass through the true corner, the vertex moves there, and
+    /// the residual — what any entity must actually *carry* — is zero. The
+    /// declaration bounds the move; the limit binds what is carried.
+    #[test]
+    fn a_unanimous_miss_far_past_the_limit_snaps_within_the_declaration() {
+        let off = 5.0 * MAX_ALLOWED_TOLERANCE;
+        let (store, geo, report) = import(&block_with_a_loose_vertex(off, Some(9.0e-2)));
+        no_error_diagnostics(&report);
+        let body = brep_body(&report.solids[0].outcome);
+        assert_eq!(store.check_with_geometry(&geo, body), Vec::new());
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|d| d.message.starts_with("healed: vertex")),
+            "the snap must be reported: {:?}",
+            report.diagnostics
+        );
+    }
+
+    /// A miss whose curves genuinely *disagree* — the corner-0→4 line
+    /// re-anchored 5× the limit off the two lines still through each of its
+    /// vertices — is beyond repair, however wide the declaration: the best
+    /// split still leaves residuals (half the disagreement) more than a
+    /// vertex can carry. No feet-ball or re-foot iteration may talk its way
+    /// past what the curves themselves refuse to agree on.
     #[test]
     fn a_miss_too_wide_to_split_is_still_refused() {
         let off = 5.0 * MAX_ALLOWED_TOLERANCE;
-        let (_, _, report) = import(&block_with_a_loose_vertex(off, Some(9.0e-2)));
+        let (_, _, report) = import(&block_with_a_loose_edge_line(off, Some(9.0e-2)));
         assert!(
             matches!(report.solids[0].outcome, SolidOutcome::Failed),
             "got {:?}",
@@ -8964,9 +9087,11 @@ mod tests {
         );
     }
 
-    /// [`reconcile_vertices`] itself, on the fixture: one move, to the
-    /// midpoint, measured honestly — and none when the miss is round-off
-    /// slop a vertex can already carry.
+    /// [`reconcile_vertices`] itself, on both fixtures: unanimous curves
+    /// snap the vertex to their common point carrying nothing (of-3jgq),
+    /// genuinely disagreeing curves split the miss at the true minimax
+    /// point — and nothing moves when the miss is round-off slop a vertex
+    /// can already carry.
     #[test]
     fn reconcile_vertices_splits_the_miss_at_the_minimax_point() {
         let off = 1.5 * MAX_ALLOWED_TOLERANCE;
@@ -8991,15 +9116,40 @@ mod tests {
                 closure,
             )
         };
+        // The three corner lines are concurrent at the corner — the +x line
+        // contains the displaced vertex and the corner both — so the move
+        // goes all the way there and the residual collapses to zero.
         let moves = reconcile(&file);
         let [m] = &moves[..] else {
             panic!("expected exactly one move, got {}", moves.len());
         };
         assert_eq!(m.vertex, 9);
-        assert!((m.point - Point3::new(-1.0 + off / 2.0, -1.0, -1.0)).norm() < 1e-4);
+        assert!((m.point - Point3::new(-1.0, -1.0, -1.0)).norm() < 1e-6);
         assert!((m.was - off).abs() < 1e-12, "got {}", m.was);
-        assert!((m.now - off / 2.0).abs() < 1e-4, "got {}", m.now);
-        assert!((m.moved - off / 2.0).abs() < 1e-4, "got {}", m.moved);
+        assert!(m.now < 1e-6, "got {}", m.now);
+        assert!((m.moved - off).abs() < 1e-6, "got {}", m.moved);
+
+        // Re-anchor the corner's z-line instead: at each of its ends the
+        // incident curves genuinely disagree by `off`, no common point
+        // exists, and the minimax point splits the miss — half the
+        // disagreement on every edge, the of-5cn5 midpoint reading.
+        let src = block_with_a_loose_edge_line(off, Some(5.0e-2));
+        let file = super::super::parse::parse(&src).expect("fixture parses");
+        let moves = reconcile(&file);
+        let [m9, m13] = &moves[..] else {
+            panic!("expected both line ends moved, got {}", moves.len());
+        };
+        for (m, z) in [(m9, -1.0), (m13, 1.0)] {
+            assert_eq!(m.vertex, if z < 0.0 { 9 } else { 13 });
+            assert!(
+                (m.point - Point3::new(-1.0 + off / 2.0, -1.0, z)).norm() < 1e-4,
+                "expected the split midpoint, got {:?}",
+                m.point
+            );
+            assert!((m.was - off).abs() < 1e-12, "got {}", m.was);
+            assert!((m.now - off / 2.0).abs() < 1e-4, "got {}", m.now);
+            assert!((m.moved - off / 2.0).abs() < 1e-4, "got {}", m.moved);
+        }
 
         // Round-off slop stays put: the closure floor already carries it.
         let src = block_with_a_loose_vertex(LOOSE_VERTEX_OFFSET, Some(1.0e-4));
